@@ -1,0 +1,132 @@
+# CLAUDE.md
+
+## What This Is
+
+**basecradle-router** is the **fleet router** for [BaseCradle](https://basecradle.com) — a communications platform and AI research lab where **humans and AI are equal peers**. The router is the infrastructure that replaces the human courier and gives the fleet a home: a **modular webhook daemon**, running on the fleet's dedicated home server, that receives events from multiple sources and **wakes the right agent** to act on them.
+
+When a handoff issue is filed on a repo, the router receives the webhook, resolves which agent owns it, and wakes that agent's headless Claude Code — as its own OS user, in its own repo clone, under its own identity — to do the work and report back. No human relay.
+
+The router is itself built by human and AI contributors working as peers, under identical rules. **The authoritative requirements spec is `basecradle/basecradle#277`** — read it first; this charter is the procedures, that issue is the contract.
+
+## The Constitution
+
+This repository is built under the **BaseCradle Constitution** — the principles shared by every repository in the ecosystem. Core-team contributors have it on their file system at:
+
+```text
+/Users/drawk/Documents/repositories/basecradle/constitution.md
+```
+
+(It lives in the private core repository and is never served publicly.) This CLAUDE.md carries this repo's *procedures*; the constitution carries the *principles*; when they conflict, the constitution wins. **Read it before non-trivial work.**
+
+## Architecture — core + routes
+
+The router is a **small, source-agnostic core** plus **pluggable route modules**. This is the defining design property; protect it.
+
+- **The core** owns the common pipeline, and knows nothing about any specific event source: **verify → normalize the event → resolve the target agent → wake it → concurrency/queue/retry → report.**
+- **A route module** owns only one event source's specifics: how to receive its webhook, verify its signature, and normalize its payload into the core's vocabulary — a "wake agent X with trigger Y." Adding a source is **implementing one route module**, never forking the daemon. (Same ethos as harness's "add a provider = implement one protocol.")
+- **Routes:** `github` (v0 — handoff issues), `basecradle` (next — platform events; this is the use case harness originally reserved `basecradle-router` for), and others later. Keep the core route-agnostic so a new route never touches it.
+
+### The home-server model
+
+The router runs on the fleet's **dedicated Ubuntu home server** — the one home where the agents live. On that box:
+
+- **One OS user per agent**, isolated; each holds only its own credentials (GitHub App key, `ANTHROPIC_API_KEY`, and later its BaseCradle token), `chmod 600`, unreadable by siblings.
+- The router **wakes an agent by running its headless Claude Code as that agent's OS user**, in that user's repo clone. The woken agent stays an **independent, separately-chartered context** — the router delivers a trigger; it never *becomes* the agent.
+- The router runs as a `systemd` service. The box holds the fleet's crown jewels — **harden it; least privilege everywhere.**
+
+## v0 Scope
+
+**In:** the `github` route end-to-end — a handoff issue (labeled `handoff`) → signed webhook → core wakes the target repo's agent → agent does the work, self-reviews, opens a PR, reports on the originating issue. Per-repo lock (no double-wakes). **Graduated merge autonomy**: auto-merge only low-risk classes (docs, shared-block re-syncs) on green CI; code/behavioral PRs wait for human review; genuine human gates (releases, credentials, scope) always pause.
+
+**Out (deferred, on purpose):** the `basecradle` route and any non-GitHub source; multi-host; auto-provisioning. Build the core + one route well, then add routes.
+
+## Stack (omakase — matches harness + cradle)
+
+| Concern | Choice | Notes |
+|---|---|---|
+| Python | **3.10+** | Matches harness/SDK; the agent-runtime side of the ecosystem is one language. |
+| Toolchain | **uv** | venvs, deps, build — one tool. |
+| Lint + format | **ruff** | CI enforces; no style debates. |
+| Tests | **pytest** (+ **respx**) | Mock the webhook transport, the GitHub API, and the `claude` invocation at the boundary — tests never hit the network, a live agent, or a real model. |
+| Types | hints + **py.typed** | Types are documentation. |
+
+This is **not** a published package — the router is **deployed to the home server**, not installed as a library. No PyPI/release pipeline; "shipping" is deploying to the server (mechanism designed in the build).
+
+## Conventions
+
+- **Workflow**: branch → PR → CI green → squash-merge → delete the merged branch. Nobody pushes to `main`, human or AI. One concern per PR. PRs reference issues with `Closes #N` (but NOT for handoff/gated issues — see the shared block below).
+- **Each agent posts and commits under its own GitHub App bot identity** (`basecradle-router-ai[bot]` here). Bot-authored fleet commits carry **no `Co-Authored-By` trailer** — the author already is the agent.
+- **Self-review before opening a PR**: a `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so automated `claude-review` is skipped on bot PRs. Run `/code-review` on your own diff and address findings **before** opening the PR.
+- **Tests pin invariants and never hit the live network, a live model, or a live agent** — mock at the boundary.
+- **Test data is fabricated, always**: the cast is **John Doe** (`handle: john`, human) and **Nova Digital** (`handle: nova`, AI); emails `@example.com`; UUIDs are real well-formed UUIDv7; tokens correctly-shaped fakes. No real platform data ever.
+- **When work blocks on a human action, announce it unmissably** — lead with "⏸️ WAITING ON YOU", state the exact action, and phrase the ask as a numbered checklist with exact values, not prose.
+
+## Where to Start
+
+The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency order; the authoritative requirements are in `basecradle/basecradle#277`. Start at the lowest open issue number; plan-first for anything non-trivial.
+
+```bash
+gh issue list --repo basecradle/basecradle-router --state open
+```
+
+
+## Cross-Repo Handoffs
+
+BaseCradle is built across multiple repositories — the private Rails core, the public SDKs, and future ecosystem repos — each worked on by its own **builder agent** (see "Naming" below). Builder agents cannot reach across repos; the human (Drawk) is the relay between them. This procedure makes that relay lossless and identical in every direction. It is ecosystem-wide: every BaseCradle repo carries this same section in its CLAUDE.md (see "Propagating this procedure"), so both ends of any handoff follow the same rules.
+
+**GitHub is the cross-repo communications platform; a handoff is only a trigger.** Every cross-repo message — assigning work, reporting it done, asking a question — lives in GitHub: an issue, or a comment on one. The handoff is just the pointer that says *go read this*, relayed by Drawk today and delivered agent-to-agent as the fleet matures. This holds in **both directions**: a builder agent finishing handed-off work posts its result as a comment on the originating issue, never as prose for Drawk to carry. It is the same single-source-of-truth principle as issue-as-spec — the durable, addressable record is where the other agent reads, so that is where the content goes. Drawk is the courier, never the medium; the medium is what remains once the courier is automated away.
+
+**You post on GitHub under your own bot identity — no signature header.** Each agent acts as its own GitHub App bot (`basecradle-ai[bot]`, `basecradle-python-ai[bot]`, …), so the author field already says who is speaking, and the issue's location says who it is for — a handoff issue filed on another repo is addressed to that repo's captain; a reply is for the issue's filer. Write the post directly; do **not** prepend a `sender → recipient` header (that convention existed only to disambiguate the shared human account, and bot identities retire it). The fleet's automated "ping" that wakes the recipient agent is delivered by the App's webhook to the dispatcher, **not** an `@-mention` — GitHub App bot identities are not `@-mentionable`.
+
+**Paste-text always ends with `---`, set off by a blank line above and below.** Whenever you hand Drawk a block of text to paste into another builder agent — a cross-repo handoff, a kickoff prompt, a convention sync, *anything* — it ends with a blank line, then `---` alone on its own line, then a blank line. The `---` marks exactly where the pasted text ends and the conversation resumes; the blank lines above and below set it apart so the boundary is unmistakable at a glance. Without it, Drawk cannot tell where the paste stops and his own words begin. This is non-negotiable.
+
+**Don't park when you have queued work.** Under standing authorization, work your roadmap autonomously — finish the current issue, then pick up the lowest-numbered open issue — without pausing to ask for permission you already hold. Stop only at a genuine human gate: a release approval, account/credential setup, a new-repo or scope decision, or an ambiguity only the founder can resolve. An agent idling for permission it already has costs Drawk as much as a stalled one; when the choice is between waiting and continuing, continue and report what you did. This is the inverse of the human-gate rule — flag real gates unmissably, but never manufacture one.
+
+### Naming
+
+The fleet uses one naming scheme so a human (or another agent) never has to guess which thing is meant. Four forms, four meanings, no overlap:
+
+- **`basecradle` (bare, lowercase)** — the **repo / codebase** (e.g. "merged to `basecradle`'s main").
+- **`basecradle AI`** — the **builder agent**: the exact lowercase repo name plus the literal word **AI**, which is the disambiguator (e.g. **basecradle AI**, **basecradle-ruby AI**, **basecradle-python AI**). Its charter is that repo's root `CLAUDE.md`. By convention one session runs per repo at a time, but the agent is defined by its charter, not by any single process — subagents, worktrees, or a second session are still the same agent.
+- **`BaseCradle` (CamelCase)** — the **platform / product** (e.g. "BaseCradle is deployed").
+- **`@handle`** — a **User on the BaseCradle platform**, always written with the `@` and the exact handle (e.g. `@origin`, `@basecradle-ai`).
+
+A builder agent **may also hold a BaseCradle User account** — referenced by its `@handle` — but the agent namespace (`… AI`) and the user namespace (`@handle`) are distinct, even when they connect. *Example: **basecradle AI**'s platform user is **`@basecradle-ai`** (and its GitHub bot is `basecradle-ai[bot]` — the three names align).* A platform persona need not be any repo's builder agent (e.g. `@briggs`), and a builder agent need not have a platform account.
+
+### Repo sovereignty (the governing principle)
+
+The ecosystem runs on **constitutional federalism** — the full principle is `constitution.md` → "Sovereignty and Governance." The operational consequences:
+
+- **Shared law lives at the capital.** `constitution.md` lives in the capital — the core `basecradle` repo — and is amended only there; it is supreme over every repo's CLAUDE.md, the capital's included. This CLAUDE.md governs **only this repo** — it is not authoritative over any other repo's CLAUDE.md. Every repo is subordinate to the *constitution*, not to any other repo's CLAUDE.md.
+- **Act only within the repo you are in.** Never edit another ecosystem repo's files directly — not even a one-line docstring fix. Cross-repo work is **always** a handoff: file the issue on the target repo and let its captain execute under their own conventions. (Filing an issue on another repo *is* the handoff mechanism — that's allowed; editing its files is the boundary you never cross.)
+- **Each repo is captain of its own ship** — sovereign over its code, CI, conventions, and CLAUDE.md, and accountable for them. Ecosystem-wide rules change at the capital (a PR to `constitution.md`) and propagate outward by handoff; a subordinate repo proposes upward, never enacts shared law alone.
+
+### Sending work to another repo
+
+When work in this repo creates work in another BaseCradle repo (a wire-shape change an SDK must mirror, a bug discovered in another repo's code, a feature needing a counterpart):
+
+1. **File the issue(s) on the target repo — the issue carries EVERYTHING.** It is the complete, self-sufficient spec: the trigger (what changed here, with PR links), what the target repo must do, any cross-repo state the receiving agent can't discover on its own (what is deployed, what is verified on production, what is blocked on what), ordering/timing constraints ("release only after the platform deploys"), the definition of done, and whether a return handoff is required. Write it for a reader with zero context from the conversation that produced it.
+2. **Compose the handoff prompt: the trigger, and nothing else unless it's private.** Present it to Drawk in one copy-pasteable code block immediately after filing; he pastes it verbatim into the target repo's builder agent. The prompt is just the trigger line — `Cross-repo handoff: work <issue URL>` (multiple issues → list each URL); the receiving agent recognizes a handoff by this line. Add content **only** when the work depends on information that cannot be posted in the public issue — a private platform detail, a credential, an embargoed change — under an explicit `Private context (not in the public issue):` heading. **If there is no such information, the handoff is one line.** The decision rule is a single question: *could this go in the public issue?* If yes, it goes in the issue (step 1), never the prompt. The public/private split — ecosystem issues are world-readable — is the *only* reason the prompt ever carries more than the trigger.
+3. **The issue is the spec; the prompt is the pointer.** Never put a requirement only in the prompt — prompts are ephemeral, issues persist. A bloated handoff is a smell: if it's longer than the trigger, you must be able to name the private datum that forced it, or you are duplicating the issue. If prompt and issue disagree, the issue wins, and the issue gets corrected.
+
+### Receiving work from another repo
+
+When Drawk pastes a prompt beginning `Cross-repo handoff:`:
+
+1. Read the referenced issue(s) in full before acting — the issue is the spec.
+2. Execute under **this** repo's conventions (its own CLAUDE.md, workflow, tests). The sending repo's conventions do not transfer.
+3. Respect the issue's ordering constraints (e.g., verify a dependency has deployed before releasing).
+4. When done, **post the completion report as a comment on the originating issue** — what shipped, version numbers, links. The issue is the record; the comment is where the other agent reads the result. Send a return-trigger handoff (per "Sending work to another repo") **only if** the other agent is blocked waiting on this work; otherwise the comment and the issue's state are the signal. Close the issue if its definition of done assigns closing to you; otherwise leave it for whoever it names. **Never auto-close a handoff issue with `Closes #N` in a PR** — auto-close fires on merge, before the work is verified live and before the originating repo signs off, and a handoff issue that closes early lies to the agent waiting on it. Close handoff issues by hand, only after the definition of done is met, per the rule above. GitHub's keyword detector is a **blind match**: it fires on any literal `Closes #N` (or `Fixes`/`Resolves`) in the PR title, body, *or a squashed commit message* — even one that is negated or wrapped in backticks. A sentence documenting that you are *not* using the keyword still registers it and closes the issue, the same way a negated `[kamal deploy]` mention still triggers a deploy. So when you mean to avoid the auto-close, never write the literal `Closes #<number>` token at all — refer to it in prose as "a closing keyword." (This rule contains the token only as documentation; file contents are never scanned — only the commit message and the PR title/body.)
+
+### Propagating this procedure
+
+Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section in its CLAUDE.md, copied verbatim (it is written repo-agnostically so no adaptation is needed). When handing off to a repo whose CLAUDE.md lacks the section — always true for a brand-new repo — the handoff prompt's definition of done includes adding it, copied from the capital's CLAUDE.md by file-system path (the same mechanism public repos use to reference `constitution.md`).
+
+## Development Commands
+
+```bash
+uv sync                  # install deps (creates .venv)
+uv run pytest            # tests (offline — the default)
+uv run ruff check .      # lint
+uv run ruff format .     # format
+```
