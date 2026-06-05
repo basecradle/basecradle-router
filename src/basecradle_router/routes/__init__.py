@@ -7,9 +7,11 @@ from basecradle_router.routes.base import (
     RouteError,
     SignatureError,
 )
+from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.registry import RouteRegistry, UnknownRouteError
 
 __all__ = [
+    "GithubRoute",
     "InboundRequest",
     "PayloadError",
     "Route",
