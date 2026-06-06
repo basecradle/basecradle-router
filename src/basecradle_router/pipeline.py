@@ -40,7 +40,7 @@ from basecradle_router.concurrency import (
     with_retry,
 )
 from basecradle_router.config import Config, ConfigError
-from basecradle_router.merge_policy import MergeDecision, MergePolicy, PullRequest
+from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -92,7 +92,7 @@ class PipelineResult:
     records: list[StageRecord] = field(default_factory=list)
     event: Event | None = None
     agent: Agent | None = None
-    decision: MergeDecision | None = None
+    merged: bool | None = None  # True/False once the merge stage ran; None if it did not
 
     @property
     def stages(self) -> list[tuple[Stage, Outcome]]:
@@ -265,9 +265,9 @@ class Pipeline:
         pr = self.pr_provider(agent, event, woke)
         if pr is None:
             return  # no PR to evaluate (the merge stage simply does not run)
-        decision = self.merge_policy.run(pr)
-        result.decision = decision
-        self._record(result, Stage.MERGE, Outcome.OK, decision.value)
+        merged = self.merge_policy.run(pr)
+        result.merged = merged
+        self._record(result, Stage.MERGE, Outcome.OK, "merged" if merged else "ci-pending")
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, detail: str = ""
