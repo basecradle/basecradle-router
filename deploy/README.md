@@ -122,7 +122,7 @@ once the box exists**.
   structured so it could become Ansible *if* the fleet ever goes multi-host (out of scope now).
 
 ### Phase B — Daemon deploy *(authored ahead as ready-to-review files, per Drawk 2026-06-05; applied only once the box exists)*
-- **B1** systemd unit `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
+- **B1** ✅ **Authored (#36).** systemd unit `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
   the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
   `Restart=on-failure`, `TimeoutStopSec` to let the app drain in-flight wakes on shutdown, bound to
   localhost (Caddy fronts it).
@@ -134,7 +134,7 @@ once the box exists**.
   > separation + the wake-runner boundary (#28), not namespace sandboxing of the router. The unit
   > applies only the wake-compatible directives (`ProtectSystem=full`, `PrivateTmp`, the kernel/cgroup
   > protections). Stronger per-wake isolation later: launch each wake in its own `systemd-run --scope`.
-- **B2** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
+- **B2** ✅ **Authored (#35).** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- claude -p "<trigger>"`.
   It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
@@ -143,12 +143,18 @@ once the box exists**.
   `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
   `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
   (validate with `visudo -cf`).
-- **B3** `HomeServerWaker` in `wake.py`: assembles that wrapper argv (`--user`/`--cwd`/`--`) and an
-  `env_provider` that resolves to "the wrapper sources the agent's `agent.env`." The deferred consumer of
-  `run_as_user`. **Code change → its own PR with tests** (subprocess mocked at the boundary, as always).
+- **B3** ✅ **Done (#40).** `HomeServerWaker` in `wake.py` assembles the wrapper argv
+  (`--user`/`--cwd`/`--`); env is empty (the wrapper sources the agent's `agent.env` after the drop).
 - **B4** ✅ **Done (#30).** Fast-ack in `server.py`: `accept` runs inline → `202`, `execute` (the wake)
   runs as a tracked background task drained on shutdown.
-- **B5** Caddyfile: reverse-proxy to the local uvicorn; obtain the cert for `ai.basecradle.com`.
+- **B5** Caddyfile (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
+  reverse-proxy to the local uvicorn (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then
+  `caddy validate` + `systemctl reload caddy`.
+
+> **Also shipped (not in the original B-list):** the ASGI **entrypoint** `basecradle_router.app:create_app`
+> + the `uvicorn` dependency (#37) — the composition root the systemd unit's `ExecStart` runs — and a
+> note that the merge stage is a no-op until **live merge automation (#38)**: the router wakes agents,
+> who open their own PRs.
 
 ### Phase C — Go-live (ruby-first canary)
 The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + router-wake loop end-to-end.
