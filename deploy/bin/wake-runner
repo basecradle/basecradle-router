@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# wake-runner — the wake privilege boundary on the fleet home server.
+#
+# Installed ROOT-OWNED at /opt/basecradle-router/bin/wake-runner (root:root, 0755,
+# in a root-owned directory the `router` user cannot write). The unprivileged
+# `router` daemon invokes it through one locked sudoers rule:
+#
+#   sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone> -- claude -p "<trigger>"
+#
+# It validates the request, drops to the agent's own OS user, and runs the wake
+# in the agent's clone with the agent's own credentials. The router never runs as
+# root and never reads an agent's secrets — the wrapper drops privileges first,
+# then (as the agent) sources that agent's env. This is the runtime contract the
+# HomeServerWaker (#29) assembles against.
+#
+# The boundary, stated as invariants this script enforces:
+#   - only root (via the sudoers rule) may run it;
+#   - the target must be a real agent login user (UID >= 1000, never root/system),
+#     registered in the agent registry with exactly the requested clone path;
+#   - only `claude` may ever be launched — no arbitrary binary;
+#   - the agent's secrets are read by the AGENT, after the privilege drop.
+# Even a fully-compromised router can therefore only do what it can already do
+# legitimately — wake a registered agent — and can reach neither root nor any
+# non-agent user nor any command other than claude.
+#
+set -euo pipefail
+
+REGISTRY=/etc/basecradle-router/agents.json
+MIN_UID=1000
+
+die() {
+	printf 'wake-runner: %s\n' "$*" >&2
+	exit 1
+}
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (via the sudoers rule)"
+
+user=""
+cwd=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--user)
+		[[ $# -ge 2 ]] || die "--user needs a value"
+		user="$2"
+		shift 2
+		;;
+	--cwd)
+		[[ $# -ge 2 ]] || die "--cwd needs a value"
+		cwd="$2"
+		shift 2
+		;;
+	--)
+		shift
+		break
+		;;
+	*) die "unexpected argument before '--': $1" ;;
+	esac
+done
+
+[[ -n $user ]] || die "missing --user"
+[[ -n $cwd ]] || die "missing --cwd"
+[[ $# -gt 0 ]] || die "missing command after '--' (expected: claude -p <trigger>)"
+
+# The target must be a real agent login user — never root or a system account.
+id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
+target_uid="$(id -u "$user")"
+[[ $target_uid -ge $MIN_UID ]] || die "refusing: $user (uid $target_uid) is not an agent login user"
+
+# The (user, clone) pair must be registered — the wrapper trusts only the registry.
+command -v jq >/dev/null 2>&1 || die "jq is required to validate against the registry"
+[[ -r $REGISTRY ]] || die "registry not readable: $REGISTRY"
+match="$(jq -r --arg u "$user" --arg c "$cwd" \
+	'to_entries[] | select(.value.os_user == $u and .value.clone_path == $c) | .key' \
+	"$REGISTRY")" || die "could not read registry $REGISTRY"
+[[ -n $match ]] || die "refusing: ($user, $cwd) is not a registered agent clone"
+
+# Defence in depth against a poisoned registry: the clone must resolve (no `..`,
+# no symlink escape) to a path inside the agent's own home, never elsewhere.
+real_cwd="$(realpath -e -- "$cwd" 2>/dev/null)" || die "clone path does not exist: $cwd"
+case "$real_cwd/" in
+"/home/$user/"*) : ;;
+*) die "refusing: clone $cwd resolves outside /home/$user" ;;
+esac
+
+# Only the trusted, system-installed `claude` may ever be launched. A basename
+# check is NOT enough: `exec "$@"` would run a caller-supplied path verbatim, so a
+# binary literally named `claude` planted in an agent-writable dir would pass it.
+# Require the bare word and resolve the real binary ourselves, off a trusted PATH —
+# root-owned `claude`, never anything the (possibly-compromised) router can plant.
+[[ "$1" == claude ]] || die "refusing: command must be the bare word 'claude', got '$1'"
+trusted_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+claude_bin="$(PATH="$trusted_path" command -v claude)" || die "claude not found on the trusted PATH"
+shift # drop the 'claude' word; the remainder (e.g. -p <trigger>) are claude's args
+
+# Drop to the agent and run the wake: as the agent, load its own env (0600, the
+# router never reads it), cd into the clone, exec the trusted claude. The inline
+# script takes the cwd as $1 and the command (claude_bin + args) as $2..; root
+# never interpolates the trigger — it is passed as an inert positional argument.
+# SC2016 is intentional: the single quotes are load-bearing — $HOME/$1/$@ must
+# expand in the AGENT's bash after runuser, never in root's, so the untrusted
+# trigger is never evaluated in a privileged context.
+# shellcheck disable=SC2016
+exec runuser -u "$user" -- /bin/bash -c '
+	set -euo pipefail
+	env_file="$HOME/.config/basecradle/agent.env"
+	if [[ -r $env_file ]]; then
+		set -a
+		# shellcheck source=/dev/null
+		. "$env_file"
+		set +a
+	fi
+	cd "$1"
+	shift
+	exec "$@"
+' wake-runner "$real_cwd" "$claude_bin" "$@"
