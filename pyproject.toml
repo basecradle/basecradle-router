@@ -5,7 +5,9 @@ description = "The fleet router for BaseCradle — a modular webhook daemon that
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "uvicorn>=0.30",
+]
 
 [dependency-groups]
 dev = [
