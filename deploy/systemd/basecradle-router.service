@@ -1,0 +1,58 @@
+# BaseCradle fleet router — the webhook daemon, as a systemd service.
+#
+# Install to /etc/systemd/system/basecradle-router.service, then
+#   systemctl daemon-reload && systemctl enable --now basecradle-router
+#
+# PREREQUISITES (this unit references them; it cannot start until they exist):
+#   - the ASGI entrypoint `basecradle_router.app:create_app` and the `uvicorn`
+#     runtime dependency — the composition root (a follow-up code issue);
+#   - a deployable waker — HomeServerWaker (#29), which assembles the wake-runner
+#     argv settled in #28. Until that is wired, the daemon has no real way to wake.
+#   - /etc/basecradle-router/router.env filled out-of-band (the webhook secret).
+
+[Unit]
+Description=BaseCradle fleet router — webhook daemon that wakes the right agent
+Documentation=https://github.com/basecradle/basecradle-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=router
+Group=router
+WorkingDirectory=/opt/basecradle-router/app
+EnvironmentFile=/etc/basecradle-router/router.env
+
+# SINGLE WORKER — load-bearing, never add --workers. The per-repo threading.Lock
+# only serializes wakes within one process; multiple worker processes would each
+# hold their own locks and could double-wake a repo's clone. Bind to localhost
+# only — Caddy (the TLS front end, #31) reverse-proxies to this port.
+ExecStart=/home/router/.local/bin/uv run --project /opt/basecradle-router/app \
+    uvicorn --factory basecradle_router.app:create_app --host 127.0.0.1 --port 8000
+
+Restart=on-failure
+RestartSec=2s
+# The app drains in-flight wakes on lifespan shutdown; give it room before SIGKILL
+# on stop/restart (each wake is also bounded by its own configured timeout).
+TimeoutStopSec=120s
+
+# --- Hardening -------------------------------------------------------------
+# The wake (sudo -> runuser -> claude) runs as a CHILD of this service and so
+# inherits this unit's sandbox namespace. That bounds what we can lock down:
+#   - NoNewPrivileges MUST stay off — it would block the sudo -> wake-runner escalation.
+#   - ProtectHome MUST stay off — the wake reads/writes the agent's clone under /home.
+#   - ProtectSystem=strict and MemoryDenyWriteExecute are deliberately NOT used —
+#     they would make /home read-only and break Node's JIT, killing the wake.
+# The real isolation is the per-OS-user separation + the wake-runner boundary (#28),
+# not namespace sandboxing of the router. (A future option for stronger per-wake
+# isolation: launch each wake in its own `systemd-run --scope` outside this sandbox.)
+# What we CAN safely set — none of it touches /home, JIT, or setuid execution:
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

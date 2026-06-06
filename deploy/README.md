@@ -1,9 +1,9 @@
 # Home-server provisioning spec & deployment roadmap
 
-> **Status:** approved design (issue #24, 2026-06-05). The provisioning spec below is buildable now;
-> the systemd/deploy *authoring* (Phase B) is deliberately held until the box exists. This document
-> is the contract; the scripts and units that implement it land in this `deploy/` directory as each
-> phase is built.
+> **Status:** approved design (issue #24, 2026-06-05). This document is the contract; the scripts and
+> units that implement it live in this `deploy/` directory. Phase A (provisioning) and the Phase B
+> deploy files are authored as ready-to-review artifacts; the Phase B files are **applied only once the
+> box exists** (per Drawk, 2026-06-05).
 
 ## What this is
 
@@ -84,11 +84,13 @@ as the agent, so the unprivileged `router` daemon never touches an agent secret.
 on the box out-of-band (a founder gate), `chmod 600`, never in git.
 
 ### Installed software
-- **System-wide (root):** `git`, `gh` CLI, **Node.js LTS + Claude Code** (native installer to
-  `/usr/local`), **`uv`**, **Caddy**.
+- **System-wide (root):** `git`, `gh` CLI (official apt repo), **Node.js LTS + Claude Code**
+  (`npm install -g`, so every agent user gets `claude`), **Caddy** (official apt repo). All by
+  `deploy/bootstrap.sh`.
+- **The `router` user:** **`uv`** (only the daemon needs it).
 - **Per-agent (in each agent's home):** that repo's language toolchain via its own version manager
   (asdf/mise) — e.g. Ruby for `agent-ruby` — matching how that repo actually builds.
-- **The daemon's own Python:** `uv`-managed venv in `/opt/basecradle-router/.venv`.
+- **The daemon's own Python:** `uv`-managed venv under `/opt/basecradle-router/app`.
 
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
@@ -99,7 +101,7 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
   > **INVARIANT — a single uvicorn worker. Never `--workers N`.** The threaded model's per-repo
   > `threading.Lock` ([`concurrency.py`](../src/basecradle_router/concurrency.py)) serializes same-repo
   > wakes only *within one process*. Multiple worker processes would each hold independent locks and
-  > could double-wake the same repo's clone. This is pinned in the systemd unit's comment when authored.
+  > could double-wake the same repo's clone. Pinned in the systemd unit (`deploy/systemd/`).
 - Webhook URL: `https://ai.basecradle.com/webhooks/github`.
 
 ---
@@ -107,7 +109,8 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
 ## Part 2 — Deployment roadmap
 
 Sequenced; *(founder)* marks a human gate, *(steward)* marks basecradle-router AI's work. Phase B
-authoring is **held until the box exists**, per issue #24.
+files are **authored ahead as ready-to-review artifacts** (per Drawk, 2026-06-05) but **applied only
+once the box exists**.
 
 ### Phase A — Provisioning
 - **A1** *(founder)* Provision the Lightsail Ubuntu 24.04 box (4 GB/2 vCPU/80 GB), attach a static IP,
@@ -119,13 +122,18 @@ authoring is **held until the box exists**, per issue #24.
   structured so it could become Ansible *if* the fleet ever goes multi-host (out of scope now).
 
 ### Phase B — Daemon deploy *(authored ahead as ready-to-review files, per Drawk 2026-06-05; applied only once the box exists)*
-- **B1** systemd unit `basecradle-router.service`: runs `uvicorn` (single worker) as `router`,
-  `EnvironmentFile=/etc/basecradle-router/router.env`, `Restart=on-failure`, plus sandboxing
-  (`ProtectSystem=strict`, `ProtectHome=yes` — the router never reads agent homes; the wrapper does, as
-  the agent — `PrivateTmp=yes`, …).
-  > **Documented caveat:** `NoNewPrivileges=yes` **cannot** be set on this service — it would block the
-  > `sudo`→wrapper escalation the wake depends on. That one flag is the deliberate trade for the
-  > privilege-drop design; every other sandboxing directive stays on.
+- **B1** systemd unit `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
+  the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
+  `Restart=on-failure`, `TimeoutStopSec` to let the app drain in-flight wakes on shutdown, bound to
+  localhost (Caddy fronts it).
+  > **Sandboxing is constrained by the in-process wake.** The wake (`sudo`→`runuser`→`claude`) runs as a
+  > *child* of this service and inherits its namespace, so the strong filesystem directives **cannot**
+  > be used: `NoNewPrivileges=yes` would block the `sudo`→wrapper escalation; `ProtectHome=yes` would
+  > hide the agent's clone under `/home`; `ProtectSystem=strict` would make `/home` read-only; and
+  > `MemoryDenyWriteExecute=yes` would kill Node's JIT. The real isolation is the per-OS-user
+  > separation + the wake-runner boundary (#28), not namespace sandboxing of the router. The unit
+  > applies only the wake-compatible directives (`ProtectSystem=full`, `PrivateTmp`, the kernel/cgroup
+  > protections). Stronger per-wake isolation later: launch each wake in its own `systemd-run --scope`.
 - **B2** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- claude -p "<trigger>"`.
