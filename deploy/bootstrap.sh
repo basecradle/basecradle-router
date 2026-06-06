@@ -133,6 +133,17 @@ ensure_router_user() {
 		--shell /usr/sbin/nologin "$ROUTER_USER"
 }
 
+# Idempotently ensure an exact line is present in a file, creating the file (owned
+# by the given user) if absent. Used to append shell-rc defaults without clobbering.
+ensure_line() {
+	local line="$1" file="$2" owner="$3" group="$4"
+	if [[ -f $file ]] && grep -qxF "$line" "$file"; then
+		return
+	fi
+	printf '%s\n' "$line" >>"$file"
+	chown "$owner:$group" "$file"
+}
+
 # Create an empty file with locked-down mode if absent; never clobber existing content.
 ensure_empty_file() {
 	local path="$1" owner="$2" group="$3" mode="$4"
@@ -177,6 +188,15 @@ provision_agent_user() {
 	install -d -o "$user" -g "$user" -m 0700 \
 		"/home/$user/repos" "/home/$user/.config" "/home/$user/.config/basecradle"
 	ensure_empty_file "/home/$user/.config/basecradle/agent.env" "$user" "$user" 0600
+	# Default this agent's interactive/login shells to umask 077 as well, so files
+	# it writes OUTSIDE a wake (a hands-on debug session, a cron job) are private by
+	# default too. The wake path itself is already locked at the launch boundary by
+	# wake-runner; this is the matching default for every other way this user runs a
+	# shell, so least privilege holds for the agent at every layer and for every
+	# future onboarded agent. (basecradle-router#57)
+	for rc in .bashrc .profile; do
+		ensure_line "umask 077" "/home/$user/$rc" "$user" "$user"
+	done
 	# This agent's Claude Code defaults (merged into any existing settings.json):
 	#   - Opus 4.8 High (per #41);
 	#   - permissions.defaultMode = bypassPermissions — a wake is headless (no human
