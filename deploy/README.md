@@ -95,8 +95,10 @@ The agent mints its own short-lived `<slug>[bot]` tokens from these with **`depl
 (installed root-owned at `/usr/local/bin/gh-app-token`): `gh-app-token --token` / `--author` / `--remote`.
 It reads the creds from the environment (each box agent holds only its own) and signs the JWT via the
 `openssl` CLI, so it needs no extra runtime — the same shape as the laptop fleet helper. Each agent's
-Claude Code is defaulted to **Opus 4.8 High** (`~/.claude/settings.json`: `model` + `effortLevel`, by
-`bootstrap.sh`).
+Claude Code is defaulted (`~/.claude/settings.json`, by `bootstrap.sh`) to **Opus 4.8 High**
+(`model` + `effortLevel`) and **`permissions.defaultMode = bypassPermissions`** — a wake is headless
+(no human to approve prompts), so the agent must act autonomously; the security boundary is the
+per-OS-user isolation + the wake-runner wrapper, not Claude's interactive prompts.
 
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
 on the box out-of-band (a founder gate), `chmod 600`, never in git.
