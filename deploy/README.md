@@ -55,11 +55,14 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
 
 ### Filesystem & credential layout
 ```
-/opt/basecradle-router/            # the daemon: checked-out repo + uv venv, owned by `router`
+/opt/basecradle-router/            # ROOT-owned tree (router cannot write it)
+  app/                             # the daemon: checked-out repo + uv venv, owned by `router`
   bin/wake-runner                  # root-owned (root:root, 0755) privilege-drop wrapper
 /etc/basecradle-router/
   router.env                       # daemon config (owner router, 0600) — see below
-  agents.json                      # the agent registry (BASECRADLE_ROUTER_AGENTS); NO secrets
+  agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
+                                   #   read-only (0640) — it is the wake-runner's trusted allowlist
+                                   #   so the daemon must not be able to write it; NO secrets
 /home/agent-ruby/                  # mode 700, owned by agent-ruby
   repos/basecradle-ruby/           # the agent's own clone (cwd of its wake)
   .config/basecradle/agent.env     # 0600 — the agent's secrets (see below)
@@ -115,7 +118,7 @@ authoring is **held until the box exists**, per issue #24.
   their modes/owners, install Caddy. Bash over Ansible: one box, "convention over configuration";
   structured so it could become Ansible *if* the fleet ever goes multi-host (out of scope now).
 
-### Phase B — Daemon deploy *(HOLD authoring until the box exists)*
+### Phase B — Daemon deploy *(authored ahead as ready-to-review files, per Drawk 2026-06-05; applied only once the box exists)*
 - **B1** systemd unit `basecradle-router.service`: runs `uvicorn` (single worker) as `router`,
   `EnvironmentFile=/etc/basecradle-router/router.env`, `Restart=on-failure`, plus sandboxing
   (`ProtectSystem=strict`, `ProtectHome=yes` — the router never reads agent homes; the wrapper does, as
@@ -123,15 +126,20 @@ authoring is **held until the box exists**, per issue #24.
   > **Documented caveat:** `NoNewPrivileges=yes` **cannot** be set on this service — it would block the
   > `sudo`→wrapper escalation the wake depends on. That one flag is the deliberate trade for the
   > privilege-drop design; every other sandboxing directive stays on.
-- **B2** the root-owned `wake-runner` wrapper + the per-agent `sudoers` rule.
-- **B3** `HomeServerWaker` in `wake.py`: assembles the
-  `sudo /opt/basecradle-router/bin/wake-runner <agent> -- claude -p "<trigger>"` argv; the
-  `env_provider` resolves to "the wrapper sources the agent's `agent.env`." This is the deferred
-  consumer of `run_as_user`. **Code change → its own PR with tests** (subprocess mocked at the boundary,
-  as always).
-- **B4** Fast-ack in `server.py`: respond `202` immediately and run the pipeline on a background worker
-  so GitHub's ~10s webhook timeout is met regardless of wake duration. Today `__call__` *awaits* the
-  pipeline — already noted in `server.py` as a deferred deploy concern. **Code change → its own PR.**
+- **B2** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
+  (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
+  `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- claude -p "<trigger>"`.
+  It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
+  with that exact clone), `claude`-only — then `runuser`s to the agent, which sources its own `agent.env`
+  and execs the wake. **Install root-owned, in the root-owned `bin/`:**
+  `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
+  `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
+  (validate with `visudo -cf`).
+- **B3** `HomeServerWaker` in `wake.py`: assembles that wrapper argv (`--user`/`--cwd`/`--`) and an
+  `env_provider` that resolves to "the wrapper sources the agent's `agent.env`." The deferred consumer of
+  `run_as_user`. **Code change → its own PR with tests** (subprocess mocked at the boundary, as always).
+- **B4** ✅ **Done (#30).** Fast-ack in `server.py`: `accept` runs inline → `202`, `execute` (the wake)
+  runs as a tracked background task drained on shutdown.
 - **B5** Caddyfile: reverse-proxy to the local uvicorn; obtain the cert for `ai.basecradle.com`.
 
 ### Phase C — Go-live (ruby-first canary)

@@ -139,12 +139,21 @@ ensure_empty_file() {
 
 ensure_dirs() {
 	log "directory skeleton"
-	install -d -o "$ROUTER_USER" -g "$ROUTER_USER" -m 0755 "$OPT_DIR" "$OPT_DIR/bin"
+	# /opt/basecradle-router is a ROOT-owned tree. The daemon code + venv live in
+	# app/ (router-owned — the daemon deploys itself there). The root-owned
+	# wake-runner wrapper lives in bin/. Keeping the tree root and bin/ root-owned
+	# is load-bearing for the privilege boundary: if `router` could write bin/, it
+	# could replace the wrapper that sudo runs as root. Do not make these router-owned.
+	install -d -o root -g root -m 0755 "$OPT_DIR" "$OPT_DIR/bin"
+	install -d -o "$ROUTER_USER" -g "$ROUTER_USER" -m 0755 "$OPT_DIR/app"
 	install -d -o root -g "$ROUTER_USER" -m 0750 "$ETC_DIR"
-	# Daemon config: router.env carries the webhook signing secret (0600); agents.json
-	# is the non-secret registry (0640, router-readable). Both filled out-of-band.
+	# router.env carries the webhook signing secret: router-owned, 0600.
 	ensure_empty_file "$ETC_DIR/router.env" "$ROUTER_USER" "$ROUTER_USER" 0600
-	ensure_empty_file "$ETC_DIR/agents.json" "$ROUTER_USER" "$ROUTER_USER" 0640
+	# agents.json is the registry the wake-runner trusts as its allowlist, so it must
+	# be ROOT-owned and router read-only — if router could write it, a compromised
+	# daemon could poison it to aim a wake at an arbitrary user. Root writes it during
+	# onboarding; the daemon only reads it.
+	ensure_empty_file "$ETC_DIR/agents.json" root "$ROUTER_USER" 0640
 }
 
 # Lay down one agent's home skeleton: the OS user, a 700 home unreadable by siblings,

@@ -1,0 +1,16 @@
+# BaseCradle fleet router — the one privilege the router daemon holds.
+#
+# Install to /etc/sudoers.d/basecradle-router, root:root, mode 0440, and validate
+# with `visudo -cf /etc/sudoers.d/basecradle-router` before trusting it.
+#
+# The unprivileged `router` user may run ONLY the root-owned wake-runner wrapper,
+# as root, without a password (the daemon is non-interactive). The wrapper — not
+# this rule — decides which agent user, clone, and command are permitted; this
+# rule's job is only to narrow root access to that single binary. Its safety
+# depends on /opt/basecradle-router/bin/wake-runner (and its directory) being
+# root-owned and not writable by `router`; see deploy/bootstrap.sh.
+#
+# Pin a scrubbed environment and a trusted PATH for this command, so the boundary
+# never depends on the base sudoers defaults staying put.
+Defaults!/opt/basecradle-router/bin/wake-runner env_reset, secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+router ALL=(root) NOPASSWD: /opt/basecradle-router/bin/wake-runner
