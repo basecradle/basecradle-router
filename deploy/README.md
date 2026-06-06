@@ -38,18 +38,23 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
 | Static IP | Attached | DNS target for `ai.basecradle.com`. |
 
 ### OS-user layout — the security spine
-- **One unprivileged OS user per agent:** `agent-ruby`, `agent-python`, `agent-harness`, …
-  (`agent-<repo-shortname>`). Home mode `700`; each holds only its own credentials, unreadable by
-  siblings. **basecradle AI (the capital) gets no OS user yet** — it stays on the founder's laptop +
-  subscription for the foreseeable future and is not migrated to the server now.
+- **One unprivileged OS user per agent, named by the agent's fleet identity slug:**
+  `basecradle-ruby-ai`, `basecradle-python-ai`, `basecradle-harness-ai`, … (`basecradle-<repo>-ai`).
+  This is the **same slug** as the agent's GitHub bot (`basecradle-ruby-ai[bot]`) and its BaseCradle
+  platform handle — agent / bot / handle / OS-user all align under one identity; there is no separate
+  naming scheme. Home mode `700`; each holds only its own credentials, unreadable by siblings.
+  **basecradle AI (the capital) gets no OS user yet** — it stays on the founder's laptop + subscription
+  for the foreseeable future and is not migrated to the server now.
 - **One unprivileged `router` service user** runs the daemon. It does **not** run as root and
-  **cannot read any agent's secrets**.
+  **cannot read any agent's secrets**. This is deliberately a *minimal, non-agent* service account, kept
+  separate from the fleet-slug agent users (steward's call, per #26): the daemon is the dispatcher, never
+  a woken agent, so it carries no fleet identity — just the least privilege it needs to run and escalate.
 - **Privilege drop for a wake:** the `router` user escalates *only* through a **root-owned wrapper**,
   `/opt/basecradle-router/bin/wake-runner`, invoked via a locked `sudoers` rule that grants `router`
   exactly that one command and nothing else. The wrapper validates the requested agent against the
-  registry, then `exec`s `runuser -u agent-<x> -- claude -p "<trigger>"` in that agent's clone. **The
-  wrapper is the privilege boundary** — deliberately not argv-matching in `sudoers` (which is brittle
-  and bypassable). This keeps the long-running webhook daemon fully unprivileged.
+  registry, then `exec`s `runuser -u basecradle-<repo>-ai -- claude -p "<trigger>"` in that agent's
+  clone. **The wrapper is the privilege boundary** — deliberately not argv-matching in `sudoers` (which
+  is brittle and bypassable). This keeps the long-running webhook daemon fully unprivileged.
 - **The steward** (basecradle-router AI) runs on the box inherently as the daemon's operator; it needs
   no separate wake-user.
 
@@ -63,7 +68,7 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
                                    #   read-only (0640) — it is the wake-runner's trusted allowlist
                                    #   so the daemon must not be able to write it; NO secrets
-/home/agent-ruby/                  # mode 700, owned by agent-ruby
+/home/basecradle-ruby-ai/          # mode 700, owned by basecradle-ruby-ai (the fleet slug)
   repos/basecradle-ruby/           # the agent's own clone (cwd of its wake)
   .config/basecradle/agent.env     # 0600 — the agent's secrets (see below)
 ```
@@ -89,15 +94,15 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
   `deploy/bootstrap.sh`.
 - **The `router` user:** **`uv`** (only the daemon needs it).
 - **Per-agent (in each agent's home):** that repo's language toolchain via its own version manager
-  (asdf/mise) — e.g. Ruby for `agent-ruby` — matching how that repo actually builds.
+  (asdf/mise) — e.g. Ruby for `basecradle-ruby-ai` — matching how that repo actually builds.
 - **The daemon's own Python:** `uv`-managed venv under `/opt/basecradle-router/app`.
 
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
   the local ASGI app. One-block Caddyfile; only 80/443 exposed.
 - The ASGI app ([`server.py`](../src/basecradle_router/server.py)) is served by **`uvicorn`** — the
-  router's *first* runtime dependency (`dependencies = []` today). It is the minimal omakase ASGI
-  server.
+  router's first runtime dependency (added in #37, run via the entrypoint
+  `basecradle_router.app:create_app`). It is the minimal omakase ASGI server.
   > **INVARIANT — a single uvicorn worker. Never `--workers N`.** The threaded model's per-repo
   > `threading.Lock` ([`concurrency.py`](../src/basecradle_router/concurrency.py)) serializes same-repo
   > wakes only *within one process*. Multiple worker processes would each hold independent locks and
@@ -160,11 +165,11 @@ once the box exists**.
 The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + router-wake loop end-to-end.
 - **C1** *(founder)* Create a per-agent **Anthropic API key** for basecradle-ruby AI; place ruby's
   `agent.env` on the box.
-- **C2** *(steward)* Create `agent-ruby`, clone `basecradle-ruby`, register it in `agents.json`.
+- **C2** *(steward)* Create `basecradle-ruby-ai`, clone `basecradle-ruby` into `/home/basecradle-ruby-ai/repos/basecradle-ruby`, register it in `agents.json`.
 - **C3** *(founder)* Enable the **GitHub App webhook** → `https://ai.basecradle.com/webhooks/github`,
   signing secret matching `router.env`.
 - **C4** **Canary run:** file a trivial `handoff` issue on `basecradle-ruby` and confirm the **live**
-  loop — webhook → verify → wake ruby *as* `agent-ruby` → PR → report. The first un-mocked end-to-end run.
+  loop — webhook → verify → wake ruby *as* `basecradle-ruby-ai` → PR → report. The first un-mocked end-to-end run.
 - **C5** On a green canary, onboard the remaining worker agents (python, harness, …) by repeating
   C1–C2. **basecradle AI last**, and only once the system is proven stable — and per the standing
   decision it stays on the laptop for the foreseeable future, so it is effectively not migrated this
