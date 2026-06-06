@@ -169,7 +169,11 @@ once the box exists**.
   and execs the wake. **Install root-owned, in the root-owned `bin/`:**
   `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
   `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
-  (validate with `visudo -cf`).
+  (validate with `visudo -cf`). **After this first install, `deploy/deploy.sh` reinstalls the
+  wrapper from the deployed tree on every deploy**, so the live wrapper can never silently drift from
+  `main` (it is code on the launch path, but lives root-owned outside the router-owned `app/` tree the
+  app-rsync mirrors). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
+  dangerous, so it stays this documented manual step.
 - **B3** ✅ **Done (#40).** `HomeServerWaker` in `wake.py` assembles the wrapper argv
   (`--user`/`--cwd`/`--`); env is empty (the wrapper sources the agent's `agent.env` after the drop).
 - **B4** ✅ **Done (#30).** Fast-ack in `server.py`: `accept` runs inline → `202`, `execute` (the wake)

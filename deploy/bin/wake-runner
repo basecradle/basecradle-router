@@ -103,6 +103,13 @@ shift # drop the 'claude' word; the remainder (e.g. -p <trigger>) are claude's a
 # shellcheck disable=SC2016
 exec runuser -u "$user" -- /bin/bash -c '
 	set -euo pipefail
+	# Lock the agent process to umask 077 before anything is written: every file
+	# the woken claude creates (memory, settings, scratch) then lands 600 and every
+	# dir 700, so each agent memory is private to that agent BY DEFAULT at the
+	# filesystem layer -- not only where a migration happened to chmod the bits.
+	# This is the single shared launch boundary, so it covers every agent, present
+	# and future, and is inherited by the claude exec-ed below. (basecradle-router#57)
+	umask 077
 	env_file="$HOME/.config/basecradle/agent.env"
 	if [[ -r $env_file ]]; then
 		set -a
