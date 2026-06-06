@@ -11,7 +11,8 @@
 #   - create the unprivileged `router` service user
 #   - lay down the directory skeleton with correct owners/modes
 #   - optionally lay down a per-agent user's (secret-less, repo-less) home skeleton
-#     for each agent passed as an argument, e.g.  bootstrap.sh agent-ruby
+#     for each agent passed as an argument. The agent user is named by its fleet
+#     identity slug — basecradle-<repo>-ai — e.g.  bootstrap.sh basecradle-ruby-ai
 #
 # What this deliberately does NOT do (other issues / out-of-band):
 #   - the systemd unit (#27), the wake-runner wrapper + sudoers (#28),
@@ -196,7 +197,7 @@ main() {
 	done
 	log "bootstrap complete."
 	if [[ $# -eq 0 ]]; then
-		log "no agent users requested (pass e.g. 'agent-ruby' to lay one down)."
+		log "no agent users requested (pass the fleet slug, e.g. 'basecradle-ruby-ai', to lay one down)."
 	fi
 	log "next, once the box is up (separate steps): systemd unit (#27), wake-runner"
 	log "  wrapper + sudoers (#28), Caddyfile + TLS (#31), agent onboarding (#32)."
