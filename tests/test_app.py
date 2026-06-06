@@ -51,10 +51,14 @@ def _registry_file(tmp_path) -> str:
     return str(path)
 
 
+HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
+
+
 def _env(tmp_path) -> dict[str, str]:
     return {
         "BASECRADLE_ROUTER_AGENTS": _registry_file(tmp_path),
         "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET": SECRET,
+        "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": HANDOFF_SENDER,
     }
 
 
@@ -68,6 +72,7 @@ def _signed_body() -> tuple[bytes, dict[str, str]]:
             "labels": [{"name": "handoff"}],
         },
         "repository": {"full_name": NOVA.repo},
+        "sender": {"login": HANDOFF_SENDER, "type": "User"},
     }
     body = json.dumps(payload).encode("utf-8")
     digest = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
@@ -135,3 +140,12 @@ def test_create_app_raises_config_error_when_config_is_missing() -> None:
     # No agent registry path set → a ConfigError naming the missing variable, not a crash.
     with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_AGENTS"):
         create_app({})
+
+
+def test_create_app_requires_the_trusted_actors_allow_list(tmp_path) -> None:
+    # The github route's trust gate is a security control: a deployment missing it
+    # fails loudly at startup rather than silently disabling the check.
+    env = _env(tmp_path)
+    del env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"]
+    with pytest.raises(ConfigError, match="GITHUB_TRUSTED_ACTORS is required"):
+        create_app(env, waker=_RecordingWaker())

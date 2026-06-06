@@ -17,6 +17,7 @@ from basecradle_router.routes import (
     PayloadError,
     Route,
     SignatureError,
+    UntrustedSenderError,
 )
 from basecradle_router.routes.github import (
     DELIVERY_HEADER,
@@ -26,6 +27,13 @@ from basecradle_router.routes.github import (
 
 SECRET = "s3cret-fake-webhook-signing-key"
 BODY = b'{"action":"opened","issue":{"number":42}}'
+
+# The fleet allow-list under test: John Doe (human org member) and a fabricated
+# fleet App bot. GitHub logins are case-insensitive, so "John" must match "john".
+TRUSTED_ACTOR = "john"
+FLEET_BOT = "basecradle-python-ai[bot]"
+TRUSTED = frozenset({TRUSTED_ACTOR, FLEET_BOT})
+UNTRUSTED_ACTOR = "drive-by-stranger"
 
 
 def _sign(body: bytes, secret: str) -> str:
@@ -39,53 +47,53 @@ def _request(body: bytes = BODY, signature: str | None = None) -> InboundRequest
 
 
 def test_github_route_satisfies_the_protocol() -> None:
-    assert isinstance(GithubRoute(), Route)
-    assert GithubRoute().name == "github"
+    assert isinstance(GithubRoute(TRUSTED), Route)
+    assert GithubRoute(TRUSTED).name == "github"
 
 
 def test_verify_accepts_a_correct_signature() -> None:
-    GithubRoute().verify(_request(signature=_sign(BODY, SECRET)), SECRET)
+    GithubRoute(TRUSTED).verify(_request(signature=_sign(BODY, SECRET)), SECRET)
 
 
 def test_verify_accepts_regardless_of_header_case() -> None:
     req = InboundRequest(headers={"x-hub-signature-256": _sign(BODY, SECRET)}, body=BODY)
-    GithubRoute().verify(req, SECRET)
+    GithubRoute(TRUSTED).verify(req, SECRET)
 
 
 def test_verify_rejects_a_tampered_body() -> None:
     signature = _sign(BODY, SECRET)
     tampered = _request(body=BODY + b" ", signature=signature)
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute().verify(tampered, SECRET)
+        GithubRoute(TRUSTED).verify(tampered, SECRET)
 
 
 def test_verify_rejects_the_wrong_secret() -> None:
     signature = _sign(BODY, "a-different-secret")
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute().verify(_request(signature=signature), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=signature), SECRET)
 
 
 def test_verify_rejects_a_missing_header() -> None:
     with pytest.raises(SignatureError, match="missing"):
-        GithubRoute().verify(_request(signature=None), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=None), SECRET)
 
 
 def test_verify_rejects_a_malformed_header() -> None:
     # A bare hexdigest with no 'sha256=' prefix is malformed.
     bare = _sign(BODY, SECRET).removeprefix("sha256=")
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute().verify(_request(signature=bare), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=bare), SECRET)
 
 
 def test_verify_rejects_the_wrong_algorithm_prefix() -> None:
     sha1ish = "sha1=" + _sign(BODY, SECRET).removeprefix("sha256=")
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute().verify(_request(signature=sha1ish), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=sha1ish), SECRET)
 
 
 def test_verify_rejects_an_empty_signature_header() -> None:
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute().verify(_request(signature=""), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=""), SECRET)
 
 
 def test_verify_binds_the_signature_to_the_exact_body() -> None:
@@ -93,14 +101,14 @@ def test_verify_binds_the_signature_to_the_exact_body() -> None:
     other_body = b'{"action":"closed"}'
     signature = _sign(BODY, SECRET)
     with pytest.raises(SignatureError):
-        GithubRoute().verify(_request(body=other_body, signature=signature), SECRET)
+        GithubRoute(TRUSTED).verify(_request(body=other_body, signature=signature), SECRET)
 
 
 def test_verify_rejects_a_non_ascii_signature_without_crashing() -> None:
     # A header digest with non-ASCII bytes must reject as a SignatureError, not
     # leak a TypeError from hmac.compare_digest's str/ASCII restriction.
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute().verify(_request(signature="sha256=café"), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature="sha256=café"), SECRET)
 
 
 # --- normalize -------------------------------------------------------------
@@ -121,6 +129,7 @@ def _issues_payload(
     added_label: str = "handoff",
     repo: str = TARGET_REPO,
     number: int = ISSUE_NUMBER,
+    sender: str | None = TRUSTED_ACTOR,
 ) -> dict:
     payload: dict = {
         "action": action,
@@ -132,6 +141,8 @@ def _issues_payload(
         },
         "repository": {"full_name": repo},
     }
+    if sender is not None:
+        payload["sender"] = {"login": sender, "type": "User"}
     if action == "labeled":
         payload["label"] = {"name": added_label}
     return payload
@@ -154,7 +165,7 @@ def _issues_request(
 
 
 def test_normalize_opened_handoff_round_trips() -> None:
-    event = GithubRoute().normalize(_issues_request(_issues_payload(action="opened")))
+    event = GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
     assert event is not None
     assert event.source == "github"
     assert event.kind is EventKind.HANDOFF
@@ -170,67 +181,117 @@ def test_normalize_opened_handoff_round_trips() -> None:
 def test_normalize_labeled_handoff_round_trips() -> None:
     # The handoff label is the one just added.
     payload = _issues_payload(action="labeled", labels=(), added_label="handoff")
-    event = GithubRoute().normalize(_issues_request(payload))
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
     assert event is not None
     assert event.kind is EventKind.HANDOFF
 
 
 def test_normalize_ignores_opened_without_handoff_label() -> None:
     payload = _issues_payload(action="opened", labels=("bug", "enhancement"))
-    assert GithubRoute().normalize(_issues_request(payload)) is None
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
 def test_normalize_ignores_unrelated_label_on_already_handoff_issue() -> None:
     # A 'labeled' event adding a non-handoff label must not re-trigger, even if
     # the issue already carries the handoff label.
     payload = _issues_payload(action="labeled", labels=("handoff",), added_label="bug")
-    assert GithubRoute().normalize(_issues_request(payload)) is None
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
 def test_normalize_ignores_non_issues_event() -> None:
-    assert GithubRoute().normalize(_issues_request(_issues_payload(), event="push")) is None
+    assert GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(), event="push")) is None
 
 
 def test_normalize_ignores_ping_event() -> None:
     req = _issues_request(raw_body=b'{"zen": "Non-blocking is better."}', event="ping")
-    assert GithubRoute().normalize(req) is None
+    assert GithubRoute(TRUSTED).normalize(req) is None
 
 
 def test_normalize_ignores_non_actionable_action() -> None:
     payload = _issues_payload(action="closed")
-    assert GithubRoute().normalize(_issues_request(payload)) is None
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
 def test_normalize_rejects_malformed_json() -> None:
     with pytest.raises(PayloadError, match="not valid JSON"):
-        GithubRoute().normalize(_issues_request(raw_body=b"{not json"))
+        GithubRoute(TRUSTED).normalize(_issues_request(raw_body=b"{not json"))
 
 
 def test_normalize_rejects_non_object_body() -> None:
     with pytest.raises(PayloadError, match="must be a JSON object"):
-        GithubRoute().normalize(_issues_request(raw_body=b"[1, 2, 3]"))
+        GithubRoute(TRUSTED).normalize(_issues_request(raw_body=b"[1, 2, 3]"))
 
 
 def test_normalize_rejects_missing_issue_object() -> None:
     with pytest.raises(PayloadError, match="'issue' object"):
-        GithubRoute().normalize(_issues_request(raw_body=b'{"action": "opened"}'))
+        GithubRoute(TRUSTED).normalize(_issues_request(raw_body=b'{"action": "opened"}'))
 
 
 def test_normalize_rejects_handoff_missing_repository() -> None:
     payload = _issues_payload(action="opened")
     del payload["repository"]
     with pytest.raises(PayloadError, match="'repository' object"):
-        GithubRoute().normalize(_issues_request(payload))
+        GithubRoute(TRUSTED).normalize(_issues_request(payload))
 
 
 def test_normalize_rejects_non_integer_issue_number() -> None:
     payload = _issues_payload(action="opened")
     payload["issue"]["number"] = "42"
     with pytest.raises(PayloadError, match="issue.number"):
-        GithubRoute().normalize(_issues_request(payload))
+        GithubRoute(TRUSTED).normalize(_issues_request(payload))
 
 
 def test_normalize_rejects_missing_delivery_header() -> None:
     payload = _issues_payload(action="opened")
     with pytest.raises(PayloadError, match=DELIVERY_HEADER):
-        GithubRoute().normalize(_issues_request(payload, delivery=None))
+        GithubRoute(TRUSTED).normalize(_issues_request(payload, delivery=None))
+
+
+# --- trusted-sender gate (defense-in-depth) --------------------------------
+#
+# The handoff label only wakes an agent if a *trusted fleet actor* applied it.
+# These run after verify(), so the sender is GitHub-attested, not spoofable.
+
+
+def test_normalize_rejects_handoff_from_untrusted_sender() -> None:
+    # A handoff labeled by someone not on the allow-list is rejected, not woken.
+    payload = _issues_payload(action="labeled", labels=(), sender=UNTRUSTED_ACTOR)
+    with pytest.raises(UntrustedSenderError, match="untrusted actor"):
+        GithubRoute(TRUSTED).normalize(_issues_request(payload))
+
+
+def test_normalize_accepts_handoff_from_trusted_fleet_bot() -> None:
+    # A fleet App bot (login like 'name[bot]') is a trusted actor.
+    payload = _issues_payload(action="labeled", labels=(), sender=FLEET_BOT)
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+    assert event.kind is EventKind.HANDOFF
+
+
+def test_normalize_matches_trusted_sender_case_insensitively() -> None:
+    # GitHub logins are case-insensitive: 'John' must match allow-listed 'john'.
+    payload = _issues_payload(action="opened", sender="John")
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+
+
+def test_normalize_rejects_handoff_with_no_sender() -> None:
+    # Fail closed: an unidentifiable sender cannot be trusted.
+    payload = _issues_payload(action="opened", sender=None)
+    with pytest.raises(UntrustedSenderError, match="no identifiable sender"):
+        GithubRoute(TRUSTED).normalize(_issues_request(payload))
+
+
+def test_normalize_rejects_handoff_with_malformed_sender() -> None:
+    # A 'sender' present but without a string login fails closed, too.
+    payload = _issues_payload(action="opened")
+    payload["sender"] = {"login": None}
+    with pytest.raises(UntrustedSenderError, match="no identifiable sender"):
+        GithubRoute(TRUSTED).normalize(_issues_request(payload))
+
+
+def test_normalize_checks_sender_only_for_handoffs() -> None:
+    # A non-handoff issue from an untrusted sender is still a clean ignore — the
+    # trust gate guards wakes, it does not reject every non-fleet issue.
+    payload = _issues_payload(action="opened", labels=("bug",), sender=UNTRUSTED_ACTOR)
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None

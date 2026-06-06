@@ -18,6 +18,9 @@ from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
 
 SECRET = "whsec_" + "0" * 32
+HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
+TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
+UNTRUSTED_SENDER = "drive-by-stranger"
 NOVA = Agent(
     repo="basecradle/basecradle-python",
     os_user="nova",
@@ -61,7 +64,7 @@ def _config(agents: dict[str, Agent] | None = None) -> Config:
 
 def _registry() -> RouteRegistry:
     registry = RouteRegistry()
-    registry.register(GithubRoute())
+    registry.register(GithubRoute(TRUSTED_ACTORS))
     return registry
 
 
@@ -97,6 +100,7 @@ def _github_request(
     event: str = "issues",
     sign: bool = True,
     delivery: str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+    sender: str = HANDOFF_SENDER,
 ) -> InboundRequest:
     payload = {
         "action": action,
@@ -107,6 +111,7 @@ def _github_request(
             "labels": [{"name": name} for name in labels],
         },
         "repository": {"full_name": repo},
+        "sender": {"login": sender, "type": "User"},
     }
     body = json.dumps(payload).encode("utf-8")
     headers = {"X-GitHub-Event": event, "X-GitHub-Delivery": delivery}
@@ -236,6 +241,20 @@ def test_malformed_payload_is_rejected_at_normalize() -> None:
     pipeline, _, _ = _pipeline()
     result = pipeline.handle("github", InboundRequest(headers=headers, body=broken.body))
     assert (Stage.NORMALIZE, Outcome.REJECTED) in result.stages
+
+
+def test_handoff_from_untrusted_sender_is_rejected_at_normalize() -> None:
+    # A correctly-signed handoff from an actor not on the fleet allow-list is
+    # rejected at normalize — no wake. Defense-in-depth behind GitHub's perms.
+    pipeline, waker, _ = _pipeline()
+    result = pipeline.handle("github", _github_request(sender=UNTRUSTED_SENDER))
+
+    assert result.stages == [
+        (Stage.ROUTE, Outcome.OK),
+        (Stage.VERIFY, Outcome.OK),
+        (Stage.NORMALIZE, Outcome.REJECTED),
+    ]
+    assert waker.calls == []
 
 
 # --- wake retry ------------------------------------------------------------

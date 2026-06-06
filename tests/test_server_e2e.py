@@ -27,6 +27,8 @@ from basecradle_router.server import WebhookServer
 from basecradle_router.wake import WakeResult
 
 SECRET = "whsec_" + "0" * 32
+HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
+TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
 NOVA = Agent(
     repo="basecradle/basecradle-python",
     os_user="nova",
@@ -63,7 +65,7 @@ def _config() -> Config:
 
 def _registry() -> RouteRegistry:
     registry = RouteRegistry()
-    registry.register(GithubRoute())
+    registry.register(GithubRoute(TRUSTED_ACTORS))
     return registry
 
 
@@ -90,6 +92,7 @@ def _signed_body(
     action: str = "opened",
     labels: tuple[str, ...] = ("handoff",),
     repo: str = "basecradle/basecradle-python",
+    sender: str = HANDOFF_SENDER,
 ) -> tuple[bytes, dict[str, str]]:
     payload = {
         "action": action,
@@ -100,6 +103,7 @@ def _signed_body(
             "labels": [{"name": name} for name in labels],
         },
         "repository": {"full_name": repo},
+        "sender": {"login": sender, "type": "User"},
     }
     body = json.dumps(payload).encode("utf-8")
     digest = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()

@@ -77,8 +77,15 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
 ```
 BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
 BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
+BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. drawkkwast,basecradle-router-ai[bot]>
 # BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"
 ```
+
+`BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
+handoff only wakes an agent if the webhook `sender` — the actor who applied the `handoff` label — is on
+this allow-list of fleet actors (org members + fleet App bots). It is **required and non-empty**; the
+daemon refuses to start without it, so the check can never be silently off. List human org members by
+their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched case-insensitively.
 
 **`agent.env`** (per agent, sourced by the wrapper *as that user*) holds that agent's secrets — its
 `ANTHROPIC_API_KEY` and its GitHub App credentials, and later its BaseCradle token. This is the live

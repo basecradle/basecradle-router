@@ -19,6 +19,7 @@ ENV_PREFIX = "BASECRADLE_ROUTER_"
 _AGENTS_VAR = f"{ENV_PREFIX}AGENTS"
 _ENABLED_ROUTES_VAR = f"{ENV_PREFIX}ENABLED_ROUTES"
 _DEFAULT_ENABLED_ROUTES = ("github",)
+_GITHUB_TRUSTED_ACTORS_VAR = f"{ENV_PREFIX}GITHUB_TRUSTED_ACTORS"
 
 
 class ConfigError(Exception):
@@ -129,3 +130,27 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         enabled_routes=enabled,
         webhook_secrets=MappingProxyType(secrets),
     )
+
+
+def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:
+    """The github route's allow-list of actors permitted to trigger a wake.
+
+    Read from ``BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS`` as a comma-separated
+    list of GitHub logins (the fleet's org members and App bots, e.g.
+    ``drawkkwast,basecradle-router-ai[bot]``). It is **required** and must be
+    non-empty: this is a security control, so a deployment that forgets it fails
+    loudly at startup rather than silently disabling the gate. Source-specific
+    config, so it lives on the github route (via the composition root), not on the
+    source-agnostic core :class:`Config`.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(_GITHUB_TRUSTED_ACTORS_VAR)
+    if not raw:
+        raise ConfigError(
+            f"{_GITHUB_TRUSTED_ACTORS_VAR} is required "
+            "(comma-separated GitHub logins of trusted fleet actors)"
+        )
+    actors = frozenset(actor.strip() for actor in raw.split(",") if actor.strip())
+    if not actors:
+        raise ConfigError(f"{_GITHUB_TRUSTED_ACTORS_VAR} is set but lists no actors")
+    return actors

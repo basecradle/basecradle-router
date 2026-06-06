@@ -8,7 +8,8 @@
 #     runtime dependency — the composition root (a follow-up code issue);
 #   - a deployable waker — HomeServerWaker (#29), which assembles the wake-runner
 #     argv settled in #28. Until that is wired, the daemon has no real way to wake.
-#   - /etc/basecradle-router/router.env filled out-of-band (the webhook secret).
+#   - /etc/basecradle-router/router.env filled out-of-band (the webhook secret
+#     and the GITHUB_TRUSTED_ACTORS allow-list; see deploy/README.md).
 
 [Unit]
 Description=BaseCradle fleet router — webhook daemon that wakes the right agent
