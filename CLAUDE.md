@@ -10,13 +10,13 @@ The router is itself built by human and AI contributors working as peers, under 
 
 ## The Constitution
 
-This repository is built under the **BaseCradle Constitution** — the principles shared by every repository in the ecosystem. Core-team contributors have it on their file system at:
+This repository is built under the **BaseCradle Constitution** — the principles shared by every repository in the BaseCradle ecosystem. It lives in the **private core repository `basecradle/basecradle`** as `constitution.md` (default branch); it is repo-internal and never served publicly. Read it from GitHub with your fleet credentials — this works from any machine (laptop or fleet server), unlike a local checkout path:
 
-```text
-/Users/drawk/Documents/repositories/basecradle/constitution.md
+```bash
+gh api repos/basecradle/basecradle/contents/constitution.md -H "Accept: application/vnd.github.raw"
 ```
 
-(It lives in the private core repository and is never served publicly.) This CLAUDE.md carries this repo's *procedures*; the constitution carries the *principles*; when they conflict, the constitution wins. **Read it before non-trivial work.**
+(or read a local checkout of `basecradle/basecradle` if you have one). Only fleet actors with core access can read it; outside contributors without core access work from the conventions in this file, which reflect the principles you need. This CLAUDE.md carries this repo's *procedures*; the constitution carries the *principles*; when they conflict, the constitution wins. **Read it before non-trivial work.**
 
 ## Architecture — core + routes
 
@@ -133,7 +133,7 @@ When Drawk pastes a prompt beginning `Cross-repo handoff:`:
 
 ### Propagating this procedure
 
-Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section in its CLAUDE.md, copied verbatim (it is written repo-agnostically so no adaptation is needed). When handing off to a repo whose CLAUDE.md lacks the section — always true for a brand-new repo — the handoff prompt's definition of done includes adding it, copied from the capital's CLAUDE.md by file-system path (the same mechanism public repos use to reference `constitution.md`).
+Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section in its CLAUDE.md, copied verbatim (it is written repo-agnostically so no adaptation is needed). When handing off to a repo whose CLAUDE.md lacks the section — always true for a brand-new repo — the handoff prompt's definition of done includes adding it, fetched from GitHub (`basecradle/basecradle` → `CLAUDE.md`, with fleet credentials) — the same mechanism repos use to reference `constitution.md`.
 
 ## Development Commands
 
