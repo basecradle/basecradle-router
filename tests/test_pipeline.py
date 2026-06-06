@@ -10,7 +10,7 @@ import json
 from types import MappingProxyType
 
 from basecradle_router.config import Config
-from basecradle_router.merge_policy import MergeDecision, MergePolicy, PullRequest
+from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, Stage
 from basecradle_router.routes import InboundRequest, RouteRegistry
@@ -119,14 +119,8 @@ def _github_request(
     return InboundRequest(headers=headers, body=body)
 
 
-def _docs_pr(_agent, _event, _woke) -> PullRequest:
-    return PullRequest(
-        number=99,
-        repo="basecradle/basecradle-python",
-        changed_paths=("README.md",),
-        labels=frozenset(),
-        ci_green=True,
-    )
+def _green_pr(_agent, _event, _woke) -> PullRequest:
+    return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=True)
 
 
 # --- the happy path --------------------------------------------------------
@@ -151,31 +145,27 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
     assert result.agent is NOVA
 
 
-def test_low_risk_pr_auto_merges_through_the_merge_stage() -> None:
-    pipeline, _, merger = _pipeline(pr_provider=_docs_pr)
+def test_green_pr_auto_merges_through_the_merge_stage() -> None:
+    pipeline, _, merger = _pipeline(pr_provider=_green_pr)
     result = pipeline.handle("github", _github_request())
 
     assert (Stage.MERGE, Outcome.OK) in result.stages
-    assert result.decision is MergeDecision.AUTO_MERGE
+    assert result.merged is True
     assert len(merger.merged) == 1
 
 
-def test_gated_handoff_pauses_and_does_not_merge() -> None:
-    def gated_pr(_a, _e, _w) -> PullRequest:
-        return PullRequest(
-            number=99,
-            repo="basecradle/basecradle-python",
-            changed_paths=("src/release.py",),
-            labels=frozenset({"release"}),
-            ci_green=True,
-        )
+def test_red_pr_runs_the_merge_stage_but_does_not_merge() -> None:
+    # Earned Autonomy: a red PR is not merged *yet* — there is no human pause, just
+    # CI not yet green. The merge stage still records OK (it ran cleanly).
+    def red_pr(_a, _e, _w) -> PullRequest:
+        return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=False)
 
-    pipeline, _, merger = _pipeline(pr_provider=gated_pr)
+    pipeline, _, merger = _pipeline(pr_provider=red_pr)
     result = pipeline.handle("github", _github_request())
 
-    assert result.decision is MergeDecision.PAUSE
-    assert merger.merged == []
     assert (Stage.MERGE, Outcome.OK) in result.stages
+    assert result.merged is False
+    assert merger.merged == []
 
 
 # --- ignore / reject / fail ------------------------------------------------

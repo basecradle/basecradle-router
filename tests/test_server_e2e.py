@@ -165,43 +165,32 @@ def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
     assert event.trigger == f"Cross-repo handoff: work {ISSUE_URL}"
 
 
-def test_low_risk_pr_auto_merges_end_to_end() -> None:
-    def docs_pr(_a, _e, _w) -> PullRequest:
-        return PullRequest(
-            number=99,
-            repo="basecradle/basecradle-python",
-            changed_paths=("README.md",),
-            labels=frozenset(),
-            ci_green=True,
-        )
+def test_green_pr_auto_merges_end_to_end() -> None:
+    def green_pr(_a, _e, _w) -> PullRequest:
+        return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=True)
 
-    server, _, merger = _build(pr_provider=docs_pr)
+    server, _, merger = _build(pr_provider=green_pr)
     body, headers = _signed_body()
     status, _ = _post(server, "/webhooks/github", body, headers)
 
-    # The merge happens in the background, after the ack — so its outcome is not
-    # in the 202 body; we observe it through the (mocked) merger instead.
+    # The merge happens in the background, after the ack — so its outcome is not in
+    # the 202 body; we observe it through the (mocked) merger instead. Per Earned
+    # Autonomy a green PR auto-merges with no per-PR human gate.
     assert status == 202
     assert len(merger.merged) == 1
     assert merger.merged[0].number == 99
 
 
-def test_gated_handoff_pauses_end_to_end() -> None:
-    def gated_pr(_a, _e, _w) -> PullRequest:
-        return PullRequest(
-            number=99,
-            repo="basecradle/basecradle-python",
-            changed_paths=("CLAUDE.md",),  # unmarked charter edit → scope gate
-            labels=frozenset(),
-            ci_green=True,
-        )
+def test_red_pr_is_not_merged_end_to_end() -> None:
+    def red_pr(_a, _e, _w) -> PullRequest:
+        return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=False)
 
-    server, _, merger = _build(pr_provider=gated_pr)
+    server, _, merger = _build(pr_provider=red_pr)
     body, headers = _signed_body()
     status, _ = _post(server, "/webhooks/github", body, headers)
 
     assert status == 202
-    assert merger.merged == []  # a gate never auto-merges (the merge ran, and paused)
+    assert merger.merged == []  # not green → not merged yet (no human pause, just CI)
 
 
 def test_non_handoff_event_is_ignored_end_to_end() -> None:

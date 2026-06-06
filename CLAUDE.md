@@ -36,7 +36,7 @@ The router runs on the fleet's **dedicated Ubuntu home server** — the one home
 
 ## v0 Scope
 
-**In:** the `github` route end-to-end — a handoff issue (labeled `handoff`) → signed webhook → core wakes the target repo's agent → agent does the work, self-reviews, opens a PR, reports on the originating issue. Per-repo lock (no double-wakes). **Graduated merge autonomy**: auto-merge only low-risk classes (docs, shared-block re-syncs) on green CI; code/behavioral PRs wait for human review; genuine human gates (releases, credentials, scope) always pause.
+**In:** the `github` route end-to-end — a handoff issue (labeled `handoff`) → signed webhook → core wakes the target repo's agent → agent does the work, self-reviews, opens a PR, reports on the originating issue. Per-repo lock (no double-wakes). **Merge autonomy (Earned Autonomy)**: a captain's own PRs auto-merge on green CI — code, docs, charter alike — with **no per-PR human review** (a merge to `main` is reversible, so it needs no gate). The only firebreaks are at the *irreversible/outward* step (publish/deploy), enforced at the **platform** (a GitHub Environment approval) and only for agents that have not yet earned the trust to act unsupervised there — training wheels, retired as a captain matures (constitution → Earned Autonomy).
 
 **Out (deferred, on purpose):** the `basecradle` route and any non-GitHub source; multi-host; auto-provisioning. Build the core + one route well, then add routes.
 

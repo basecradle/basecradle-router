@@ -180,5 +180,5 @@ def _summary(result: PipelineResult) -> dict:
     return {
         "outcome": result.terminal.value if result.terminal else "none",
         "stages": [[stage.value, outcome.value] for stage, outcome in result.stages],
-        "decision": result.decision.value if result.decision else None,
+        "merged": result.merged,
     }
