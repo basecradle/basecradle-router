@@ -71,7 +71,13 @@ install_gh() {
 	apt_install gh
 }
 
-node_major() { node -v 2>/dev/null | sed -n 's/^v\([0-9]\{1,\}\).*/\1/p'; }
+node_major() {
+	# Must succeed (return 0) when node is absent, or `have="$(node_major)"` would
+	# trip `set -e` (a missing `node` exits 127 through the pipe under pipefail).
+	if command -v node >/dev/null 2>&1; then
+		node -v | sed -n 's/^v\([0-9]\{1,\}\).*/\1/p'
+	fi
+}
 
 install_node_and_claude() {
 	local have
