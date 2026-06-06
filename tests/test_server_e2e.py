@@ -207,6 +207,19 @@ def test_non_handoff_event_is_ignored_end_to_end() -> None:
     assert waker.calls == []
 
 
+def test_handoff_from_untrusted_sender_is_rejected_end_to_end() -> None:
+    # A correctly-signed handoff whose actor is not on the fleet allow-list is
+    # rejected (400, malformed/unacceptable) and wakes no agent — the trust gate
+    # holds through the full server stack, not just the route in isolation.
+    server, waker, _ = _build()
+    body, headers = _signed_body(sender="drive-by-stranger")
+    status, summary = _post(server, "/webhooks/github", body, headers)
+
+    assert status == 400
+    assert summary["outcome"] == "rejected"
+    assert waker.calls == []
+
+
 def test_bad_signature_is_unauthorized_end_to_end() -> None:
     server, waker, _ = _build()
     body, headers = _signed_body()
