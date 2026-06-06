@@ -1,0 +1,28 @@
+# BaseCradle fleet router — TLS front end for the webhook endpoint.
+#
+# Install to /etc/caddy/Caddyfile (replacing the package default), then
+#   caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
+#
+# Caddy automatically obtains and renews a Let's Encrypt certificate for the
+# hostname below (needs inbound 80 for the ACME challenge + 443 for traffic).
+# It reverse-proxies to the local uvicorn the systemd unit runs on 127.0.0.1:8000.
+
+ai.basecradle.com {
+	# Cap the request body: GitHub webhook deliveries are small; this bounds a
+	# hostile-payload DoS before the body is read and verified. (GitHub's own
+	# delivery cap is 25 MB; we sit comfortably under it.)
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy 127.0.0.1:8000
+
+	# Access log to the journal; Caddy logs TLS/ACME there too.
+	log {
+		output stderr
+		format console
+	}
+}
+
+# Optional: set an ACME account email for Let's Encrypt expiry notices by adding a
+# global options block above this site:  { email ops@basecradle.com }
