@@ -18,7 +18,7 @@ from types import MappingProxyType
 
 from basecradle_router.concurrency import RepoLocks
 from basecradle_router.config import Config
-from basecradle_router.merge_policy import MergeDecision, MergePolicy, PullRequest
+from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
@@ -134,6 +134,10 @@ def _post(server: WebhookServer, path: str, body: bytes, headers: dict[str, str]
             sent.append(message)
 
         await server(scope, receive, send)
+        # The response is sent from the fast accept half; the wake runs in the
+        # background. Drain it so post-wake state (the woken agent, the merge) is
+        # observable — without changing that the status was acked before the wake.
+        await server.drain()
         status = next(m["status"] for m in sent if m["type"] == "http.response.start")
         raw = next(m["body"] for m in sent if m["type"] == "http.response.body")
         return status, json.loads(raw)
@@ -150,8 +154,8 @@ def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
 
     status, summary = _post(server, "/webhooks/github", body, headers)
 
-    assert status == 200
-    assert summary["outcome"] == "ok"
+    assert status == 202  # fast-acked: accepted and now processing in the background
+    assert summary["outcome"] == "ok"  # the accept half (through resolve) succeeded
     # The right agent was woken with the right trigger — directly, no relay.
     assert len(waker.calls) == 1
     agent, event = waker.calls[0]
@@ -173,11 +177,13 @@ def test_low_risk_pr_auto_merges_end_to_end() -> None:
 
     server, _, merger = _build(pr_provider=docs_pr)
     body, headers = _signed_body()
-    status, summary = _post(server, "/webhooks/github", body, headers)
+    status, _ = _post(server, "/webhooks/github", body, headers)
 
-    assert status == 200
-    assert summary["decision"] == MergeDecision.AUTO_MERGE.value
+    # The merge happens in the background, after the ack — so its outcome is not
+    # in the 202 body; we observe it through the (mocked) merger instead.
+    assert status == 202
     assert len(merger.merged) == 1
+    assert merger.merged[0].number == 99
 
 
 def test_gated_handoff_pauses_end_to_end() -> None:
@@ -192,11 +198,10 @@ def test_gated_handoff_pauses_end_to_end() -> None:
 
     server, _, merger = _build(pr_provider=gated_pr)
     body, headers = _signed_body()
-    status, summary = _post(server, "/webhooks/github", body, headers)
+    status, _ = _post(server, "/webhooks/github", body, headers)
 
-    assert status == 200
-    assert summary["decision"] == MergeDecision.PAUSE.value
-    assert merger.merged == []  # a gate never auto-merges
+    assert status == 202
+    assert merger.merged == []  # a gate never auto-merges (the merge ran, and paused)
 
 
 def test_non_handoff_event_is_ignored_end_to_end() -> None:
@@ -243,6 +248,66 @@ def test_unregistered_repo_is_accepted_then_logged_not_a_retry_storm() -> None:
     assert summary["outcome"] == "failed"
     assert summary["stages"][-1] == ["resolve", "failed"]
     assert waker.calls == []
+
+
+# --- fast-ack: the response precedes the wake ------------------------------
+
+
+def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
+    # A wake takes minutes; GitHub abandons the delivery after ~10s. So the 202
+    # must be sent *while the wake is still running*. We block the wake on an event
+    # we control and assert the ack is observed before the wake completes. The
+    # discriminator is `wake_done`: a correct server reaches the assertion with the
+    # wake still blocked (not done); a server that awaited the wake before acking
+    # would only get there after the wake finished — and fail the assertion.
+    release = threading.Event()
+    wake_done = threading.Event()
+
+    class _BlockingWaker:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Agent, Event]] = []
+
+        def wake(self, agent: Agent, event: Event) -> WakeResult:
+            self.calls.append((agent, event))
+            release.wait(timeout=5)  # safety net so a broken test can never hang CI
+            wake_done.set()
+            return WakeResult(exit_code=0)
+
+    waker = _BlockingWaker()
+    server, _, _ = _build(waker=waker)
+    body, headers = _signed_body()
+
+    async def _drive() -> int:
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/webhooks/github",
+            "headers": [
+                (k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()
+            ],
+        }
+        incoming = [{"type": "http.request", "body": body, "more_body": False}]
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0)
+
+        async def send(message):
+            sent.append(message)
+
+        await server(scope, receive, send)
+        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+        # The wake is still blocked on `release`, so it cannot have completed — the
+        # ack provably preceded it. (A blocking-ack server would only reach here
+        # after the wake's own timeout fired and set wake_done.)
+        assert not wake_done.is_set()
+        release.set()  # let the backgrounded wake finish, then drain it cleanly
+        await server.drain()
+        assert wake_done.is_set()  # it did run — in the background, after the ack
+        return status
+
+    assert asyncio.run(_drive()) == 202
+    assert len(waker.calls) == 1
 
 
 # --- the per-repo lock prevents a concurrent double-wake -------------------

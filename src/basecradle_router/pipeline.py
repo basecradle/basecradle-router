@@ -5,6 +5,14 @@ One inbound webhook flows through fixed stages — **verify → normalize → re
 source: it asks the registry for the route, and the route owns the
 GitHub-specific parts. Adding a source never touches this file.
 
+The stages split at the wake into a fast :meth:`Pipeline.accept` half
+(route → verify → normalize → resolve — no subprocess, milliseconds) and a slow
+:meth:`Pipeline.execute` half (lock → wake → merge — a minutes-long ``claude``
+subprocess). This is what lets the server *fast-ack*: answer the webhook from the
+accept half and run the wake in the background. :meth:`Pipeline.handle` is simply
+``accept`` then ``execute`` — the synchronous whole, unchanged for callers that
+want it (the offline tests).
+
 Every stage records a structured :class:`StageRecord` (the router's own log; the
 *agent* reports separately by commenting on the issue). A non-handoff event
 short-circuits cleanly as ``IGNORED``; a bad signature or malformed payload is
@@ -97,6 +105,20 @@ class PipelineResult:
         return self.records[-1].outcome if self.records else None
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptResult:
+    """The outcome of the fast :meth:`Pipeline.accept` half.
+
+    ``result`` carries the accept-stage records (route → resolve). ``pending`` is
+    the ``(agent, event)`` to run through :meth:`Pipeline.execute` when the event
+    is an actionable handoff, or ``None`` when it was rejected, ignored, or failed
+    to resolve — i.e. when there is no wake to run.
+    """
+
+    result: PipelineResult
+    pending: tuple[Agent, Event] | None
+
+
 # "What PR did this wake produce?" — the agent opened it during the wake; the
 # real impl queries GitHub, v0 mocks it. ``None`` means no PR to evaluate.
 PrProvider = Callable[[Agent, Event, WakeResult], PullRequest | None]
@@ -127,29 +149,64 @@ class Pipeline:
     sleep: Callable[[float], None] = time.sleep
 
     def handle(self, source: str, request: InboundRequest) -> PipelineResult:
-        """Run ``request`` for ``source`` through the pipeline; never raises.
+        """Run ``request`` for ``source`` synchronously, end to end; never raises.
 
-        Returns a :class:`PipelineResult` whose ``records`` are the ordered stage
-        outcomes. Expected conditions (ignore, reject, stage failure) resolve to
-        records; an unexpected error is caught, recorded ``FAILED``, and
-        swallowed so one bad event cannot take down the daemon.
+        The synchronous whole — :meth:`accept` then :meth:`execute` — used by
+        callers that want the full trip in one call (the offline tests). The
+        server uses the two halves separately so it can fast-ack. Returns a
+        :class:`PipelineResult` whose ``records`` are the ordered stage outcomes;
+        expected conditions resolve to records and unexpected errors are caught
+        and recorded ``FAILED`` so one bad event cannot take down the daemon.
+        """
+        accepted = self.accept(source, request)
+        if accepted.pending is not None:
+            agent, event = accepted.pending
+            self.execute(agent, event, accepted.result)
+        return accepted.result
+
+    def accept(self, source: str, request: InboundRequest) -> AcceptResult:
+        """The fast half: route → verify → normalize → resolve; never raises.
+
+        Returns an :class:`AcceptResult` whose ``pending`` is the ``(agent,
+        event)`` to wake when the event is an actionable handoff, or ``None``
+        otherwise (rejected, ignored, or failed to resolve). No wake runs here —
+        this half is cheap enough to answer a webhook within its timeout.
         """
         result = PipelineResult()
-        current = Stage.ROUTE
         try:
-            current = self._run(source, request, result)
+            pending = self._accept(source, request, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
-            self._record(result, current, Outcome.FAILED, f"unexpected: {exc}")
-        return result
+            self._record(result, Stage.ROUTE, Outcome.FAILED, f"unexpected: {exc}")
+            pending = None
+        return AcceptResult(result=result, pending=pending)
 
-    def _run(self, source: str, request: InboundRequest, result: PipelineResult) -> Stage:
-        """Drive the stages, returning the stage reached (for the catch-all's label)."""
+    def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
+        """The slow half: lock → wake → merge, appended to ``result``; never raises.
+
+        Serialized per repo by the lock so no two sessions ever share a clone.
+        Runs the minutes-long ``claude`` wake, so the server runs it off the
+        request path (in the background) after acking.
+        """
+        try:
+            with self.locks.guard(event.target_repo):
+                self._record(result, Stage.LOCK, Outcome.OK, event.target_repo)
+                wake_result = self._wake(agent, event, result)
+                if wake_result is None:
+                    return
+                self._merge(agent, event, wake_result, result)
+        except Exception as exc:  # last-resort: a stage bug must never crash the daemon
+            self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")
+
+    def _accept(
+        self, source: str, request: InboundRequest, result: PipelineResult
+    ) -> tuple[Agent, Event] | None:
+        """Drive the accept stages; return ``(agent, event)`` iff there is a wake to run."""
         # Route: find the source's module. Unknown source is a rejection.
         try:
             route = self.registry.get(source)
         except UnknownRouteError as exc:
             self._record(result, Stage.ROUTE, Outcome.REJECTED, str(exc))
-            return Stage.ROUTE
+            return None
         self._record(result, Stage.ROUTE, Outcome.OK, source)
 
         # Verify: the security boundary. A missing secret is our misconfiguration,
@@ -158,10 +215,10 @@ class Pipeline:
             route.verify(request, self.config.webhook_secret(source))
         except SignatureError as exc:
             self._record(result, Stage.VERIFY, Outcome.REJECTED, str(exc))
-            return Stage.VERIFY
+            return None
         except ConfigError as exc:
             self._record(result, Stage.VERIFY, Outcome.FAILED, str(exc))
-            return Stage.VERIFY
+            return None
         self._record(result, Stage.VERIFY, Outcome.OK)
 
         # Normalize: payload → Event, or a clean ignore.
@@ -169,10 +226,10 @@ class Pipeline:
             event = route.normalize(request)
         except PayloadError as exc:
             self._record(result, Stage.NORMALIZE, Outcome.REJECTED, str(exc))
-            return Stage.NORMALIZE
+            return None
         if event is None:
             self._record(result, Stage.NORMALIZE, Outcome.IGNORED)
-            return Stage.NORMALIZE
+            return None
         result.event = event
         self._record(result, Stage.NORMALIZE, Outcome.OK, event.delivery_id)
 
@@ -181,18 +238,11 @@ class Pipeline:
             agent = resolve_agent(event, self.config)
         except ConfigError as exc:
             self._record(result, Stage.RESOLVE, Outcome.FAILED, str(exc))
-            return Stage.RESOLVE
+            return None
         result.agent = agent
         self._record(result, Stage.RESOLVE, Outcome.OK, agent.repo)
 
-        # Lock + wake + merge: serialized per repo so no two sessions share a clone.
-        with self.locks.guard(event.target_repo):
-            self._record(result, Stage.LOCK, Outcome.OK, event.target_repo)
-            wake_result = self._wake(agent, event, result)
-            if wake_result is None:
-                return Stage.WAKE
-            self._merge(agent, event, wake_result, result)
-        return Stage.MERGE
+        return agent, event
 
     def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> WakeResult | None:
         # A wake failure is retryable transient by policy here (the boundary
