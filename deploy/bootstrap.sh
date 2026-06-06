@@ -177,15 +177,20 @@ provision_agent_user() {
 	install -d -o "$user" -g "$user" -m 0700 \
 		"/home/$user/repos" "/home/$user/.config" "/home/$user/.config/basecradle"
 	ensure_empty_file "/home/$user/.config/basecradle/agent.env" "$user" "$user" 0600
-	# Default this agent's Claude Code to Opus 4.8 High (per #41), merging into any
-	# existing settings.json rather than clobbering it.
+	# This agent's Claude Code defaults (merged into any existing settings.json):
+	#   - Opus 4.8 High (per #41);
+	#   - permissions.defaultMode = bypassPermissions — a wake is headless (no human
+	#     to approve prompts), so the agent must act autonomously. The security
+	#     boundary is the per-OS-user isolation + the wake-runner wrapper, not
+	#     Claude's interactive prompts. (Authorized by Drawk, 2026-06-05.)
 	install -d -o "$user" -g "$user" -m 0700 "/home/$user/.claude"
 	local settings="/home/$user/.claude/settings.json" tmp
 	tmp="$(mktemp)"
+	local defaults='.model = "claude-opus-4-8" | .effortLevel = "high" | .permissions.defaultMode = "bypassPermissions"'
 	if [[ -f $settings ]] && jq empty "$settings" 2>/dev/null; then
-		jq '.model = "claude-opus-4-8" | .effortLevel = "high"' "$settings" >"$tmp"
+		jq "$defaults" "$settings" >"$tmp"
 	else
-		printf '{"model":"claude-opus-4-8","effortLevel":"high"}\n' >"$tmp"
+		jq -n "$defaults" >"$tmp"
 	fi
 	install -o "$user" -g "$user" -m 0600 "$tmp" "$settings"
 	rm -f "$tmp"
