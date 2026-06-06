@@ -12,6 +12,8 @@ import pytest
 from basecradle_router import wake as wake_module
 from basecradle_router.models import Agent, Event, EventKind, IssueRef
 from basecradle_router.wake import (
+    WAKE_RUNNER,
+    HomeServerWaker,
     SubprocessWaker,
     WakeError,
     WakeInvocation,
@@ -203,3 +205,81 @@ def test_default_runner_is_the_module_default() -> None:
     # Guards the "tests never cross the real boundary unless they monkeypatch it"
     # contract: the out-of-the-box runner is the subprocess one.
     assert SubprocessWaker().runner is wake_module._run_subprocess
+
+
+# --- the home-server waker (runs through the wake-runner wrapper) -----------
+
+
+def test_home_server_waker_satisfies_the_protocol() -> None:
+    assert isinstance(HomeServerWaker(), Waker)
+
+
+def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
+    runner = _FakeRunner(WakeResult(exit_code=0, stdout="opened PR"))
+    result = HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+
+    assert runner.invocation is not None
+    # The exact contract: sudo <wrapper> --user U --cwd DIR -- claude -p TRIGGER.
+    assert runner.invocation.argv == (
+        "sudo",
+        WAKE_RUNNER,
+        "--user",
+        "nova",
+        "--cwd",
+        "/home/nova/basecradle-python",
+        "--",
+        "claude",
+        "-p",
+        EVENT.trigger,
+    )
+    assert runner.invocation.run_as_user == "nova"
+    assert result.ok and result.stdout == "opened PR"
+
+
+def test_home_server_waker_passes_no_env_and_an_irrelevant_cwd() -> None:
+    # The wrapper sources the agent's own env after the privilege drop, so the
+    # router must hand over nothing — no secret ever flows through it.
+    runner = _FakeRunner(WakeResult(exit_code=0))
+    HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+    assert runner.invocation is not None
+    assert runner.invocation.env == {}
+    assert runner.invocation.cwd == "/"
+
+
+def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> None:
+    # A trigger full of shell metacharacters must remain a single argv element —
+    # it is data passed to claude, never a string a shell could re-interpret.
+    nasty = "work; rm -rf / `whoami` $(id) && echo pwned"
+    event = Event(
+        source="github",
+        kind=EventKind.HANDOFF,
+        target_repo=NOVA.repo,
+        origin=EVENT.origin,
+        trigger=nasty,
+        delivery_id=EVENT.delivery_id,
+    )
+    runner = _FakeRunner(WakeResult(exit_code=0))
+    HomeServerWaker(runner=runner).wake(NOVA, event)
+    assert runner.invocation is not None
+    assert runner.invocation.argv[-1] == nasty  # exactly one element, verbatim
+    assert runner.invocation.argv.count(nasty) == 1
+
+
+def test_home_server_waker_honours_a_custom_wrapper_path_and_timeout() -> None:
+    runner = _FakeRunner(WakeResult(exit_code=0))
+    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner", timeout=1800.0).wake(NOVA, EVENT)
+    assert runner.invocation is not None
+    assert runner.invocation.argv[1] == "/opt/x/wake-runner"
+    assert runner.invocation.timeout == 1800.0
+
+
+def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
+    runner = _FakeRunner(WakeResult(exit_code=3, stderr="refusing: not a registered agent clone"))
+    with pytest.raises(WakeError, match="not a registered agent clone") as excinfo:
+        HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+    assert excinfo.value.exit_code == 3
+    assert NOVA.repo in str(excinfo.value)
+
+
+def test_home_server_waker_default_runner_is_the_subprocess_one() -> None:
+    assert HomeServerWaker().runner is wake_module._run_subprocess

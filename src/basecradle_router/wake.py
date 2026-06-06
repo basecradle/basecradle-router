@@ -125,6 +125,21 @@ def _run_subprocess(invocation: WakeInvocation) -> WakeResult:
     )
 
 
+def _result_or_raise(result: WakeResult, agent: Agent) -> WakeResult:
+    """Return a clean (exit 0) result, or raise :class:`WakeError` naming the repo.
+
+    The shared tail of every waker: a non-zero exit becomes a ``WakeError`` carrying
+    the exit code and the best available detail (stderr, then stdout, then a clear
+    placeholder — never an empty message)."""
+    if not result.ok:
+        detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        raise WakeError(
+            f"wake of {agent.repo} exited {result.exit_code}: {detail}",
+            exit_code=result.exit_code,
+        )
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class SubprocessWaker:
     """A :class:`Waker` that runs ``claude -p "<trigger>"`` in the agent's clone.
@@ -152,12 +167,53 @@ class SubprocessWaker:
         )
 
     def wake(self, agent: Agent, event: Event) -> WakeResult:
-        invocation = self.invocation_for(agent, event)
-        result = self.runner(invocation)
-        if not result.ok:
-            detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
-            raise WakeError(
-                f"wake of {agent.repo} exited {result.exit_code}: {detail}",
-                exit_code=result.exit_code,
-            )
-        return result
+        return _result_or_raise(self.runner(self.invocation_for(agent, event)), agent)
+
+
+# The root-owned wrapper the home-server waker escalates through (see deploy/).
+WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
+
+
+@dataclass(frozen=True, slots=True)
+class HomeServerWaker:
+    """The deployable :class:`Waker` — runs the wake through the wake-runner wrapper.
+
+    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> -- claude -p
+    "<trigger>"`` and runs it. The root-owned wrapper validates the request, drops
+    to the agent's own OS user, and (as the agent) sources that agent's
+    ``agent.env`` — so the router itself passes **no** environment and never holds a
+    secret. The trigger rides as a single ``argv`` element, never a shell string, so
+    it is never re-interpreted. ``runner`` is the same injectable seam tests replace;
+    ``wrapper`` is overridable for tests.
+    """
+
+    runner: Runner = _run_subprocess
+    wrapper: str = WAKE_RUNNER
+    timeout: float | None = None
+
+    def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
+        """Assemble the sudo+wrapper command — pure, no I/O."""
+        return WakeInvocation(
+            argv=(
+                "sudo",
+                self.wrapper,
+                "--user",
+                agent.os_user,
+                "--cwd",
+                agent.clone_path,
+                "--",
+                "claude",
+                "-p",
+                event.trigger,
+            ),
+            # The wrapper cd's into the clone as the agent; the router's own cwd is
+            # irrelevant, and "/" is always present. Env is empty by design — the
+            # wrapper supplies the agent's environment after the privilege drop.
+            cwd="/",
+            env=MappingProxyType({}),
+            run_as_user=agent.os_user,
+            timeout=self.timeout,
+        )
+
+    def wake(self, agent: Agent, event: Event) -> WakeResult:
+        return _result_or_raise(self.runner(self.invocation_for(agent, event)), agent)
