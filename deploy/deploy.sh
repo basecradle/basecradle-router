@@ -96,6 +96,11 @@ sudo rsync -a --delete --exclude '.venv/' "${STAGING}/" "${APP_DIR}/"
 sudo chown -R router:router "${APP_DIR}"
 sudo -u router env HOME=/home/router /home/router/.local/bin/uv sync --project "${APP_DIR}"
 echo "${local_sha}" | sudo tee "${STAMP}" >/dev/null
+# World-readable so the hourly drift timer (which runs as the unprivileged router
+# user, whose sudoers grants only wake-runner) can read the stamp without sudo. The
+# dir /etc/basecradle-router is 750 root:router, so the router user traverses it as a
+# group member; the ubuntu user cannot, which is why the confirm step reads it via sudo.
+sudo chmod 0644 "${STAMP}"
 sudo systemctl restart basecradle-router
 # Give it a moment to bind, then assert it is actually up.
 sleep 3
@@ -112,6 +117,9 @@ on_box "sudo SMOKE_URL='${SMOKE_URL}' bash ${APP_DIR}/deploy/smoke-test.sh" ||
 log "Step 4/4 — confirm"
 echo "  deployed SHA : ${local_sha}"
 echo "  trusted actors (live): $(on_box "sudo grep -E '^BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=' '${STAMP%/*}/router.env' | cut -d= -f2- || true")"
-on_box "bash ${APP_DIR}/deploy/drift-check.sh" || die "drift check failed immediately after deploy — investigate"
+# Run via sudo, like the smoke-test step: this SSH session is `ubuntu`, who cannot
+# traverse the 750 /etc/basecradle-router to read the stamp. (drift-check.sh itself
+# never sudos — it also runs from the timer as `router`, which has no such grant.)
+on_box "sudo bash ${APP_DIR}/deploy/drift-check.sh" || die "drift check failed immediately after deploy — investigate"
 
 green "DONE — live daemon == ${local_sha}, #52 gate verified enforced on the box."
