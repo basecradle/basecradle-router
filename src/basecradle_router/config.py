@@ -60,6 +60,11 @@ def _route_secret_var(route: str) -> str:
     return f"{ENV_PREFIX}{route.upper()}_WEBHOOK_SECRET"
 
 
+def _split_csv(raw: str) -> frozenset[str]:
+    """Parse a comma-separated env value into stripped, non-empty items."""
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
 def _load_agents(path: str) -> dict[str, Agent]:
     try:
         raw = json.loads(_read(path))
@@ -112,7 +117,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     if raw_routes is None:
         enabled = frozenset(_DEFAULT_ENABLED_ROUTES)
     else:
-        enabled = frozenset(r.strip() for r in raw_routes.split(",") if r.strip())
+        enabled = _split_csv(raw_routes)
         if not enabled:
             raise ConfigError(f"{_ENABLED_ROUTES_VAR} is set but lists no routes")
 
@@ -150,7 +155,7 @@ def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozense
             f"{_GITHUB_TRUSTED_ACTORS_VAR} is required "
             "(comma-separated GitHub logins of trusted fleet actors)"
         )
-    actors = frozenset(actor.strip() for actor in raw.split(",") if actor.strip())
+    actors = _split_csv(raw)
     if not actors:
         raise ConfigError(f"{_GITHUB_TRUSTED_ACTORS_VAR} is set but lists no actors")
     return actors
