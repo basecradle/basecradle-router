@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Mint a short-lived GitHub App installation token for the fleet agent whose
+credentials are in the environment.
+
+Same shape as the laptop's fleet `gh-app-token`, adapted for the home server:
+each box agent holds only ITS OWN credentials (in its `agent.env`, sourced by the
+wake-runner after the privilege drop), so this reads them from the environment
+rather than a central registry, and signs the JWT via the `openssl` CLI so it
+needs no Python crypto dependency. It never prints key material.
+
+    gh-app-token              # ~1h installation token to stdout (default --token)
+    gh-app-token --token      # same
+    gh-app-token --author     # "slug[bot] <id+slug[bot]@users.noreply.github.com>"
+    gh-app-token --remote     # authenticated https push URL for basecradle/<repo>
+
+Environment (from the agent's agent.env):
+    GH_APP_SLUG          e.g. basecradle-ruby-ai
+    GH_APP_ID            the GitHub App id
+    GH_APP_BOT_USER_ID   the bot user id (for the commit-author email)
+    GH_APP_PEM_B64       base64 of the App private-key PEM
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+API = "https://api.github.com"
+
+
+def die(msg: str) -> None:
+    sys.stderr.write(f"gh-app-token: {msg}\n")
+    sys.exit(1)
+
+
+def env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        die(f"{name} not set (is the agent's agent.env loaded?)")
+    return val
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def api(method: str, path: str, bearer: str):
+    req = urllib.request.Request(
+        API + path,
+        method=method,
+        data=b"" if method == "POST" else None,
+    )
+    req.add_header("Authorization", f"Bearer {bearer}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "basecradle-fleet")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:300].decode(errors="replace")
+        die(f"GitHub API {method} {path} -> {exc.code}: {body}")
+
+
+def mint_token(app_id: str, pem: bytes) -> str:
+    now = int(time.time())
+    header = b64url(b'{"alg":"RS256","typ":"JWT"}')
+    payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": int(app_id)}).encode())
+    signing_input = f"{header}.{payload}".encode()
+
+    # openssl needs the key as a file; keep it 0600 and unlink it promptly.
+    fd, keyfile = tempfile.mkstemp(prefix="ghapp-", suffix=".pem")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, pem)
+        os.close(fd)
+        signed = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", keyfile],
+            input=signing_input,
+            capture_output=True,
+        )
+        if signed.returncode != 0:
+            die(f"openssl sign failed: {signed.stderr.decode(errors='replace')[:200]}")
+    finally:
+        os.unlink(keyfile)
+    jwt = f"{signing_input.decode()}.{b64url(signed.stdout)}"
+
+    installs = api("GET", "/app/installations", jwt)
+    inst = next(
+        (i for i in installs if i.get("account", {}).get("login") == "basecradle"),
+        installs[0] if installs else None,
+    )
+    if not inst:
+        die("no GitHub App installation found")
+    return api("POST", f"/app/installations/{inst['id']}/access_tokens", jwt)["token"]
+
+
+def main() -> None:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "--token"
+    slug = env("GH_APP_SLUG")
+
+    if mode == "--author":
+        bot_user_id = env("GH_APP_BOT_USER_ID")
+        print(f"{slug}[bot] <{bot_user_id}+{slug}[bot]@users.noreply.github.com>")
+        return
+
+    if mode not in ("--token", "--remote"):
+        die(f"unknown mode: {mode} (use --token|--author|--remote)")
+
+    token = mint_token(env("GH_APP_ID"), base64.b64decode(env("GH_APP_PEM_B64")))
+
+    if mode == "--token":
+        print(token)
+    else:  # --remote
+        repo = slug[:-3] if slug.endswith("-ai") else slug  # basecradle-ruby-ai -> basecradle-ruby
+        print(f"https://x-access-token:{token}@github.com/basecradle/{repo}.git")
+
+
+if __name__ == "__main__":
+    main()

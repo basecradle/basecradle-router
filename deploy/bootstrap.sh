@@ -177,7 +177,19 @@ provision_agent_user() {
 	install -d -o "$user" -g "$user" -m 0700 \
 		"/home/$user/repos" "/home/$user/.config" "/home/$user/.config/basecradle"
 	ensure_empty_file "/home/$user/.config/basecradle/agent.env" "$user" "$user" 0600
-	log "agent user $user ready — still to do OUT-OF-BAND (onboarding, #32):"
+	# Default this agent's Claude Code to Opus 4.8 High (per #41), merging into any
+	# existing settings.json rather than clobbering it.
+	install -d -o "$user" -g "$user" -m 0700 "/home/$user/.claude"
+	local settings="/home/$user/.claude/settings.json" tmp
+	tmp="$(mktemp)"
+	if [[ -f $settings ]] && jq empty "$settings" 2>/dev/null; then
+		jq '.model = "claude-opus-4-8" | .effortLevel = "high"' "$settings" >"$tmp"
+	else
+		printf '{"model":"claude-opus-4-8","effortLevel":"high"}\n' >"$tmp"
+	fi
+	install -o "$user" -g "$user" -m 0600 "$tmp" "$settings"
+	rm -f "$tmp"
+	log "agent user $user ready (Claude Code defaulted to Opus 4.8 High) — still to do OUT-OF-BAND (onboarding, #32):"
 	log "    clone its repo into /home/$user/repos, register it in $ETC_DIR/agents.json,"
 	log "    and write its secrets into /home/$user/.config/basecradle/agent.env"
 }
