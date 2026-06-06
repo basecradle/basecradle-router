@@ -81,9 +81,22 @@ BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
 ```
 
 **`agent.env`** (per agent, sourced by the wrapper *as that user*) holds that agent's secrets — its
-GitHub App key / token-minting helper, its `ANTHROPIC_API_KEY`, and later its BaseCradle token. This is
-the live implementation of `wake.py`'s `env_provider` seam: the env is resolved by the wrapper running
-as the agent, so the unprivileged `router` daemon never touches an agent secret.
+`ANTHROPIC_API_KEY` and its GitHub App credentials, and later its BaseCradle token. This is the live
+implementation of `wake.py`'s `env_provider` seam: the env is resolved by the wrapper running as the
+agent, so the unprivileged `router` daemon never touches an agent secret. The GitHub App credentials are:
+```
+ANTHROPIC_API_KEY=sk-ant-...
+GH_APP_SLUG=basecradle-ruby-ai
+GH_APP_ID=<github app id>
+GH_APP_BOT_USER_ID=<bot user id, for the commit-author email>
+GH_APP_PEM_B64=<base64 of the App private-key PEM>
+```
+The agent mints its own short-lived `<slug>[bot]` tokens from these with **`deploy/bin/gh-app-token`**
+(installed root-owned at `/usr/local/bin/gh-app-token`): `gh-app-token --token` / `--author` / `--remote`.
+It reads the creds from the environment (each box agent holds only its own) and signs the JWT via the
+`openssl` CLI, so it needs no extra runtime — the same shape as the laptop fleet helper. Each agent's
+Claude Code is defaulted to **Opus 4.8 High** (`~/.claude/settings.json`: `model` + `effortLevel`, by
+`bootstrap.sh`).
 
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
 on the box out-of-band (a founder gate), `chmod 600`, never in git.
