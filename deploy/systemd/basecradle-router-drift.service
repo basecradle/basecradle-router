@@ -16,8 +16,10 @@ Documentation=https://github.com/basecradle/basecradle-router
 
 [Service]
 Type=oneshot
-# Runs as the unprivileged daemon user; it only needs to read the (world-readable)
-# deploy stamp and reach github.com over https. No secrets, no privilege.
+# Runs as the unprivileged daemon user (NOT root — least privilege): it only reads
+# the deploy stamp and reaches github.com over https. deploy.sh writes the stamp
+# 0644, and /etc/basecradle-router is 750 root:router, so `router` traverses the dir
+# as a group member and reads the stamp without sudo — no false "no stamp" alarm.
 User=router
 Group=router
 ExecStart=/opt/basecradle-router/app/deploy/drift-check.sh
