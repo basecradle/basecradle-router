@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from basecradle_router.config import load_config
+from basecradle_router.config import load_config, load_github_trusted_actors
 from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
@@ -49,7 +49,7 @@ def create_app(
     """
     config = load_config(env)
     registry = RouteRegistry()
-    registry.register(GithubRoute())
+    registry.register(GithubRoute(load_github_trusted_actors(env)))
     pipeline = Pipeline(
         registry=registry,
         config=config,

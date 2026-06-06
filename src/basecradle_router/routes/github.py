@@ -9,13 +9,17 @@ malformed, or tampered gets past it into the core pipeline.
 :meth:`GithubRoute.normalize` is the other half: it turns a verified ``issues``
 webhook into a core :class:`~basecradle_router.models.Event`, gating on the
 ``handoff`` label so only a handoff issue wakes an agent — everything else is a
-well-formed *ignore*, not an error.
+well-formed *ignore*, not an error. As defense-in-depth it *also* gates on the
+webhook ``sender``: a handoff only wakes an agent if a **trusted fleet actor**
+applied the label. Because this check runs *after* :meth:`verify`, the ``sender``
+field is GitHub-attested and not attacker-spoofable.
 """
 
 from __future__ import annotations
 
 import hmac
 import json
+from collections.abc import Iterable
 from hashlib import sha256
 from typing import Any
 
@@ -24,6 +28,7 @@ from basecradle_router.routes.base import (
     InboundRequest,
     PayloadError,
     SignatureError,
+    UntrustedSenderError,
 )
 
 SIGNATURE_HEADER = "X-Hub-Signature-256"
@@ -36,9 +41,18 @@ _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 
 
 class GithubRoute:
-    """The GitHub webhook route. ``name`` is the source key the registry uses."""
+    """The GitHub webhook route. ``name`` is the source key the registry uses.
+
+    ``trusted_actors`` is the allow-list of GitHub logins permitted to trigger a
+    wake — the fleet's org members and App bots. A handoff whose ``sender`` is not
+    on it is rejected (defense-in-depth behind GitHub's own permission model).
+    GitHub logins are case-insensitive, so the list is matched case-insensitively.
+    """
 
     name = "github"
+
+    def __init__(self, trusted_actors: Iterable[str]) -> None:
+        self._trusted_actors = frozenset(actor.lower() for actor in trusted_actors)
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
@@ -70,7 +84,9 @@ class GithubRoute:
         Returns ``None`` (a well-formed ignore) for any webhook that is not a
         handoff: a non-``issues`` event, a non-``opened``/``labeled`` action, or
         an issue without the ``handoff`` label. Raises :class:`PayloadError` only
-        when an ``issues`` payload is structurally malformed.
+        when an ``issues`` payload is structurally malformed, and
+        :class:`UntrustedSenderError` when a genuine handoff was triggered by an
+        actor who is not a trusted fleet member.
         """
         if request.header(EVENT_HEADER) != "issues":
             return None
@@ -86,6 +102,12 @@ class GithubRoute:
 
         if not _is_handoff(action, issue, data):
             return None
+
+        # Defense-in-depth: the label says "handoff", but only a trusted fleet
+        # actor may actually trigger a wake. This runs after verify(), so the
+        # sender is GitHub-attested. An untrusted (or unidentifiable) sender is a
+        # rejection, not a wake — fail closed.
+        self._require_trusted_sender(data)
 
         repository = data.get("repository")
         if not isinstance(repository, dict):
@@ -112,6 +134,23 @@ class GithubRoute:
             )
         except ValueError as exc:
             raise PayloadError(f"malformed issues payload: {exc}") from exc
+
+    def _require_trusted_sender(self, data: dict[str, Any]) -> None:
+        """Raise :class:`UntrustedSenderError` unless the webhook's actor is trusted.
+
+        The ``sender`` is the actor GitHub attributes the delivery to — who opened
+        the issue or applied the label. We can't identify the actor from a missing
+        or malformed ``sender``, so that fails closed (an untrusted sender), the
+        same as a known-but-not-allowed login.
+        """
+        sender = data.get("sender")
+        login = sender.get("login") if isinstance(sender, dict) else None
+        if not isinstance(login, str) or not login:
+            raise UntrustedSenderError("handoff webhook has no identifiable sender")
+        if login.lower() not in self._trusted_actors:
+            raise UntrustedSenderError(
+                f"handoff label applied by untrusted actor {login!r}; not a fleet member"
+            )
 
 
 def _parse(body: bytes) -> dict[str, Any]:

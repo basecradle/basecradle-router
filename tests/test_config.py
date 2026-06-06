@@ -7,7 +7,11 @@ import json
 
 import pytest
 
-from basecradle_router.config import ConfigError, load_config
+from basecradle_router.config import (
+    ConfigError,
+    load_config,
+    load_github_trusted_actors,
+)
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -100,3 +104,31 @@ def test_config_maps_are_read_only(tmp_path) -> None:
         config.agents["basecradle/x"] = None  # type: ignore[index]
     with pytest.raises(TypeError):
         config.webhook_secrets["github"] = "x"  # type: ignore[index]
+
+
+# --- github trusted-actor allow-list ---------------------------------------
+
+_ACTORS_VAR = "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"
+
+
+def test_trusted_actors_parse_a_comma_separated_list() -> None:
+    env = {_ACTORS_VAR: "john, basecradle-python-ai[bot] ,nova"}
+    assert load_github_trusted_actors(env) == frozenset(
+        {"john", "basecradle-python-ai[bot]", "nova"}
+    )
+
+
+def test_trusted_actors_ignore_blanks_and_whitespace() -> None:
+    assert load_github_trusted_actors({_ACTORS_VAR: "john, ,, nova ,"}) == frozenset(
+        {"john", "nova"}
+    )
+
+
+def test_trusted_actors_required_when_unset() -> None:
+    with pytest.raises(ConfigError, match=f"{_ACTORS_VAR} is required"):
+        load_github_trusted_actors({})
+
+
+def test_trusted_actors_empty_list_fails() -> None:
+    with pytest.raises(ConfigError, match="lists no actors"):
+        load_github_trusted_actors({_ACTORS_VAR: " , , "})

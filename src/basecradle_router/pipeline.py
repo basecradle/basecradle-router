@@ -49,6 +49,7 @@ from basecradle_router.routes import (
     RouteRegistry,
     SignatureError,
     UnknownRouteError,
+    UntrustedSenderError,
 )
 from basecradle_router.wake import WakeError, Waker, WakeResult
 
@@ -221,10 +222,11 @@ class Pipeline:
             return None
         self._record(result, Stage.VERIFY, Outcome.OK)
 
-        # Normalize: payload → Event, or a clean ignore.
+        # Normalize: payload → Event, or a clean ignore. A malformed payload or a
+        # handoff from an untrusted actor is a rejection (logged, no wake).
         try:
             event = route.normalize(request)
-        except PayloadError as exc:
+        except (PayloadError, UntrustedSenderError) as exc:
             self._record(result, Stage.NORMALIZE, Outcome.REJECTED, str(exc))
             return None
         if event is None:
