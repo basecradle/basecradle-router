@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# deploy/smoke-test.sh — the LIVE post-deploy smoke test.
+#
+# Proves the running daemon on the box actually enforces the security boundary —
+# not that the code merged, but that the bytes serving traffic right now behave.
+# It POSTs three synthetic, GitHub-shaped webhooks at the live endpoint and
+# asserts the response of each:
+#
+#   1. bad signature                      -> 401  (verify rejects; nothing spoofed)
+#   2. valid sig, UNTRUSTED sender        -> 400  (the #52 trusted-actor gate rejects)
+#   3. valid sig, TRUSTED sender,         -> 200  (gate ALLOWS the trusted actor; the
+#      UNREGISTERED repo                          event is accepted, then resolve finds
+#                                                 no agent, so NO wake fires — safe)
+#
+# Case 3 deliberately targets a repo that is not in the registry: it exercises the
+# whole accept path past the trust gate WITHOUT waking any real agent. Together,
+# (2) and (3) prove the gate both rejects strangers and admits the fleet; (1)
+# proves the HMAC boundary in front of it. This is the test whose ABSENCE let the
+# box drift to pre-#52 code undetected (issue #54).
+#
+# Runs ON THE BOX (it reads the signing secret + trusted-actor list from
+# router.env, which is root-readable only). deploy.sh invokes it over SSH after a
+# restart; you can also run it by hand:  sudo deploy/smoke-test.sh
+#
+# Config (env overrides):
+#   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
+#   SMOKE_URL         the endpoint to hit            (default https://ai.basecradle.com/webhooks/github)
+#
+# It never waits on a wake and never touches a real agent, so it is safe to run
+# against production at any time.
+#
+set -euo pipefail
+
+ROUTER_ENV_FILE="${ROUTER_ENV_FILE:-/etc/basecradle-router/router.env}"
+SMOKE_URL="${SMOKE_URL:-https://ai.basecradle.com/webhooks/github}"
+
+# A repo that is never in the registry, so case 3 resolves to no agent => no wake.
+UNREGISTERED_REPO="basecradle/__router-smoke-test-do-not-register__"
+UNTRUSTED_LOGIN="router-smoke-untrusted-actor"
+
+green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
+red() { printf '\033[1;31m%s\033[0m\n' "$*"; }
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+die() {
+	red "smoke-test: $*" >&2
+	exit 1
+}
+
+[[ -r "$ROUTER_ENV_FILE" ]] || die "cannot read $ROUTER_ENV_FILE (run with sudo / as root)"
+
+# Pull only the two values we need; do not source arbitrary lines into the shell.
+# `|| true` so a missing key yields an empty string and the friendly die() below
+# fires — without it, grep's exit 1 under `set -o pipefail` would abort with no message.
+secret="$(grep -E '^BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+actors="$(grep -E '^BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+[[ -n "$secret" ]] || die "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET not set in $ROUTER_ENV_FILE"
+[[ -n "$actors" ]] || die "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS not set in $ROUTER_ENV_FILE"
+
+# First non-empty, trimmed trusted actor — a real fleet login the gate must admit.
+trusted_login="$(printf '%s' "$actors" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -m1 . || true)"
+[[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
+
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+# Emit a GitHub `issues` "labeled handoff" payload for the given sender + repo.
+payload() {
+	local sender=$1 repo=$2
+	cat <<-JSON
+		{"action":"labeled",
+		 "label":{"name":"handoff"},
+		 "issue":{"number":1,
+		          "html_url":"https://github.com/${repo}/issues/1",
+		          "title":"Router live smoke test (no-op)",
+		          "labels":[{"name":"handoff"}]},
+		 "repository":{"full_name":"${repo}"},
+		 "sender":{"login":"${sender}"}}
+	JSON
+}
+
+sign() { openssl dgst -sha256 -hmac "$secret" "$1" | awk '{print $NF}'; }
+
+# POST a body file with a given signature header; echo the HTTP status code.
+post() {
+	local body_file=$1 signature=$2
+	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+		-X POST "$SMOKE_URL" \
+		-H 'Content-Type: application/json' \
+		-H 'X-GitHub-Event: issues' \
+		-H 'X-GitHub-Delivery: smoke-00000000-0000-0000-0000-000000000000' \
+		-H "X-Hub-Signature-256: sha256=${signature}" \
+		--data-binary "@${body_file}"
+}
+
+rc=0
+check() {
+	local name=$1 expect=$2 got=$3
+	if [[ "$got" == "$expect" ]]; then
+		green "  PASS  ${name}: HTTP ${got} (expected ${expect})"
+	else
+		red "  FAIL  ${name}: HTTP ${got} (EXPECTED ${expect})"
+		rc=1
+	fi
+}
+
+log "Smoke-testing live daemon at ${SMOKE_URL}"
+log "Trusted actor under test: ${trusted_login}"
+
+# Case 1 — bad signature. Body is otherwise valid; the signature is garbage.
+payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c1.json"
+check "bad signature rejected" 401 "$(post "$workdir/c1.json" "0000000000000000000000000000000000000000000000000000000000000000")"
+
+# Case 2 — valid signature, UNTRUSTED sender. The #52 gate must reject (no wake).
+payload "$UNTRUSTED_LOGIN" "$UNREGISTERED_REPO" >"$workdir/c2.json"
+check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(sign "$workdir/c2.json")")"
+
+# Case 3 — valid signature, TRUSTED sender, unregistered repo. Gate admits it;
+# resolve finds no agent, so it is accepted-and-logged with NO wake.
+payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
+check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
+
+echo
+if [[ $rc -eq 0 ]]; then
+	green "LIVE SMOKE TEST PASSED — the running daemon enforces the #52 trust gate."
+else
+	red "LIVE SMOKE TEST FAILED — the running daemon does NOT behave as expected. Do NOT consider this deploy done."
+fi
+exit $rc

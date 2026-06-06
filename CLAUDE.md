@@ -61,6 +61,19 @@ This is **not** a published package — the router is **deployed to the home ser
 - **Test data is fabricated, always**: the cast is **John Doe** (`handle: john`, human) and **Nova Digital** (`handle: nova`, AI); emails `@example.com`; UUIDs are real well-formed UUIDv7; tokens correctly-shaped fakes. No real platform data ever.
 - **When work blocks on a human action, announce it unmissably** — lead with "⏸️ WAITING ON YOU", state the exact action, and phrase the ask as a numbered checklist with exact values, not prose.
 
+## Deploying — Definition of Done
+
+**This repo's artifact is a *running service*, so `merged` ≠ `done`.** A merge to `main` changes nothing on the box; the change is only real once it is **running on `ai.basecradle.com` and a live smoke test passes**. The Definition of Done for any change that alters the running daemon is, in order:
+
+> **tested (offline) → deployed to the box → smoke-tested LIVE → confirmed.**
+
+Treating "merged" as "done" is exactly what let the box drift to pre-#52 code while three security/policy PRs sat merged-but-unrun (issue #54). Don't repeat it.
+
+- **The loop is one command:** [`deploy/deploy.sh`](deploy/deploy.sh) runs the whole DoD — it refuses to deploy unless `ruff` + `pytest` are green locally *and* `HEAD == origin/main` (no dirty tree, no stale code), rsyncs the checkout to the box, `uv sync`s, **stamps the deployed commit SHA**, restarts the service, then runs the live smoke test and **fails loudly** if the running daemon misbehaves. A deploy that doesn't end green is not done.
+- **The live smoke test** ([`deploy/smoke-test.sh`](deploy/smoke-test.sh)) POSTs synthetic signed webhooks at the real endpoint and asserts the security boundary on the *running* bytes: bad signature → 401, untrusted sender → 400 (the #52 gate rejects), trusted sender for an **unregistered** repo → 200 (the gate admits, and no agent is woken). It never wakes a real agent, so it is safe against production anytime.
+- **Drift can never be silent again.** [`deploy/drift-check.sh`](deploy/drift-check.sh) compares the deployed SHA against `origin/main` (tokenless `git ls-remote` — the repo is public, so the box needs no credential to ask). A systemd timer (`deploy/systemd/basecradle-router-drift.{service,timer}`) runs it hourly so a merge that never reached the box shows up in `systemctl --failed`, not months later.
+- **Why not fully-automated CD (GHA → prod)?** Deliberate. Pushing from a GitHub-hosted runner needs an SSH key to the crown-jewels box stored in CI, or the box's SSH opened to GitHub's runner ranges; a self-hosted runner means GitHub's agent executing workflow code *on* that box. Both regress the box's posture ("least privilege everywhere"). The chosen model — a self-verifying one-command deploy from a trusted local checkout + a drift alarm — kills the silent-drift root cause without that trade. Revisit only if the deploy cadence makes the manual step the bottleneck.
+
 ## Where to Start
 
 The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency order; the authoritative requirements are in `basecradle/basecradle#277`. Start at the lowest open issue number; plan-first for anything non-trivial.

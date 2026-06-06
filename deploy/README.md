@@ -203,6 +203,77 @@ backup of `agents.json` with a documented rebuild, and liveness alerting on the 
 
 ---
 
+## Part 3 — Shipping: the deploy loop (Definition of Done)
+
+**`merged` ≠ `done`.** The artifact is a running service; a merge to `main` changes nothing on the box
+until the code is rsynced there and the daemon restarts. Issue #54 was the proof: #50/#52/#53 sat merged
+but unrun for a day while the live daemon served pre-#52 code, because "done" silently meant "merged" and
+nothing redeployed. The Definition of Done is therefore the full loop, codified in `CLAUDE.md`
+("Deploying — Definition of Done") and implemented here:
+
+> **tested (offline) → deployed to the box → smoke-tested LIVE → confirmed.**
+
+### One command: `deploy/deploy.sh`
+Run from a trusted local checkout. It *is* the loop, so a deploy can never silently half-finish:
+
+1. **Test (offline gate)** — refuses to proceed unless `ruff` + `pytest` pass locally **and** `HEAD ==
+   origin/main` with a clean tree (so you can only ship merged, current code; `FORCE=1` overrides for an
+   emergency).
+2. **Deploy** — rsyncs the checkout to staging on the box, `sudo rsync`s into `/opt/basecradle-router/app`,
+   `chown`s to `router`, `uv sync`s, **stamps the deployed commit SHA** to `/etc/basecradle-router/deployed-sha`,
+   and restarts the service (asserting it comes back active).
+3. **Smoke (live)** — runs `deploy/smoke-test.sh` against the real endpoint; a failure aborts the deploy
+   loudly. *This deploy is not done unless the smoke test is green.*
+4. **Confirm** — prints the deployed SHA, the live trusted-actor list, and a drift check that must read
+   "in sync".
+
+```bash
+# from the laptop checkout, on a clean main:
+ROUTER_SSH_KEY=<path to the Lightsail key> deploy/deploy.sh
+```
+Config via env: `ROUTER_HOST` (default `ubuntu@ai.basecradle.com` — the public DNS name; **no infra IP
+lives in this repo**), `ROUTER_SSH_KEY`, `SMOKE_URL`, `FORCE=1`.
+
+> **Why rsync-from-laptop, not a token on the box?** The box holds the fleet's crown jewels, so it carries
+> no GitHub credential — code arrives by rsync from a trusted checkout, never by the box pulling. The daemon
+> just *runs* the code; it never pushes or pulls.
+
+### The live smoke test: `deploy/smoke-test.sh`
+Proves the **running** daemon enforces the boundary — not that code merged, but that the bytes serving
+traffic right now behave. Three synthetic, GitHub-shaped, HMAC-signed webhooks at the live endpoint:
+
+| Case | Webhook | Asserted | Proves |
+|---|---|---|---|
+| 1 | bad signature | **401** | the HMAC verify boundary holds |
+| 2 | valid sig, **untrusted** sender | **400** | the #52 trusted-actor gate **rejects** strangers |
+| 3 | valid sig, **trusted** sender, **unregistered** repo | **200** | the gate **admits** the fleet — and no agent is woken (resolve finds none) |
+
+Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
+**without waking any real agent** — safe to run against production at any time. It reads the signing secret
+and the trusted-actor list from `router.env` (root-readable only), so it runs on the box (`deploy.sh`
+invokes it over SSH; or `sudo deploy/smoke-test.sh` by hand). The same three status-code outcomes are pinned
+offline in `tests/test_server_e2e.py`, so the smoke test can't bit-rot against the route logic unnoticed.
+
+### Drift can never be silent: `deploy/drift-check.sh` + the timer
+`drift-check.sh` compares the stamped deployed SHA against the live tip of `origin/main`, fetched
+tokenlessly with `git ls-remote` (the repo is public, so the box needs no credential to ask "what is main
+now?"). It exits non-zero and prints loudly on drift (or a missing stamp). `deploy.sh` runs it as the final
+confirm step, and `deploy/systemd/basecradle-router-drift.{service,timer}` run it **hourly** as the `router`
+user — so a merge that never reached the box surfaces in `systemctl --failed` and the journal, instead of
+going unnoticed for a day. It only reads; it never auto-deploys.
+
+### Why not fully-automated CD (GitHub Actions → prod)?
+Deliberately not done. Auto-deploy-on-merge from a GitHub-hosted runner needs either an SSH key to the
+crown-jewels box stored in CI secrets, or the box's SSH opened to GitHub's shared runner ranges; a
+self-hosted runner means GitHub's runner agent executing workflow code *on* the box that holds every agent's
+credentials. Both regress the box's governing constraint ("least privilege everywhere"). The chosen model —
+a self-verifying **one-command deploy** from a trusted local checkout, plus a **drift alarm** that makes
+the merge≠deploy gap loud — closes the silent-drift root cause (#54) without that security trade. Revisit
+only if the manual deploy step ever becomes the bottleneck; the natural next step would be a pull-based,
+human-initiated deploy on the box, not unattended push from CI.
+
+---
+
 ## Founder gates (in order)
 The human actions this phase needs. Surfaced here so they are never a surprise; the steward builds
 right up to each gate and pauses only at it.

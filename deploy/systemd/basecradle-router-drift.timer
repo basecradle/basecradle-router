@@ -1,0 +1,16 @@
+# Schedule for the deployed-vs-main drift check (basecradle-router-drift.service).
+#
+# Hourly is plenty: a deploy is the normal way main reaches the box, and this is
+# the backstop that catches a merge that never got deployed. Install alongside the
+# .service, then: systemctl enable --now basecradle-router-drift.timer
+
+[Unit]
+Description=Run the BaseCradle router drift check hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
