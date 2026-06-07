@@ -1,16 +1,18 @@
 # Schedule for the clean-reboot check (basecradle-router-reboot.service).
 #
-# AUTHORED, NOT YET ENABLED. Enabling THIS timer is what turns automatic reboots
-# on — exactly the policy decision issue #66 defers until the mechanism is proven.
-# Do NOT `enable --now` it until that decision is taken; the service it drives
-# (reboot-if-required.sh) is safe to run by hand on a manual cadence in the
-# meantime. When the policy lands, tune the window below and:
+# ENABLED — automatic reboots are ON (founder decision, issue #66: "done" means
+# auto-reboot is operational, not deferred). Enabling this timer is what turns
+# automatic reboots on:
 #   systemctl daemon-reload && systemctl enable --now basecradle-router-reboot.timer
 #
-# The window below is a low-traffic placeholder: 08:00 UTC ~= 03:00 US Central
-# (Drawk's tz). The orchestrator no-ops unless a reboot is actually pending, so the
-# timer firing daily is cheap; an actual reboot only happens on the days an update
-# staged one. RandomizedDelaySec spreads the wake so it is never exactly on the hour.
+# The window is low-traffic: 08:00 UTC ~= 02:00-03:00 US Central (Drawk's tz; the
+# fixed-UTC time drifts an hour across DST, both ends well inside the quiet window).
+# The orchestrator (reboot-if-required.sh) NO-OPS unless a reboot is actually
+# pending, so the timer firing daily is cheap; an actual reboot only happens on the
+# days an OS update staged one. RandomizedDelaySec spreads the wake off the exact
+# hour. The post-boot recovery gate (basecradle-router-recovery.service) confirms
+# the box came back and alarms (systemctl --failed) if it did not — that gate is
+# what makes an unattended reboot safe.
 
 [Unit]
 Description=Run the BaseCradle router clean-reboot check in a low-traffic window

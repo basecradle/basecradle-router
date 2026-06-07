@@ -291,9 +291,10 @@ human-initiated deploy on the box, not unattended push from CI.
 **The gap this closes (issue #66).** `unattended-upgrades` installs security/kernel patches but **does
 not reboot**, so a kernel fix can sit installed-but-inactive — "applied in name only" — until someone
 remembers to reboot. The fleet home box was found exactly like that (running an unpatched kernel with a
-newer one already on disk). We deliberately **did not** turn on blind automatic reboots; instead this
-service now owns a reboot mechanism that is clean and observable, so automatic reboots can be turned on
-*safely* — and the **policy** for when to reboot is the one decision left to make.
+newer one already on disk). This service now owns a reboot mechanism that is clean and observable, and
+**automatic reboots are turned on** (founder decision, issue #66: "done" means auto-reboot is
+operational — that is the whole point of building this). What makes an unattended reboot safe is the
+post-boot recovery gate below: the box reboots cleanly, then proves it came back or alarms loudly.
 
 Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 
@@ -315,18 +316,20 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 ### systemd units (`deploy/systemd/`)
 | Unit | Role | Enable? |
 |---|---|---|
-| `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) | **Enable now** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational, and it verifies recovery after *any* reboot — manual or automatic — so it adds value before the policy is decided. |
-| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `reboot-if-required.sh`) | Install (`daemon-reload`); harmless idle until its timer is enabled. |
-| `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Do NOT enable yet** — enabling this *is* turning automatic reboots on, the deferred policy decision below. Until then, run `reboot-if-required.sh` by hand on a manual cadence. |
+| `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |
+| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `reboot-if-required.sh`) | `static` (timer-driven). Install (`daemon-reload`). |
+| `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
 
-### The deferred decision (now unblocked)
-With the mechanism in place, the **reboot policy** can be chosen: **automatic** in a low-traffic window
-(enable `basecradle-router-reboot.timer`, tune its `OnCalendar`) vs. a **manual cadence** (the steward
-runs `reboot-if-required.sh` after an update window). Either way the reboot itself is now clean and the
-recovery is alarmed. This decision was explicitly held until this mechanism existed (issue #66); it is a
-founder/steward call, scoped to how much unattended action the box should take (least privilege on the
-crown-jewels host). It pairs with the Phase D hardening duty (`unattended-upgrades` — the install half,
-already on; this is the reboot half).
+### The reboot policy (decided: automatic)
+**Automatic reboots are on.** The `basecradle-router-reboot.timer` fires daily in a low-traffic window
+(`OnCalendar=08:00 UTC` ≈ 02:00–03:00 US Central; `RandomizedDelaySec=15min`); `reboot-if-required.sh`
+no-ops unless a reboot is actually pending, so an actual reboot happens only on the days an OS update
+staged one. This is the founder's call (issue #66): the deferral was only until the mechanism existed and
+was verified working — now it is, so the box reboots itself to take security/kernel patches, and the
+recovery gate confirms it came back (or alarms). It pairs with the Phase D hardening duty
+(`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works
+(`systemctl start basecradle-router-reboot.service`, or `reboot-if-required.sh` by hand) for an
+out-of-window reboot.
 
 ---
 
