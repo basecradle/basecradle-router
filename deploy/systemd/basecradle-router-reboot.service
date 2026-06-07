@@ -1,0 +1,28 @@
+# BaseCradle router — clean reboot when an OS update has staged one (oneshot).
+#
+# Runs deploy/reboot-if-required.sh: a no-op unless /var/run/reboot-required exists,
+# otherwise it drains the router and performs a controlled reboot. This is the
+# "perform the reboot cleanly" half of issue #66; the post-boot health gate is
+# basecradle-router-recovery.service.
+#
+# AUTHORED, NOT YET ENABLED — the automatic-reboot POLICY is deliberately deferred
+# (issue #66): turning blind automatic reboots on was held until this mechanism
+# existed. Now that it does, the decision (automatic in a window vs. a manual
+# cadence) can be made. Enable the paired .timer ONLY once that decision is taken;
+# until then, run reboot-if-required.sh by hand on a manual cadence.
+#
+# Install (driven by the timer, so no [Install] section here):
+#   systemctl daemon-reload   # then enable the .timer when policy says so
+
+[Unit]
+Description=BaseCradle router — clean reboot when an OS update staged one
+Documentation=https://github.com/basecradle/basecradle-router
+
+[Service]
+Type=oneshot
+# The drain (systemctl stop basecradle-router) blocks until in-flight wakes finish,
+# bounded by that unit's TimeoutStopSec (120s). Keep this start timeout above that so
+# systemd never kills the orchestrator mid-drain (which would skip the reboot and
+# mark the unit failed). Once it reaches `exec systemctl reboot`, the box goes down.
+TimeoutStartSec=300
+ExecStart=/opt/basecradle-router/app/deploy/reboot-if-required.sh

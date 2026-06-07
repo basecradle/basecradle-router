@@ -1,0 +1,37 @@
+# BaseCradle router — post-boot recovery verification (services + /up liveness).
+#
+# Runs deploy/verify-recovery.sh once per boot, AFTER the daemon + Caddy have been
+# ordered up, and FAILS loudly if the box did not come back healthy — so a reboot
+# that left the fleet home serving nothing surfaces in `systemctl --failed` and the
+# journal instead of going unnoticed (the same alarm convention as the drift timer).
+# This is the post-boot half of the clean-reboot mechanism (issue #66); it pairs
+# with deploy/reboot-if-required.sh.
+#
+# Safe to ENABLE NOW: it is read-only and purely observational, and it checks
+# recovery after ANY reboot (manual or automatic), so it adds value before the
+# automatic-reboot policy is decided.
+#
+# Install to /etc/systemd/system/, then:
+#   systemctl daemon-reload && systemctl enable basecradle-router-recovery.service
+# (enable, not --now: it is meant to run at boot; it will run on the next reboot.)
+
+[Unit]
+Description=BaseCradle router — post-boot recovery verification (services + /up)
+Documentation=https://github.com/basecradle/basecradle-router
+# Order after the things we verify so they have been started before we look. The
+# script still polls (After only orders start, it does not wait for health), so a
+# slow or flapping unit is tolerated within the script's retry budget.
+After=basecradle-router.service caddy.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# verify-recovery.sh polls for up to RETRIES*RETRY_INTERVAL (~150s by default) while
+# services finish coming up. That exceeds systemd's default oneshot start timeout
+# (~90s), which would kill the check mid-poll and mark it failed spuriously. Give it
+# comfortable headroom above the poll budget.
+TimeoutStartSec=300
+ExecStart=/opt/basecradle-router/app/deploy/verify-recovery.sh
+
+[Install]
+WantedBy=multi-user.target
