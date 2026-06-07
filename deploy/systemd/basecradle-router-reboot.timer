@@ -23,7 +23,15 @@ Description=Run the BaseCradle router clean-reboot check in a low-traffic window
 [Timer]
 OnCalendar=*-*-* 05:00:00 America/Chicago
 RandomizedDelaySec=15min
-Persistent=true
+# Persistent=false (the default) ON PURPOSE: a reboot must happen ONLY in the 5 AM
+# window, never as a catch-up at an arbitrary time. Persistent=true would fire the
+# service immediately when the timer starts after a missed run (box was off across
+# 5 AM, or deploy.sh re-arms it with `enable --now` after inactivity) — and if a
+# reboot were pending that would reboot the box off-window. Missing one day's window
+# is harmless: the next day's 5 AM catches the still-pending reboot. (Contrast the
+# DRIFT timer, which keeps Persistent=true — catching up a missed SHA comparison is
+# both harmless and useful.)
+Persistent=false
 
 [Install]
 WantedBy=timers.target

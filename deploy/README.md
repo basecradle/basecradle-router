@@ -231,8 +231,11 @@ Run from a trusted local checkout. It *is* the loop, so a deploy can never silen
    origin/main` with a clean tree (so you can only ship merged, current code; `FORCE=1` overrides for an
    emergency).
 2. **Deploy** — rsyncs the checkout to staging on the box, `sudo rsync`s into `/opt/basecradle-router/app`,
-   `chown`s to `router`, `uv sync`s, **stamps the deployed commit SHA** to `/etc/basecradle-router/deployed-sha`,
-   and restarts the service (asserting it comes back active).
+   `chown`s to `router`, `uv sync`s, reinstalls the root-owned `wake-runner` wrapper, **installs + enables
+   the managed systemd units** from the deployed tree (the daemon, drift `.{service,timer}`, recovery
+   `.service`, reboot `.{service,timer}` — `daemon-reload`, arm the timers, enable the recovery gate;
+   issue #71, so a merged unit can't be merged-but-not-installed), **stamps the deployed commit SHA** to
+   `/etc/basecradle-router/deployed-sha`, and restarts the service (asserting it comes back active).
 3. **Smoke (live)** — runs `deploy/smoke-test.sh` against the real endpoint, then asserts the
    fleet-uniform liveness route `GET /up` is green over the public TLS path (Caddy → uvicorn); either
    failure aborts the deploy loudly. *This deploy is not done unless both are green.*
@@ -314,6 +317,10 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
   silently serving nothing.
 
 ### systemd units (`deploy/systemd/`)
+> Since issue #71, **`deploy/deploy.sh` installs + enables these from the deployed tree on every run** —
+> `daemon-reload`, arm the timers, enable the recovery gate. The `enable` commands below are the explicit
+> contract / first-time-by-hand fallback; you don't run them per deploy.
+
 | Unit | Role | Enable? |
 |---|---|---|
 | `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |

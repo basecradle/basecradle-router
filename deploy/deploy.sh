@@ -111,6 +111,32 @@ sudo -u router env HOME=/home/router /home/router/.local/bin/uv sync --project "
 # never abort an already-mutated deploy on a box missing the dir.
 sudo install -d -o root -g root -m 0755 /opt/basecradle-router/bin
 sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/bin/wake-runner" /opt/basecradle-router/bin/wake-runner
+# Install + enable the managed systemd units from the deployed tree, every deploy
+# (issue #71). The units are CODE the box runs, but they live in /etc/systemd/system/
+# OUTSIDE the router-owned app/ tree the rsync mirrors -- so, exactly like wake-runner
+# above, a merged unit change would silently never reach the box (the unit-level
+# version of the merge!=deploy gap, #54). It bit us twice: the drift alarm (#55/#58)
+# and the reboot/recovery units (#66) were each merged but left uninstalled until a
+# manual step. Reinstalling them here from the same trusted checkout closes that gap:
+# a merged unit can never again be merged-but-not-installed. Explicit per-unit lines
+# (no loop var) so every path expands client-side cleanly into this heredoc.
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router.service"          /etc/systemd/system/basecradle-router.service
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router-drift.service"    /etc/systemd/system/basecradle-router-drift.service
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router-drift.timer"      /etc/systemd/system/basecradle-router-drift.timer
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router-recovery.service" /etc/systemd/system/basecradle-router-recovery.service
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router-reboot.service"   /etc/systemd/system/basecradle-router-reboot.service
+sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/basecradle-router-reboot.timer"     /etc/systemd/system/basecradle-router-reboot.timer
+sudo systemctl daemon-reload
+# Enable the units meant to run. Timers get --now so they are armed immediately; the
+# recovery oneshot is boot-only (enable, NOT --now -- it runs at boot, not mid-deploy);
+# the daemon's restart stays the one explicit restart below, not here. The two static,
+# timer-driven services (drift.service, reboot.service) are installed but never enabled
+# directly. reboot.timer is armed deliberately -- automatic reboots are ON (policy
+# decided, #69), so every deploy keeps the 5 AM Central timer armed.
+sudo systemctl enable basecradle-router.service
+sudo systemctl enable basecradle-router-recovery.service
+sudo systemctl enable --now basecradle-router-drift.timer
+sudo systemctl enable --now basecradle-router-reboot.timer
 echo "${local_sha}" | sudo tee "${STAMP}" >/dev/null
 # World-readable so the hourly drift timer (which runs as the unprivileged router
 # user, whose sudoers grants only wake-runner) can read the stamp without sudo. The
@@ -148,5 +174,11 @@ echo "  trusted actors (live): $(on_box "sudo grep -E '^BASECRADLE_ROUTER_GITHUB
 # traverse the 750 /etc/basecradle-router to read the stamp. (drift-check.sh itself
 # never sudos — it also runs from the timer as `router`, which has no such grant.)
 on_box "sudo bash ${APP_DIR}/deploy/drift-check.sh" || die "drift check failed immediately after deploy — investigate"
+# Show the managed timers are armed (issue #71): list-timers is read-only and needs no
+# sudo. Surfaces the next drift check and the next 5 AM Central auto-reboot check, so a
+# deploy confirms at a glance that the alarms and the reboot policy are actually live.
+echo "  managed timers (next elapse):"
+on_box "systemctl list-timers --no-pager basecradle-router-drift.timer basecradle-router-reboot.timer" || true
+echo "  recovery gate enabled: $(on_box "systemctl is-enabled basecradle-router-recovery.service || true")"
 
 green "DONE — live daemon == ${local_sha}, #52 gate verified enforced on the box."
