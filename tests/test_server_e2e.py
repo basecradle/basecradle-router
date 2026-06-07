@@ -189,7 +189,9 @@ def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
     assert agent is NOVA
     assert agent.os_user == "nova"
     assert agent.clone_path == "/home/nova/basecradle-python"
-    assert event.trigger == f"Cross-repo handoff: work {ISSUE_URL}"
+    # Leads with the verbatim recognition marker; the quarantine envelope follows
+    # (asserted in detail in test_github_route).
+    assert event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
 
 
 def test_green_pr_auto_merges_end_to_end() -> None:
