@@ -25,6 +25,7 @@
 #   ROUTER_HOST     ssh target            (default ubuntu@ai.basecradle.com)
 #   ROUTER_SSH_KEY  ssh private key path  (default: your ssh config / agent)
 #   SMOKE_URL       smoke-test endpoint   (default https://ai.basecradle.com/webhooks/github)
+#   UP_URL          liveness endpoint     (default https://ai.basecradle.com/up)
 #   FORCE=1         skip the clean-tree / HEAD==origin/main guards (emergency only)
 #
 set -euo pipefail
@@ -32,7 +33,9 @@ set -euo pipefail
 ROUTER_HOST="${ROUTER_HOST:-ubuntu@ai.basecradle.com}"
 ROUTER_SSH_KEY="${ROUTER_SSH_KEY:-}"
 SMOKE_URL="${SMOKE_URL:-https://ai.basecradle.com/webhooks/github}"
+UP_URL="${UP_URL:-https://ai.basecradle.com/up}"
 FORCE="${FORCE:-0}"
+LIVENESS_BODY='<!DOCTYPE html><html><body style="background-color: green"></body></html>'
 
 APP_DIR=/opt/basecradle-router/app
 STAGING=/home/ubuntu/basecradle-router
@@ -125,6 +128,17 @@ green "deployed ${local_sha}; service restarted and active"
 log "Step 3/4 — live smoke test"
 on_box "sudo SMOKE_URL='${SMOKE_URL}' bash ${APP_DIR}/deploy/smoke-test.sh" ||
 	die "LIVE SMOKE TEST FAILED — the running daemon is NOT correct. This deploy is NOT done."
+
+# Liveness over the REAL public TLS path (Caddy -> uvicorn), from here, not the box:
+# proves the deployed app actually serves the fleet-uniform GET /up and that the
+# whole front-to-back chain is green. Run after the smoke test so we already know
+# the daemon restarted and is enforcing its boundary.
+log "  live liveness check — GET ${UP_URL}"
+up_body="$(curl -fsS --max-time 15 "$UP_URL")" ||
+	die "GET ${UP_URL} did not return success — the deployed app is not serving /up"
+[[ "$up_body" == "$LIVENESS_BODY" ]] ||
+	die "GET ${UP_URL} returned an unexpected body (liveness contract broken): ${up_body}"
+green "liveness OK — ${UP_URL} is green"
 
 # --- 4. CONFIRM ------------------------------------------------------------
 log "Step 4/4 — confirm"

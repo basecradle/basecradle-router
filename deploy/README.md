@@ -130,6 +130,12 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
   > wakes only *within one process*. Multiple worker processes would each hold independent locks and
   > could double-wake the same repo's clone. Pinned in the systemd unit (`deploy/systemd/`).
 - Webhook URL: `https://ai.basecradle.com/webhooks/github`.
+- **Liveness:** `GET https://ai.basecradle.com/up` → `200` + the verbatim Rails health
+  body (`<!DOCTYPE html><html><body style="background-color: green"></body></html>`). It is the
+  fleet-uniform liveness path (constitution → Operational Baselines), served **from the app**, so a
+  green `/up` proves uvicorn itself is up — not merely that Caddy/the host replied. One path,
+  checked the same way as the Rails platform's `basecradle.com/up`. There is deliberately no
+  competing `/healthz`.
 
 ---
 
@@ -226,8 +232,9 @@ Run from a trusted local checkout. It *is* the loop, so a deploy can never silen
 2. **Deploy** — rsyncs the checkout to staging on the box, `sudo rsync`s into `/opt/basecradle-router/app`,
    `chown`s to `router`, `uv sync`s, **stamps the deployed commit SHA** to `/etc/basecradle-router/deployed-sha`,
    and restarts the service (asserting it comes back active).
-3. **Smoke (live)** — runs `deploy/smoke-test.sh` against the real endpoint; a failure aborts the deploy
-   loudly. *This deploy is not done unless the smoke test is green.*
+3. **Smoke (live)** — runs `deploy/smoke-test.sh` against the real endpoint, then asserts the
+   fleet-uniform liveness route `GET /up` is green over the public TLS path (Caddy → uvicorn); either
+   failure aborts the deploy loudly. *This deploy is not done unless both are green.*
 4. **Confirm** — prints the deployed SHA, the live trusted-actor list, and a drift check that must read
    "in sync".
 
