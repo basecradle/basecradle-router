@@ -1,9 +1,10 @@
 """End-to-end: a signed GitHub handoff webhook → the ASGI server → a woken agent.
 
 The capstone. Everything but the code under test is fabricated and mocked — the
-transport (the ASGI app is driven in-process), the GitHub API (the merger), and
-the ``claude`` invocation (the waker). No network, no model, no live agent: the
-human courier is gone.
+transport (the ASGI app is driven in-process) and the ``claude`` invocation (the
+waker). No network, no model, no live agent: the human courier is gone. The
+pipeline ends at the wake — the router never merges (the woken agent enables
+GitHub native auto-merge on its own PR; see issue #38).
 
 Cast: John Doe (``john``, human) files a handoff; Nova Digital (``nova``, AI) is
 woken in her own clone.
@@ -18,7 +19,6 @@ from types import MappingProxyType
 
 from basecradle_router.concurrency import RepoLocks
 from basecradle_router.config import Config
-from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
@@ -47,14 +47,6 @@ class _RecordingWaker:
         return WakeResult(exit_code=0, stdout="opened PR")
 
 
-class _RecordingMerger:
-    def __init__(self) -> None:
-        self.merged: list[PullRequest] = []
-
-    def merge(self, pr: PullRequest) -> None:
-        self.merged.append(pr)
-
-
 def _config() -> Config:
     return Config(
         agents=MappingProxyType({NOVA.repo: NOVA}),
@@ -69,22 +61,18 @@ def _registry() -> RouteRegistry:
     return registry
 
 
-def _build(*, waker=None, merger=None, pr_provider=None, locks=None):
+def _build(*, waker=None, locks=None):
     waker = waker or _RecordingWaker()
-    merger = merger or _RecordingMerger()
     kwargs = dict(
         registry=_registry(),
         config=_config(),
         waker=waker,
-        merge_policy=MergePolicy(merger),
         sleep=lambda _d: None,
     )
-    if pr_provider is not None:
-        kwargs["pr_provider"] = pr_provider
     if locks is not None:
         kwargs["locks"] = locks
     server = WebhookServer(Pipeline(**kwargs))
-    return server, waker, merger
+    return server, waker
 
 
 def _signed_body(
@@ -139,8 +127,8 @@ def _post(server: WebhookServer, path: str, body: bytes, headers: dict[str, str]
 
         await server(scope, receive, send)
         # The response is sent from the fast accept half; the wake runs in the
-        # background. Drain it so post-wake state (the woken agent, the merge) is
-        # observable — without changing that the status was acked before the wake.
+        # background. Drain it so post-wake state (the woken agent) is observable
+        # — without changing that the status was acked before the wake.
         await server.drain()
         status = next(m["status"] for m in sent if m["type"] == "http.response.start")
         raw = next(m["body"] for m in sent if m["type"] == "http.response.body")
@@ -176,7 +164,7 @@ def _get(server: WebhookServer, path: str):
 
 
 def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
-    server, waker, _ = _build()
+    server, waker = _build()
     body, headers = _signed_body()
 
     status, summary = _post(server, "/webhooks/github", body, headers)
@@ -194,36 +182,8 @@ def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
     assert event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
 
 
-def test_green_pr_auto_merges_end_to_end() -> None:
-    def green_pr(_a, _e, _w) -> PullRequest:
-        return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=True)
-
-    server, _, merger = _build(pr_provider=green_pr)
-    body, headers = _signed_body()
-    status, _ = _post(server, "/webhooks/github", body, headers)
-
-    # The merge happens in the background, after the ack — so its outcome is not in
-    # the 202 body; we observe it through the (mocked) merger instead. Per Earned
-    # Autonomy a green PR auto-merges with no per-PR human gate.
-    assert status == 202
-    assert len(merger.merged) == 1
-    assert merger.merged[0].number == 99
-
-
-def test_red_pr_is_not_merged_end_to_end() -> None:
-    def red_pr(_a, _e, _w) -> PullRequest:
-        return PullRequest(number=99, repo="basecradle/basecradle-python", ci_green=False)
-
-    server, _, merger = _build(pr_provider=red_pr)
-    body, headers = _signed_body()
-    status, _ = _post(server, "/webhooks/github", body, headers)
-
-    assert status == 202
-    assert merger.merged == []  # not green → not merged yet (no human pause, just CI)
-
-
 def test_non_handoff_event_is_ignored_end_to_end() -> None:
-    server, waker, _ = _build()
+    server, waker = _build()
     body, headers = _signed_body(labels=("bug",))
     status, summary = _post(server, "/webhooks/github", body, headers)
 
@@ -236,7 +196,7 @@ def test_handoff_from_untrusted_sender_is_rejected_end_to_end() -> None:
     # A correctly-signed handoff whose actor is not on the fleet allow-list is
     # rejected (400, malformed/unacceptable) and wakes no agent — the trust gate
     # holds through the full server stack, not just the route in isolation.
-    server, waker, _ = _build()
+    server, waker = _build()
     body, headers = _signed_body(sender="drive-by-stranger")
     status, summary = _post(server, "/webhooks/github", body, headers)
 
@@ -246,7 +206,7 @@ def test_handoff_from_untrusted_sender_is_rejected_end_to_end() -> None:
 
 
 def test_bad_signature_is_unauthorized_end_to_end() -> None:
-    server, waker, _ = _build()
+    server, waker = _build()
     body, headers = _signed_body()
     headers["X-Hub-Signature-256"] = "sha256=" + "0" * 64  # wrong digest
     status, _ = _post(server, "/webhooks/github", body, headers)
@@ -256,14 +216,14 @@ def test_bad_signature_is_unauthorized_end_to_end() -> None:
 
 
 def test_unknown_source_is_not_found() -> None:
-    server, _, _ = _build()
+    server, _ = _build()
     body, headers = _signed_body()
     status, _ = _post(server, "/webhooks/gitlab", body, headers)
     assert status == 404  # path is a webhook, but no such source is registered
 
 
 def test_non_webhook_path_is_not_found() -> None:
-    server, _, _ = _build()
+    server, _ = _build()
     status, _ = _post(server, "/not-a-webhook", b"", {})
     assert status == 404
 
@@ -272,7 +232,7 @@ def test_non_webhook_path_is_not_found() -> None:
 
 
 def test_up_is_the_fleet_liveness_endpoint() -> None:
-    server, _, _ = _build()
+    server, _ = _build()
     status, content_type, body = _get(server, "/up")
 
     assert status == 200
@@ -285,23 +245,22 @@ def test_up_is_the_fleet_liveness_endpoint() -> None:
 def test_up_is_the_only_liveness_path_no_competing_healthz() -> None:
     # /up is the single public liveness contract; /healthz is deliberately not a
     # route, so the fleet never has two competing health endpoints to keep in sync.
-    server, _, _ = _build()
+    server, _ = _build()
     status, _, _ = _get(server, "/healthz")
     assert status == 404
 
 
 def test_up_does_not_wake_anything() -> None:
-    # A liveness probe must never touch the pipeline — no agent woken, no merge.
-    server, waker, merger = _build()
+    # A liveness probe must never touch the pipeline — no agent woken.
+    server, waker = _build()
     _get(server, "/up")
     assert waker.calls == []
-    assert merger.merged == []
 
 
 def test_unregistered_repo_is_accepted_then_logged_not_a_retry_storm() -> None:
     # A valid, signed handoff for a repo we don't manage: accepted (2xx) and
     # recorded as a failed resolve — never a 5xx that GitHub would retry forever.
-    server, waker, _ = _build()
+    server, waker = _build()
     body, headers = _signed_body(repo="basecradle/not-managed")
     status, summary = _post(server, "/webhooks/github", body, headers)
 
@@ -335,7 +294,7 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
             return WakeResult(exit_code=0)
 
     waker = _BlockingWaker()
-    server, _, _ = _build(waker=waker)
+    server, _ = _build(waker=waker)
     body, headers = _signed_body()
 
     async def _drive() -> int:
@@ -385,7 +344,7 @@ def test_lock_prevents_a_concurrent_double_wake_end_to_end() -> None:
             release.wait(timeout=5)
             return WakeResult(exit_code=0)
 
-    server, _, _ = _build(waker=_BlockingWaker(), locks=locks)
+    server, _ = _build(waker=_BlockingWaker(), locks=locks)
     body, headers = _signed_body()
 
     worker = threading.Thread(target=lambda: _post(server, "/webhooks/github", body, headers))

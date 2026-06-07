@@ -9,10 +9,11 @@ route, the home-server waker — into a :class:`~basecradle_router.server.Webhoo
 It is a *factory*, not a module-level ``app``, so importing the package never
 reads config or touches the network; the daemon builds itself only when started.
 
-The merge stage is intentionally a **no-op for now**: the default ``pr_provider``
-returns no PR, so the router wakes agents and they open their own PRs — auto-merge
-automation (the live ``pr_provider`` + a real merger) is deferred (#38). Until then
-the merger is never invoked, so a placeholder that fails loudly stands in for it.
+**The router never merges.** Auto-merge of a captain's own green PR is performed
+by GitHub native auto-merge — during its wake the agent opens its PR and enables
+``gh pr merge --auto --squash`` under its own bot identity, so the platform merges
+when CI goes green. The router holds no GitHub credential by design, so there is
+no merge stage to wire here (see issue #38 for the decision).
 """
 
 from __future__ import annotations
@@ -20,21 +21,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from basecradle_router.config import load_config, load_github_trusted_actors
-from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer
 from basecradle_router.wake import HomeServerWaker, Waker
-
-
-class _UnwiredMerger:
-    """Stands in until live merge automation (#38). Never called today — the default
-    ``pr_provider`` yields no PR, so the merge stage short-circuits before reaching a
-    merger. Fails loudly if a ``pr_provider`` is ever wired without a real merger."""
-
-    def merge(self, pr: PullRequest) -> None:
-        raise NotImplementedError("live merge automation is not wired yet — see issue #38")
 
 
 def create_app(
@@ -54,6 +45,5 @@ def create_app(
         registry=registry,
         config=config,
         waker=waker or HomeServerWaker(),
-        merge_policy=MergePolicy(_UnwiredMerger()),
     )
     return WebhookServer(pipeline)

@@ -1,13 +1,13 @@
 """The source-agnostic core pipeline: the stages, in order, tied together.
 
 One inbound webhook flows through fixed stages — **verify → normalize → resolve
-→ lock → wake → merge → report** — and the core knows nothing about any specific
-source: it asks the registry for the route, and the route owns the
-GitHub-specific parts. Adding a source never touches this file.
+→ lock → wake** — and the core knows nothing about any specific source: it asks
+the registry for the route, and the route owns the GitHub-specific parts. Adding
+a source never touches this file.
 
 The stages split at the wake into a fast :meth:`Pipeline.accept` half
 (route → verify → normalize → resolve — no subprocess, milliseconds) and a slow
-:meth:`Pipeline.execute` half (lock → wake → merge — a minutes-long ``claude``
+:meth:`Pipeline.execute` half (lock → wake — a minutes-long ``claude``
 subprocess). This is what lets the server *fast-ack*: answer the webhook from the
 accept half and run the wake in the background. :meth:`Pipeline.handle` is simply
 ``accept`` then ``execute`` — the synchronous whole, unchanged for callers that
@@ -19,10 +19,17 @@ short-circuits cleanly as ``IGNORED``; a bad signature or malformed payload is
 ``REJECTED``; a stage that errors is ``FAILED`` and logged — the daemon never
 crashes on one bad event.
 
-The merge stage is wired through a ``pr_provider`` seam: in reality the agent
-opens its PR during the wake and the router learns of it (and its CI state)
-later, on a separate event; v0 mocks that seam so the orchestration is provable
-offline in a single pass.
+**The pipeline ends at the wake — the router never merges.** Auto-merge of a
+captain's own green PR (constitution → Earned Autonomy) is performed by **GitHub
+native auto-merge**: during its wake the agent opens its PR and runs
+``gh pr merge --auto --squash`` under its *own* bot identity, so the platform
+merges the instant required checks pass. The router holds no GitHub credential by
+design (the wake-runner sources each agent's ``agent.env`` only after the
+privilege drop; the crown-jewels box carries no standing token), so a router-side
+merger would have meant concentrating a merge-capable token there — declined in
+favour of letting the platform do, for free and under the captain's identity,
+exactly what a green-only merge policy would have. See issue #38 for the decision
+and rationale.
 """
 
 from __future__ import annotations
@@ -40,7 +47,6 @@ from basecradle_router.concurrency import (
     with_retry,
 )
 from basecradle_router.config import Config, ConfigError
-from basecradle_router.merge_policy import MergePolicy, PullRequest
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -65,7 +71,6 @@ class Stage(Enum):
     RESOLVE = "resolve"
     LOCK = "lock"
     WAKE = "wake"
-    MERGE = "merge"
 
 
 class Outcome(Enum):
@@ -93,7 +98,6 @@ class PipelineResult:
     records: list[StageRecord] = field(default_factory=list)
     event: Event | None = None
     agent: Agent | None = None
-    merged: bool | None = None  # True/False once the merge stage ran; None if it did not
 
     @property
     def stages(self) -> list[tuple[Stage, Outcome]]:
@@ -120,32 +124,20 @@ class AcceptResult:
     pending: tuple[Agent, Event] | None
 
 
-# "What PR did this wake produce?" — the agent opened it during the wake; the
-# real impl queries GitHub, v0 mocks it. ``None`` means no PR to evaluate.
-PrProvider = Callable[[Agent, Event, WakeResult], PullRequest | None]
-
-
-def _no_pr(_agent: Agent, _event: Event, _result: WakeResult) -> PullRequest | None:
-    return None
-
-
 @dataclass(frozen=True, slots=True)
 class Pipeline:
     """Orchestrates the stages for one source's webhooks.
 
     All collaborators are injected so the whole pipeline is drivable offline:
-    ``registry``/``config`` from the route + config layers, a ``waker`` and a
-    ``merge_policy`` (both mocked in tests), per-repo ``locks``, an optional
-    ``pr_provider`` for the merge stage, and a ``sleep`` used by the wake retry
+    ``registry``/``config`` from the route + config layers, a ``waker`` (mocked
+    in tests), per-repo ``locks``, and a ``sleep`` used by the wake retry
     (injected as a no-op in tests so nothing really waits).
     """
 
     registry: RouteRegistry
     config: Config
     waker: Waker
-    merge_policy: MergePolicy
     locks: RepoLocks = field(default_factory=RepoLocks)
-    pr_provider: PrProvider = _no_pr
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
 
@@ -182,19 +174,18 @@ class Pipeline:
         return AcceptResult(result=result, pending=pending)
 
     def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
-        """The slow half: lock → wake → merge, appended to ``result``; never raises.
+        """The slow half: lock → wake, appended to ``result``; never raises.
 
         Serialized per repo by the lock so no two sessions ever share a clone.
         Runs the minutes-long ``claude`` wake, so the server runs it off the
-        request path (in the background) after acking.
+        request path (in the background) after acking. The pipeline ends here:
+        the woken agent opens its own PR and enables GitHub native auto-merge, so
+        the router never merges (see the module docstring and issue #38).
         """
         try:
             with self.locks.guard(event.target_repo):
                 self._record(result, Stage.LOCK, Outcome.OK, event.target_repo)
-                wake_result = self._wake(agent, event, result)
-                if wake_result is None:
-                    return
-                self._merge(agent, event, wake_result, result)
+                self._wake(agent, event, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")
 
@@ -246,7 +237,7 @@ class Pipeline:
 
         return agent, event
 
-    def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> WakeResult | None:
+    def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> None:
         # A wake failure is retryable transient by policy here (the boundary
         # reports it as a plain WakeError); the bound stops a permanent fault.
         def attempt() -> WakeResult:
@@ -259,17 +250,8 @@ class Pipeline:
             woke = with_retry(attempt, attempts=self.wake_attempts, sleep=self.sleep)
         except RetryExhausted as exc:
             self._record(result, Stage.WAKE, Outcome.FAILED, str(exc.__cause__ or exc))
-            return None
+            return
         self._record(result, Stage.WAKE, Outcome.OK, f"exit {woke.exit_code}")
-        return woke
-
-    def _merge(self, agent: Agent, event: Event, woke: WakeResult, result: PipelineResult) -> None:
-        pr = self.pr_provider(agent, event, woke)
-        if pr is None:
-            return  # no PR to evaluate (the merge stage simply does not run)
-        merged = self.merge_policy.run(pr)
-        result.merged = merged
-        self._record(result, Stage.MERGE, Outcome.OK, "merged" if merged else "ci-pending")
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, detail: str = ""
