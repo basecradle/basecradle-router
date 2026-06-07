@@ -146,7 +146,9 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
     assert len(waker.calls) == 1
     woken_agent, woken_event = waker.calls[0]
     assert woken_agent is NOVA
-    assert woken_event.trigger == f"Cross-repo handoff: work {ISSUE_URL}"
+    # The wake carries the handoff-recognition marker (the route's quarantine
+    # envelope follows it — asserted in detail in test_github_route).
+    assert woken_event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
     assert result.agent is NOVA
 
 
