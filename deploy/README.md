@@ -208,8 +208,9 @@ The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + rout
   phase.
 
 ### Phase D — Hardening (ongoing steward duty)
-SSH hardening + `fail2ban`, `unattended-upgrades`, retention for the pipeline's structured stage log,
-backup of `agents.json` with a documented rebuild, and liveness alerting on the systemd service.
+SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
+clean-reboot mechanism in Part 4), retention for the pipeline's structured stage log, backup of
+`agents.json` with a documented rebuild, and liveness alerting on the systemd service.
 
 ---
 
@@ -282,6 +283,50 @@ a self-verifying **one-command deploy** from a trusted local checkout, plus a **
 the merge≠deploy gap loud — closes the silent-drift root cause (#54) without that security trade. Revisit
 only if the manual deploy step ever becomes the bottleneck; the natural next step would be a pull-based,
 human-initiated deploy on the box, not unattended push from CI.
+
+---
+
+## Part 4 — OS updates & reboots (clean, observable reboots)
+
+**The gap this closes (issue #66).** `unattended-upgrades` installs security/kernel patches but **does
+not reboot**, so a kernel fix can sit installed-but-inactive — "applied in name only" — until someone
+remembers to reboot. The fleet home box was found exactly like that (running an unpatched kernel with a
+newer one already on disk). We deliberately **did not** turn on blind automatic reboots; instead this
+service now owns a reboot mechanism that is clean and observable, so automatic reboots can be turned on
+*safely* — and the **policy** for when to reboot is the one decision left to make.
+
+Two halves, mirroring the deploy loop's "do it, then verify it" shape:
+
+- **Perform the reboot cleanly — [`deploy/reboot-if-required.sh`](reboot-if-required.sh).** A no-op
+  unless `/var/run/reboot-required` exists (the flag apt drops when an installed package needs a
+  reboot). When it does: it **drains** the router first — `systemctl stop basecradle-router`, which
+  blocks on the unit's lifespan drain (bounded by `TimeoutStopSec`) so in-flight wakes finish rather
+  than being severed — then performs a controlled `systemctl reboot`. A drain failure is logged but does
+  **not** abort the reboot (a stuck unit must never pin an unpatched kernel forever).
+- **Verify recovery after boot — [`deploy/verify-recovery.sh`](verify-recovery.sh).** Asserts the
+  services are active **and** `/up` is green (polling, since `After=` only orders start, not health),
+  and **exits nonzero + loud** if the box did not come back. It checks `/up` on the **local** app
+  (`127.0.0.1:8000`) so a green result proves uvicorn itself recovered, independent of Caddy/DNS/TLS
+  (the `caddy` service check covers the front end). Run by the
+  `basecradle-router-recovery.service` oneshot unit at every boot, a failure lands in `systemctl
+  --failed` and the journal — the **same alarm convention as the drift check** — instead of the box
+  silently serving nothing.
+
+### systemd units (`deploy/systemd/`)
+| Unit | Role | Enable? |
+|---|---|---|
+| `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) | **Enable now** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational, and it verifies recovery after *any* reboot — manual or automatic — so it adds value before the policy is decided. |
+| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `reboot-if-required.sh`) | Install (`daemon-reload`); harmless idle until its timer is enabled. |
+| `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Do NOT enable yet** — enabling this *is* turning automatic reboots on, the deferred policy decision below. Until then, run `reboot-if-required.sh` by hand on a manual cadence. |
+
+### The deferred decision (now unblocked)
+With the mechanism in place, the **reboot policy** can be chosen: **automatic** in a low-traffic window
+(enable `basecradle-router-reboot.timer`, tune its `OnCalendar`) vs. a **manual cadence** (the steward
+runs `reboot-if-required.sh` after an update window). Either way the reboot itself is now clean and the
+recovery is alarmed. This decision was explicitly held until this mechanism existed (issue #66); it is a
+founder/steward call, scoped to how much unattended action the box should take (least privilege on the
+crown-jewels host). It pairs with the Phase D hardening duty (`unattended-upgrades` — the install half,
+already on; this is the reboot half).
 
 ---
 
