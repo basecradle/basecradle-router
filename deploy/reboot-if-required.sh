@@ -20,10 +20,11 @@
 #                gate is deploy/verify-recovery.sh (run by the recovery systemd
 #                unit), which confirms the box came back and alerts if it did not.
 #
-# WHEN it runs is a policy decision deliberately deferred (issue #66): this script
-# is the *mechanism* that makes an automatic reboot safe. Drive it from the
-# (not-yet-enabled) basecradle-router-reboot.timer in a low-traffic window, or run
-# it by hand on a manual cadence — either way the reboot itself is now clean.
+# WHEN it runs: automatic reboots are ON (founder decision, issue #66). The
+# basecradle-router-reboot.timer drives this in a low-traffic window; it is also
+# safe to run by hand anytime. Either way the reboot itself is clean, and the
+# post-boot basecradle-router-recovery.service confirms the box came back (and
+# alarms if it did not) — that gate is what makes the unattended reboot safe.
 #
 # Runs ON THE BOX as root (the reboot timer runs as root). It is a no-op on a box
 # that does not need a reboot, so it is safe to run anytime.

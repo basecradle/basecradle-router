@@ -5,14 +5,13 @@
 # "perform the reboot cleanly" half of issue #66; the post-boot health gate is
 # basecradle-router-recovery.service.
 #
-# AUTHORED, NOT YET ENABLED — the automatic-reboot POLICY is deliberately deferred
-# (issue #66): turning blind automatic reboots on was held until this mechanism
-# existed. Now that it does, the decision (automatic in a window vs. a manual
-# cadence) can be made. Enable the paired .timer ONLY once that decision is taken;
-# until then, run reboot-if-required.sh by hand on a manual cadence.
+# Driven by basecradle-router-reboot.timer (ENABLED — automatic reboots are ON per
+# the founder decision in issue #66). This service is `static` (no [Install]); the
+# timer activates it. It is also safe to `systemctl start` by hand to force an
+# immediate clean reboot check (it no-ops unless a reboot is actually pending).
 #
-# Install (driven by the timer, so no [Install] section here):
-#   systemctl daemon-reload   # then enable the .timer when policy says so
+# Install (the timer is what gets enabled):
+#   systemctl daemon-reload && systemctl enable --now basecradle-router-reboot.timer
 
 [Unit]
 Description=BaseCradle router — clean reboot when an OS update staged one
