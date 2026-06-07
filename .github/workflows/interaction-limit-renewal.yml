@@ -1,0 +1,41 @@
+name: Interaction-limit renewal
+
+# Keep this repo's public write-surface locked to org members, durably
+# (basecradle-router#60, workstream 3). GitHub interaction limits expire after at
+# most 6 months; this re-applies collaborators_only on a schedule and audits the
+# whole fleet for gaps, so a limit can never silently lapse (the surface the #60
+# injection came through).
+#
+# CREDENTIAL: setting an interaction limit needs a token with repo
+# Administration:write. The built-in GITHUB_TOKEN CANNOT do this (administration is
+# not a grantable GITHUB_TOKEN permission → 403), so this reads FLEET_ADMIN_TOKEN
+# from repo secrets: a fleet App installation token / fine-grained PAT with repo
+# Administration:write (least privilege — NOT org-admin), scoped to the org's
+# public repos. Until that secret exists the job no-ops with a clear notice rather
+# than failing red every month.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of each month — monthly cadence keeps every public
+    # repo's 6-month clock comfortably reset, with months of margin before expiry.
+    - cron: "0 6 1 * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Renew + audit interaction limits
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
+        run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::notice::FLEET_ADMIN_TOKEN not set — skipping. Provision a token" \
+                 "with repo Administration:write to activate renewal (see #60)."
+            exit 0
+          fi
+          .github/scripts/interaction-limit-renewal.sh
