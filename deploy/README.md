@@ -189,9 +189,15 @@ once the box exists**.
   `caddy validate` + `systemctl reload caddy`.
 
 > **Also shipped (not in the original B-list):** the ASGI **entrypoint** `basecradle_router.app:create_app`
-> + the `uvicorn` dependency (#37) — the composition root the systemd unit's `ExecStart` runs — and a
-> note that the merge stage is a no-op until **live merge automation (#38)**: the router wakes agents,
-> who open their own PRs.
+> + the `uvicorn` dependency (#37) — the composition root the systemd unit's `ExecStart` runs.
+>
+> **The pipeline ends at the wake — the router never merges (#38, decided).** Auto-merge of a captain's
+> own green PR (Earned Autonomy) is done by **GitHub native auto-merge**: during its wake the agent opens
+> its PR and runs `gh pr merge --auto --squash` under its own bot identity, so the platform merges when
+> required checks pass. A router-side merger was rejected — it would have meant a standing merge-capable
+> token on the crown-jewels box, contradicting "the router holds no secret." Per-repo prerequisite:
+> branch protection with required status checks, **Allow auto-merge**, and **Automatically delete head
+> branches** all enabled (part of repo bootstrap).
 
 ### Phase C — Go-live (ruby-first canary)
 The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + router-wake loop end-to-end.

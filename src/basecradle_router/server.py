@@ -14,7 +14,7 @@ serialize same-repo wakes across those threads.
 server runs only the pipeline's fast :meth:`~basecradle_router.pipeline.Pipeline.accept`
 half (route → verify → normalize → resolve — microseconds, run inline) on the
 request path, answers immediately, and runs the slow
-:meth:`~basecradle_router.pipeline.Pipeline.execute` half (lock → wake → merge)
+:meth:`~basecradle_router.pipeline.Pipeline.execute` half (lock → wake)
 as a *background task* on the thread pool. The HTTP response therefore reflects
 the **accept** stage:
 ``202`` accepted-and-now-processing, ``401`` bad signature, ``404`` no such
@@ -212,5 +212,4 @@ def _summary(result: PipelineResult) -> dict:
     return {
         "outcome": result.terminal.value if result.terminal else "none",
         "stages": [[stage.value, outcome.value] for stage, outcome in result.stages],
-        "merged": result.merged,
     }
