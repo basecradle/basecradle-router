@@ -1,8 +1,11 @@
-"""Per-repo locks and bounded retry — deterministic, no flaky sleeps.
+"""Per-agent locks and bounded retry — deterministic, no flaky sleeps.
 
 Contention is proven with non-blocking acquires (not timing); the one real
 two-thread test sequences with an Event, never a sleep. Retry uses an injected
 clock so nothing actually waits.
+
+The lock key is an agent's harness-instance identity (its OS-user slug), not a
+repo — every input source for one agent serializes on the same key.
 """
 
 import threading
@@ -10,81 +13,81 @@ import threading
 import pytest
 
 from basecradle_router.concurrency import (
-    RepoLocks,
+    AgentLocks,
     RetryExhausted,
     TransientError,
     with_retry,
 )
 
-REPO_A = "basecradle/basecradle-python"
-REPO_B = "basecradle/basecradle-ruby"
+AGENT_A = "nova"
+AGENT_B = "basecradle-ruby-ai"
 
 
-# --- RepoLocks -------------------------------------------------------------
+# --- AgentLocks ------------------------------------------------------------
 
 
-def test_different_repos_do_not_contend() -> None:
-    locks = RepoLocks()
-    assert locks.acquire(REPO_A) is True
-    # A different repo is free while REPO_A is held.
-    assert locks.acquire(REPO_B, blocking=False) is True
-    locks.release(REPO_A)
-    locks.release(REPO_B)
+def test_different_agents_do_not_contend() -> None:
+    locks = AgentLocks()
+    assert locks.acquire(AGENT_A) is True
+    # A different agent is free while AGENT_A is held.
+    assert locks.acquire(AGENT_B, blocking=False) is True
+    locks.release(AGENT_A)
+    locks.release(AGENT_B)
 
 
-def test_same_repo_contends_then_frees() -> None:
-    locks = RepoLocks()
-    assert locks.acquire(REPO_A) is True
-    # A second acquire of the same repo cannot proceed while it is held.
-    assert locks.acquire(REPO_A, blocking=False) is False
-    locks.release(REPO_A)
-    # Once released, the repo is acquirable again.
-    assert locks.acquire(REPO_A, blocking=False) is True
-    locks.release(REPO_A)
+def test_same_agent_contends_then_frees() -> None:
+    locks = AgentLocks()
+    assert locks.acquire(AGENT_A) is True
+    # A second acquire for the same agent cannot proceed while it is held.
+    assert locks.acquire(AGENT_A, blocking=False) is False
+    locks.release(AGENT_A)
+    # Once released, the agent is acquirable again.
+    assert locks.acquire(AGENT_A, blocking=False) is True
+    locks.release(AGENT_A)
 
 
 def test_guard_serializes_and_releases() -> None:
-    locks = RepoLocks()
-    with locks.guard(REPO_A):
-        assert locks.acquire(REPO_A, blocking=False) is False
+    locks = AgentLocks()
+    with locks.guard(AGENT_A):
+        assert locks.acquire(AGENT_A, blocking=False) is False
     # Guard released on normal exit.
-    assert locks.acquire(REPO_A, blocking=False) is True
-    locks.release(REPO_A)
+    assert locks.acquire(AGENT_A, blocking=False) is True
+    locks.release(AGENT_A)
 
 
 def test_guard_releases_on_error() -> None:
-    locks = RepoLocks()
-    with pytest.raises(RuntimeError), locks.guard(REPO_A):
+    locks = AgentLocks()
+    with pytest.raises(RuntimeError), locks.guard(AGENT_A):
         raise RuntimeError("boom")
     # The lock must be released even though the guarded block raised.
-    assert locks.acquire(REPO_A, blocking=False) is True
-    locks.release(REPO_A)
+    assert locks.acquire(AGENT_A, blocking=False) is True
+    locks.release(AGENT_A)
 
 
-def test_different_repo_proceeds_while_another_is_held() -> None:
-    # A real two-thread proof that REPO_B runs to completion while REPO_A is
+def test_different_agent_proceeds_while_another_is_held() -> None:
+    # A real two-thread proof that AGENT_B runs to completion while AGENT_A is
     # held by another thread. Sequenced with Events — no sleeps, no flakes.
-    locks = RepoLocks()
+    locks = AgentLocks()
     a_held = threading.Event()
     let_a_go = threading.Event()
     b_done = threading.Event()
 
     def hold_a() -> None:
-        with locks.guard(REPO_A):
+        with locks.guard(AGENT_A):
             a_held.set()
             let_a_go.wait(timeout=5)
 
     def run_b() -> None:
-        with locks.guard(REPO_B):
+        with locks.guard(AGENT_B):
             b_done.set()
 
     holder = threading.Thread(target=hold_a)
     runner = threading.Thread(target=run_b)
     holder.start()
-    assert a_held.wait(timeout=5)  # REPO_A is now held by `holder`
+    assert a_held.wait(timeout=5)  # AGENT_A is now held by `holder`
 
     runner.start()
-    # REPO_B completes despite REPO_A still being held — concurrency proven.
+    # AGENT_B completes despite AGENT_A still being held — concurrency proven.
     assert b_done.wait(timeout=5)
     runner.join(timeout=5)
 

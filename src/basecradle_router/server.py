@@ -7,8 +7,8 @@ the smallest surface we can manage: Python stdlib, no web framework.
 The app is async but the pipeline is synchronous and blocking (the threaded
 model: a wake is a minutes-long subprocess). The bridge is
 :func:`asyncio.to_thread`, which runs the blocking pipeline on a worker thread
-and leaves the event loop free — and lets the per-repo ``threading.Lock``
-serialize same-repo wakes across those threads.
+and leaves the event loop free — and lets the per-agent ``threading.Lock``
+serialize same-agent wakes (from any source) across those threads.
 
 **Fast-ack.** A wake takes minutes; GitHub abandons a webhook after ~10s. So the
 server runs only the pipeline's fast :meth:`~basecradle_router.pipeline.Pipeline.accept`

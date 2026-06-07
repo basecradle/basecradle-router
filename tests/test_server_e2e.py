@@ -17,7 +17,7 @@ import json
 import threading
 from types import MappingProxyType
 
-from basecradle_router.concurrency import RepoLocks
+from basecradle_router.concurrency import AgentLocks
 from basecradle_router.config import Config
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
@@ -330,11 +330,11 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
     assert len(waker.calls) == 1
 
 
-# --- the per-repo lock prevents a concurrent double-wake -------------------
+# --- the per-agent lock prevents a concurrent double-wake ------------------
 
 
 def test_lock_prevents_a_concurrent_double_wake_end_to_end() -> None:
-    locks = RepoLocks()
+    locks = AgentLocks()
     in_wake = threading.Event()
     release = threading.Event()
 
@@ -349,12 +349,12 @@ def test_lock_prevents_a_concurrent_double_wake_end_to_end() -> None:
 
     worker = threading.Thread(target=lambda: _post(server, "/webhooks/github", body, headers))
     worker.start()
-    assert in_wake.wait(timeout=5)  # the first wake is running, holding the repo lock
+    assert in_wake.wait(timeout=5)  # the first wake is running, holding the agent lock
 
-    # While that wake runs, the repo is locked — a second wake could not start.
-    assert locks.acquire(NOVA.repo, blocking=False) is False
+    # While that wake runs, the agent is locked — a second wake could not start.
+    assert locks.acquire(NOVA.harness_key, blocking=False) is False
 
     release.set()
     worker.join(timeout=5)
-    assert locks.acquire(NOVA.repo, blocking=False) is True  # released afterwards
-    locks.release(NOVA.repo)
+    assert locks.acquire(NOVA.harness_key, blocking=False) is True  # released afterwards
+    locks.release(NOVA.harness_key)

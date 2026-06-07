@@ -73,6 +73,28 @@ class Agent:
         _require(self.clone_path, "Agent.clone_path")
         _require(self.bot_slug, "Agent.bot_slug")
 
+    @property
+    def harness_key(self) -> str:
+        """The identity of this agent's one harness instance — the serialization key.
+
+        The constitution makes an agent's identity **unified across every input
+        path**: every channel that can address the agent (a GitHub event, a
+        BaseCradle message, any future source) converges on a single
+        identity-and-memory locus — today, one harness instance running as this
+        agent's own OS user, against its own home and memory. The router enforces
+        that convergence by serializing *every* input for the agent on this one
+        key, so two sources can never fan into two parallel sessions writing the
+        same memory (the split-brain the principle exists to prevent).
+
+        The OS user *is* that instance's identity — slug == OS user == home, one
+        agent to one harness instance — so it is the key. It is deliberately
+        **not** ``repo``: a repo is a GitHub-shaped notion a non-GitHub input
+        need not carry, whereas every input resolves to an agent. Keying on the
+        repo only happens to work while GitHub is the sole source; keying on the
+        agent is correct for all of them.
+        """
+        return self.os_user
+
 
 @dataclass(frozen=True, slots=True)
 class Event:
