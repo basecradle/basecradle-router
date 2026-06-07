@@ -37,6 +37,17 @@ from basecradle_router.routes import InboundRequest
 
 WEBHOOK_PREFIX = "/webhooks/"
 
+# The fleet-uniform liveness path (constitution → Operational Baselines). Served
+# from the app itself — so a green ``GET /up`` proves *uvicorn* is up (true service
+# health), not merely that Caddy or the host replied. The status, body, and
+# content type match Rails' ``Rails::HealthController`` output verbatim, so
+# ``basecradle.com/up`` (the Rails platform) and ``ai.basecradle.com/up`` (this
+# service) are indistinguishable to any checker — one path, checked the same way
+# everywhere. It is the single public liveness contract: there is deliberately no
+# competing ``/healthz``.
+LIVENESS_PATH = "/up"
+LIVENESS_BODY = b'<!DOCTYPE html><html><body style="background-color: green"></body></html>'
+
 
 class WebhookServer:
     """An ASGI application wrapping a :class:`~basecradle_router.pipeline.Pipeline`."""
@@ -54,6 +65,14 @@ class WebhookServer:
             await self._lifespan(receive, send)
             return
         if scope_type != "http":  # websockets etc. are not part of this surface
+            return
+
+        # Liveness probe: a tiny, unauthenticated GET answered before the webhook
+        # dispatch and entirely outside the pipeline — no body read, no signature,
+        # no route/verify machinery. A health check must stay cheap and never look
+        # like traffic the core has to reason about.
+        if scope["method"] == "GET" and scope["path"] == LIVENESS_PATH:
+            await self._send_liveness(send)
             return
 
         if scope["method"] != "POST" or not scope["path"].startswith(self.prefix):
@@ -139,6 +158,19 @@ class WebhookServer:
         for key, value in scope["headers"]:
             headers.setdefault(key.decode("latin-1"), value.decode("latin-1"))
         return headers
+
+    @staticmethod
+    async def _send_liveness(send) -> None:
+        # Verbatim Rails health output (status + body + content type) so the fleet's
+        # liveness check is uniform across the Rails platform and this service.
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/html; charset=utf-8")],
+            }
+        )
+        await send({"type": "http.response.body", "body": LIVENESS_BODY})
 
     @staticmethod
     async def _send(send, status: int, body: dict) -> None:

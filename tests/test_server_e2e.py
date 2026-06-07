@@ -149,6 +149,29 @@ def _post(server: WebhookServer, path: str, body: bytes, headers: dict[str, str]
     return asyncio.run(_drive())
 
 
+def _get(server: WebhookServer, path: str):
+    """Drive a GET through the ASGI app; return (status, content-type, raw body)."""
+
+    async def _drive():
+        scope = {"type": "http", "method": "GET", "path": path, "headers": []}
+        incoming = [{"type": "http.request", "body": b"", "more_body": False}]
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0)
+
+        async def send(message):
+            sent.append(message)
+
+        await server(scope, receive, send)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        body = next(m["body"] for m in sent if m["type"] == "http.response.body")
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in start["headers"]}
+        return start["status"], headers.get("content-type", ""), body
+
+    return asyncio.run(_drive())
+
+
 # --- the capstone: no human courier ----------------------------------------
 
 
@@ -239,8 +262,38 @@ def test_unknown_source_is_not_found() -> None:
 
 def test_non_webhook_path_is_not_found() -> None:
     server, _, _ = _build()
-    status, _ = _post(server, "/healthz", b"", {})
+    status, _ = _post(server, "/not-a-webhook", b"", {})
     assert status == 404
+
+
+# --- /up: the fleet-uniform liveness endpoint ------------------------------
+
+
+def test_up_is_the_fleet_liveness_endpoint() -> None:
+    server, _, _ = _build()
+    status, content_type, body = _get(server, "/up")
+
+    assert status == 200
+    assert content_type.startswith("text/html")
+    # Byte-for-byte the Rails health body, so basecradle.com/up and
+    # ai.basecradle.com/up are indistinguishable to any checker.
+    assert body == b'<!DOCTYPE html><html><body style="background-color: green"></body></html>'
+
+
+def test_up_is_the_only_liveness_path_no_competing_healthz() -> None:
+    # /up is the single public liveness contract; /healthz is deliberately not a
+    # route, so the fleet never has two competing health endpoints to keep in sync.
+    server, _, _ = _build()
+    status, _, _ = _get(server, "/healthz")
+    assert status == 404
+
+
+def test_up_does_not_wake_anything() -> None:
+    # A liveness probe must never touch the pipeline — no agent woken, no merge.
+    server, waker, merger = _build()
+    _get(server, "/up")
+    assert waker.calls == []
+    assert merger.merged == []
 
 
 def test_unregistered_repo_is_accepted_then_logged_not_a_retry_storm() -> None:
