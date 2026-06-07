@@ -6,7 +6,10 @@ on:
   pull_request:
 
 jobs:
-  check:
+  # Job id is the published check-run name, and the "Protect main" ruleset
+  # requires the status context "CI" — so this job must be named CI (not the
+  # workflow's `name:`, which GitHub does not use as the required context).
+  CI:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
