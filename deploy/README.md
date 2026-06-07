@@ -321,10 +321,11 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 | `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
 
 ### The reboot policy (decided: automatic)
-**Automatic reboots are on.** The `basecradle-router-reboot.timer` fires daily in a low-traffic window
-(`OnCalendar=08:00 UTC` ≈ 02:00–03:00 US Central; `RandomizedDelaySec=15min`); `reboot-if-required.sh`
-no-ops unless a reboot is actually pending, so an actual reboot happens only on the days an OS update
-staged one. This is the founder's call (issue #66): the deferral was only until the mechanism existed and
+**Automatic reboots are on.** The `basecradle-router-reboot.timer` fires daily at **5:00 AM US Central**
+(`OnCalendar=*-*-* 05:00:00 America/Chicago` — the timezone is named in the spec so it stays 5 AM Central
+across DST; the box's systemd 255 supports this, vs. a fixed UTC value that would drift an hour;
+`RandomizedDelaySec=15min`). `reboot-if-required.sh` no-ops unless a reboot is actually pending, so an
+actual reboot happens only on the days an OS update staged one. This is the founder's call (issue #66): the deferral was only until the mechanism existed and
 was verified working — now it is, so the box reboots itself to take security/kernel patches, and the
 recovery gate confirms it came back (or alarms). It pairs with the Phase D hardening duty
 (`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works

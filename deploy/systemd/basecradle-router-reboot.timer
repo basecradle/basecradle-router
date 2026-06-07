@@ -5,20 +5,23 @@
 # automatic reboots on:
 #   systemctl daemon-reload && systemctl enable --now basecradle-router-reboot.timer
 #
-# The window is low-traffic: 08:00 UTC ~= 02:00-03:00 US Central (Drawk's tz; the
-# fixed-UTC time drifts an hour across DST, both ends well inside the quiet window).
-# The orchestrator (reboot-if-required.sh) NO-OPS unless a reboot is actually
-# pending, so the timer firing daily is cheap; an actual reboot only happens on the
-# days an OS update staged one. RandomizedDelaySec spreads the wake off the exact
-# hour. The post-boot recovery gate (basecradle-router-recovery.service) confirms
-# the box came back and alarms (systemctl --failed) if it did not — that gate is
-# what makes an unattended reboot safe.
+# The window is 5:00 AM US Central, year-round. We name the timezone in the calendar
+# spec (America/Chicago) rather than a fixed UTC time so it stays exactly 5 AM Central
+# across DST with no manual babysitting — a fixed UTC value would drift an hour (5 AM
+# Central is 10:00 UTC in CDT but 11:00 UTC in CST). The box runs systemd 255, which
+# supports a tz in OnCalendar (verified: `systemd-analyze calendar` normalizes it and
+# resolves the next elapse to 5 AM Central). The orchestrator (reboot-if-required.sh)
+# NO-OPS unless a reboot is actually pending, so the timer firing daily is cheap; an
+# actual reboot happens only on the days an OS update staged one. RandomizedDelaySec
+# spreads the wake off the exact minute. The post-boot recovery gate
+# (basecradle-router-recovery.service) confirms the box came back and alarms
+# (systemctl --failed) if it did not — that gate is what makes an unattended reboot safe.
 
 [Unit]
 Description=Run the BaseCradle router clean-reboot check in a low-traffic window
 
 [Timer]
-OnCalendar=*-*-* 08:00:00 UTC
+OnCalendar=*-*-* 05:00:00 America/Chicago
 RandomizedDelaySec=15min
 Persistent=true
 
