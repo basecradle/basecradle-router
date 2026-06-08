@@ -51,6 +51,22 @@ def test_agent_round_trips() -> None:
     assert agent.os_user == "nova"
 
 
+def test_harness_key_is_the_os_user_not_the_repo() -> None:
+    # The serialization key is the agent's one harness instance — its OS user —
+    # so every input source for the agent funnels onto the same lock. It must be
+    # the OS-user identity, never the (GitHub-shaped) repo, which a non-GitHub
+    # input need not carry. See Agent.harness_key and issue #78.
+    agent = Agent(
+        repo="basecradle/basecradle-python",
+        os_user="nova",
+        clone_path="/home/nova/basecradle-python",
+        bot_slug="basecradle-python-ai",
+    )
+    assert agent.harness_key == "nova"
+    assert agent.harness_key == agent.os_user
+    assert agent.harness_key != agent.repo
+
+
 @pytest.mark.parametrize("repo", ["", "no-slash", "too/many/slashes", "/leading", "trailing/"])
 def test_repo_must_be_owner_slash_name(repo: str) -> None:
     with pytest.raises(ValueError, match="owner/name|non-empty"):

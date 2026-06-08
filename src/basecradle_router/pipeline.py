@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from basecradle_router.concurrency import (
-    RepoLocks,
+    AgentLocks,
     RetryExhausted,
     TransientError,
     with_retry,
@@ -130,14 +130,14 @@ class Pipeline:
 
     All collaborators are injected so the whole pipeline is drivable offline:
     ``registry``/``config`` from the route + config layers, a ``waker`` (mocked
-    in tests), per-repo ``locks``, and a ``sleep`` used by the wake retry
+    in tests), per-agent ``locks``, and a ``sleep`` used by the wake retry
     (injected as a no-op in tests so nothing really waits).
     """
 
     registry: RouteRegistry
     config: Config
     waker: Waker
-    locks: RepoLocks = field(default_factory=RepoLocks)
+    locks: AgentLocks = field(default_factory=AgentLocks)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
 
@@ -176,15 +176,21 @@ class Pipeline:
     def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
         """The slow half: lock → wake, appended to ``result``; never raises.
 
-        Serialized per repo by the lock so no two sessions ever share a clone.
-        Runs the minutes-long ``claude`` wake, so the server runs it off the
-        request path (in the background) after acking. The pipeline ends here:
-        the woken agent opens its own PR and enables GitHub native auto-merge, so
-        the router never merges (see the module docstring and issue #38).
+        Serialized per agent — by the agent's harness-instance identity, not its
+        repo — so an agent never runs two concurrent sessions against its one
+        home and memory (and so never two sessions sharing its clone). This is
+        where the constitution's unified-identity rule lands in the core: every
+        input source for an agent funnels through this one lock into a single
+        ordered stream the lone harness instance drains, so a future input module
+        can never fan a second parallel session onto the same agent. Runs the
+        minutes-long ``claude`` wake, so the server runs it off the request path
+        (in the background) after acking. The pipeline ends here: the woken agent
+        opens its own PR and enables GitHub native auto-merge, so the router never
+        merges (see the module docstring and issue #38).
         """
         try:
-            with self.locks.guard(event.target_repo):
-                self._record(result, Stage.LOCK, Outcome.OK, event.target_repo)
+            with self.locks.guard(agent.harness_key):
+                self._record(result, Stage.LOCK, Outcome.OK, agent.harness_key)
                 self._wake(agent, event, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")

@@ -241,12 +241,12 @@ def test_wake_gives_up_after_the_bound_and_records_failure() -> None:
 # --- the lock prevents concurrent double-wakes -----------------------------
 
 
-def test_same_repo_is_locked_during_a_wake() -> None:
+def test_same_agent_is_locked_during_a_wake() -> None:
     import threading
 
-    from basecradle_router.concurrency import RepoLocks
+    from basecradle_router.concurrency import AgentLocks
 
-    locks = RepoLocks()
+    locks = AgentLocks()
     in_wake = threading.Event()
     release = threading.Event()
 
@@ -265,12 +265,12 @@ def test_same_repo_is_locked_during_a_wake() -> None:
     )
     worker = threading.Thread(target=lambda: pipeline.handle("github", _github_request()))
     worker.start()
-    assert in_wake.wait(timeout=5)  # the wake is running, holding the repo lock
+    assert in_wake.wait(timeout=5)  # the wake is running, holding the agent lock
 
-    # The repo is locked: a second wake cannot start concurrently.
-    assert locks.acquire(NOVA.repo, blocking=False) is False
+    # The agent is locked: a second wake cannot start concurrently.
+    assert locks.acquire(NOVA.harness_key, blocking=False) is False
 
     release.set()
     worker.join(timeout=5)
-    assert locks.acquire(NOVA.repo, blocking=False) is True  # released after the wake
-    locks.release(NOVA.repo)
+    assert locks.acquire(NOVA.harness_key, blocking=False) is True  # released after the wake
+    locks.release(NOVA.harness_key)
