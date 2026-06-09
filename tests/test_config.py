@@ -140,6 +140,25 @@ def test_unknown_kind_fails(tmp_path) -> None:
         load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
 
 
+def test_duplicate_recipient_uuid_fails_loudly(tmp_path) -> None:
+    # Two personas claiming the same uuid would silently misroute one's events to
+    # the other; the recipient index is a bijection, so this must fail at load.
+    second = {**HARNESS_ENTRY, "os_user": "kim", "clone_path": "/home/kim/harness"}
+    bad = {"jt": HARNESS_ENTRY, "kim": second}
+    bad_path = _write_registry(tmp_path, bad, name="bad.json")
+    with pytest.raises(ConfigError, match="reuses recipient_uuid"):
+        load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
+
+
+def test_harness_key_shaped_like_a_repo_fails(tmp_path) -> None:
+    # A harness key must be a bare slug — never owner/name — so it stays out of the
+    # github key-space and a Recipient(by="repo") lookup can never hit it.
+    bad = {"basecradle/jt": HARNESS_ENTRY}
+    bad_path = _write_registry(tmp_path, bad, name="bad.json")
+    with pytest.raises(ConfigError, match="bare slug"):
+        load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
+
+
 def test_github_entry_with_non_repo_key_fails(tmp_path) -> None:
     # A builder entry's key must be owner/name — the legacy shape check is preserved.
     bad = {"not-a-repo": {"os_user": "x", "clone_path": "/c", "bot_slug": "b"}}

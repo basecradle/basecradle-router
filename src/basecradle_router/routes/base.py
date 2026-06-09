@@ -9,10 +9,11 @@ route, never forking the daemon.
 from __future__ import annotations
 
 import hmac
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from basecradle_router.models import Event
 
@@ -87,6 +88,22 @@ def verify_hmac_sha256(request: InboundRequest, secret: str, *, header: str) -> 
     # non-ASCII chars, and the header value is attacker-controlled.
     if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("ascii")):
         raise SignatureError(f"{header} does not match the request body")
+
+
+def parse_json_object(body: bytes) -> dict[str, Any]:
+    """Decode a webhook body into a JSON object, or raise :class:`PayloadError`.
+
+    The shared body-parse boundary every JSON source uses, so a malformed body is
+    a uniform, well-described :class:`PayloadError` (a 400) rather than a per-route
+    re-implementation that could drift in its error shape.
+    """
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise PayloadError(f"body is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PayloadError("webhook body must be a JSON object")
+    return data
 
 
 @runtime_checkable

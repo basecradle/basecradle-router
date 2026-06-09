@@ -22,13 +22,13 @@ not an error — the same shape as github's non-handoff ignore.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from basecradle_router.models import Event, EventKind, Recipient
 from basecradle_router.routes.base import (
     InboundRequest,
     PayloadError,
+    parse_json_object,
     verify_hmac_sha256,
 )
 
@@ -71,7 +71,7 @@ class BasecradleRoute:
         if request.header(EVENT_HEADER) not in _ACTIONABLE_EVENTS:
             return None
 
-        data = _parse(request.body)
+        data = parse_json_object(request.body)
 
         delivery_id = request.header(DELIVERY_HEADER)
         if not delivery_id:
@@ -90,16 +90,6 @@ class BasecradleRoute:
             )
         except ValueError as exc:
             raise PayloadError(f"malformed basecradle payload: {exc}") from exc
-
-
-def _parse(body: bytes) -> dict[str, Any]:
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise PayloadError(f"body is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise PayloadError("webhook body must be a JSON object")
-    return data
 
 
 def _text(obj: dict[str, Any], key: str, label: str) -> str:
