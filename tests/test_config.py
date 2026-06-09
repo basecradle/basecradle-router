@@ -20,6 +20,14 @@ REGISTRY = {
         "bot_slug": "basecradle-python-ai",
     }
 }
+JT_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"
+HARNESS_ENTRY = {
+    "os_user": "jt",
+    "clone_path": "/home/jt/harness",
+    "kind": "harness",
+    "recipient_uuid": JT_UUID,
+    "wake_bin": "/home/jt/venv/bin/basecradle-harness-wake",
+}
 FAKE_SECRET = "whsec_" + "0" * 32  # correctly-shaped fake
 
 
@@ -96,6 +104,48 @@ def test_agent_for_unknown_repo_fails(tmp_path) -> None:
     config = load_config(_env(tmp_path))
     with pytest.raises(ConfigError, match="no agent registered"):
         config.agent_for("basecradle/unknown")
+
+
+# --- harness (non-repo) agent entries --------------------------------------
+
+
+def test_harness_entry_parses_and_indexes_by_recipient_uuid(tmp_path) -> None:
+    from basecradle_router.models import Recipient, WakeKind
+
+    registry = {**REGISTRY, "jt": HARNESS_ENTRY}
+    config = load_config(
+        _env(tmp_path, BASECRADLE_ROUTER_AGENTS=_write_registry(tmp_path, registry, name="r.json"))
+    )
+    # Keyed by its bare slug, with the harness wake shape and no bot_slug.
+    jt = config.agent_for("jt")
+    assert jt.wake_kind is WakeKind.HARNESS
+    assert jt.wake_bin == "/home/jt/venv/bin/basecradle-harness-wake"
+    assert jt.bot_slug is None
+    # A basecradle event resolves to it by recipient_uuid; github builders are untouched.
+    assert config.agent_for_recipient(Recipient(by="recipient_uuid", value=JT_UUID)) is jt
+    assert config.agent_for("basecradle/basecradle-python").wake_kind is WakeKind.CLAUDE
+
+
+def test_harness_entry_missing_field_fails(tmp_path) -> None:
+    bad = {"jt": {k: v for k, v in HARNESS_ENTRY.items() if k != "wake_bin"}}
+    bad_path = _write_registry(tmp_path, bad, name="bad.json")
+    with pytest.raises(ConfigError, match="missing 'wake_bin'"):
+        load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
+
+
+def test_unknown_kind_fails(tmp_path) -> None:
+    bad = {"jt": {**HARNESS_ENTRY, "kind": "robot"}}
+    bad_path = _write_registry(tmp_path, bad, name="bad.json")
+    with pytest.raises(ConfigError, match="unknown kind 'robot'"):
+        load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
+
+
+def test_github_entry_with_non_repo_key_fails(tmp_path) -> None:
+    # A builder entry's key must be owner/name — the legacy shape check is preserved.
+    bad = {"not-a-repo": {"os_user": "x", "clone_path": "/c", "bot_slug": "b"}}
+    bad_path = _write_registry(tmp_path, bad, name="bad.json")
+    with pytest.raises(ConfigError, match="owner/name"):
+        load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
 
 
 def test_config_maps_are_read_only(tmp_path) -> None:

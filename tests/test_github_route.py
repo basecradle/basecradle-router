@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from basecradle_router.models import EventKind
+from basecradle_router.models import EventKind, Recipient
 from basecradle_router.routes import (
     GithubRoute,
     InboundRequest,
@@ -169,14 +169,14 @@ def test_normalize_opened_handoff_round_trips() -> None:
     assert event is not None
     assert event.source == "github"
     assert event.kind is EventKind.HANDOFF
-    assert event.target_repo == TARGET_REPO
+    assert event.recipient == Recipient(by="repo", value=TARGET_REPO)
     assert event.origin.repo == TARGET_REPO
     assert event.origin.number == ISSUE_NUMBER
     assert event.origin.url == ISSUE_URL
     assert event.origin.title == "Mirror the wire-shape change"
-    # The trigger leads with the verbatim handoff-recognition marker; the security
+    # The wake_arg leads with the verbatim handoff-recognition marker; the security
     # envelope is asserted in detail by test_handoff_trigger_quarantines_thread_content.
-    assert event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
+    assert event.wake_arg.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
     assert event.delivery_id == DELIVERY
 
 
@@ -186,7 +186,7 @@ def test_handoff_trigger_quarantines_thread_content() -> None:
     # escalation duty. This pins that security envelope so it can't silently regress.
     event = GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
     assert event is not None
-    trigger = event.trigger
+    trigger = event.wake_arg
 
     # Recognition marker stays first and verbatim (the receiving agent keys on it).
     assert trigger.splitlines()[0] == f"Cross-repo handoff: work {ISSUE_URL}"

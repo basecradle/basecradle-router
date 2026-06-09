@@ -30,7 +30,7 @@ SECRET = "whsec_" + "0" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
 TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
 NOVA = Agent(
-    repo="basecradle/basecradle-python",
+    key="basecradle/basecradle-python",
     os_user="nova",
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
@@ -49,7 +49,7 @@ class _RecordingWaker:
 
 def _config() -> Config:
     return Config(
-        agents=MappingProxyType({NOVA.repo: NOVA}),
+        agents=MappingProxyType({NOVA.key: NOVA}),
         enabled_routes=frozenset({"github"}),
         webhook_secrets=MappingProxyType({"github": SECRET}),
     )
@@ -179,7 +179,7 @@ def test_signed_handoff_wakes_the_target_agent_no_human_courier() -> None:
     assert agent.clone_path == "/home/nova/basecradle-python"
     # Leads with the verbatim recognition marker; the quarantine envelope follows
     # (asserted in detail in test_github_route).
-    assert event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
+    assert event.wake_arg.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
 
 
 def test_non_handoff_event_is_ignored_end_to_end() -> None:

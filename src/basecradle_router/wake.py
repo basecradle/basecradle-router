@@ -21,7 +21,22 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
-from basecradle_router.models import Agent, Event
+from basecradle_router.models import Agent, Event, WakeKind
+
+
+def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
+    """The agent-kind-specific command (binary + args) the wake launches.
+
+    A builder runs ``claude -p "<trigger>"``; a harness persona runs its own
+    ``<wake_bin> --timeline "<uuid>"``. Either way the single event value
+    (:attr:`Event.wake_arg` — the trigger or the timeline uuid) rides as one inert
+    argv element, never a shell string, so it is never re-interpreted. The home
+    server's wake-runner independently pins the binary against the registry, so a
+    compromised router cannot substitute a different command here.
+    """
+    if agent.wake_kind is WakeKind.HARNESS:
+        return (agent.wake_bin, "--timeline", event.wake_arg)
+    return ("claude", "-p", event.wake_arg)
 
 
 class WakeError(Exception):
@@ -134,7 +149,7 @@ def _result_or_raise(result: WakeResult, agent: Agent) -> WakeResult:
     if not result.ok:
         detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
         raise WakeError(
-            f"wake of {agent.repo} exited {result.exit_code}: {detail}",
+            f"wake of {agent.key} exited {result.exit_code}: {detail}",
             exit_code=result.exit_code,
         )
     return result
@@ -159,7 +174,7 @@ class SubprocessWaker:
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
         """Assemble the command to wake ``agent`` for ``event`` — pure, no I/O."""
         return WakeInvocation(
-            argv=("claude", "-p", event.trigger),
+            argv=wake_command(agent, event),
             cwd=agent.clone_path,
             env=MappingProxyType(dict(self.env_provider(agent))),
             run_as_user=agent.os_user,
@@ -178,13 +193,15 @@ WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
 class HomeServerWaker:
     """The deployable :class:`Waker` — runs the wake through the wake-runner wrapper.
 
-    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> -- claude -p
-    "<trigger>"`` and runs it. The root-owned wrapper validates the request, drops
-    to the agent's own OS user, and (as the agent) sources that agent's
-    ``agent.env`` — so the router itself passes **no** environment and never holds a
-    secret. The trigger rides as a single ``argv`` element, never a shell string, so
-    it is never re-interpreted. ``runner`` is the same injectable seam tests replace;
-    ``wrapper`` is overridable for tests.
+    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> -- <wake command>``
+    and runs it, where the wake command is the agent-kind-specific
+    :func:`wake_command` (``claude -p "<trigger>"`` for a builder, ``<wake_bin>
+    --timeline "<uuid>"`` for a harness persona). The root-owned wrapper validates
+    the request, drops to the agent's own OS user, and (as the agent) sources that
+    agent's ``agent.env`` — so the router itself passes **no** environment and never
+    holds a secret. The event value rides as a single ``argv`` element, never a
+    shell string, so it is never re-interpreted. ``runner`` is the same injectable
+    seam tests replace; ``wrapper`` is overridable for tests.
     """
 
     runner: Runner = _run_subprocess
@@ -202,9 +219,7 @@ class HomeServerWaker:
                 "--cwd",
                 agent.clone_path,
                 "--",
-                "claude",
-                "-p",
-                event.trigger,
+                *wake_command(agent, event),
             ),
             # The wrapper cd's into the clone as the agent; the router's own cwd is
             # irrelevant, and "/" is always present. Env is empty by design — the

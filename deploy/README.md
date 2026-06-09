@@ -78,7 +78,10 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
 BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
 BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
 BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. drawkkwast,basecradle-router-ai[bot]>
-# BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"
+# BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"; set to "github,basecradle"
+#   to also accept BaseCradle platform events (then the basecradle secret is required):
+# BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
+# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the agent's BaseCradle integration_secret>
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
@@ -86,6 +89,46 @@ handoff only wakes an agent if the webhook `sender` — the actor who applied th
 this allow-list of fleet actors (org members + fleet App bots). It is **required and non-empty**; the
 daemon refuses to start without it, so the check can never be silently off. List human org members by
 their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched case-insensitively.
+
+The **basecradle route** (issue #87) accepts signed BaseCradle platform events at
+`POST /webhooks/basecradle`. Enable it by adding `basecradle` to
+`BASECRADLE_ROUTER_ENABLED_ROUTES` and setting `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` to the
+recipient agent's `integration_secret` (the platform signs each delivery with it, HMAC-SHA256 over the
+raw body in `X-BaseCradle-Signature`, exactly like GitHub). The platform decides what to deliver to whom,
+so a valid signature *is* the trust — there is no extra actor allow-list here. A `message.created`
+delivery resolves to the agent by its BaseCradle user uuid (`recipient_uuid`) and wakes that agent's
+harness for the event's `timeline_uuid`.
+
+#### The registry (`agents.json`)
+
+A JSON object of **agent key → fields**. The key is the agent's stable slug: a GitHub builder's key is
+the `owner/name` repo it captains; a harness persona's key is its bare slug (e.g. `jt`). An entry's
+`kind` selects how it is read (absent ⇒ `github`); existing github entries are unchanged.
+
+```jsonc
+{
+  // A GitHub builder (kind defaults to "github"): woken via `claude -p "<trigger>"`,
+  // resolved by the repo a handoff issue is filed on.
+  "basecradle/basecradle-ruby": {
+    "os_user": "basecradle-ruby-ai",
+    "clone_path": "/home/basecradle-ruby-ai/repos/basecradle-ruby",
+    "bot_slug": "basecradle-ruby-ai"
+  },
+  // A harness persona: woken via its OWN wake CLI in its venv, resolved by its
+  // BaseCradle user uuid. No bot_slug; carries kind/recipient_uuid/wake_bin.
+  "jt": {
+    "kind": "harness",
+    "os_user": "jt",
+    "clone_path": "/home/jt/harness",
+    "recipient_uuid": "019e916c-7f45-700e-afc0-f45557b237b7",
+    "wake_bin": "/home/jt/venv/bin/basecradle-harness-wake"
+  }
+}
+```
+
+The `wake-runner` reads the same registry: for a harness entry it launches **only** the pinned
+`wake_bin` (which must resolve inside that agent's `/home/<user>`), never a caller-supplied path — the
+same registry-is-the-only-authority rule that confines builders to the system `claude`.
 
 **`agent.env`** (per agent, sourced by the wrapper *as that user*) holds that agent's secrets — its
 `ANTHROPIC_API_KEY` and its GitHub App credentials, and later its BaseCradle token. This is the live
@@ -169,7 +212,11 @@ once the box exists**.
   > protections). Stronger per-wake isolation later: launch each wake in its own `systemd-run --scope`.
 - **B2** ✅ **Authored (#35).** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
-  `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- claude -p "<trigger>"`.
+  `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- <wake command>`,
+  where the wake command is `claude -p "<trigger>"` for a builder or `<wake_bin> --timeline "<uuid>"`
+  for a harness persona (#87) — the binary decided by the registry, never the caller's argv. The
+  `sudoers` rule is command-generic (it grants only the wrapper), so adding the harness kind needs no
+  sudoers change: the registry entry for the new agent is what authorizes its wake.
   It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
   with that exact clone), `claude`-only — then `runuser`s to the agent, which sources its own `agent.env`
   and execs the wake. **Install root-owned, in the root-owned `bin/`:**

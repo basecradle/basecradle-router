@@ -19,7 +19,7 @@ from basecradle_router.wake import HomeServerWaker, WakeResult
 
 SECRET = "whsec_" + "0" * 32
 NOVA = Agent(
-    repo="basecradle/basecradle-python",
+    key="basecradle/basecradle-python",
     os_user="nova",
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
@@ -40,7 +40,7 @@ def _registry_file(tmp_path) -> str:
     path.write_text(
         json.dumps(
             {
-                NOVA.repo: {
+                NOVA.key: {
                     "os_user": NOVA.os_user,
                     "clone_path": NOVA.clone_path,
                     "bot_slug": NOVA.bot_slug,
@@ -68,10 +68,10 @@ def _signed_body() -> tuple[bytes, dict[str, str]]:
         "issue": {
             "number": 42,
             "title": "Mirror the wire-shape change",
-            "html_url": f"https://github.com/{NOVA.repo}/issues/42",
+            "html_url": f"https://github.com/{NOVA.key}/issues/42",
             "labels": [{"name": "handoff"}],
         },
-        "repository": {"full_name": NOVA.repo},
+        "repository": {"full_name": NOVA.key},
         "sender": {"login": HANDOFF_SENDER, "type": "User"},
     }
     body = json.dumps(payload).encode("utf-8")

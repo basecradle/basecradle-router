@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from basecradle_router.config import load_config, load_github_trusted_actors
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
+from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer
 from basecradle_router.wake import HomeServerWaker, Waker
@@ -40,7 +41,12 @@ def create_app(
     """
     config = load_config(env)
     registry = RouteRegistry()
-    registry.register(GithubRoute(load_github_trusted_actors(env)))
+    # Register a route only when its source is enabled, so each route's own
+    # required config (the github trust allow-list) is demanded only when in use.
+    if "github" in config.enabled_routes:
+        registry.register(GithubRoute(load_github_trusted_actors(env)))
+    if "basecradle" in config.enabled_routes:
+        registry.register(BasecradleRoute())
     pipeline = Pipeline(
         registry=registry,
         config=config,

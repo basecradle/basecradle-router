@@ -5,7 +5,7 @@ Test cast: John Doe (``john``, human) / Nova Digital (``nova``, AI).
 
 import pytest
 
-from basecradle_router.models import Event, EventKind, IssueRef
+from basecradle_router.models import Event, EventKind, IssueRef, Recipient
 from basecradle_router.routes import (
     InboundRequest,
     PayloadError,
@@ -36,15 +36,15 @@ class FakeRoute:
         return Event(
             source=self.name,
             kind=EventKind.HANDOFF,
-            target_repo="basecradle/basecradle-python",
+            recipient=Recipient(by="repo", value="basecradle/basecradle-python"),
+            wake_arg="Cross-repo handoff: work https://github.com/basecradle/basecradle-python/issues/42",
+            delivery_id=DELIVERY_ID,
             origin=IssueRef(
                 repo="basecradle/basecradle-python",
                 number=42,
                 url="https://github.com/basecradle/basecradle-python/issues/42",
                 title="Mirror the wire-shape change",
             ),
-            trigger="Cross-repo handoff: work https://github.com/basecradle/basecradle-python/issues/42",
-            delivery_id=DELIVERY_ID,
         )
 
 
@@ -76,7 +76,7 @@ def test_normalize_round_trips_a_handoff() -> None:
     event = FakeRoute().normalize(_request(**{"X-Fake-Event": "handoff"}))
     assert event is not None
     assert event.kind is EventKind.HANDOFF
-    assert event.target_repo == "basecradle/basecradle-python"
+    assert event.recipient == Recipient(by="repo", value="basecradle/basecradle-python")
 
 
 def test_normalize_ignores_non_handoff() -> None:
