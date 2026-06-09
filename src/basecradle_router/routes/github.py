@@ -17,25 +17,22 @@ field is GitHub-attested and not attacker-spoofable.
 
 from __future__ import annotations
 
-import hmac
 import json
 from collections.abc import Iterable
-from hashlib import sha256
 from typing import Any
 
-from basecradle_router.models import Event, EventKind, IssueRef
+from basecradle_router.models import Event, EventKind, IssueRef, Recipient
 from basecradle_router.routes.base import (
     InboundRequest,
     PayloadError,
-    SignatureError,
     UntrustedSenderError,
+    verify_hmac_sha256,
 )
 
 SIGNATURE_HEADER = "X-Hub-Signature-256"
 EVENT_HEADER = "X-GitHub-Event"
 DELIVERY_HEADER = "X-GitHub-Delivery"
 
-_ALGORITHM_PREFIX = "sha256="
 HANDOFF_LABEL = "handoff"
 _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 
@@ -90,24 +87,11 @@ class GithubRoute:
 
         Valid means: a present ``X-Hub-Signature-256`` header of the form
         ``sha256=<hexdigest>`` whose digest equals the HMAC-SHA256 of the raw
-        body under ``secret``. The comparison is constant-time.
+        body under ``secret``. Delegates to the shared
+        :func:`~basecradle_router.routes.base.verify_hmac_sha256` boundary so
+        every HMAC-signed route verifies identically.
         """
-        provided = request.header(SIGNATURE_HEADER)
-        if provided is None:
-            raise SignatureError(f"missing {SIGNATURE_HEADER} header")
-        if not provided.startswith(_ALGORITHM_PREFIX):
-            raise SignatureError(
-                f"malformed {SIGNATURE_HEADER}: expected '{_ALGORITHM_PREFIX}<hexdigest>'"
-            )
-
-        expected = (
-            _ALGORITHM_PREFIX + hmac.new(secret.encode("utf-8"), request.body, sha256).hexdigest()
-        )
-
-        # Compare as bytes: hmac.compare_digest raises TypeError on a str with
-        # non-ASCII chars, and the header value is attacker-controlled.
-        if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("ascii")):
-            raise SignatureError(f"{SIGNATURE_HEADER} does not match the request body")
+        verify_hmac_sha256(request, secret, header=SIGNATURE_HEADER)
 
     def normalize(self, request: InboundRequest) -> Event | None:
         """Turn a verified ``issues`` webhook into an :class:`Event`, or ignore it.
@@ -158,10 +142,10 @@ class GithubRoute:
             return Event(
                 source=self.name,
                 kind=EventKind.HANDOFF,
-                target_repo=origin.repo,
-                origin=origin,
-                trigger=_HANDOFF_TRIGGER.format(url=origin.url),
+                recipient=Recipient(by="repo", value=origin.repo),
+                wake_arg=_HANDOFF_TRIGGER.format(url=origin.url),
                 delivery_id=delivery_id,
+                origin=origin,
             )
         except ValueError as exc:
             raise PayloadError(f"malformed issues payload: {exc}") from exc

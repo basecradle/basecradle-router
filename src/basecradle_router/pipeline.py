@@ -239,7 +239,7 @@ class Pipeline:
             self._record(result, Stage.RESOLVE, Outcome.FAILED, str(exc))
             return None
         result.agent = agent
-        self._record(result, Stage.RESOLVE, Outcome.OK, agent.repo)
+        self._record(result, Stage.RESOLVE, Outcome.OK, agent.key)
 
         return agent, event
 

@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from basecradle_router.models import Agent
+from basecradle_router.models import Agent, Recipient, WakeKind
+
+_EMPTY: Mapping[str, Agent] = MappingProxyType({})
 
 ENV_PREFIX = "BASECRADLE_ROUTER_"
 _AGENTS_VAR = f"{ENV_PREFIX}AGENTS"
@@ -30,22 +32,47 @@ class ConfigError(Exception):
 class Config:
     """Everything the daemon needs that isn't code.
 
-    ``agents`` maps ``owner/name`` to the captain to wake; ``webhook_secrets``
-    maps a route name to its signing secret; ``enabled_routes`` is the set of
-    routes the daemon will accept events for.
+    ``agents`` maps an agent's stable ``key`` (a ``owner/name`` repo for a github
+    builder, a bare slug for a harness persona) to the agent to wake;
+    ``recipient_index`` maps a harness persona's BaseCradle user uuid to the same
+    agent, so a basecradle event resolves by ``recipient_uuid`` while github
+    resolves by repo; ``webhook_secrets`` maps a route name to its signing secret;
+    ``enabled_routes`` is the set of routes the daemon will accept events for.
     """
 
     agents: Mapping[str, Agent]
     enabled_routes: frozenset[str]
     webhook_secrets: Mapping[str, str]
+    recipient_index: Mapping[str, Agent] = field(default_factory=lambda: _EMPTY)
 
-    def agent_for(self, repo: str) -> Agent:
+    def agent_for(self, key: str) -> Agent:
         try:
-            return self.agents[repo]
+            return self.agents[key]
         except KeyError:
             raise ConfigError(
-                f"no agent registered for repo {repo!r}; add it to the registry at {_AGENTS_VAR}"
+                f"no agent registered for {key!r}; add it to the registry at {_AGENTS_VAR}"
             ) from None
+
+    def agent_for_recipient(self, recipient: Recipient) -> Agent:
+        """Resolve a normalized event's :class:`Recipient` to its agent.
+
+        Dispatches on the recipient's source-set tag without naming any source:
+        ``"repo"`` is a direct key lookup (a github builder's key *is* its repo);
+        ``"recipient_uuid"`` consults the harness-persona index. An unknown tag or
+        an unregistered value is a loud :class:`ConfigError` (a registry gap),
+        never a silent miss.
+        """
+        if recipient.by == "repo":
+            return self.agent_for(recipient.value)
+        if recipient.by == "recipient_uuid":
+            try:
+                return self.recipient_index[recipient.value]
+            except KeyError:
+                raise ConfigError(
+                    f"no agent registered for recipient_uuid {recipient.value!r}; "
+                    f"add it to the registry at {_AGENTS_VAR}"
+                ) from None
+        raise ConfigError(f"unknown recipient kind {recipient.by!r}")
 
     def webhook_secret(self, route: str) -> str:
         try:
@@ -65,7 +92,15 @@ def _split_csv(raw: str) -> frozenset[str]:
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _load_agents(path: str) -> dict[str, Agent]:
+def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
+    """Parse the registry into ``(agents-by-key, agents-by-recipient_uuid)``.
+
+    An entry's ``kind`` selects how it is read: absent or ``"github"`` is a
+    builder (keyed by its ``owner/name`` repo, woken via ``claude``); ``"harness"``
+    is a non-builder persona (keyed by its bare slug, woken via its ``wake_bin``,
+    resolved for basecradle events by its ``recipient_uuid``). Existing github
+    entries — which carry no ``kind`` — therefore load unchanged.
+    """
     try:
         raw = json.loads(_read(path))
     except FileNotFoundError:
@@ -73,24 +108,69 @@ def _load_agents(path: str) -> dict[str, Agent]:
     except json.JSONDecodeError as exc:
         raise ConfigError(f"agent registry at {path} is not valid JSON: {exc}") from None
     if not isinstance(raw, dict):
-        raise ConfigError(f"agent registry at {path} must be a JSON object of repo -> fields")
+        raise ConfigError(f"agent registry at {path} must be a JSON object of key -> fields")
 
     agents: dict[str, Agent] = {}
-    for repo, fields in raw.items():
+    by_recipient: dict[str, Agent] = {}
+    for key, fields in raw.items():
         if not isinstance(fields, dict):
-            raise ConfigError(f"agent entry for {repo!r} must be a JSON object")
-        try:
-            agents[repo] = Agent(
-                repo=repo,
-                os_user=fields["os_user"],
-                clone_path=fields["clone_path"],
-                bot_slug=fields["bot_slug"],
+            raise ConfigError(f"agent entry for {key!r} must be a JSON object")
+        kind = fields.get("kind", "github")
+        if kind == "github":
+            agent = _build_github_agent(key, fields)
+        elif kind == "harness":
+            agent = _build_harness_agent(key, fields)
+            by_recipient[agent.recipient_uuid] = agent
+        else:
+            raise ConfigError(
+                f"agent entry for {key!r} has unknown kind {kind!r} "
+                "(expected 'github' or 'harness')"
             )
-        except KeyError as exc:
-            raise ConfigError(f"agent entry for {repo!r} is missing {exc.args[0]!r}") from None
-        except ValueError as exc:
-            raise ConfigError(f"agent entry for {repo!r} is invalid: {exc}") from None
-    return agents
+        agents[key] = agent
+    return agents, by_recipient
+
+
+def _build_github_agent(key: str, fields: dict) -> Agent:
+    # A github builder is keyed by the repo it captains; preserve the owner/name
+    # shape check the legacy registry relied on.
+    try:
+        _require_repo(key)
+    except ValueError as exc:
+        raise ConfigError(f"agent entry for {key!r} is invalid: {exc}") from None
+    try:
+        return Agent(
+            key=key,
+            os_user=fields["os_user"],
+            clone_path=fields["clone_path"],
+            wake_kind=WakeKind.CLAUDE,
+            bot_slug=fields["bot_slug"],
+        )
+    except KeyError as exc:
+        raise ConfigError(f"agent entry for {key!r} is missing {exc.args[0]!r}") from None
+    except ValueError as exc:
+        raise ConfigError(f"agent entry for {key!r} is invalid: {exc}") from None
+
+
+def _build_harness_agent(key: str, fields: dict) -> Agent:
+    try:
+        return Agent(
+            key=key,
+            os_user=fields["os_user"],
+            clone_path=fields["clone_path"],
+            wake_kind=WakeKind.HARNESS,
+            recipient_uuid=fields["recipient_uuid"],
+            wake_bin=fields["wake_bin"],
+        )
+    except KeyError as exc:
+        raise ConfigError(f"agent entry for {key!r} is missing {exc.args[0]!r}") from None
+    except ValueError as exc:
+        raise ConfigError(f"agent entry for {key!r} is invalid: {exc}") from None
+
+
+def _require_repo(value: str) -> None:
+    owner, _, name = value.partition("/")
+    if not owner or not name or "/" in name:
+        raise ValueError(f"github agent key must be 'owner/name', got {value!r}")
 
 
 def _read(path: str) -> str:
@@ -111,7 +191,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     agents_path = env.get(_AGENTS_VAR)
     if not agents_path:
         raise ConfigError(f"{_AGENTS_VAR} is required (path to the agent registry JSON)")
-    agents = _load_agents(agents_path)
+    agents, by_recipient = _load_agents(agents_path)
 
     raw_routes = env.get(_ENABLED_ROUTES_VAR)
     if raw_routes is None:
@@ -134,6 +214,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         agents=MappingProxyType(agents),
         enabled_routes=enabled,
         webhook_secrets=MappingProxyType(secrets),
+        recipient_index=MappingProxyType(by_recipient),
     )
 
 

@@ -10,7 +10,7 @@ import subprocess
 import pytest
 
 from basecradle_router import wake as wake_module
-from basecradle_router.models import Agent, Event, EventKind, IssueRef
+from basecradle_router.models import Agent, Event, EventKind, IssueRef, Recipient, WakeKind
 from basecradle_router.wake import (
     WAKE_RUNNER,
     HomeServerWaker,
@@ -22,7 +22,7 @@ from basecradle_router.wake import (
 )
 
 NOVA = Agent(
-    repo="basecradle/basecradle-python",
+    key="basecradle/basecradle-python",
     os_user="nova",
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
@@ -31,9 +31,27 @@ ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
 EVENT = Event(
     source="github",
     kind=EventKind.HANDOFF,
-    target_repo=NOVA.repo,
-    origin=IssueRef(repo=NOVA.repo, number=42, url=ISSUE_URL, title="Mirror the wire-shape change"),
-    trigger=f"Cross-repo handoff: work {ISSUE_URL}",
+    recipient=Recipient(by="repo", value=NOVA.key),
+    wake_arg=f"Cross-repo handoff: work {ISSUE_URL}",
+    delivery_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+    origin=IssueRef(repo=NOVA.key, number=42, url=ISSUE_URL, title="Mirror the wire-shape change"),
+)
+
+# A harness persona (@jt): woken via its own wake CLI, not claude.
+JT = Agent(
+    key="jt",
+    os_user="jt",
+    clone_path="/home/jt/harness",
+    wake_kind=WakeKind.HARNESS,
+    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
+    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+)
+TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
+JT_EVENT = Event(
+    source="basecradle",
+    kind=EventKind.PLATFORM_EVENT,
+    recipient=Recipient(by="recipient_uuid", value=JT.recipient_uuid),
+    wake_arg=TIMELINE_UUID,
     delivery_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd",
 )
 
@@ -62,12 +80,28 @@ def test_wake_assembles_command_cwd_env_and_run_as_user() -> None:
     result = waker.wake(NOVA, EVENT)
 
     assert runner.invocation is not None
-    assert runner.invocation.argv == ("claude", "-p", EVENT.trigger)
+    assert runner.invocation.argv == ("claude", "-p", EVENT.wake_arg)
     assert runner.invocation.cwd == "/home/nova/basecradle-python"
     assert runner.invocation.env == env
     assert runner.invocation.run_as_user == "nova"
     assert result.ok
     assert result.stdout == "done"
+
+
+def test_wake_assembles_the_harness_command_for_a_persona() -> None:
+    runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
+    waker = SubprocessWaker(runner=runner)
+
+    waker.wake(JT, JT_EVENT)
+
+    assert runner.invocation is not None
+    assert runner.invocation.argv == (
+        "/home/jt/venv/bin/basecradle-harness-wake",
+        "--timeline",
+        TIMELINE_UUID,
+    )
+    assert runner.invocation.cwd == "/home/jt/harness"
+    assert runner.invocation.run_as_user == "jt"
 
 
 def test_env_provider_receives_the_agent() -> None:
@@ -106,7 +140,7 @@ def test_non_zero_exit_raises_wake_error_with_code_and_stderr() -> None:
     with pytest.raises(WakeError, match="model overloaded") as excinfo:
         waker.wake(NOVA, EVENT)
     assert excinfo.value.exit_code == 2
-    assert NOVA.repo in str(excinfo.value)
+    assert NOVA.key in str(excinfo.value)
 
 
 def test_non_zero_exit_falls_back_to_stdout_then_placeholder() -> None:
@@ -156,7 +190,7 @@ def test_default_runner_invokes_subprocess_with_assembled_command(monkeypatch) -
     waker = SubprocessWaker(env_provider=lambda agent: env)  # default real runner
     result = waker.wake(NOVA, EVENT)
 
-    assert captured["argv"] == ["claude", "-p", EVENT.trigger]
+    assert captured["argv"] == ["claude", "-p", EVENT.wake_arg]
     assert captured["kwargs"]["cwd"] == "/home/nova/basecradle-python"
     assert captured["kwargs"]["env"] == env
     assert captured["kwargs"]["capture_output"] is True
@@ -230,10 +264,33 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
         "--",
         "claude",
         "-p",
-        EVENT.trigger,
+        EVENT.wake_arg,
     )
     assert runner.invocation.run_as_user == "nova"
     assert result.ok and result.stdout == "opened PR"
+
+
+def test_home_server_waker_assembles_the_harness_wake_command() -> None:
+    # A harness persona is woken via its registry-pinned wake CLI, not claude:
+    # sudo <wrapper> --user jt --cwd <home> -- <wake_bin> --timeline <uuid>.
+    runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
+    result = HomeServerWaker(runner=runner).wake(JT, JT_EVENT)
+
+    assert runner.invocation is not None
+    assert runner.invocation.argv == (
+        "sudo",
+        WAKE_RUNNER,
+        "--user",
+        "jt",
+        "--cwd",
+        "/home/jt/harness",
+        "--",
+        "/home/jt/venv/bin/basecradle-harness-wake",
+        "--timeline",
+        TIMELINE_UUID,
+    )
+    assert runner.invocation.run_as_user == "jt"
+    assert result.ok and result.stdout == "replied"
 
 
 def test_home_server_waker_passes_no_env_and_an_irrelevant_cwd() -> None:
@@ -253,10 +310,10 @@ def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> No
     event = Event(
         source="github",
         kind=EventKind.HANDOFF,
-        target_repo=NOVA.repo,
-        origin=EVENT.origin,
-        trigger=nasty,
+        recipient=Recipient(by="repo", value=NOVA.key),
+        wake_arg=nasty,
         delivery_id=EVENT.delivery_id,
+        origin=EVENT.origin,
     )
     runner = _FakeRunner(WakeResult(exit_code=0))
     HomeServerWaker(runner=runner).wake(NOVA, event)
@@ -278,7 +335,7 @@ def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
     with pytest.raises(WakeError, match="not a registered agent clone") as excinfo:
         HomeServerWaker(runner=runner).wake(NOVA, EVENT)
     assert excinfo.value.exit_code == 3
-    assert NOVA.repo in str(excinfo.value)
+    assert NOVA.key in str(excinfo.value)
 
 
 def test_home_server_waker_default_runner_is_the_subprocess_one() -> None:

@@ -19,6 +19,17 @@
 # proves the HMAC boundary in front of it. This is the test whose ABSENCE let the
 # box drift to pre-#52 code undetected (issue #54).
 #
+# Once the capital wires the basecradle route, two more cases prove its boundary
+# the same way — both safe against production (they never target @jt's real uuid):
+#
+#   4. bad signature                      -> 401  (shared HMAC boundary rejects)
+#   5. valid sig, UNREGISTERED recipient  -> 200  (verify admits; resolve finds no
+#                                                  agent, so NO wake fires — safe)
+#
+# These self-gate: skipped if the basecradle secret is unset, and skipped if the
+# running daemon does not yet serve the route, so a deploy made before the capital
+# enables basecradle stays green.
+#
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
 # router.env, which is root-readable only). deploy.sh invokes it over SSH after a
 # restart; you can also run it by hand:  sudo deploy/smoke-test.sh
@@ -119,6 +130,63 @@ check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(s
 # resolve finds no agent, so it is accepted-and-logged with NO wake.
 payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
 check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
+
+# --- basecradle route (only once the capital has wired it) -----------------
+#
+# The same security-boundary proof for the basecradle route, and equally safe
+# against production: it never targets @jt's real uuid, so it never wakes a real
+# harness. It self-gates twice — skipped if the secret is unset, and skipped if
+# the live daemon does not yet serve the route (a bad-sig probe returns 404, not
+# 401) — so a deploy made before the capital enables basecradle stays green.
+BC_URL="${BC_URL:-${SMOKE_URL%/*}/basecradle}"
+# A uuid that is never a registered recipient, so the valid-sig case wakes nothing.
+UNREGISTERED_RECIPIENT="00000000-0000-7000-8000-000000000000"
+SMOKE_TIMELINE="00000000-0000-7000-8000-0000000000aa"
+
+bc_secret="$(grep -E '^BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+
+bc_payload() {
+	local recipient=$1
+	cat <<-JSON
+		{"event":"message.created",
+		 "event_id":"smoke-00000000-0000-0000-0000-000000000000",
+		 "occurred_at":"2026-01-01T00:00:00Z",
+		 "actor_uuid":null,
+		 "recipient_uuid":"${recipient}",
+		 "timeline_uuid":"${SMOKE_TIMELINE}",
+		 "resource":{"type":"message","uuid":"${SMOKE_TIMELINE}","url":"https://ai.basecradle.com/smoke"}}
+	JSON
+}
+
+bc_sign() { openssl dgst -sha256 -hmac "$bc_secret" "$1" | awk '{print $NF}'; }
+
+bc_post() {
+	local body_file=$1 signature=$2
+	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+		-X POST "$BC_URL" \
+		-H 'Content-Type: application/json' \
+		-H 'X-BaseCradle-Event: message.created' \
+		-H 'X-BaseCradle-Delivery: smoke-00000000-0000-0000-0000-000000000000' \
+		-H "X-BaseCradle-Signature: sha256=${signature}" \
+		--data-binary "@${body_file}"
+}
+
+if [[ -z "$bc_secret" ]]; then
+	log "basecradle route: secret not set in $ROUTER_ENV_FILE — not wired yet; skipping"
+else
+	bc_payload "$UNREGISTERED_RECIPIENT" >"$workdir/bc.json"
+	probe="$(bc_post "$workdir/bc.json" "0000000000000000000000000000000000000000000000000000000000000000")"
+	if [[ "$probe" == "404" ]]; then
+		log "basecradle route: not enabled on the running daemon (404); skipping"
+	else
+		# Case 4 — bad signature. The shared HMAC boundary must reject it.
+		check "basecradle bad signature rejected" 401 "$probe"
+		# Case 5 — valid signature, unregistered recipient. Verify admits it; resolve
+		# finds no agent, so it is accepted-and-logged with NO wake (safe vs prod).
+		check "basecradle valid sig, unknown recipient => no wake" 200 \
+			"$(bc_post "$workdir/bc.json" "$(bc_sign "$workdir/bc.json")")"
+	fi
+fi
 
 echo
 if [[ $rc -eq 0 ]]; then

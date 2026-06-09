@@ -8,11 +8,15 @@ route, never forking the daemon.
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Protocol, runtime_checkable
 
 from basecradle_router.models import Event
+
+HMAC_SHA256_PREFIX = "sha256="
 
 
 class RouteError(Exception):
@@ -56,6 +60,33 @@ class InboundRequest:
             if key.lower() == target:
                 return value
         return None
+
+
+def verify_hmac_sha256(request: InboundRequest, secret: str, *, header: str) -> None:
+    """Raise :class:`SignatureError` unless ``request`` carries a valid signature.
+
+    The shared signature boundary for every HMAC-signed source (GitHub's
+    ``X-Hub-Signature-256``, BaseCradle's ``X-BaseCradle-Signature``): both sign
+    the **raw** request body with HMAC-SHA256 under a per-route shared secret and
+    deliver the digest as ``sha256=<hexdigest>``. Valid means a present, correctly
+    prefixed header whose digest equals the HMAC of the exact body bytes under
+    ``secret``; the comparison is constant-time. One audited implementation keeps
+    every route's security boundary identical and impossible to subtly diverge.
+    """
+    provided = request.header(header)
+    if provided is None:
+        raise SignatureError(f"missing {header} header")
+    if not provided.startswith(HMAC_SHA256_PREFIX):
+        raise SignatureError(f"malformed {header}: expected '{HMAC_SHA256_PREFIX}<hexdigest>'")
+
+    expected = (
+        HMAC_SHA256_PREFIX + hmac.new(secret.encode("utf-8"), request.body, sha256).hexdigest()
+    )
+
+    # Compare as bytes: hmac.compare_digest raises TypeError on a str with
+    # non-ASCII chars, and the header value is attacker-controlled.
+    if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("ascii")):
+        raise SignatureError(f"{header} does not match the request body")
 
 
 @runtime_checkable

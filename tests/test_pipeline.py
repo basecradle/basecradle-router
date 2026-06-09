@@ -11,23 +11,33 @@ import json
 from types import MappingProxyType
 
 from basecradle_router.config import Config
-from basecradle_router.models import Agent, Event
+from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, Stage
-from basecradle_router.routes import InboundRequest, RouteRegistry
+from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
 
 SECRET = "whsec_" + "0" * 32
+BASECRADLE_SECRET = "whsec_" + "1" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
 TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
 UNTRUSTED_SENDER = "drive-by-stranger"
 NOVA = Agent(
-    repo="basecradle/basecradle-python",
+    key="basecradle/basecradle-python",
     os_user="nova",
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
+JT = Agent(
+    key="jt",
+    os_user="jt",
+    clone_path="/home/jt/harness",
+    wake_kind=WakeKind.HARNESS,
+    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
+    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+)
 ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
+TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
 
 
 # --- doubles ---------------------------------------------------------------
@@ -48,7 +58,7 @@ class _StubWaker:
 
 def _config(agents: dict[str, Agent] | None = None) -> Config:
     return Config(
-        agents=MappingProxyType({NOVA.repo: NOVA} if agents is None else agents),
+        agents=MappingProxyType({NOVA.key: NOVA} if agents is None else agents),
         enabled_routes=frozenset({"github"}),
         webhook_secrets=MappingProxyType({"github": SECRET}),
     )
@@ -130,8 +140,98 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
     assert woken_agent is NOVA
     # The wake carries the handoff-recognition marker (the route's quarantine
     # envelope follows it — asserted in detail in test_github_route).
-    assert woken_event.trigger.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
+    assert woken_event.wake_arg.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
     assert result.agent is NOVA
+
+
+# --- the basecradle route: a platform event wakes a harness persona --------
+
+
+def _basecradle_pipeline(waker: _StubWaker | None = None) -> tuple[Pipeline, _StubWaker]:
+    waker = waker or _StubWaker()
+    registry = RouteRegistry()
+    registry.register(BasecradleRoute())
+    config = Config(
+        agents=MappingProxyType({JT.key: JT}),
+        enabled_routes=frozenset({"basecradle"}),
+        webhook_secrets=MappingProxyType({"basecradle": BASECRADLE_SECRET}),
+        recipient_index=MappingProxyType({JT.recipient_uuid: JT}),
+    )
+    return (
+        Pipeline(registry=registry, config=config, waker=waker, sleep=lambda _d: None),
+        waker,
+    )
+
+
+def _basecradle_request(
+    *,
+    event: str = "message.created",
+    recipient_uuid: str = JT.recipient_uuid,
+    timeline_uuid: str = TIMELINE_UUID,
+    sign: bool = True,
+    delivery: str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+) -> InboundRequest:
+    payload = {
+        "event": event,
+        "event_id": delivery,
+        "occurred_at": "2026-06-09T00:00:00Z",
+        "actor_uuid": None,
+        "recipient_uuid": recipient_uuid,
+        "timeline_uuid": timeline_uuid,
+        "resource": {"type": "message", "uuid": timeline_uuid, "url": "https://x"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"X-BaseCradle-Event": event, "X-BaseCradle-Delivery": delivery}
+    if sign:
+        import hashlib
+        import hmac
+
+        digest = hmac.new(BASECRADLE_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        headers["X-BaseCradle-Signature"] = f"sha256={digest}"
+    return InboundRequest(headers=headers, body=body)
+
+
+def test_signed_platform_event_wakes_the_harness_persona() -> None:
+    pipeline, waker = _basecradle_pipeline()
+    result = pipeline.handle("basecradle", _basecradle_request())
+
+    assert result.stages == [
+        (Stage.ROUTE, Outcome.OK),
+        (Stage.VERIFY, Outcome.OK),
+        (Stage.NORMALIZE, Outcome.OK),
+        (Stage.RESOLVE, Outcome.OK),
+        (Stage.LOCK, Outcome.OK),
+        (Stage.WAKE, Outcome.OK),
+    ]
+    assert len(waker.calls) == 1
+    woken_agent, woken_event = waker.calls[0]
+    assert woken_agent is JT  # resolved by recipient_uuid, not a repo
+    assert woken_event.wake_arg == TIMELINE_UUID  # the timeline the harness processes
+
+
+def test_basecradle_bad_signature_is_rejected_before_normalize() -> None:
+    pipeline, waker = _basecradle_pipeline()
+    result = pipeline.handle("basecradle", _basecradle_request(sign=False))
+    assert result.stages[-1] == (Stage.VERIFY, Outcome.REJECTED)
+    assert waker.calls == []
+
+
+def test_basecradle_unknown_recipient_fails_at_resolve_no_wake() -> None:
+    pipeline, waker = _basecradle_pipeline()
+    result = pipeline.handle(
+        "basecradle",
+        _basecradle_request(recipient_uuid="019e0000-0000-7000-8000-000000000000"),
+    )
+    assert result.terminal is Outcome.FAILED
+    assert result.stages[-1][0] is Stage.RESOLVE
+    assert waker.calls == []
+
+
+def test_basecradle_non_message_event_is_ignored() -> None:
+    pipeline, waker = _basecradle_pipeline()
+    result = pipeline.handle("basecradle", _basecradle_request(event="reaction.created"))
+    assert result.stages[-1] == (Stage.NORMALIZE, Outcome.IGNORED)
+    assert waker.calls == []
 
 
 # --- ignore / reject / fail ------------------------------------------------
@@ -164,7 +264,7 @@ def test_missing_secret_fails_at_verify_without_crashing() -> None:
     # An enabled route with no configured secret is our misconfiguration: the
     # verify stage fails (logged) rather than the daemon crashing.
     config = Config(
-        agents=MappingProxyType({NOVA.repo: NOVA}),
+        agents=MappingProxyType({NOVA.key: NOVA}),
         enabled_routes=frozenset({"github"}),
         webhook_secrets=MappingProxyType({}),  # no github secret
     )

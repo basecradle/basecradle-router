@@ -14,15 +14,24 @@
 # then (as the agent) sources that agent's env. This is the runtime contract the
 # HomeServerWaker (#29) assembles against.
 #
+# Two agent kinds are wakeable, selected by the registry entry's `kind`:
+#   - a builder ("github", the default): only the trusted, system-installed
+#     `claude` may be launched, resolved off a root-owned PATH;
+#   - a harness persona ("harness", e.g. @jt): only the exact `wake_bin` the
+#     registry pins for that agent may be launched (its own wake CLI in its venv).
+# Either way the binary is decided by the ROOT-OWNED registry, never by the
+# caller's argv, so a compromised router cannot substitute a different command.
+#
 # The boundary, stated as invariants this script enforces:
 #   - only root (via the sudoers rule) may run it;
 #   - the target must be a real agent login user (UID >= 1000, never root/system),
 #     registered in the agent registry with exactly the requested clone path;
-#   - only `claude` may ever be launched — no arbitrary binary;
+#   - only the registry-sanctioned binary for that agent may be launched —
+#     `claude` for a builder, the pinned `wake_bin` for a harness persona — and a
+#     harness `wake_bin` must resolve inside the agent's own home;
 #   - the agent's secrets are read by the AGENT, after the privilege drop.
 # Even a fully-compromised router can therefore only do what it can already do
-# legitimately — wake a registered agent — and can reach neither root nor any
-# non-agent user nor any command other than claude.
+# legitimately — wake a registered agent with that agent's own sanctioned command.
 #
 set -euo pipefail
 
@@ -68,12 +77,16 @@ target_uid="$(id -u "$user")"
 [[ $target_uid -ge $MIN_UID ]] || die "refusing: $user (uid $target_uid) is not an agent login user"
 
 # The (user, clone) pair must be registered — the wrapper trusts only the registry.
+# Pull, in one shot, the matched entry's key, kind (default "github"), and wake_bin
+# so the launched binary is decided by the registry, never the caller's argv.
 command -v jq >/dev/null 2>&1 || die "jq is required to validate against the registry"
 [[ -r $REGISTRY ]] || die "registry not readable: $REGISTRY"
-match="$(jq -r --arg u "$user" --arg c "$cwd" \
-	'to_entries[] | select(.value.os_user == $u and .value.clone_path == $c) | .key' \
+entry="$(jq -r --arg u "$user" --arg c "$cwd" \
+	'to_entries[] | select(.value.os_user == $u and .value.clone_path == $c)
+	 | [.key, (.value.kind // "github"), (.value.wake_bin // "")] | @tsv' \
 	"$REGISTRY")" || die "could not read registry $REGISTRY"
-[[ -n $match ]] || die "refusing: ($user, $cwd) is not a registered agent clone"
+[[ -n $entry ]] || die "refusing: ($user, $cwd) is not a registered agent clone"
+IFS=$'\t' read -r match kind wake_bin <<<"$entry"
 
 # Defence in depth against a poisoned registry: the clone must resolve (no `..`,
 # no symlink escape) to a path inside the agent's own home, never elsewhere.
@@ -83,20 +96,47 @@ case "$real_cwd/" in
 *) die "refusing: clone $cwd resolves outside /home/$user" ;;
 esac
 
-# Only the trusted, system-installed `claude` may ever be launched. A basename
-# check is NOT enough: `exec "$@"` would run a caller-supplied path verbatim, so a
-# binary literally named `claude` planted in an agent-writable dir would pass it.
-# Require the bare word and resolve the real binary ourselves, off a trusted PATH —
-# root-owned `claude`, never anything the (possibly-compromised) router can plant.
-[[ "$1" == claude ]] || die "refusing: command must be the bare word 'claude', got '$1'"
-trusted_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-claude_bin="$(PATH="$trusted_path" command -v claude)" || die "claude not found on the trusted PATH"
-shift # drop the 'claude' word; the remainder (e.g. -p <trigger>) are claude's args
+# Resolve the binary to launch from the REGISTRY's kind for this agent — never
+# from the caller's argv path verbatim. The launched program is whatever the
+# root-owned registry sanctions for this agent; argv[1] must match it.
+case "$kind" in
+github)
+	# Only the trusted, system-installed `claude` may ever be launched. A basename
+	# check is NOT enough: `exec "$@"` would run a caller-supplied path verbatim, so
+	# a binary literally named `claude` planted in an agent-writable dir would pass.
+	# Require the bare word and resolve the real binary ourselves, off a trusted
+	# PATH — root-owned `claude`, never anything the (compromised) router can plant.
+	[[ "$1" == claude ]] || die "refusing: command must be the bare word 'claude', got '$1'"
+	trusted_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+	launch_bin="$(PATH="$trusted_path" command -v claude)" || die "claude not found on the trusted PATH"
+	;;
+harness)
+	# A harness persona's wake CLI lives in its OWN venv (agent-writable), so it
+	# cannot be resolved off a root PATH. The control instead is the registry: the
+	# launched path must equal the `wake_bin` the registry pins for this agent, and
+	# must resolve to a real executable inside the agent's own home. The router
+	# supplies argv[1] but cannot deviate from the pinned value; running it as the
+	# agent (below) confers no privilege the agent lacks over its own venv.
+	[[ -n $wake_bin ]] || die "refusing: harness agent $match has no wake_bin in the registry"
+	[[ "$1" == "$wake_bin" ]] || die "refusing: command must be the registered wake_bin '$wake_bin', got '$1'"
+	launch_bin="$(realpath -e -- "$1" 2>/dev/null)" || die "wake_bin does not exist: $1"
+	case "$launch_bin/" in
+	"/home/$user/"*) : ;;
+	*) die "refusing: wake_bin $1 resolves outside /home/$user" ;;
+	esac
+	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
+	;;
+*)
+	die "refusing: agent $match has unknown kind '$kind'"
+	;;
+esac
+shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
 
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
-# router never reads it), cd into the clone, exec the trusted claude. The inline
-# script takes the cwd as $1 and the command (claude_bin + args) as $2..; root
-# never interpolates the trigger — it is passed as an inert positional argument.
+# router never reads it), cd into the clone, exec the registry-sanctioned binary.
+# The inline script takes the cwd as $1 and the command (launch_bin + args) as
+# $2..; root never interpolates the trigger/timeline — it is passed as an inert
+# positional argument.
 # SC2016 is intentional: the single quotes are load-bearing — $HOME/$1/$@ must
 # expand in the AGENT's bash after runuser, never in root's, so the untrusted
 # trigger is never evaluated in a privileged context.
@@ -120,4 +160,4 @@ exec runuser -u "$user" -- /bin/bash -c '
 	cd "$1"
 	shift
 	exec "$@"
-' wake-runner "$real_cwd" "$claude_bin" "$@"
+' wake-runner "$real_cwd" "$launch_bin" "$@"
