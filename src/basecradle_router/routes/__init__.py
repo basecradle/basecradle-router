@@ -7,6 +7,7 @@ from basecradle_router.routes.base import (
     RouteError,
     SignatureError,
     UntrustedSenderError,
+    parse_json_object,
     verify_hmac_sha256,
 )
 from basecradle_router.routes.basecradle import BasecradleRoute
@@ -24,5 +25,6 @@ __all__ = [
     "SignatureError",
     "UnknownRouteError",
     "UntrustedSenderError",
+    "parse_json_object",
     "verify_hmac_sha256",
 ]

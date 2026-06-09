@@ -17,7 +17,6 @@ field is GitHub-attested and not attacker-spoofable.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from typing import Any
 
@@ -26,6 +25,7 @@ from basecradle_router.routes.base import (
     InboundRequest,
     PayloadError,
     UntrustedSenderError,
+    parse_json_object,
     verify_hmac_sha256,
 )
 
@@ -106,7 +106,7 @@ class GithubRoute:
         if request.header(EVENT_HEADER) != "issues":
             return None
 
-        data = _parse(request.body)
+        data = parse_json_object(request.body)
         action = data.get("action")
         if action not in _ACTIONABLE_ACTIONS:
             return None
@@ -166,16 +166,6 @@ class GithubRoute:
             raise UntrustedSenderError(
                 f"handoff label applied by untrusted actor {login!r}; not a fleet member"
             )
-
-
-def _parse(body: bytes) -> dict[str, Any]:
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise PayloadError(f"body is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise PayloadError("webhook body must be a JSON object")
-    return data
 
 
 def _is_handoff(action: str, issue: dict[str, Any], data: dict[str, Any]) -> bool:

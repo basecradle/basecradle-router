@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from basecradle_router.models import Agent, Recipient, WakeKind
+from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
 
 _EMPTY: Mapping[str, Agent] = MappingProxyType({})
 
@@ -120,6 +120,15 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
             agent = _build_github_agent(key, fields)
         elif kind == "harness":
             agent = _build_harness_agent(key, fields)
+            # The recipient_uuid index must be a bijection: two entries claiming the
+            # same uuid would silently misroute one persona's events to the other.
+            # Fail loudly, matching the rest of load_config's posture (no silent miss).
+            if agent.recipient_uuid in by_recipient:
+                raise ConfigError(
+                    f"agent entry for {key!r} reuses recipient_uuid "
+                    f"{agent.recipient_uuid!r}, already claimed by "
+                    f"{by_recipient[agent.recipient_uuid].key!r}"
+                )
             by_recipient[agent.recipient_uuid] = agent
         else:
             raise ConfigError(
@@ -132,9 +141,10 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
 
 def _build_github_agent(key: str, fields: dict) -> Agent:
     # A github builder is keyed by the repo it captains; preserve the owner/name
-    # shape check the legacy registry relied on.
+    # shape check the legacy registry relied on (the same rule models.py enforces
+    # on a repo, so the two key-spaces stay disjoint — see _build_harness_agent).
     try:
-        _require_repo(key)
+        _require_repo(key, "github agent key")
     except ValueError as exc:
         raise ConfigError(f"agent entry for {key!r} is invalid: {exc}") from None
     try:
@@ -152,6 +162,14 @@ def _build_github_agent(key: str, fields: dict) -> Agent:
 
 
 def _build_harness_agent(key: str, fields: dict) -> Agent:
+    # A harness persona is keyed by a bare slug, never an ``owner/name`` repo —
+    # which keeps it out of the github key-space, so a ``Recipient(by="repo")``
+    # lookup can never resolve to a harness agent and feed it a builder's trigger.
+    if "/" in key:
+        raise ConfigError(
+            f"agent entry for {key!r} is invalid: a harness agent key must be a "
+            "bare slug (no '/'), not an 'owner/name' repo"
+        )
     try:
         return Agent(
             key=key,
@@ -165,12 +183,6 @@ def _build_harness_agent(key: str, fields: dict) -> Agent:
         raise ConfigError(f"agent entry for {key!r} is missing {exc.args[0]!r}") from None
     except ValueError as exc:
         raise ConfigError(f"agent entry for {key!r} is invalid: {exc}") from None
-
-
-def _require_repo(value: str) -> None:
-    owner, _, name = value.partition("/")
-    if not owner or not name or "/" in name:
-        raise ValueError(f"github agent key must be 'owner/name', got {value!r}")
 
 
 def _read(path: str) -> str:
