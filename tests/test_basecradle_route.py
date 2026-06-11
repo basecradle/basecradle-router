@@ -139,10 +139,24 @@ def test_normalize_message_created_round_trips() -> None:
     assert event.origin is None
 
 
-def test_normalize_ignores_non_message_event() -> None:
-    # A non-message delivery is a clean ignore (None), not an error — the harness
-    # wake is for new messages; other delivery types need no wake.
-    assert BasecradleRoute().normalize(_request(event="reaction.created")) is None
+@pytest.mark.parametrize("event", ["task.activated", "webhook_event.received"])
+def test_normalize_wakes_on_the_other_actionable_events(event: str) -> None:
+    # task.activated (a scheduled self-instruction comes due) and
+    # webhook_event.received (an external POST to the agent's inbound endpoint)
+    # ride the same firehose envelope as a message — recipient_uuid + timeline_uuid
+    # — and must wake the agent for that timeline, not fall on the floor (#90).
+    e = BasecradleRoute().normalize(_request(event=event))
+    assert e is not None
+    assert e.kind is EventKind.PLATFORM_EVENT
+    assert e.recipient == Recipient(by="recipient_uuid", value=JT_UUID)
+    assert e.wake_arg == TIMELINE_UUID
+    assert e.delivery_id == DELIVERY
+
+
+def test_normalize_ignores_non_actionable_event() -> None:
+    # An event outside the actionable set is a clean ignore (None), not an error —
+    # nothing for the harness to do, so no wake. (A deliberate, logged ignore.)
+    assert BasecradleRoute().normalize(_request(event="participant.removed")) is None
 
 
 def test_normalize_ignores_event_with_no_event_header() -> None:
