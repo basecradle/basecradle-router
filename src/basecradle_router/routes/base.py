@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 from typing import Any, Protocol, runtime_checkable
 
 from basecradle_router.models import Event
 
 HMAC_SHA256_PREFIX = "sha256="
+
+logger = logging.getLogger("basecradle_router.routes")
 
 
 class RouteError(Exception):
@@ -104,6 +108,58 @@ def parse_json_object(body: bytes) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise PayloadError("webhook body must be a JSON object")
     return data
+
+
+class DeliveryDecision(Enum):
+    """What a route decided to do with one *verified* inbound delivery.
+
+    The two **quiet** outcomes a route chooses between in ``normalize`` — the pair
+    that used to be indistinguishable in the logs (basecradle-router#91): a
+    deliberate ignore looked byte-identical to an event class silently falling on
+    the floor, so a dead ``task.activated`` capability read as healthy until a
+    human poked it. ``WOKE`` means the delivery was classified actionable and
+    dispatched to the wake path (the server answers ``202``); ``IGNORED`` means it
+    was well-formed but deliberately not actionable (the server answers ``200``).
+    Loud outcomes — a bad signature, a malformed payload, an untrusted sender —
+    are *rejections* the pipeline already logs at ``WARNING`` with their cause, so
+    they are deliberately not part of this quiet pair.
+    """
+
+    WOKE = "woke"
+    IGNORED = "ignored"
+
+
+def log_delivery_decision(
+    source: str,
+    event_type: str | None,
+    decision: DeliveryDecision,
+    *,
+    recipient: str | None = None,
+) -> None:
+    """Emit the one uniform, structured line recording a delivery's ignore-vs-act fate.
+
+    One format for every route, so an operator (or a metric scraper over the logs)
+    can answer *"did this event type wake an agent or get ignored, and for whom?"*
+    from observability alone — the signal the silent ``task.activated`` drop lacked
+    (basecradle-router#91). It is the **route** that emits it, because only the
+    route knows its source's ``event_type`` for a delivery it chose to ignore (the
+    core never learns the source's vocabulary); the format is centralized here so
+    the contract cannot drift route-to-route. ``recipient`` is logged when the
+    route already knows it — the actionable path, where the body is parsed — and
+    left ``<unknown>`` for an ignore that short-circuits before parsing, because
+    the load-bearing field for spotting a silently-dropped *class* is the
+    ``event_type``, not the per-recipient firehose target (deliveries are already
+    per-recipient). ``decision`` is the *router's* dispatch choice, not the wake's
+    eventual exit code: a ``WOKE`` whose later resolve/wake fails is recorded
+    loudly and separately by the pipeline.
+    """
+    logger.info(
+        "delivery source=%s event_type=%s decision=%s recipient=%s",
+        source,
+        event_type or "<none>",
+        decision.value,
+        recipient or "<unknown>",
+    )
 
 
 @runtime_checkable

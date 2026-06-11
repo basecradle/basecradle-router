@@ -22,9 +22,11 @@ from typing import Any
 
 from basecradle_router.models import Event, EventKind, IssueRef, Recipient
 from basecradle_router.routes.base import (
+    DeliveryDecision,
     InboundRequest,
     PayloadError,
     UntrustedSenderError,
+    log_delivery_decision,
     parse_json_object,
     verify_hmac_sha256,
 )
@@ -101,14 +103,19 @@ class GithubRoute:
         an issue without the ``handoff`` label. Raises :class:`PayloadError` only
         when an ``issues`` payload is structurally malformed, and
         :class:`UntrustedSenderError` when a genuine handoff was triggered by an
-        actor who is not a trusted fleet member.
+        actor who is not a trusted fleet member. Emits a structured decision line
+        for each quiet outcome (basecradle-router#91) so a deliberate ignore is
+        visible in observability, never indistinguishable from a silent drop.
         """
-        if request.header(EVENT_HEADER) != "issues":
+        event_type = request.header(EVENT_HEADER)
+        if event_type != "issues":
+            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
             return None
 
         data = parse_json_object(request.body)
         action = data.get("action")
         if action not in _ACTIONABLE_ACTIONS:
+            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
             return None
 
         issue = data.get("issue")
@@ -116,6 +123,7 @@ class GithubRoute:
             raise PayloadError("issues event is missing an 'issue' object")
 
         if not _is_handoff(action, issue, data):
+            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
             return None
 
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
@@ -139,7 +147,7 @@ class GithubRoute:
                 url=_text(issue, "html_url", "issue.html_url"),
                 title=_text(issue, "title", "issue.title"),
             )
-            return Event(
+            event = Event(
                 source=self.name,
                 kind=EventKind.HANDOFF,
                 recipient=Recipient(by="repo", value=origin.repo),
@@ -149,6 +157,8 @@ class GithubRoute:
             )
         except ValueError as exc:
             raise PayloadError(f"malformed issues payload: {exc}") from exc
+        log_delivery_decision(self.name, event_type, DeliveryDecision.WOKE, recipient=origin.repo)
+        return event
 
     def _require_trusted_sender(self, data: dict[str, Any]) -> None:
         """Raise :class:`UntrustedSenderError` unless the webhook's actor is trusted.

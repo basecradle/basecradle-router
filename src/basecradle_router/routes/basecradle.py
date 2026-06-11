@@ -26,8 +26,10 @@ from typing import Any
 
 from basecradle_router.models import Event, EventKind, Recipient
 from basecradle_router.routes.base import (
+    DeliveryDecision,
     InboundRequest,
     PayloadError,
+    log_delivery_decision,
     parse_json_object,
     verify_hmac_sha256,
 )
@@ -63,12 +65,16 @@ class BasecradleRoute:
     def normalize(self, request: InboundRequest) -> Event | None:
         """Turn a verified delivery into an :class:`Event`, or ignore it.
 
-        Returns ``None`` (a well-formed ignore) for any delivery that is not a
-        ``message.created`` event. Raises :class:`PayloadError` when an actionable
+        Returns ``None`` (a well-formed ignore) for any delivery that is not in
+        the actionable set. Raises :class:`PayloadError` when an actionable
         delivery is structurally malformed — missing the delivery id, the
-        recipient uuid, or the timeline uuid the wake needs.
+        recipient uuid, or the timeline uuid the wake needs. Emits a structured
+        decision line either way (basecradle-router#91) so an ignore is a
+        *visible* deliberate ignore, never a silent drop.
         """
-        if request.header(EVENT_HEADER) not in _ACTIONABLE_EVENTS:
+        event_type = request.header(EVENT_HEADER)
+        if event_type not in _ACTIONABLE_EVENTS:
+            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
             return None
 
         data = parse_json_object(request.body)
@@ -81,7 +87,7 @@ class BasecradleRoute:
         timeline_uuid = _text(data, "timeline_uuid", "timeline_uuid")
 
         try:
-            return Event(
+            event = Event(
                 source=self.name,
                 kind=EventKind.PLATFORM_EVENT,
                 recipient=Recipient(by="recipient_uuid", value=recipient_uuid),
@@ -90,6 +96,10 @@ class BasecradleRoute:
             )
         except ValueError as exc:
             raise PayloadError(f"malformed basecradle payload: {exc}") from exc
+        log_delivery_decision(
+            self.name, event_type, DeliveryDecision.WOKE, recipient=recipient_uuid
+        )
+        return event
 
 
 def _text(obj: dict[str, Any], key: str, label: str) -> str:

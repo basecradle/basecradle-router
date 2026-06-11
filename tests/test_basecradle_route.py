@@ -18,6 +18,7 @@ import pytest
 from basecradle_router.models import EventKind, Recipient
 from basecradle_router.routes import (
     BasecradleRoute,
+    DeliveryDecision,
     InboundRequest,
     PayloadError,
     Route,
@@ -171,3 +172,39 @@ def test_normalize_rejects_missing_recipient_uuid() -> None:
 def test_normalize_rejects_missing_timeline_uuid() -> None:
     with pytest.raises(PayloadError, match="timeline_uuid"):
         BasecradleRoute().normalize(_request(_payload(timeline_uuid=None)))
+
+
+# --- observability: the ignore-vs-act decision is logged (#91) --------------
+
+
+def test_normalize_logs_the_woke_decision_for_a_message(caplog) -> None:
+    # An acted message records decision=woke with the event type and the recipient
+    # it resolved to — the signal a silent task.activated drop lacked.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        BasecradleRoute().normalize(_request())
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "source=basecradle" in line
+    assert "event_type=message.created" in line
+    assert f"decision={DeliveryDecision.WOKE.value}" in line
+    assert f"recipient={JT_UUID}" in line
+
+
+def test_normalize_logs_the_ignored_decision_with_the_event_type(caplog) -> None:
+    # A non-actionable delivery is a *visible* deliberate ignore: the event type is
+    # named so an unexpectedly-ignored class is discoverable from observability.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        BasecradleRoute().normalize(_request(event="reaction.created"))
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "source=basecradle" in line
+    assert "event_type=reaction.created" in line
+    assert f"decision={DeliveryDecision.IGNORED.value}" in line
+
+
+def test_normalize_logs_ignored_event_type_none_when_header_absent(caplog) -> None:
+    # A delivery with no event header is still a visible ignore (event_type=<none>),
+    # not a silent drop.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        BasecradleRoute().normalize(_request(event=None))
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "event_type=<none>" in line
+    assert f"decision={DeliveryDecision.IGNORED.value}" in line
