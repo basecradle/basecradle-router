@@ -30,12 +30,51 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
 
 WEBHOOK_PREFIX = "/webhooks/"
+
+# The package logger every router log line descends from — the pipeline's per-stage
+# records and the routes' ignore-vs-act decision lines (#91) all log under it.
+_ROOT_LOGGER = "basecradle_router"
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+
+def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
+    """Route the daemon's own loggers to stdout at ``level`` (systemd → journald).
+
+    Without this the observability was *silent on the deployed box* (#91): uvicorn
+    configures only its ``uvicorn.*`` loggers, so our ``basecradle_router.*``
+    loggers inherit the root's default ``WARNING`` — which dropped every INFO
+    record (the per-stage pipeline log *and* the ignore-vs-act decision lines)
+    while WARNING rejections still surfaced. The very signal meant to kill
+    "green-while-dead" was itself green-while-dead. Attaching a stdout handler to
+    the package logger at INFO is what makes those lines actually reach the
+    operator's journal.
+
+    Called from the ASGI lifespan startup, so it configures the *running daemon*
+    and never the unit tests (which drive the HTTP path, never lifespan). It is
+    idempotent — a second startup re-uses the existing handler instead of stacking
+    a duplicate — and leaves ``propagate`` on, so a caplog-based test still sees
+    records through the root.
+    """
+    pkg = logging.getLogger(_ROOT_LOGGER)
+    pkg.setLevel(level)
+    for existing in pkg.handlers:
+        if getattr(existing, "_basecradle_router", False):
+            existing.setLevel(level)
+            return
+    handler = logging.StreamHandler(sys.stdout if stream is None else stream)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    handler._basecradle_router = True  # tag our own handler so re-config is idempotent
+    pkg.addHandler(handler)
+
 
 # The fleet-uniform liveness path (constitution → Operational Baselines). Served
 # from the app itself — so a green ``GET /up`` proves *uvicorn* is up (true service
@@ -125,6 +164,11 @@ class WebhookServer:
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
+                # Configure logging here — when the daemon actually starts serving —
+                # so the running process emits its INFO observability to journald,
+                # without mutating global logging state during unit tests (which
+                # drive the HTTP path, never the lifespan protocol). See #91.
+                configure_logging()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart
