@@ -14,12 +14,21 @@ actor allow-list here as there is on github, where any org actor can fire a
 webhook.
 
 :meth:`BasecradleRoute.normalize` turns a verified delivery in the actionable set
-(``_ACTIONABLE_EVENTS`` — a new message, an activated scheduled task, or an
-inbound webhook event) into a core :class:`~basecradle_router.models.Event` that
-resolves to the agent by its BaseCradle user uuid (``recipient_uuid``) and wakes
-its harness for the delivery's ``timeline_uuid``. Every other delivery type is a
-well-formed *ignore*, not an error — the same shape as github's non-handoff
-ignore, and logged as a deliberate ignore so it is never a silent drop.
+(``_ACTIONABLE_EVENTS`` — a new message, a peer's asset, an activated scheduled
+task, or an inbound webhook event) into a core
+:class:`~basecradle_router.models.Event` that resolves to the agent by its
+BaseCradle user uuid (``recipient_uuid``) and wakes its harness for the delivery's
+``timeline_uuid``. Every other delivery type is a well-formed *ignore*, not an
+error — the same shape as github's non-handoff ignore, and logged as a deliberate
+ignore so it is never a silent drop.
+
+The route is deliberately **actor-agnostic**: it wakes timeline-scoped and never
+reads ``actor_uuid``, so it cannot itself tell a peer's post from the agent's own.
+That is why ``asset.created`` — which the agent self-authors via ``generate_image``
+— is safe to wake on *only* once the harness self-filters its own authored items
+(``actor_uuid`` == self) on wake; otherwise the agent would wake-loop on its own
+output. The self-filter is the harness's invariant, not the router's; this event
+must not ship ahead of it (basecradle-router#95, gated on basecradle-harness#95).
 """
 
 from __future__ import annotations
@@ -49,29 +58,43 @@ DELIVERY_HEADER = "X-BaseCradle-Delivery"
 # nothing and a needless wake costs a wasted session — the set stays tight, and an
 # event is added only when acting on it is real.
 MESSAGE_CREATED_EVENT = "message.created"
+ASSET_CREATED_EVENT = "asset.created"
 TASK_ACTIVATED_EVENT = "task.activated"
 WEBHOOK_EVENT_RECEIVED_EVENT = "webhook_event.received"
 
-# Actionable today. Every member is delivered with ``actor_uuid: null`` (or is
-# otherwise free of self-echo), so none can wake an agent on its own action —
-# the wake-loop hazard that gates the rest:
+# Actionable — the founder's minimum required wake set (basecradle-router#95):
 #   message.created        — a new message on a timeline the agent views.
-#   task.activated         — a scheduled self-instruction comes due; the activated
-#                            task is already a timeline item the harness reconciles
-#                            on wake, so this is complete router-side alone.
+#   asset.created          — a peer posted a file asset to a timeline the agent
+#                            views. UNLIKE the others, this is *self-authorable*:
+#                            the agent's own ``generate_image`` posts an asset with
+#                            ``actor_uuid`` == itself, so waking on it would loop the
+#                            agent on its own output — UNLESS the harness self-filters
+#                            its own authored items (``actor_uuid`` == self) on wake.
+#                            The router stays actor-agnostic by design (it wakes
+#                            timeline-scoped and never reads ``actor_uuid``); the
+#                            self-filter is the harness's, and this event MUST NOT
+#                            ship ahead of it (see the route docstring + #95).
+#   task.activated         — a scheduled instruction comes due; the harness
+#                            reconciles newly-activated tasks on wake (the wake is
+#                            NOT message-only — that earlier assumption was wrong;
+#                            the task reconciler shipped in basecradle-harness#95).
 #   webhook_event.received — an external service POSTed to the agent's inbound
-#                            webhook endpoint; the harness companion surfaces the
-#                            unseen delivery on wake (basecradle-harness#91). Waking
-#                            is harmless before that lands — the wake is idempotent.
+#                            webhook endpoint; the harness surfaces the unseen
+#                            delivery on wake (basecradle-harness#91).
 #
 # Deliberately NOT actionable (kept a clean, logged ignore):
-#   Self-echo risk — needs harness ``actor_uuid == self`` filtering before it can
-#   be added without a wake-loop: ``participant.added``, ``asset.created``.
+#   participant.added — also self-authorable and NOT in the founder's required set;
+#                       stays deferred (Tier 2) behind the same harness self-filter.
 #   No action implied: ``task.created`` (not due yet), ``webhook_endpoint.created``
 #   (admin), ``timeline.created`` (reaches only the creator), ``timeline.locked`` /
 #   ``timeline.unlocked`` (informational), ``participant.removed`` (nothing to do).
 _ACTIONABLE_EVENTS = frozenset(
-    {MESSAGE_CREATED_EVENT, TASK_ACTIVATED_EVENT, WEBHOOK_EVENT_RECEIVED_EVENT}
+    {
+        MESSAGE_CREATED_EVENT,
+        ASSET_CREATED_EVENT,
+        TASK_ACTIVATED_EVENT,
+        WEBHOOK_EVENT_RECEIVED_EVENT,
+    }
 )
 
 
