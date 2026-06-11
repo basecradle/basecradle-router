@@ -13,7 +13,9 @@ woken in her own clone.
 import asyncio
 import hashlib
 import hmac
+import io
 import json
+import logging
 import threading
 from types import MappingProxyType
 
@@ -23,7 +25,7 @@ from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
-from basecradle_router.server import WebhookServer
+from basecradle_router.server import WebhookServer, configure_logging
 from basecradle_router.wake import WakeResult
 
 SECRET = "whsec_" + "0" * 32
@@ -358,3 +360,77 @@ def test_lock_prevents_a_concurrent_double_wake_end_to_end() -> None:
     worker.join(timeout=5)
     assert locks.acquire(NOVA.harness_key, blocking=False) is True  # released afterwards
     locks.release(NOVA.harness_key)
+
+
+# --- the daemon's own INFO observability actually reaches stdout (#91) ------
+#
+# The deployed-box gap: the decision lines and pipeline stage records log at INFO
+# under `basecradle_router.*`, but nothing configured those loggers, so on the box
+# (where uvicorn configures only its own loggers) every INFO record was dropped and
+# the observability was itself silent live. These pin the fix.
+
+
+def _with_clean_package_logger(fn):
+    """Run ``fn`` with the package logger's handlers/level snapshotted and restored.
+
+    configure_logging mutates the process-global ``basecradle_router`` logger; the
+    snapshot keeps that mutation from leaking into other tests.
+    """
+    pkg = logging.getLogger("basecradle_router")
+    saved_handlers, saved_level = pkg.handlers[:], pkg.level
+    pkg.handlers.clear()
+    try:
+        fn(pkg)
+    finally:
+        pkg.handlers[:] = saved_handlers
+        pkg.setLevel(saved_level)
+
+
+def test_configure_logging_emits_info_records_to_the_stream() -> None:
+    def check(pkg: logging.Logger) -> None:
+        buffer = io.StringIO()
+        configure_logging(stream=buffer)
+        assert pkg.level == logging.INFO
+        # A child logger's INFO record (a decision line) must reach the handler —
+        # this is exactly what was dropped at WARNING on the box.
+        logging.getLogger("basecradle_router.routes").info("delivery decision=woke")
+        assert "delivery decision=woke" in buffer.getvalue()
+
+    _with_clean_package_logger(check)
+
+
+def test_configure_logging_is_idempotent_no_duplicate_handlers() -> None:
+    def check(pkg: logging.Logger) -> None:
+        configure_logging(stream=io.StringIO())
+        configure_logging(stream=io.StringIO())  # a second startup must not stack
+        tagged = [h for h in pkg.handlers if getattr(h, "_basecradle_router", False)]
+        assert len(tagged) == 1
+
+    _with_clean_package_logger(check)
+
+
+def test_lifespan_startup_configures_logging() -> None:
+    # The wiring: uvicorn drives the ASGI lifespan on real startup, which is where
+    # the daemon configures its own logging — so the running process is observable
+    # even though no unit test (HTTP-only) ever triggers it.
+    def check(pkg: logging.Logger) -> None:
+        server, _ = _build()
+
+        async def _drive() -> None:
+            incoming = [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}]
+            sent: list[dict] = []
+
+            async def receive():
+                return incoming.pop(0)
+
+            async def send(message):
+                sent.append(message)
+
+            await server({"type": "lifespan"}, receive, send)
+            assert {"type": "lifespan.startup.complete"} in sent
+
+        asyncio.run(_drive())
+        assert pkg.level == logging.INFO
+        assert any(getattr(h, "_basecradle_router", False) for h in pkg.handlers)
+
+    _with_clean_package_logger(check)

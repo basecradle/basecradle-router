@@ -19,6 +19,13 @@
 # proves the HMAC boundary in front of it. This is the test whose ABSENCE let the
 # box drift to pre-#52 code undetected (issue #54).
 #
+# Case 3 also drives a verified handoff through normalize, so it logs an INFO
+# `decision=woke` line. The test then asserts that line actually reached journald —
+# the LIVE half of #91, because the decision logging being merged + unit-tested is
+# not enough: on the box those INFO records were silently dropped, so the
+# observability meant to catch a dead capability was itself dead. (Case 5 asserts
+# the same for the basecradle route.)
+#
 # Once the capital wires the basecradle route, two more cases prove its boundary
 # the same way — both safe against production (they never target @jt's real uuid):
 #
@@ -115,8 +122,33 @@ check() {
 	fi
 }
 
+# Assert the running daemon actually EMITTED a log line matching $2 to journald
+# since $3 — the live half of #91. The decision logging being merged and unit-
+# tested is not enough: on the box it was silently dropped at WARNING, so a dead
+# capability read as healthy. This proves the INFO record reached the operator's
+# journal. A short retry absorbs journald ingestion lag (the record is written
+# synchronously during the request, but ingestion is a beat behind the HTTP ack).
+assert_journal_has() {
+	local name=$1 pattern=$2 since=$3
+	for _ in 1 2 3 4 5; do
+		if journalctl -u basecradle-router --since "$since" --no-pager 2>/dev/null |
+			grep -qE "$pattern"; then
+			green "  PASS  ${name}: decision line present in journald"
+			return 0
+		fi
+		sleep 1
+	done
+	red "  FAIL  ${name}: no journald line /${pattern}/ since ${since}"
+	red "        decision logging is wired but NOT emitting at the deployed level (#91)"
+	rc=1
+}
+
 log "Smoke-testing live daemon at ${SMOKE_URL}"
 log "Trusted actor under test: ${trusted_login}"
+
+# Journald boundary for the observability assertions below: capture it before any
+# POST so a decision line emitted by the cases that follow is guaranteed >= it.
+obs_since="$(date '+%Y-%m-%d %H:%M:%S')"
 
 # Case 1 — bad signature. Body is otherwise valid; the signature is garbage.
 payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c1.json"
@@ -130,6 +162,12 @@ check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(s
 # resolve finds no agent, so it is accepted-and-logged with NO wake.
 payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
 check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
+
+# Case 3 also drove a verified handoff through normalize, which logs a WOKE
+# decision line (recipient = the unregistered repo) before resolve drops it. Assert
+# that INFO line actually reached journald — the live observability check (#91).
+assert_journal_has "github decision line emitted (#91)" \
+	"delivery source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
 
 # --- basecradle route (only once the capital has wired it) -----------------
 #
@@ -185,6 +223,11 @@ else
 		# finds no agent, so it is accepted-and-logged with NO wake (safe vs prod).
 		check "basecradle valid sig, unknown recipient => no wake" 200 \
 			"$(bc_post "$workdir/bc.json" "$(bc_sign "$workdir/bc.json")")"
+		# Case 5 normalized a message.created, logging a WOKE decision line for the
+		# unregistered recipient. Assert the basecradle route's INFO observability
+		# reaches journald too — this is the route the #91 silent-drop was found on.
+		assert_journal_has "basecradle decision line emitted (#91)" \
+			"delivery source=basecradle .*decision=woke .*recipient=${UNREGISTERED_RECIPIENT}" "$obs_since"
 	fi
 fi
 
