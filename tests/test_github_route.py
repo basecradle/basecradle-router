@@ -12,6 +12,7 @@ import pytest
 
 from basecradle_router.models import EventKind, Recipient
 from basecradle_router.routes import (
+    DeliveryDecision,
     GithubRoute,
     InboundRequest,
     PayloadError,
@@ -318,3 +319,29 @@ def test_normalize_checks_sender_only_for_handoffs() -> None:
     # trust gate guards wakes, it does not reject every non-fleet issue.
     payload = _issues_payload(action="opened", labels=("bug",), sender=UNTRUSTED_ACTOR)
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+
+
+# --- observability: the ignore-vs-act decision is logged (#91) --------------
+
+
+def test_normalize_logs_the_woke_decision_for_a_handoff(caplog) -> None:
+    # An acted handoff records decision=woke with the source's event type and the
+    # repo it resolved to — so observability can confirm the wake from logs alone.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "source=github" in line
+    assert "event_type=issues" in line
+    assert f"decision={DeliveryDecision.WOKE.value}" in line
+    assert f"recipient={TARGET_REPO}" in line
+
+
+def test_normalize_logs_the_ignored_decision_with_the_event_type(caplog) -> None:
+    # The silent-drop fix: a deliberate ignore is *visible*, and names the event
+    # type so a whole class being dropped is discoverable from observability.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        GithubRoute(TRUSTED).normalize(_issues_request(event="ping"))
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "source=github" in line
+    assert "event_type=ping" in line
+    assert f"decision={DeliveryDecision.IGNORED.value}" in line
