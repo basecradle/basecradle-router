@@ -16,3 +16,7 @@ build/
 *.pem
 .env
 .env.*
+
+# macOS
+.DS_Store
+._*
