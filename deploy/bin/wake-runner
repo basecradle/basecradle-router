@@ -11,8 +11,10 @@
 # It validates the request, drops to the agent's own OS user, and runs the wake
 # in the agent's clone with the agent's own credentials. The router never runs as
 # root and never reads an agent's secrets — the wrapper drops privileges first,
-# then (as the agent) sources that agent's env. This is the runtime contract the
-# HomeServerWaker (#29) assembles against.
+# then (as the agent) loads that agent's env. The env file is parsed as literal
+# KEY=VALUE lines, never bash-sourced, so a secret containing a shell-special
+# character ($, backtick, $( ), spaces, quotes) is data and never code (#109).
+# This is the runtime contract the HomeServerWaker (#29) assembles against.
 #
 # Two agent kinds are wakeable, selected by the registry entry's `kind`:
 #   - a builder ("github", the default): only the trusted, system-installed
@@ -29,7 +31,8 @@
 #   - only the registry-sanctioned binary for that agent may be launched —
 #     `claude` for a builder, the pinned `wake_bin` for a harness persona — and a
 #     harness `wake_bin` must resolve inside the agent's own home;
-#   - the agent's secrets are read by the AGENT, after the privilege drop.
+#   - the agent's secrets are read by the AGENT, after the privilege drop, and
+#     parsed literally (KEY=VALUE), never evaluated as shell.
 # Even a fully-compromised router can therefore only do what it can already do
 # legitimately — wake a registered agent with that agent's own sanctioned command.
 #
@@ -150,13 +153,48 @@ exec runuser -u "$user" -- /bin/bash -c '
 	# This is the single shared launch boundary, so it covers every agent, present
 	# and future, and is inherited by the claude exec-ed below. (basecradle-router#57)
 	umask 077
+	# >>> load_agent_env >>>
+	# Load KEY=VALUE pairs from the agent env file LITERALLY -- no shell
+	# evaluation, no command substitution. A credential is DATA, not code: a
+	# value containing $, a backtick, $( ), spaces, or quotes is taken verbatim.
+	# This replaces a bash `source` of the file, which evaluated every value --
+	# a secret with a $ (e.g. a random password) aborted the wake under set -u,
+	# and a value like $(cmd) would have EXECUTED cmd as the agent. (#109)
+	# (No literal single-quote appears below: this whole script is wrapped in
+	# single quotes for runuser, so the quote chars are built with printf.)
+	load_agent_env() {
+		local _envf=$1 _line _key _val _last
+		local _dq _sq
+		_dq=$(printf "\042")   # one double-quote char
+		_sq=$(printf "\047")   # one single-quote char
+		while IFS= read -r _line || [[ -n $_line ]]; do
+			_line=${_line#"${_line%%[![:space:]]*}"}   # strip leading whitespace
+			[[ -z $_line || ${_line:0:1} == "#" ]] && continue
+			_line=${_line#export }                     # tolerate an `export ` prefix
+			[[ $_line == *=* ]] || continue            # no = -> not an assignment
+			_key=${_line%%=*}                          # everything before the FIRST =
+			_val=${_line#*=}                           # the rest, verbatim
+			_key=${_key%"${_key##*[![:space:]]}"}      # trim whitespace around the key
+			_key=${_key#"${_key%%[![:space:]]*}"}
+			[[ $_key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+			# Strip ONE layer of matching surrounding quotes, if present, so the
+			# interim single-quote workaround on existing files keeps working.
+			if [[ ${#_val} -ge 2 ]]; then
+				_last=${_val:${#_val}-1}
+				if [[ ${_val:0:1} == "$_dq" && $_last == "$_dq" ]]; then
+					_val=${_val:1:${#_val}-2}
+				elif [[ ${_val:0:1} == "$_sq" && $_last == "$_sq" ]]; then
+					_val=${_val:1:${#_val}-2}
+				fi
+			fi
+			# export NAME=VALUE assigns the literal bytes of _val -- the value is
+			# never re-parsed for expansion or command substitution.
+			export "$_key=$_val"
+		done <"$_envf"
+	}
+	# <<< load_agent_env <<<
 	env_file="$HOME/.config/basecradle/agent.env"
-	if [[ -r $env_file ]]; then
-		set -a
-		# shellcheck source=/dev/null
-		. "$env_file"
-		set +a
-	fi
+	[[ -r $env_file ]] && load_agent_env "$env_file"
 	cd "$1"
 	shift
 	exec "$@"

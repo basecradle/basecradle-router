@@ -294,7 +294,7 @@ def test_home_server_waker_assembles_the_harness_wake_command() -> None:
 
 
 def test_home_server_waker_passes_no_env_and_an_irrelevant_cwd() -> None:
-    # The wrapper sources the agent's own env after the privilege drop, so the
+    # The wrapper loads the agent's own env after the privilege drop, so the
     # router must hand over nothing — no secret ever flows through it.
     runner = _FakeRunner(WakeResult(exit_code=0))
     HomeServerWaker(runner=runner).wake(NOVA, EVENT)
