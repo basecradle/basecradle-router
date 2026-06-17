@@ -185,3 +185,17 @@ class Event:
         _require(self.delivery_id, "Event.delivery_id")
         if self.origin is not None and not isinstance(self.origin, IssueRef):
             raise ValueError(f"Event.origin must be an IssueRef or None, got {self.origin!r}")
+
+    @property
+    def stream_key(self) -> str:
+        """A stable id for the finest-grained wake sub-stream this event belongs to.
+
+        The per-(agent, stream) wake-rate breaker keys on this, so one looping
+        timeline or issue trips even while the agent's overall rate stays under the
+        per-agent cap. A source that reports an ``origin`` (a github handoff issue)
+        keys on the issue ``url``; one that does not (a basecradle timeline event)
+        keys on its ``wake_arg`` (the timeline uuid). Both are stable across a loop's
+        repeated wakes and compact enough to log — and both are core vocabulary, so
+        this stays source-agnostic.
+        """
+        return self.origin.url if self.origin is not None else self.wake_arg

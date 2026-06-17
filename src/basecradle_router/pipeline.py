@@ -40,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
+from basecradle_router.breaker import WakeRateBreaker
 from basecradle_router.concurrency import (
     AgentLocks,
     RetryExhausted,
@@ -70,6 +71,7 @@ class Stage(Enum):
     NORMALIZE = "normalize"
     RESOLVE = "resolve"
     LOCK = "lock"
+    BREAKER = "breaker"
     WAKE = "wake"
 
 
@@ -138,6 +140,7 @@ class Pipeline:
     config: Config
     waker: Waker
     locks: AgentLocks = field(default_factory=AgentLocks)
+    breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
 
@@ -174,7 +177,7 @@ class Pipeline:
         return AcceptResult(result=result, pending=pending)
 
     def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
-        """The slow half: lock → wake, appended to ``result``; never raises.
+        """The slow half: lock → breaker → wake, appended to ``result``; never raises.
 
         Serialized per agent — by the agent's harness-instance identity, not its
         repo — so an agent never runs two concurrent sessions against its one
@@ -182,15 +185,33 @@ class Pipeline:
         where the constitution's unified-identity rule lands in the core: every
         input source for an agent funnels through this one lock into a single
         ordered stream the lone harness instance drains, so a future input module
-        can never fan a second parallel session onto the same agent. Runs the
-        minutes-long ``claude`` wake, so the server runs it off the request path
-        (in the background) after acking. The pipeline ends here: the woken agent
-        opens its own PR and enables GitHub native auto-merge, so the router never
-        merges (see the module docstring and issue #38).
+        can never fan a second parallel session onto the same agent.
+
+        Inside the lock, immediately before the wake, the **wake-rate circuit
+        breaker** gates the dispatch (basecradle-router#110): it counts the rate at
+        which wakes actually fire for this agent (and this sub-stream) and, over a
+        generous sanity cap, *refuses* the wake — a logged, visible decision and a
+        loud escalation, the runaway-loop backstop. Because it sits inside the lock
+        (which already serializes same-agent wakes one at a time), it measures true
+        dispatch rate: a runaway fires back-to-back and trips, a legitimate burst of
+        queued deliveries drains one slow wake at a time and never does. A refused
+        wake is recorded ``BREAKER``/``IGNORED`` and no wake runs; an admitted one
+        falls through to the wake unrecorded, so the happy path is unchanged.
+
+        Runs the minutes-long ``claude`` wake off the request path (in the
+        background) after acking. The pipeline ends here: the woken agent opens its
+        own PR and enables GitHub native auto-merge, so the router never merges (see
+        the module docstring and issue #38).
         """
         try:
             with self.locks.guard(agent.harness_key):
                 self._record(result, Stage.LOCK, Outcome.OK, agent.harness_key)
+                outcome = self.breaker.admit(agent.harness_key, event.stream_key)
+                if not outcome.admitted:
+                    # A trip/refusal is a deliberate, visible drop — recorded like the
+                    # route's IGNORED decisions; the breaker already escalated loudly.
+                    self._record(result, Stage.BREAKER, Outcome.IGNORED, outcome.detail)
+                    return
                 self._wake(agent, event, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")

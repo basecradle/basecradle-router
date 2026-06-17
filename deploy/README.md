@@ -82,6 +82,13 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 #   to also accept BaseCradle platform events (then the basecradle secret is required):
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the agent's BaseCradle integration_secret>
+#
+# Wake-rate circuit breaker (the runaway-loop backstop, issue #110) — all optional,
+# generous defaults; only a genuine runaway should ever trip it:
+# BASECRADLE_ROUTER_WAKE_BREAKER_MAX=20          # per-agent wakes per window
+# BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW=60       # rolling window, seconds
+# BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN=60     # halt seconds after a trip (auto-reset)
+# BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX=15   # per-(agent, timeline/issue) wakes per window; 0 disables
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
@@ -98,6 +105,20 @@ raw body in `X-BaseCradle-Signature`, exactly like GitHub). The platform decides
 so a valid signature *is* the trust — there is no extra actor allow-list here. A `message.created`
 delivery resolves to the agent by its BaseCradle user uuid (`recipient_uuid`) and wakes that agent's
 harness for the event's `timeline_uuid`.
+
+The **wake-rate circuit breaker** (issue #110) is the router's cross-agent runaway backstop. The router
+is the single chokepoint for every wake, so it alone can catch a runaway loop the per-agent harness layer
+can't (a harness that crashes before it can self-track, a multi-agent ping-pong, a novel loop from a
+drop-in `tools/` or MCP server). It tracks wakes per **agent** (and per **(agent, timeline/issue)**) in a
+rolling window; over a generous sanity cap it **trips** — stops dispatching that scope's wakes, logs a
+visible refusal, and escalates with a loud `CIRCUIT BREAKER TRIPPED` `ERROR` the NOC can detect — then
+**auto-resets** once the cooldown elapses and the window clears (a transient burst self-heals). The four
+`router.env` knobs above tune it; defaults (20/60 s per agent, 15/60 s per stream, 60 s cooldown) are set
+so legitimate multi-peer activity never trips it. Refusing a wake never loses data — the platform's
+cursor-paginated read API is the source of truth and push is best-effort — so a tripped agent simply
+pauses its push until the loop is understood. The breaker is defense-in-depth with, and independent of,
+the harness's own per-timeline self-breaker (basecradle-harness#138): no shared protocol, each trips on
+its own view.
 
 #### The registry (`agents.json`)
 

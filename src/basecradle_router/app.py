@@ -20,7 +20,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from basecradle_router.config import load_config, load_github_trusted_actors
+from basecradle_router.breaker import WakeRateBreaker
+from basecradle_router.config import (
+    load_breaker_config,
+    load_config,
+    load_github_trusted_actors,
+)
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.basecradle import BasecradleRoute
@@ -51,5 +56,6 @@ def create_app(
         registry=registry,
         config=config,
         waker=waker or HomeServerWaker(),
+        breaker=WakeRateBreaker(load_breaker_config(env)),
     )
     return WebhookServer(pipeline)
