@@ -9,9 +9,15 @@ import pytest
 
 from basecradle_router.config import (
     ConfigError,
+    load_breaker_config,
     load_config,
     load_github_trusted_actors,
 )
+
+_BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
+_BREAKER_WINDOW_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW"
+_BREAKER_COOLDOWN_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN"
+_BREAKER_STREAM_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX"
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -201,3 +207,43 @@ def test_trusted_actors_required_when_unset() -> None:
 def test_trusted_actors_empty_list_fails() -> None:
     with pytest.raises(ConfigError, match="lists no actors"):
         load_github_trusted_actors({_ACTORS_VAR: " , , "})
+
+
+# --- wake-rate breaker config ----------------------------------------------
+
+
+def test_breaker_config_defaults_when_unset() -> None:
+    cfg = load_breaker_config({})
+    assert (cfg.max_wakes, cfg.window, cfg.cooldown, cfg.stream_max_wakes) == (
+        20,
+        60.0,
+        60.0,
+        15,
+    )
+
+
+def test_breaker_config_reads_each_knob_from_env() -> None:
+    cfg = load_breaker_config(
+        {
+            _BREAKER_MAX_VAR: "30",
+            _BREAKER_WINDOW_VAR: "90",
+            _BREAKER_COOLDOWN_VAR: "120",
+            _BREAKER_STREAM_MAX_VAR: "0",
+        }
+    )
+    assert (cfg.max_wakes, cfg.window, cfg.cooldown, cfg.stream_max_wakes) == (
+        30,
+        90.0,
+        120.0,
+        0,
+    )
+
+
+def test_breaker_config_non_numeric_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError, match=f"{_BREAKER_MAX_VAR} must be an integer"):
+        load_breaker_config({_BREAKER_MAX_VAR: "lots"})
+
+
+def test_breaker_config_out_of_range_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError, match="invalid wake breaker configuration"):
+        load_breaker_config({_BREAKER_MAX_VAR: "0"})

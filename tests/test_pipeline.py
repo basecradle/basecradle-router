@@ -10,6 +10,7 @@ Test cast: John Doe (human) hands off; Nova Digital (``nova``, AI) is woken.
 import json
 from types import MappingProxyType
 
+from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, Stage
@@ -75,6 +76,7 @@ def _pipeline(
     waker: _StubWaker | None = None,
     config: Config | None = None,
     locks=None,
+    breaker: WakeRateBreaker | None = None,
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     kwargs = dict(
@@ -85,6 +87,8 @@ def _pipeline(
     )
     if locks is not None:
         kwargs["locks"] = locks
+    if breaker is not None:
+        kwargs["breaker"] = breaker
     return Pipeline(**kwargs), waker
 
 
@@ -336,6 +340,54 @@ def test_wake_gives_up_after_the_bound_and_records_failure() -> None:
     assert result.terminal is Outcome.FAILED
     assert result.stages[-1][0] is Stage.WAKE
     assert len(waker.calls) == 3  # the default bound
+
+
+# --- the wake-rate circuit breaker gates dispatch at the chokepoint --------
+
+
+def test_a_wake_burst_trips_the_breaker_and_halts_dispatch() -> None:
+    # A synthetic runaway: a low cap (2 wakes/window) so a third delivery trips
+    # the breaker at the chokepoint — the wake is refused, recorded, not dispatched.
+    breaker = WakeRateBreaker(BreakerConfig(max_wakes=2, window=60.0, cooldown=60.0))
+    pipeline, waker = _pipeline(breaker=breaker)
+
+    for _ in range(2):
+        result = pipeline.handle("github", _github_request())
+        assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert len(waker.calls) == 2
+
+    # The third dispatch trips: locked, then refused by the breaker — no wake.
+    tripped = pipeline.handle("github", _github_request())
+    assert tripped.stages == [
+        (Stage.ROUTE, Outcome.OK),
+        (Stage.VERIFY, Outcome.OK),
+        (Stage.NORMALIZE, Outcome.OK),
+        (Stage.RESOLVE, Outcome.OK),
+        (Stage.LOCK, Outcome.OK),
+        (Stage.BREAKER, Outcome.IGNORED),
+    ]
+    assert len(waker.calls) == 2  # dispatch stopped — the waker was not called again
+
+
+def test_breaker_cooldown_restores_dispatch_through_the_pipeline() -> None:
+    clock = [0.0]
+    breaker = WakeRateBreaker(
+        BreakerConfig(max_wakes=2, window=60.0, cooldown=30.0), clock=lambda: clock[0]
+    )
+    pipeline, waker = _pipeline(breaker=breaker)
+
+    for _ in range(2):
+        pipeline.handle("github", _github_request())
+    assert pipeline.handle("github", _github_request()).stages[-1] == (
+        Stage.BREAKER,
+        Outcome.IGNORED,
+    )  # tripped
+    assert len(waker.calls) == 2
+
+    clock[0] = 31.0  # past the cooldown
+    healed = pipeline.handle("github", _github_request())
+    assert healed.stages[-1] == (Stage.WAKE, Outcome.OK)  # dispatch resumed
+    assert len(waker.calls) == 3
 
 
 # --- the lock prevents concurrent double-wakes -----------------------------

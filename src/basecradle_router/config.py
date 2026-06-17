@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from basecradle_router.breaker import BreakerConfig
 from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
 
 _EMPTY: Mapping[str, Agent] = MappingProxyType({})
@@ -22,6 +23,12 @@ _AGENTS_VAR = f"{ENV_PREFIX}AGENTS"
 _ENABLED_ROUTES_VAR = f"{ENV_PREFIX}ENABLED_ROUTES"
 _DEFAULT_ENABLED_ROUTES = ("github",)
 _GITHUB_TRUSTED_ACTORS_VAR = f"{ENV_PREFIX}GITHUB_TRUSTED_ACTORS"
+
+_BREAKER_PREFIX = f"{ENV_PREFIX}WAKE_BREAKER_"
+_BREAKER_MAX_VAR = f"{_BREAKER_PREFIX}MAX"
+_BREAKER_WINDOW_VAR = f"{_BREAKER_PREFIX}WINDOW"
+_BREAKER_COOLDOWN_VAR = f"{_BREAKER_PREFIX}COOLDOWN"
+_BREAKER_STREAM_MAX_VAR = f"{_BREAKER_PREFIX}STREAM_MAX"
 
 
 class ConfigError(Exception):
@@ -228,6 +235,49 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         webhook_secrets=MappingProxyType(secrets),
         recipient_index=MappingProxyType(by_recipient),
     )
+
+
+def _int_env(env: Mapping[str, str], var: str, default: int) -> int:
+    raw = env.get(var)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise ConfigError(f"{var} must be an integer, got {raw!r}") from None
+
+
+def _float_env(env: Mapping[str, str], var: str, default: float) -> float:
+    raw = env.get(var)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        raise ConfigError(f"{var} must be a number, got {raw!r}") from None
+
+
+def load_breaker_config(env: Mapping[str, str] | None = None) -> BreakerConfig:
+    """Build the wake-rate breaker's :class:`BreakerConfig` from ``env``.
+
+    All four knobs are optional with generous safe defaults (so a deployment that
+    sets none still gets the runaway backstop): ``BASECRADLE_ROUTER_WAKE_BREAKER_MAX``
+    (per-agent wakes per window, default 20), ``_WINDOW`` (rolling window seconds,
+    default 60), ``_COOLDOWN`` (halt seconds after a trip, default 60), and
+    ``_STREAM_MAX`` (per-(agent, stream) wakes per window, default 15; ``0`` disables
+    the per-stream scope). An unparseable or out-of-range value is a loud
+    :class:`ConfigError` naming the variable, never a silent fallback to the default.
+    """
+    env = os.environ if env is None else env
+    try:
+        return BreakerConfig(
+            max_wakes=_int_env(env, _BREAKER_MAX_VAR, 20),
+            window=_float_env(env, _BREAKER_WINDOW_VAR, 60.0),
+            cooldown=_float_env(env, _BREAKER_COOLDOWN_VAR, 60.0),
+            stream_max_wakes=_int_env(env, _BREAKER_STREAM_MAX_VAR, 15),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"invalid wake breaker configuration: {exc}") from exc
 
 
 def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:
