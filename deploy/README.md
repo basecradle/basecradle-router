@@ -151,10 +151,14 @@ The `wake-runner` reads the same registry: for a harness entry it launches **onl
 `wake_bin` (which must resolve inside that agent's `/home/<user>`), never a caller-supplied path — the
 same registry-is-the-only-authority rule that confines builders to the system `claude`.
 
-**`agent.env`** (per agent, sourced by the wrapper *as that user*) holds that agent's secrets — its
+**`agent.env`** (per agent, loaded by the wrapper *as that user*) holds that agent's secrets — its
 `ANTHROPIC_API_KEY` and its GitHub App credentials, and later its BaseCradle token. This is the live
 implementation of `wake.py`'s `env_provider` seam: the env is resolved by the wrapper running as the
-agent, so the unprivileged `router` daemon never touches an agent secret. The GitHub App credentials are:
+agent, so the unprivileged `router` daemon never touches an agent secret. The file is parsed as
+**literal `KEY=VALUE` lines, never bash-`source`d** (#109): the value after the first `=` is taken
+verbatim (one layer of surrounding quotes stripped), so a secret containing `$`, a backtick, `$( )`,
+spaces, or quotes is loaded as data and never evaluated as shell. Quoting values is therefore optional,
+not load-bearing. The GitHub App credentials are:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 GH_APP_SLUG=basecradle-ruby-ai
@@ -239,8 +243,8 @@ once the box exists**.
   `sudoers` rule is command-generic (it grants only the wrapper), so adding the harness kind needs no
   sudoers change: the registry entry for the new agent is what authorizes its wake.
   It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
-  with that exact clone), `claude`-only — then `runuser`s to the agent, which sources its own `agent.env`
-  and execs the wake. **Install root-owned, in the root-owned `bin/`:**
+  with that exact clone), `claude`-only — then `runuser`s to the agent, which loads its own `agent.env`
+  (literal `KEY=VALUE`, never sourced — #109) and execs the wake. **Install root-owned, in the root-owned `bin/`:**
   `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
   `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
   (validate with `visudo -cf`). **After this first install, `deploy/deploy.sh` reinstalls the
@@ -249,7 +253,7 @@ once the box exists**.
   app-rsync mirrors). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
   dangerous, so it stays this documented manual step.
 - **B3** ✅ **Done (#40).** `HomeServerWaker` in `wake.py` assembles the wrapper argv
-  (`--user`/`--cwd`/`--`); env is empty (the wrapper sources the agent's `agent.env` after the drop).
+  (`--user`/`--cwd`/`--`); env is empty (the wrapper loads the agent's `agent.env` after the drop).
 - **B4** ✅ **Done (#30).** Fast-ack in `server.py`: `accept` runs inline → `202`, `execute` (the wake)
   runs as a tracked background task drained on shutdown.
 - **B5** Caddyfile (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
