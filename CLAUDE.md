@@ -103,6 +103,37 @@ The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency
 gh issue list --repo basecradle/basecradle-router --state open
 ```
 
+## Fleet Bot Identity
+
+This repo's builder agent — **basecradle-router AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-router-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the founder's account. **This is the law:** the constitution requires each agent to act under its own identity, *never anonymously behind the founder's account.* If a `gh`/git write lands as `drawkkwast` instead of the bot, the auth routing below was skipped — that is the bug, not a cosmetic detail.
+
+| Field | Value |
+|---|---|
+| App slug | `basecradle-router-ai` |
+| App ID | `3975290` |
+| Bot user ID | `291153759` |
+| Commit-author | `basecradle-router-ai[bot] <291153759+basecradle-router-ai[bot]@users.noreply.github.com>` |
+
+Operational setup for a session that will push or post as the bot:
+
+- **Auth routing — do this first, before any `gh`/git write.** Mint a short-lived (~1h) installation token with the shared fleet helper and route both `gh` and `git push` through it:
+  ```bash
+  HELPER=~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token
+  export GH_TOKEN="$("$HELPER" basecradle-router-ai)"      # gh + the GitHub API now act as the bot
+  # push via the freshly-minted authenticated remote (re-mint per batch; tokens last ~1h):
+  git push "$("$HELPER" basecradle-router-ai --remote)" <branch>
+  # equivalently: https://x-access-token:<token>@github.com/basecradle/basecradle-router.git
+  ```
+  With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and `gh api` all post as the bot. Re-mint per batch — the token is short-lived by design. (`gh api /user` 403s on an installation token — that is expected, not a failure; verify identity by reading/posting a repo resource instead.) The helper (`gh-app-token`) and its registry (`fleet-apps.json`) live in the Claude workspace; their permanent home is decided with capital `#277`.
+- **Git author (local, never committed).** Set this clone's `.git/config` so commits carry the bot author:
+  ```bash
+  git config --local user.name "basecradle-router-ai[bot]"
+  git config --local user.email "291153759+basecradle-router-ai[bot]@users.noreply.github.com"
+  ```
+  It lives in `.git/config` only — a fresh clone starts without it, so re-run after cloning. (`"$HELPER" basecradle-router-ai --author` prints this string.)
+- **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-router-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong.
+- **CI and bot PRs.** A `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so the automated `claude-review` is skipped on bot PRs. That is why self-review is mandatory: run `/code-review` on your own diff and address findings **before** opening the PR (see "Self-review before opening a PR" under Conventions).
+
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
 Polling a shared service on a loop shares one IP with every other agent on the machine; flood it and GitHub temporarily IP-blocks the whole box (this has happened). Stay far under the limits.
