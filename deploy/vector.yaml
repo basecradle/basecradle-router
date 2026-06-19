@@ -1,0 +1,88 @@
+# BaseCradle router (ai.basecradle.com) — Better Stack Vector config
+# (telemetry: host metrics + scrubbed journald).
+#
+# Canonical, version-controlled config for the router box. It mirrors basecradle-noc's proven,
+# security-hardened config (basecradle-noc#31 enabled telemetry; basecradle-noc#33 / basecradle#338
+# hardened the scrub after an unscrubbed-journald secret leak). Install: deploy/README "Part 5 — Telemetry".
+#
+# Tailored to this box (a webhook daemon + Caddy, no database), so the generated kitchen-sink config
+# (apache/nginx/mysql/mongo/redis/postgres log + metric sources scraping absent localhost endpoints)
+# is replaced with exactly what this box has:
+#   * journald     — ALL system logs AND the router's own software: the basecradle-router.service
+#                    uvicorn daemon and the drift/reboot/recovery units all log to the journal via
+#                    stdout/stderr. journald (not a /var/log/*.log tail) catches /var/log/syslog too.
+#   * host_metrics — CPU / memory / disk / load / network.
+#
+# SECURITY — never ship raw journald to an external store (basecradle-noc#33 / basecradle#338).
+# The `ai_scrub` transform runs before the logs sink and:
+#   * DROPS whole events from `sudo` (PAM logs the full argv — any secret passed on a command
+#     line lands here; the router escalates a wake via `sudo -> wake-runner`, so this matters) and
+#     from Vector itself (its own logs can echo the sink token via component ids/config — this is
+#     how the source token leaked ~40x on the NOC box);
+#   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`)
+#     from the message as defense in depth.
+# The source ingest token is NOT in this file — it is interpolated from
+# ${BETTERSTACK_AI_SOURCE_TOKEN}, supplied to vector.service via the chmod-640 EnvironmentFile
+# /etc/vector/betterstack.env (a systemd drop-in), so the secret never lives in the repo or the
+# YAML, and a rotation is a one-line swap of that env file.
+
+sources:
+  ai_journald:
+    type: "journald"
+    current_boot_only: true
+
+  ai_host_metrics:
+    type: "host_metrics"
+    scrape_interval_secs: 30
+    collectors: [cpu, disk, filesystem, load, host, memory, network]
+
+transforms:
+  ai_scrub:
+    type: "remap"
+    inputs:
+      - "ai_journald"
+    drop_on_abort: true
+    reroute_dropped: false
+    source: |
+      # Drop whole events that are known secret carriers. sudo logs the full command line (argv)
+      # via PAM, so any secret ever passed on a command line is here; Vector's own logs can echo
+      # the sink token (component ids / config). Never ship either back to Better Stack.
+      if .SYSLOG_IDENTIFIER == "sudo" || ."_COMM" == "sudo" || .SYSLOG_IDENTIFIER == "vector" || ."_SYSTEMD_UNIT" == "vector.service" {
+          abort
+      }
+      # Redact secret-shaped patterns from the message (defense in depth for anything else that
+      # logs a secret to stdout — e.g. a heartbeat ping logging its own secret URL on failure).
+      msg = to_string(.message) ?? ""
+      msg = replace(msg, r'gh[a-z]_[A-Za-z0-9]{20,}', "[REDACTED_GH_TOKEN]")
+      msg = replace(msg, r'(?i)bearer\s+[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
+      msg = replace(msg, r'https?://\S*/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
+      msg = replace(msg, r'bc_uat_[A-Za-z0-9]+', "[REDACTED_BC_TOKEN]")
+      .message = msg
+      # Better Stack reads the event timestamp from `dt` (mirrors the generated log parser).
+      del(.source_type)
+      .dt = del(.timestamp)
+
+sinks:
+  better_stack_logs:
+    type: "http"
+    method: "post"
+    uri: "https://s2531770.eu-fsn-3.betterstackdata.com/"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    auth:
+      strategy: "bearer"
+      token: "${BETTERSTACK_AI_SOURCE_TOKEN}"
+    inputs: ["ai_scrub"]
+
+  better_stack_metrics:
+    type: "http"
+    method: "post"
+    uri: "https://s2531770.eu-fsn-3.betterstackdata.com/metrics"
+    encoding:
+      codec: "json"
+    compression: "gzip"
+    auth:
+      strategy: "bearer"
+      token: "${BETTERSTACK_AI_SOURCE_TOKEN}"
+    inputs: ["ai_host_metrics"]
