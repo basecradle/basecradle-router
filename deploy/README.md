@@ -419,6 +419,88 @@ out-of-window reboot.
 
 ---
 
+## Part 5 — Telemetry (Better Stack Vector: host metrics + scrubbed journald)
+
+Out-of-band liveness (the capital's `/up` monitor) answers *"is the box alive?"*; **telemetry**
+answers *"what is the box and the daemon actually doing?"* — host metrics (CPU / memory / disk /
+load / network) and the journald stream (system logs **plus** the router's own software: the
+`basecradle-router.service` uvicorn daemon and the drift/reboot/recovery units, which log to journald
+via stdout/stderr). It is the Better Stack **Vector** agent, shipping both to Telemetry Source
+**"AI"** (ingest host `s2531770.eu-fsn-3.betterstackdata.com`, EU `eu-fsn-3`). This mirrors the
+proven, scrubbed config `basecradle-noc` already runs (basecradle-noc#31/#33).
+
+> **⚠️ SECURITY — never ship raw journald to an external store (basecradle-noc#33 / basecradle#338).**
+> An unscrubbed install on the NOC box shipped the *entire* journal and leaked three live secrets:
+> the source ingest token (~40× — the generated config embeds the token in every component id, and
+> Vector logs component ids constantly), plus a GitHub App token and a heartbeat URL (both from a
+> `sudo` command line — **PAM logs the full argv**). On this box the router escalates every wake via
+> `sudo -> wake-runner`, so the same `sudo` argv path is live here. The scrub below closes the class
+> and is **mandatory before telemetry is enabled** (basecradle#338 class guard).
+
+**The config is version-controlled — [`deploy/vector.yaml`](vector.yaml) is the single source of
+truth**, not Better Stack's generated kitchen-sink. It is tailored to this box (a webhook daemon +
+Caddy, no database) and has three load-bearing properties:
+
+1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
+   (the argv leak path) and from Vector itself (the self-logged-token path), and **redacts**
+   secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`) as defense in
+   depth. The drop + redaction rules are byte-faithful to NOC's `noc_scrub`; do not weaken them.
+2. **`host_metrics` → metrics sink**, direct (CPU/mem/disk/load/network). The scrub guards the
+   **journald** path only — by design, mirroring NOC. `host_metrics` events are numeric gauges with
+   metric-name/host tags; they carry **no** `message`, no `sudo` argv, no `SYSLOG_IDENTIFIER` — there
+   is nothing for the log-shaped `ai_scrub` remap to drop or redact, and routing them through it would
+   *corrupt* them (it rewrites `.timestamp`→`.dt` and reads log-only fields). So "scrub before the
+   sink" is meaningful only for logs; the secret-leak class (basecradle#338) lives entirely in the
+   journald stream, and that is what `ai_scrub` gates.
+3. **The ingest token is not in the YAML** — `${BETTERSTACK_AI_SOURCE_TOKEN}` is interpolated from
+   the chmod-640 `/etc/vector/betterstack.env`, supplied to `vector.service` by the systemd drop-in
+   [`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`](systemd/vector.service.d/10-ai-betterstack-env.conf).
+   The secret lives in exactly one place; a rotation is a one-line swap of that file + a restart.
+
+**Never pass a secret as a command-line argument** (to `sudo`, `bash -s`, anything) — sudo/PAM logs
+the whole command line to the journal, and on a telemetry box that ships it. Pass secrets via
+**stdin (a piped heredoc), an env var, or a chmod-600 file**.
+
+> **Division of labor (issue #116).** The router seat authors the version-controlled config here
+> (this repo, merged to `main`); the **capital** does the on-box install, creates the token file, and
+> live-verifies. The steps below are the capital's runbook — they are **not** run from this repo's
+> `deploy/deploy.sh` (which deploys only the router daemon).
+
+### Install / update (capital, on-box)
+
+```bash
+# one-time: install the Vector apt package (the generated config it writes is replaced below)
+curl -sSL https://telemetry.betterstack.com/setup-vector/ubuntu/<SOURCE_TOKEN> -o /tmp/setup-vector.sh \
+  && yes '' | sudo bash /tmp/setup-vector.sh && rm -f /tmp/setup-vector.sh
+
+# the token's only home (chmod 640 root:vector) — substitute the real token; never commit it
+printf 'BETTERSTACK_AI_SOURCE_TOKEN=%s\n' "<SOURCE_TOKEN>" | sudo tee /etc/vector/betterstack.env
+sudo chown root:vector /etc/vector/betterstack.env && sudo chmod 640 /etc/vector/betterstack.env
+
+# systemd drop-in so vector.service sees the token for ${…} interpolation (from the repo checkout)
+sudo install -D -o root -g root -m 644 \
+  deploy/systemd/vector.service.d/10-ai-betterstack-env.conf \
+  /etc/systemd/system/vector.service.d/10-ai-betterstack-env.conf
+sudo systemctl daemon-reload
+
+# install the canonical scrubbed config (from the repo checkout), validate, restart
+sudo install -o root -g vector -m 640 deploy/vector.yaml /etc/vector/vector.yaml
+sudo bash -c 'set -a; . /etc/vector/betterstack.env; vector validate /etc/vector/vector.yaml'
+sudo systemctl restart vector
+```
+
+### Verify (the definition of done — capital)
+
+In **Better Stack → Live Tail** for the **"AI"** source: (a) system/journald logs flow, (b) the
+router's own daemon/unit logs flow, (c) host metrics populate the **"Host (Vector)"** dashboard
+(source = AI) — and **zero secret values** anywhere (the scrub is the gate). To test the scrub
+offline, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`: a
+synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and a message carrying a
+`ghs_…`/`…/heartbeat/…` token must come back `[REDACTED_…]`. Re-test after a reboot:
+`systemctl status vector` active and Live Tail resumes.
+
+---
+
 ## Founder gates (in order)
 The human actions this phase needs. Surfaced here so they are never a surprise; the steward builds
 right up to each gate and pauses only at it.
@@ -428,3 +510,6 @@ right up to each gate and pauses only at it.
 3. **Anthropic API key:** one per agent — start with **basecradle-ruby AI**.
 4. **GitHub App webhook** → `https://ai.basecradle.com/webhooks/github`, signing secret matched to
    `router.env`.
+5. **Better Stack "AI" source token** (telemetry, Part 5) — the **capital** places it on-box at
+   `/etc/vector/betterstack.env` (chmod 640 root:vector), installs Vector + the version-controlled
+   config, and live-verifies. Never committed to the repo.
