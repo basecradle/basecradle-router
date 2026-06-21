@@ -469,12 +469,25 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 ### Install / update (capital, on-box)
 
 ```bash
-# one-time: install the Vector apt package (the generated config it writes is replaced below)
-curl -sSL https://telemetry.betterstack.com/setup-vector/ubuntu/<SOURCE_TOKEN> -o /tmp/setup-vector.sh \
-  && yes '' | sudo bash /tmp/setup-vector.sh && rm -f /tmp/setup-vector.sh
+# one-time: install Vector from the official .deb — NOT Better Stack's setup-script.
+# Why the .deb and not `curl …/setup-vector/ubuntu/<TOKEN> | sudo bash`: that URL carries the source
+# token as a path segment, so it lands in argv (sudo/PAM and process logs capture it — the
+# secrets-in-argv class the constitution prohibits), and the script auto-starts Vector on a generated
+# config that embeds the token in every component id (Vector logs component ids constantly — the exact
+# path that self-leaked the NOC token ~40×). The .deb carries no token and avoids both. The timber.io
+# apt repo is dead (Vector moved to Datadog), so pin the release from GitHub.
+VECTOR_VERSION=0.56.0
+curl -fsSL -o /tmp/vector.deb \
+  "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb"
+sudo apt-get install -y /tmp/vector.deb && rm -f /tmp/vector.deb
+# the .deb enables+starts Vector on its stock config — stop+disable until the scrubbed config is in place
+sudo systemctl disable --now vector
 
-# the token's only home (chmod 640 root:vector) — substitute the real token; never commit it
-printf 'BETTERSTACK_AI_SOURCE_TOKEN=%s\n' "<SOURCE_TOKEN>" | sudo tee /etc/vector/betterstack.env
+# the token's only home (chmod 640 root:vector) — substitute the real token; never commit it.
+# Pass it via stdin (this piped heredoc) or scp a pre-written file — never as a command argument.
+sudo tee /etc/vector/betterstack.env >/dev/null <<'EOF'
+BETTERSTACK_AI_SOURCE_TOKEN=<SOURCE_TOKEN>
+EOF
 sudo chown root:vector /etc/vector/betterstack.env && sudo chmod 640 /etc/vector/betterstack.env
 
 # systemd drop-in so vector.service sees the token for ${…} interpolation (from the repo checkout)
@@ -483,10 +496,10 @@ sudo install -D -o root -g root -m 644 \
   /etc/systemd/system/vector.service.d/10-ai-betterstack-env.conf
 sudo systemctl daemon-reload
 
-# install the canonical scrubbed config (from the repo checkout), validate, restart
+# install the canonical scrubbed config (from the repo checkout), validate, then enable + start
 sudo install -o root -g vector -m 640 deploy/vector.yaml /etc/vector/vector.yaml
 sudo bash -c 'set -a; . /etc/vector/betterstack.env; vector validate /etc/vector/vector.yaml'
-sudo systemctl restart vector
+sudo systemctl enable --now vector
 ```
 
 ### Verify (the definition of done — capital)
