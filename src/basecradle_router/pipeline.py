@@ -59,6 +59,7 @@ from basecradle_router.routes import (
     UntrustedSenderError,
 )
 from basecradle_router.wake import WakeError, Waker, WakeResult
+from basecradle_router.wakelock import WakeLockGuard
 
 logger = logging.getLogger("basecradle_router.pipeline")
 
@@ -71,6 +72,7 @@ class Stage(Enum):
     NORMALIZE = "normalize"
     RESOLVE = "resolve"
     LOCK = "lock"
+    WAKE_LOCK = "wake_lock"
     BREAKER = "breaker"
     WAKE = "wake"
 
@@ -141,6 +143,7 @@ class Pipeline:
     waker: Waker
     locks: AgentLocks = field(default_factory=AgentLocks)
     breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
+    wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
 
@@ -177,7 +180,7 @@ class Pipeline:
         return AcceptResult(result=result, pending=pending)
 
     def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
-        """The slow half: lock → breaker → wake, appended to ``result``; never raises.
+        """The slow half: lock → wake-lock → breaker → wake, appended to ``result``; never raises.
 
         Serialized per agent — by the agent's harness-instance identity, not its
         repo — so an agent never runs two concurrent sessions against its one
@@ -187,7 +190,18 @@ class Pipeline:
         ordered stream the lone harness instance drains, so a future input module
         can never fan a second parallel session onto the same agent.
 
-        Inside the lock, immediately before the wake, the **wake-rate circuit
+        Inside the lock, the **NOC wake-lock** is honoured first
+        (basecradle-router#120): while the NOC converges (upgrades) this agent's
+        harness it holds a lock at ``/run/basecradle-noc/wake-locks/<slug>.lock``, and
+        the router *refuses* the wake rather than land it on a half-installed venv.
+        A held lock is recorded ``WAKE_LOCK``/``IGNORED`` and no wake runs (the
+        message stays on the platform's read API and the agent picks it up on its
+        next wake once the lock clears); a stale or absent lock falls through to the
+        wake (the guard logs the stale case). It is checked *before* the breaker so a
+        NOC-quiesced agent never consumes breaker budget. See
+        :mod:`basecradle_router.wakelock` for every edge and its fail-direction.
+
+        Then, immediately before the wake, the **wake-rate circuit
         breaker** gates the dispatch (basecradle-router#110): it counts the rate at
         which wakes actually fire for this agent (and this sub-stream) and, over a
         generous sanity cap, *refuses* the wake — a logged, visible decision and a
@@ -206,6 +220,12 @@ class Pipeline:
         try:
             with self.locks.guard(agent.harness_key):
                 self._record(result, Stage.LOCK, Outcome.OK, agent.harness_key)
+                decision = self.wake_lock.check(agent.harness_key)
+                if not decision.should_wake:
+                    # The NOC holds a converge wake-lock for this agent — a
+                    # deliberate, visible drop (the guard already logged it loudly).
+                    self._record(result, Stage.WAKE_LOCK, Outcome.IGNORED, decision.detail)
+                    return
                 outcome = self.breaker.admit(agent.harness_key, event.stream_key)
                 if not outcome.admitted:
                     # A trip/refusal is a deliberate, visible drop — recorded like the

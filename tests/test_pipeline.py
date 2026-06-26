@@ -17,6 +17,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
+from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 SECRET = "whsec_" + "0" * 32
 BASECRADLE_SECRET = "whsec_" + "1" * 32
@@ -77,6 +78,7 @@ def _pipeline(
     config: Config | None = None,
     locks=None,
     breaker: WakeRateBreaker | None = None,
+    wake_lock: WakeLockGuard | None = None,
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     kwargs = dict(
@@ -89,7 +91,24 @@ def _pipeline(
         kwargs["locks"] = locks
     if breaker is not None:
         kwargs["breaker"] = breaker
+    if wake_lock is not None:
+        kwargs["wake_lock"] = wake_lock
     return Pipeline(**kwargs), waker
+
+
+class _StubWakeLock:
+    """A wake-lock guard stub keyed by slug, so a test pins a held/stale lock."""
+
+    def __init__(self, decisions: dict[str, WakeLockState] | None = None) -> None:
+        self.decisions = decisions or {}
+        self.checked: list[str] = []
+
+    def check(self, slug: str):
+        from basecradle_router.wakelock import WakeLockDecision
+
+        self.checked.append(slug)
+        state = self.decisions.get(slug, WakeLockState.ABSENT)
+        return WakeLockDecision(state, state.value)
 
 
 def _github_request(
@@ -388,6 +407,76 @@ def test_breaker_cooldown_restores_dispatch_through_the_pipeline() -> None:
     healed = pipeline.handle("github", _github_request())
     assert healed.stages[-1] == (Stage.WAKE, Outcome.OK)  # dispatch resumed
     assert len(waker.calls) == 3
+
+
+# --- the NOC wake-lock interlock gates dispatch (basecradle-router#120) -----
+
+
+def test_held_wake_lock_refuses_the_wake() -> None:
+    # The NOC is converging this agent: the lock is held, so the wake is refused
+    # at the WAKE_LOCK stage — locked, then dropped, and the waker is never called.
+    wake_lock = _StubWakeLock({"nova": WakeLockState.HELD})
+    pipeline, waker = _pipeline(wake_lock=wake_lock)
+
+    result = pipeline.handle("github", _github_request())
+    assert result.stages == [
+        (Stage.ROUTE, Outcome.OK),
+        (Stage.VERIFY, Outcome.OK),
+        (Stage.NORMALIZE, Outcome.OK),
+        (Stage.RESOLVE, Outcome.OK),
+        (Stage.LOCK, Outcome.OK),
+        (Stage.WAKE_LOCK, Outcome.IGNORED),
+    ]
+    assert waker.calls == []  # no wake landed on the converging agent
+    assert wake_lock.checked == ["nova"]  # checked by the agent's slug (harness_key)
+
+
+def test_unparseable_wake_lock_also_refuses() -> None:
+    # Present-but-malformed honours "Present = locked": refuse, same as held.
+    wake_lock = _StubWakeLock({"nova": WakeLockState.UNPARSEABLE})
+    pipeline, waker = _pipeline(wake_lock=wake_lock)
+    result = pipeline.handle("github", _github_request())
+    assert result.stages[-1] == (Stage.WAKE_LOCK, Outcome.IGNORED)
+    assert waker.calls == []
+
+
+def test_stale_wake_lock_wakes_normally() -> None:
+    # A stale (expired) lock does not gate: dispatch proceeds through to the wake.
+    wake_lock = _StubWakeLock({"nova": WakeLockState.STALE})
+    pipeline, waker = _pipeline(wake_lock=wake_lock)
+    result = pipeline.handle("github", _github_request())
+    assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert len(waker.calls) == 1
+
+
+def test_absent_wake_lock_wakes_normally() -> None:
+    # No lock present: the common case — wake, with no WAKE_LOCK record in the trace.
+    pipeline, waker = _pipeline(wake_lock=_StubWakeLock())
+    result = pipeline.handle("github", _github_request())
+    assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert Stage.WAKE_LOCK not in [s for s, _ in result.stages]
+
+
+def test_held_wake_lock_does_not_consume_breaker_budget() -> None:
+    # The wake-lock is checked BEFORE the breaker, so a refused wake never records
+    # against the breaker window: after the lock clears, full budget remains.
+    breaker = WakeRateBreaker(BreakerConfig(max_wakes=2, window=60.0, cooldown=60.0))
+    wake_lock = _StubWakeLock({"nova": WakeLockState.HELD})
+    pipeline, waker = _pipeline(breaker=breaker, wake_lock=wake_lock)
+
+    # Three deliveries arrive while the lock is held — all refused, none counted.
+    for _ in range(3):
+        assert pipeline.handle("github", _github_request()).stages[-1] == (
+            Stage.WAKE_LOCK,
+            Outcome.IGNORED,
+        )
+    assert waker.calls == []
+
+    # The converge finishes (lock clears); two wakes still fit under the cap.
+    wake_lock.decisions.clear()
+    for _ in range(2):
+        assert pipeline.handle("github", _github_request()).stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert len(waker.calls) == 2
 
 
 # --- the lock prevents concurrent double-wakes -----------------------------
