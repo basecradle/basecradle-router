@@ -120,6 +120,23 @@ pauses its push until the loop is understood. The breaker is defense-in-depth wi
 the harness's own per-timeline self-breaker (basecradle-harness#138): no shared protocol, each trips on
 its own view.
 
+The **NOC wake-lock interlock** (issue #120, counterpart to basecradle-noc#38) keeps the router from
+waking an agent while the NOC is converging (upgrading) its harness — a wake landing on a half-installed
+venv is the failure to avoid. The NOC writes a root-owned lock at
+`/run/basecradle-noc/wake-locks/<slug>.lock` (on the `/run` tmpfs, so a reboot clears stale locks) for
+the duration of a converge; before each wake the router reads the agent's lock and, if it is **present
+and unexpired**, *refuses* the wake — logging `event=wake_refused reason=wake_lock_held agent=<slug>`
+(visible in BetterStack Live Tail via the `AI` source). No data is lost: the message stays on the
+platform's read API and the agent processes it on its next wake once the lock clears. An **expired** lock
+(the NOC died mid-converge) is treated as stale — the router wakes but logs `event=wake_lock_stale` so
+the wedged converge is visible. There is **nothing to configure** (the lock path is the only contract,
+pinned by the capital) and it is harmless with no locks present — no lock file, never refuses. The lock
+content is non-secret (slug + converge reason + timestamps), so the NOC publishes it world-readable
+(root-owned `0644` in a `0755` dir) and the unprivileged `router` daemon reads it directly; a perms fault
+fails *open* (the router wakes) with a loud `event=wake_lock_unreadable` `ERROR` rather than wedge the
+fleet. Independent of the harness's own self-breaker and of the wake-rate breaker — defense-in-depth,
+each layer on its own view.
+
 #### The registry (`agents.json`)
 
 A JSON object of **agent key → fields**. The key is the agent's stable slug: a GitHub builder's key is
