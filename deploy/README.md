@@ -7,10 +7,18 @@
 
 ## What this is
 
-The router is deployed to **one dedicated box that *is* the fleet's home** — `ai.basecradle.com`, a
-dedicated Ubuntu server. It is not a published package; "shipping" is deploying here. **basecradle-router
-AI is the server steward**: it owns provisioning, the per-agent OS users, hardening, and the systemd
-service. All server/deploy config lives in this repo (`deploy/`), not a separate infra repo.
+The router daemon runs on **one dedicated box that *is* the fleet's home** — `ai.basecradle.com`, a
+dedicated Ubuntu server. It is not a published package; the daemon reaches the box by deploy, not by
+release.
+
+> **Who does what (capital PR basecradle#363, issue #122).** **basecradle-router AI builds and
+> maintains the router daemon's code and all the version-controlled server/deploy config in this repo
+> (`deploy/`) — it never deploys.** The **capital owns and operates `ai.basecradle.com`** (the **NOC**
+> once its fleet-ops ships): it provisions the box, creates the per-agent OS users, installs the daemon,
+> and runs every command in this doc that touches the box. The router-AI is a **tenant** on the box, not
+> its operator. Throughout this doc, work marked *(router-AI)* is config the agent authors in this repo;
+> anything that installs, runs, or hardens on the box is the **capital/NOC's**, even where older wording
+> below still reads as if one actor did both.
 
 On that box the router runs as a `systemd` service, receives signed webhooks at a TLS endpoint, and —
 per inbound event — **wakes the target repo's agent by running its headless `claude -p` as that agent's
@@ -47,7 +55,7 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   for the foreseeable future and is not migrated to the server now.
 - **One unprivileged `router` service user** runs the daemon. It does **not** run as root and
   **cannot read any agent's secrets**. This is deliberately a *minimal, non-agent* service account, kept
-  separate from the fleet-slug agent users (steward's call, per #26): the daemon is the dispatcher, never
+  separate from the fleet-slug agent users (router-AI's design call, per #26): the daemon is the dispatcher, never
   a woken agent, so it carries no fleet identity — just the least privilege it needs to run and escalate.
 - **Privilege drop for a wake:** the `router` user escalates *only* through a **root-owned wrapper**,
   `/opt/basecradle-router/bin/wake-runner`, invoked via a locked `sudoers` rule that grants `router`
@@ -55,8 +63,9 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   registry, then `exec`s `runuser -u basecradle-<repo>-ai -- claude -p "<trigger>"` in that agent's
   clone. **The wrapper is the privilege boundary** — deliberately not argv-matching in `sudoers` (which
   is brittle and bypassable). This keeps the long-running webhook daemon fully unprivileged.
-- **The steward** (basecradle-router AI) runs on the box inherently as the daemon's operator; it needs
-  no separate wake-user.
+- **The box's operator** (the capital today; the NOC once its fleet-ops ships) acts on the box over its
+  own administrative SSH, not as a fleet wake-user — it installs and operates the daemon. basecradle-router
+  AI has **no** operator presence on the box: it authors this config in the repo and never logs in to deploy.
 
 ### Filesystem & credential layout
 ```
@@ -226,15 +235,18 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
 
 ## Part 2 — Deployment roadmap
 
-Sequenced; *(founder)* marks a human gate, *(steward)* marks basecradle-router AI's work. Phase B
-files are **authored ahead as ready-to-review artifacts** (per Drawk, 2026-06-05) but **applied only
-once the box exists**.
+Sequenced. The markers name the actor: *(founder)* a human gate; *(router-AI)* config
+basecradle-router AI **authors in this repo** (never runs on the box); *(capital/NOC)* an on-box action
+the **capital** runs today (the NOC once its fleet-ops ships). The router-AI never deploys — anything that
+installs, clones, runs, or hardens on the box is the capital/NOC's, even where an item also has authored
+config the router-AI wrote. Phase B files are **authored ahead as ready-to-review artifacts** (per Drawk,
+2026-06-05) but **applied only once the box exists**.
 
 ### Phase A — Provisioning
 - **A1** *(founder)* Provision the Lightsail Ubuntu 24.04 box (4 GB/2 vCPU/80 GB), attach a static IP,
   open firewall 22/80/443.
 - **A2** *(founder)* DNS: `ai.basecradle.com` **A →** static IP.
-- **A3** *(steward — authorable now)* `deploy/bootstrap.sh`: an **idempotent bash** setup script —
+- **A3** *(router-AI authors; capital/NOC runs)* `deploy/bootstrap.sh`: an **idempotent bash** setup script —
   create the `router` + per-agent users, install the system toolchains, lay down the directories with
   their modes/owners, install Caddy. Bash over Ansible: one box, "convention over configuration";
   structured so it could become Ansible *if* the fleet ever goes multi-host (out of scope now).
@@ -292,7 +304,7 @@ once the box exists**.
 The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + router-wake loop end-to-end.
 - **C1** *(founder)* Create a per-agent **Anthropic API key** for basecradle-ruby AI; place ruby's
   `agent.env` on the box.
-- **C2** *(steward)* Create `basecradle-ruby-ai`, clone `basecradle-ruby` into `/home/basecradle-ruby-ai/repos/basecradle-ruby`, register it in `agents.json`.
+- **C2** *(capital/NOC)* Create `basecradle-ruby-ai`, clone `basecradle-ruby` into `/home/basecradle-ruby-ai/repos/basecradle-ruby`, register it in `agents.json` (an on-box action — the router-AI authors the registry shape, the operator applies it).
 - **C3** *(founder)* Enable the **GitHub App webhook** → `https://ai.basecradle.com/webhooks/github`,
   signing secret matching `router.env`.
 - **C4** **Canary run:** file a trivial `handoff` issue on `basecradle-ruby` and confirm the **live**
@@ -302,25 +314,34 @@ The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + rout
   decision it stays on the laptop for the foreseeable future, so it is effectively not migrated this
   phase.
 
-### Phase D — Hardening (ongoing steward duty)
+### Phase D — Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
 clean-reboot mechanism in Part 4), retention for the pipeline's structured stage log, backup of
-`agents.json` with a documented rebuild, and liveness alerting on the systemd service.
+`agents.json` with a documented rebuild, and liveness alerting on the systemd service. The router-AI
+authors and maintains this hardening config in the repo; the box's operator (capital/NOC) applies and
+runs it on the box.
 
 ---
 
-## Part 3 — Shipping: the deploy loop (Definition of Done)
+## Part 3 — Shipping: the deploy loop (the deployer's Definition of Done)
 
-**`merged` ≠ `done`.** The artifact is a running service; a merge to `main` changes nothing on the box
-until the code is rsynced there and the daemon restarts. Issue #54 was the proof: #50/#52/#53 sat merged
-but unrun for a day while the live daemon served pre-#52 code, because "done" silently meant "merged" and
-nothing redeployed. The Definition of Done is therefore the full loop, codified in `CLAUDE.md`
-("Deploying — Definition of Done") and implemented here:
+> **The router-AI never runs this loop.** Deploying is the **capital/NOC's** job (CLAUDE.md → "Building
+> vs. Deploying — the router-AI never deploys", issue #122). `deploy/deploy.sh` carries a `DEPLOYER`
+> guard that refuses to run unless the deployer declares itself (`DEPLOYER=noc`). This section is the
+> **deployer's** runbook; the router-AI's only stake in it is keeping this config correct, green, and
+> merged.
+
+**For the deployer, `merged` ≠ `done`.** The artifact is a running service; a merge to `main` changes
+nothing on the box until the code is rsynced there and the daemon restarts. Issue #54 was the proof:
+#50/#52/#53 sat merged but unrun for a day while the live daemon served pre-#52 code, because "done"
+silently meant "merged" and nothing redeployed. The deployer's Definition of Done is therefore the full
+loop, mirrored in `CLAUDE.md` ("Building vs. Deploying") and implemented here:
 
 > **tested (offline) → deployed to the box → smoke-tested LIVE → confirmed.**
 
 ### One command: `deploy/deploy.sh`
-Run from a trusted local checkout. It *is* the loop, so a deploy can never silently half-finish:
+Run by the deployer (capital/NOC) from a trusted local checkout, with `DEPLOYER=noc`. It *is* the loop, so
+a deploy can never silently half-finish:
 
 1. **Test (offline gate)** — refuses to proceed unless `ruff` + `pytest` pass locally **and** `HEAD ==
    origin/main` with a clean tree (so you can only ship merged, current code; `FORCE=1` overrides for an
@@ -338,11 +359,12 @@ Run from a trusted local checkout. It *is* the loop, so a deploy can never silen
    "in sync".
 
 ```bash
-# from the laptop checkout, on a clean main:
-ROUTER_SSH_KEY=<path to the Lightsail key> deploy/deploy.sh
+# deployer (capital/NOC) only, from a trusted checkout on a clean main:
+DEPLOYER=noc ROUTER_SSH_KEY=<path to the Lightsail key> deploy/deploy.sh
 ```
-Config via env: `ROUTER_HOST` (default `ubuntu@ai.basecradle.com` — the public DNS name; **no infra IP
-lives in this repo**), `ROUTER_SSH_KEY`, `SMOKE_URL`, `FORCE=1`.
+Config via env: `DEPLOYER` (**required** — `noc`/`capital`; the deployer-acknowledgment guard, since the
+router-AI never deploys), `ROUTER_HOST` (default `ubuntu@ai.basecradle.com` — the public DNS name; **no
+infra IP lives in this repo**), `ROUTER_SSH_KEY`, `SMOKE_URL`, `FORCE=1`.
 
 > **Why rsync-from-laptop, not a token on the box?** The box holds the fleet's crown jewels, so it carries
 > no GitHub credential — code arrives by rsync from a trusted checkout, never by the box pulling. The daemon
@@ -532,8 +554,8 @@ synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and
 ---
 
 ## Founder gates (in order)
-The human actions this phase needs. Surfaced here so they are never a surprise; the steward builds
-right up to each gate and pauses only at it.
+The human actions this phase needs. Surfaced here so they are never a surprise; the router-AI authors
+right up to each gate and pauses only at it, and the capital/NOC operates the box past it.
 
 1. **Provision** Lightsail Ubuntu 24.04, **4 GB / 2 vCPU / 80 GB**, static IP, firewall **22/80/443**.
 2. **DNS:** `ai.basecradle.com` **A →** `<static IP>`.

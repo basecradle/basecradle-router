@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 #
-# deploy/deploy.sh — the one command that SHIPS the router.
+# deploy/deploy.sh — the deployer's one-command deploy loop for the router daemon.
 #
-# For this repo, "merged" is not "done": the artifact is a running service, and a
+# WHO RUNS THIS: the NOC — the capital, in the interim, until NOC fleet-ops ships.
+# NOT basecradle-router AI. Per the constitution ("One deployer for the fleet's
+# machines: the NOC … a captain builds and maintains software but never deploys
+# it", Operational Baselines / capital PR basecradle#363) and this repo's CLAUDE.md
+# ("Building vs. Deploying — the router-AI never deploys"), this agent authors and
+# maintains this script as code but never RUNS it against the box. The DEPLOYER
+# guard below enforces that: a bare `deploy/deploy.sh` refuses to run, so a reflexive
+# self-deploy can't happen again (the cleanup of issue #122).
+#
+# For the deployer, "merged" is not "done": the artifact is a running service, and a
 # merge to main does nothing to the box until the code is rsynced there and the
 # daemon is restarted. This script is the whole Definition-of-Done loop in one
 # place, so a deploy can never silently half-finish (the failure mode that produced
@@ -22,6 +31,8 @@
 # lives in this repo; the host is the public DNS name, overridable by env.
 #
 # Config (env overrides):
+#   DEPLOYER        REQUIRED — must be `noc` or `capital`. The deployer-acknowledgment
+#                   guard: basecradle-router AI never deploys, so a bare run refuses.
 #   ROUTER_HOST     ssh target            (default ubuntu@ai.basecradle.com)
 #   ROUTER_SSH_KEY  ssh private key path  (default: your ssh config / agent)
 #   SMOKE_URL       smoke-test endpoint   (default https://ai.basecradle.com/webhooks/github)
@@ -48,6 +59,20 @@ die() {
 	printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
 	exit 1
 }
+
+# --- DEPLOYER guard: the router-AI never deploys ---------------------------
+# Only the NOC (the capital, in the interim) deploys the router daemon to the box.
+# basecradle-router AI builds and maintains this code but never runs it against
+# ai.basecradle.com (constitution: "One deployer for the fleet's machines: the NOC";
+# CLAUDE.md: "Building vs. Deploying — the router-AI never deploys"; issue #122).
+# A bare `deploy/deploy.sh` therefore refuses to run: the deployer must declare
+# itself with DEPLOYER=noc (or DEPLOYER=capital). This is the speed-bump that stops a
+# reflexive self-deploy — it is not a security boundary (the box's SSH/sudoers are),
+# but it makes "the router-AI never deploys" mechanical, not just documented.
+case "${DEPLOYER:-}" in
+noc | capital) ;;
+*) die "Refusing to deploy: basecradle-router AI NEVER deploys — only the NOC (capital, interim) does (constitution → 'One deployer for the fleet's machines: the NOC'). If you are the NOC/capital running the on-box install, re-run with DEPLOYER=noc. If you are the router-AI: stop — file a finding/handoff to the capital instead of self-deploying (issue #122)." ;;
+esac
 
 ssh_opts=(-o StrictHostKeyChecking=accept-new)
 [[ -n "$ROUTER_SSH_KEY" ]] && ssh_opts+=(-i "$ROUTER_SSH_KEY")
