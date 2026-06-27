@@ -14,11 +14,22 @@ release.
 > **Who does what (capital PR basecradle#363, issue #122).** **basecradle-router AI builds and
 > maintains the router daemon's code and all the version-controlled server/deploy config in this repo
 > (`deploy/`) — it never deploys.** The **capital owns and operates `ai.basecradle.com`** (the **NOC**
-> once its fleet-ops ships): it provisions the box, creates the per-agent OS users, installs the daemon,
-> and runs every command in this doc that touches the box. The router-AI is a **tenant** on the box, not
-> its operator. Throughout this doc, work marked *(router-AI)* is config the agent authors in this repo;
-> anything that installs, runs, or hardens on the box is the **capital/NOC's**, even where older wording
-> below still reads as if one actor did both.
+> once its fleet-ops ships): it provisions the box, installs the daemon, and runs every command in this
+> doc that touches the box. The router-AI is a **tenant** on the box, not its operator. Throughout this
+> doc, work marked *(router-AI)* is config the agent authors in this repo; anything that installs, runs,
+> or hardens on the box is the **capital/NOC's**, even where older wording below still reads as if one
+> actor did both.
+>
+> **One caveat on "creates the per-agent OS users" — not yet true for *builder* agents.** The NOC's
+> fleet-ops provisions **harness personas** today (venv + `pip install basecradle-harness` + the `AI_*`
+> env); it cannot yet provision a **Claude-Code builder agent** (system `claude` + `ANTHROPIC_API_KEY`,
+> no venv). That capability is being **added** to the NOC as a composable *builder-leaf brick* in
+> [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53), ported from this repo's
+> `deploy/bootstrap.sh`. Until that leaf lands **and is verified live**, builder onboarding (creating the
+> builder OS user, seeding `~/.claude`, the per-agent token minter + memory dir) is done with
+> `deploy/bootstrap.sh` + out-of-band steps, run by the **capital/operator** as the interim mechanic —
+> **never by the router-AI**. So where this doc says the capital/NOC "creates the per-agent OS users,"
+> read it as **live for harness personas, in-flight for builders (noc#53)**.
 
 On that box the router runs as a `systemd` service, receives signed webhooks at a TLS endpoint, and —
 per inbound event — **wakes the target repo's agent by running its headless `claude -p` as that agent's
@@ -53,6 +64,14 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   naming scheme. Home mode `700`; each holds only its own credentials, unreadable by siblings.
   **basecradle AI (the capital) gets no OS user yet** — it stays on the founder's laptop + subscription
   for the foreseeable future and is not migrated to the server now.
+  > **These builder slugs are the *target* layout, not the current roster.** Today only
+  > **`basecradle-ruby-ai`** actually exists on the box — and it was **hand-built** (via
+  > `deploy/bootstrap.sh` + out-of-band onboarding) before the NOC became sole deployer, not
+  > NOC-provisioned. **`basecradle-python-ai`, `basecradle-harness-ai`, …** are not yet provisioned:
+  > the NOC's fleet-ops can stand up **harness personas** but not **Claude-Code builders**, and that
+  > builder-provisioning capability is being added to the NOC as a composable builder-leaf brick in
+  > [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53). So a builder slug
+  > appearing in this layout means "this is where it *will* live," not "the NOC creates it today."
 - **One unprivileged `router` service user** runs the daemon. It does **not** run as root and
   **cannot read any agent's secrets**. This is deliberately a *minimal, non-agent* service account, kept
   separate from the fleet-slug agent users (router-AI's design call, per #26): the daemon is the dispatcher, never
