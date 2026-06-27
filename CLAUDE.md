@@ -58,7 +58,7 @@ Because the router is the **single chokepoint for every wake** — every source'
 
 **In:** the `github` route end-to-end — a handoff issue (labeled `handoff`) → signed webhook → core wakes the target repo's agent → agent does the work, self-reviews, opens a PR, reports on the originating issue. Per-agent lock (no double-wakes — one harness instance per agent; see "One harness instance per agent" above). **Merge autonomy (Earned Autonomy)**: a captain's own PRs auto-merge on green CI — code, docs, charter alike — with **no per-PR human review** (a merge to `main` is reversible, so it needs no gate). The only firebreaks are at the *irreversible/outward* step (publish/deploy), enforced at the **platform** (a GitHub Environment approval) and only for agents that have not yet earned the trust to act unsupervised there — training wheels, retired as a captain matures (constitution → Earned Autonomy).
 
-**Out (deferred, on purpose):** the `basecradle` route and any non-GitHub source; multi-host; auto-provisioning. Build the core + one route well, then add routes.
+**Out (deferred, on purpose):** the `basecradle` route and any non-GitHub source; multi-host; and **auto-provisioning of *builder* agents** (be precise about which: the NOC already auto-provisions *harness personas* — that is live — so what remains deferred is *Claude-Code builder*-agent provisioning, now being added to the NOC via the composable builder-leaf brick in [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53); `deploy/bootstrap.sh` is the interim manual builder tooling until that leaf is verified live). Build the core + one route well, then add routes.
 
 ## Stack (omakase — matches harness + cradle)
 
