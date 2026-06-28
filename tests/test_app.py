@@ -149,3 +149,58 @@ def test_create_app_requires_the_trusted_actors_allow_list(tmp_path) -> None:
     del env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"]
     with pytest.raises(ConfigError, match="GITHUB_TRUSTED_ACTORS is required"):
         create_app(env, waker=_RecordingWaker())
+
+
+# --- issue_comment re-wake is wired, self-comment guard included (#129) ------
+
+NOVA_BOT = f"{NOVA.bot_slug}[bot]"  # basecradle-python-ai[bot] — Nova's own bot
+
+
+def _signed_comment(sender: str) -> tuple[bytes, dict[str, str]]:
+    payload = {
+        "action": "created",
+        "issue": {
+            "number": 42,
+            "title": "Mirror the wire-shape change",
+            "html_url": f"https://github.com/{NOVA.key}/issues/42",
+            "labels": [{"name": "handoff"}],
+        },
+        "comment": {"body": "a follow-up"},
+        "repository": {"full_name": NOVA.key},
+        "sender": {"login": sender, "type": "User"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    digest = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+    headers = {
+        "X-GitHub-Event": "issue_comment",
+        "X-GitHub-Delivery": "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+        "X-Hub-Signature-256": f"sha256={digest}",
+        "Content-Type": "application/json",
+    }
+    return body, headers
+
+
+def test_create_app_rewakes_on_a_peer_comment(tmp_path) -> None:
+    # A trusted human's reply on the handoff issue re-wakes Nova end-to-end.
+    waker = _RecordingWaker()
+    server = create_app(_env(tmp_path), waker=waker)
+    body, headers = _signed_comment(sender=HANDOFF_SENDER)
+
+    assert _post(server, "/webhooks/github", body, headers) == 202
+    assert len(waker.calls) == 1
+    assert waker.calls[0][0] == NOVA
+
+
+def test_create_app_wires_the_self_comment_guard(tmp_path) -> None:
+    # The wiring proof: a comment authored by Nova's OWN bot must not re-wake Nova
+    # (the infinite-loop guard). create_app must resolve the repo's bot from the
+    # registry, or the guard is inert — so this fails if the wiring regresses. The
+    # allow-list here is just the human filer (NOT Nova's bot): because the guard
+    # runs ahead of the trust gate, it is the GUARD — an IGNORED 200 — that stops
+    # the wake, proving the two controls are decoupled.
+    waker = _RecordingWaker()
+    server = create_app(_env(tmp_path), waker=waker)
+    body, headers = _signed_comment(sender=NOVA_BOT)
+
+    assert _post(server, "/webhooks/github", body, headers) == 200  # accepted, ignored
+    assert waker.calls == []  # no wake — the self-comment guard held

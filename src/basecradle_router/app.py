@@ -18,10 +18,11 @@ no merge stage to wire here (see issue #38 for the decision).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from basecradle_router.breaker import WakeRateBreaker
 from basecradle_router.config import (
+    Config,
     load_breaker_config,
     load_config,
     load_github_trusted_actors,
@@ -49,7 +50,12 @@ def create_app(
     # Register a route only when its source is enabled, so each route's own
     # required config (the github trust allow-list) is demanded only when in use.
     if "github" in config.enabled_routes:
-        registry.register(GithubRoute(load_github_trusted_actors(env)))
+        registry.register(
+            GithubRoute(
+                load_github_trusted_actors(env),
+                bot_login_for_repo=_bot_login_for_repo(config),
+            )
+        )
     if "basecradle" in config.enabled_routes:
         registry.register(BasecradleRoute())
     pipeline = Pipeline(
@@ -59,3 +65,24 @@ def create_app(
         breaker=WakeRateBreaker(load_breaker_config(env)),
     )
     return WebhookServer(pipeline)
+
+
+def _bot_login_for_repo(config: Config) -> Callable[[str], str | None]:
+    """A resolver from a repo to its captain agent's GitHub bot login, or ``None``.
+
+    The github route's self-comment guard (basecradle-router#129) needs to know a
+    repo's own bot identity to suppress an own-comment re-wake loop. The agent
+    registry is the authority: a builder's ``bot_slug`` (e.g. ``basecradle-ruby-ai``)
+    yields the GitHub App login ``<bot_slug>[bot]``. An unregistered repo (or a
+    non-builder without a ``bot_slug``) resolves to ``None`` — the route then
+    cannot mistake any sender for that repo's bot, which is safe because an
+    unregistered repo wakes no agent at resolve anyway.
+    """
+
+    def resolve(repo: str) -> str | None:
+        agent = config.agents.get(repo)
+        if agent is None or not agent.bot_slug:
+            return None
+        return f"{agent.bot_slug}[bot]"
+
+    return resolve

@@ -345,3 +345,156 @@ def test_normalize_logs_the_ignored_decision_with_the_event_type(caplog) -> None
     assert "source=github" in line
     assert "event_type=ping" in line
     assert f"decision={DeliveryDecision.IGNORED.value}" in line
+
+
+# --- issue_comment re-wake (#129) ------------------------------------------
+#
+# A reply on a handoff issue re-wakes its agent — a comment to a *sleeping* agent
+# is otherwise lost (polling only covers an awake agent). The same handoff Event
+# and quarantine trigger as the issues path, plus one extra gate: the recipient
+# agent's OWN comment must never re-wake it, or it loops on its own replies. The
+# repo's captain bot (for that guard) is resolved from the registry; here a stub.
+
+RECIPIENT_BOT = FLEET_BOT  # basecradle-python-ai[bot] — TARGET_REPO's own captain
+PEER_BOT = "basecradle-ai[bot]"  # a *different* fleet bot (the capital), a peer
+# A trust allow-list that admits the human filer and both bots used below.
+TRUSTED_WITH_BOTS = frozenset({TRUSTED_ACTOR, RECIPIENT_BOT, PEER_BOT})
+
+
+def _comment_route(trusted: frozenset[str] = TRUSTED_WITH_BOTS) -> GithubRoute:
+    """A github route wired so TARGET_REPO's captain bot is RECIPIENT_BOT."""
+    return GithubRoute(trusted, bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT}.get)
+
+
+def _comment_payload(
+    action: str = "created",
+    labels: tuple[str, ...] = ("handoff",),
+    repo: str = TARGET_REPO,
+    number: int = ISSUE_NUMBER,
+    sender: str | None = TRUSTED_ACTOR,
+) -> dict:
+    payload: dict = {
+        "action": action,
+        "issue": {
+            "number": number,
+            "title": "Mirror the wire-shape change",
+            "html_url": f"https://github.com/{repo}/issues/{number}",
+            "labels": [{"name": name} for name in labels],
+        },
+        "comment": {"body": "One more thing — please also bump the minor version."},
+        "repository": {"full_name": repo},
+    }
+    if sender is not None:
+        payload["sender"] = {"login": sender, "type": "User"}
+    return payload
+
+
+def _comment_request(payload: dict | None = None, **kwargs) -> InboundRequest:
+    return _issues_request(payload, event="issue_comment", **kwargs)
+
+
+def test_normalize_comment_on_handoff_rewakes_the_agent() -> None:
+    event = _comment_route().normalize(_comment_request(_comment_payload()))
+    assert event is not None
+    assert event.kind is EventKind.HANDOFF
+    assert event.recipient == Recipient(by="repo", value=TARGET_REPO)
+    assert event.origin.url == ISSUE_URL  # re-wake points at the same issue thread
+    assert event.delivery_id == DELIVERY
+
+
+def test_normalize_comment_reuses_the_quarantine_trigger_verbatim() -> None:
+    # The re-wake trigger is byte-identical to the issues-path trigger for the same
+    # issue: the new comment is exactly the "untrusted thread content" the existing
+    # envelope already quarantines, so it is reused verbatim (#129), not re-worded.
+    from_issue = GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
+    from_comment = _comment_route().normalize(_comment_request(_comment_payload()))
+    assert from_comment is not None and from_issue is not None
+    assert from_comment.wake_arg == from_issue.wake_arg
+
+
+def test_normalize_ignores_an_edited_comment() -> None:
+    # Only a newly created comment re-wakes; an edit re-reads nothing new.
+    assert _comment_route().normalize(_comment_request(_comment_payload(action="edited"))) is None
+
+
+def test_normalize_ignores_a_deleted_comment() -> None:
+    assert _comment_route().normalize(_comment_request(_comment_payload(action="deleted"))) is None
+
+
+def test_normalize_ignores_a_comment_on_a_non_handoff_issue() -> None:
+    # Handoff scope: a comment on an unrelated issue is not handed-off work.
+    payload = _comment_payload(labels=("bug", "question"))
+    assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_rejects_a_comment_from_an_untrusted_sender() -> None:
+    # Sender scope mirrors the label-wake gate: a stranger's comment wakes no one.
+    payload = _comment_payload(sender=UNTRUSTED_ACTOR)
+    with pytest.raises(UntrustedSenderError, match="untrusted actor"):
+        _comment_route().normalize(_comment_request(payload))
+
+
+def test_normalize_ignores_the_recipient_agents_own_comment() -> None:
+    # The infinite-loop guard: the agent's own progress note / completion report
+    # fires issue_comment with its own bot as sender — that must NOT re-wake it.
+    payload = _comment_payload(sender=RECIPIENT_BOT)
+    assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_self_comment_is_ignored_even_when_its_bot_is_not_trusted() -> None:
+    # The self-comment guard runs *ahead* of the trust gate, so the agent's own
+    # comment is a clean IGNORED no-op even when its bot is absent from the
+    # allow-list — the loop backstop is independent of the trust config. (With the
+    # old gate order this would raise UntrustedSenderError instead.)
+    route = GithubRoute(
+        frozenset({TRUSTED_ACTOR}),  # RECIPIENT_BOT deliberately NOT trusted
+        bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT}.get,
+    )
+    assert route.normalize(_comment_request(_comment_payload(sender=RECIPIENT_BOT))) is None
+
+
+def test_normalize_ignores_a_comment_on_a_pull_request() -> None:
+    # issue_comment fires for PR comments too — the issue object then carries a
+    # `pull_request` ref. A handoff is an issue, not a PR, so a PR comment (even a
+    # trusted peer's, even on a handoff-labeled PR) wakes no one.
+    payload = _comment_payload()
+    payload["issue"]["pull_request"] = {
+        "html_url": f"https://github.com/{TARGET_REPO}/pull/{ISSUE_NUMBER}"
+    }
+    assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_self_comment_guard_is_case_insensitive() -> None:
+    # GitHub logins are case-insensitive, so a differently-cased own login is still
+    # the agent itself and must not re-wake.
+    payload = _comment_payload(sender="BaseCradle-Python-AI[bot]")
+    assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_rewakes_on_a_different_fleet_bots_comment() -> None:
+    # The guard is specific to the recipient's OWN bot, not all bots: a reply from
+    # a *peer* bot (the capital answering a blocker) is a real re-wake.
+    payload = _comment_payload(sender=PEER_BOT)
+    event = _comment_route().normalize(_comment_request(payload))
+    assert event is not None
+    assert event.kind is EventKind.HANDOFF
+
+
+def test_normalize_rejects_a_comment_missing_the_issue_object() -> None:
+    body = b'{"action": "created", "repository": {"full_name": "x/y"}}'
+    with pytest.raises(PayloadError, match="'issue' object"):
+        _comment_route().normalize(_comment_request(raw_body=body))
+
+
+def test_normalize_rejects_a_comment_missing_the_delivery_header() -> None:
+    with pytest.raises(PayloadError, match=DELIVERY_HEADER):
+        _comment_route().normalize(_comment_request(_comment_payload(), delivery=None))
+
+
+def test_normalize_logs_woke_for_a_comment_rewake_naming_the_event_type(caplog) -> None:
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        _comment_route().normalize(_comment_request(_comment_payload()))
+    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    assert "event_type=issue_comment" in line
+    assert f"decision={DeliveryDecision.WOKE.value}" in line
+    assert f"recipient={TARGET_REPO}" in line
