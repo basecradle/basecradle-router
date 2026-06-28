@@ -36,6 +36,12 @@ RestartSec=2s
 # The app drains in-flight wakes on lifespan shutdown; give it room before SIGKILL
 # on stop/restart (each wake is also bounded by its own configured timeout).
 TimeoutStopSec=120s
+# KillMode=mixed: SIGTERM goes to the MAIN process only (the daemon, which then
+# drains in-flight wakes), not blanket to the whole control-group — so a wake
+# legitimately finishing is not torn down the instant stop is requested. The final
+# SIGKILL at TimeoutStopSec still sweeps the group as a backstop. (Default
+# control-group would SIGTERM every wake immediately, defeating the clean drain.)
+KillMode=mixed
 
 # --- Hardening -------------------------------------------------------------
 # The wake (sudo -> runuser -> claude) runs as a CHILD of this service and so
