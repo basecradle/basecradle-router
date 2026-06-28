@@ -30,6 +30,8 @@ _BREAKER_WINDOW_VAR = f"{_BREAKER_PREFIX}WINDOW"
 _BREAKER_COOLDOWN_VAR = f"{_BREAKER_PREFIX}COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = f"{_BREAKER_PREFIX}STREAM_MAX"
 
+_DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
+
 
 class ConfigError(Exception):
     """Configuration is missing or malformed. The message names the fix."""
@@ -278,6 +280,22 @@ def load_breaker_config(env: Mapping[str, str] | None = None) -> BreakerConfig:
         )
     except ValueError as exc:
         raise ConfigError(f"invalid wake breaker configuration: {exc}") from exc
+
+
+def load_dedup_ttl(env: Mapping[str, str] | None = None) -> float:
+    """The delivery-dedup TTL in seconds, from ``BASECRADLE_ROUTER_DEDUP_TTL``.
+
+    Optional with a generous default (600 s): the "recently-woke delivery" cache
+    that collapses a duplicate webhook delivery into a single wake
+    (basecradle-router#133). ``0`` disables dedup; a negative value is a loud
+    :class:`ConfigError` naming the variable, never a silent fallback. See
+    :mod:`basecradle_router.dedup`.
+    """
+    env = os.environ if env is None else env
+    ttl = _float_env(env, _DEDUP_TTL_VAR, 600.0)
+    if ttl < 0:
+        raise ConfigError(f"{_DEDUP_TTL_VAR} must be >= 0 (0 disables dedup), got {ttl!r}")
+    return ttl
 
 
 def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:

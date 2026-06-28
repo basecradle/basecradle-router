@@ -48,6 +48,7 @@ from basecradle_router.concurrency import (
     with_retry,
 )
 from basecradle_router.config import Config, ConfigError
+from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -72,6 +73,7 @@ class Stage(Enum):
     NORMALIZE = "normalize"
     RESOLVE = "resolve"
     LOCK = "lock"
+    DEDUP = "dedup"
     WAKE_LOCK = "wake_lock"
     BREAKER = "breaker"
     WAKE = "wake"
@@ -143,6 +145,7 @@ class Pipeline:
     waker: Waker
     locks: AgentLocks = field(default_factory=AgentLocks)
     breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
+    deduper: DeliveryDeduper = field(default_factory=DeliveryDeduper)
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
@@ -180,7 +183,7 @@ class Pipeline:
         return AcceptResult(result=result, pending=pending)
 
     def execute(self, agent: Agent, event: Event, result: PipelineResult) -> None:
-        """The slow half: lock → wake-lock → breaker → wake, appended to ``result``; never raises.
+        """The slow half (lock, dedup, wake-lock, breaker, wake), into ``result``; never raises.
 
         Serialized per agent — by the agent's harness-instance identity, not its
         repo — so an agent never runs two concurrent sessions against its one
@@ -190,8 +193,22 @@ class Pipeline:
         ordered stream the lone harness instance drains, so a future input module
         can never fan a second parallel session onto the same agent.
 
-        Inside the lock, the **NOC wake-lock** is honoured first
-        (basecradle-router#120): while the NOC converges (upgrades) this agent's
+        Inside the lock, **delivery dedup** is the first gate
+        (basecradle-router#133): a single logical event can arrive as two webhook
+        deliveries (e.g. two fleet Apps on one repo, both subscribed) carrying the
+        *same* ``X-GitHub-Delivery`` GUID, and without dedup each one wakes the
+        agent independently — N subscribed Apps cost N sessions for one event. The
+        :class:`~basecradle_router.dedup.DeliveryDeduper` is a short-TTL
+        "recently-*woke*" cache keyed on :attr:`Event.dedup_key`: a duplicate the
+        router has *already successfully woken for* is recorded ``DEDUP``/``IGNORED``
+        and no second wake runs. It is checked *before* the wake-lock and breaker so
+        a duplicate consumes neither budget, and the key is marked **only after a
+        successful wake** — so the lock (which serialises the duplicate behind the
+        original) guarantees the duplicate observes the mark, while a *failed*
+        original leaves the duplicate free to retry. See :mod:`basecradle_router.dedup`.
+
+        Then the **NOC wake-lock** is honoured (basecradle-router#120): while the
+        NOC converges (upgrades) this agent's
         harness it holds a lock at ``/run/basecradle-noc/wake-locks/<slug>.lock``, and
         the router *refuses* the wake rather than land it on a half-installed venv.
         A held lock is recorded ``WAKE_LOCK``/``IGNORED`` and no wake runs (the
@@ -220,6 +237,13 @@ class Pipeline:
         try:
             with self.locks.guard(agent.harness_key):
                 self._record(result, Stage.LOCK, Outcome.OK, agent.harness_key)
+                if self.deduper.seen(event.dedup_key):
+                    # A duplicate delivery of an event we already woke for — a
+                    # deliberate, visible collapse, never a silent drop. Checked
+                    # ahead of the wake-lock and breaker so a duplicate consumes
+                    # neither's budget.
+                    self._record(result, Stage.DEDUP, Outcome.IGNORED, event.dedup_key)
+                    return
                 decision = self.wake_lock.check(agent.harness_key)
                 if not decision.should_wake:
                     # The NOC holds a converge wake-lock for this agent — a
@@ -232,7 +256,11 @@ class Pipeline:
                     # route's IGNORED decisions; the breaker already escalated loudly.
                     self._record(result, Stage.BREAKER, Outcome.IGNORED, outcome.detail)
                     return
-                self._wake(agent, event, result)
+                if self._wake(agent, event, result):
+                    # Remember the delivery *only* once a wake actually succeeded, so
+                    # the duplicate serialised behind us collapses — but a failed wake
+                    # leaves the duplicate free to retry the work (see dedup module).
+                    self.deduper.mark(event.dedup_key)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")
 
@@ -284,7 +312,13 @@ class Pipeline:
 
         return agent, event
 
-    def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> None:
+    def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> bool:
+        """Dispatch the wake (with retry); return ``True`` iff it succeeded.
+
+        The boolean drives delivery dedup: the caller marks the delivery as woken
+        only on success, so a failed wake never suppresses the duplicate.
+        """
+
         # A wake failure is retryable transient by policy here (the boundary
         # reports it as a plain WakeError); the bound stops a permanent fault.
         def attempt() -> WakeResult:
@@ -297,8 +331,9 @@ class Pipeline:
             woke = with_retry(attempt, attempts=self.wake_attempts, sleep=self.sleep)
         except RetryExhausted as exc:
             self._record(result, Stage.WAKE, Outcome.FAILED, str(exc.__cause__ or exc))
-            return
+            return False
         self._record(result, Stage.WAKE, Outcome.OK, f"exit {woke.exit_code}")
+        return True
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, detail: str = ""

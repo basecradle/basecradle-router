@@ -187,6 +187,21 @@ class Event:
             raise ValueError(f"Event.origin must be an IssueRef or None, got {self.origin!r}")
 
     @property
+    def dedup_key(self) -> str:
+        """A stable, globally-unique id for *this exact delivery* — the dedup key.
+
+        The delivery-dedup cache keys on this to collapse a duplicate webhook
+        delivery (the same logical event arriving more than once — e.g. two fleet
+        Apps on one repo) into a single wake (basecradle-router#133). It pairs the
+        ``source`` with the source's per-delivery id (a github ``X-GitHub-Delivery``
+        GUID, a basecradle ``X-BaseCradle-Delivery`` id), so it is identical across
+        the duplicate deliveries of one event yet unique per genuine delivery — and
+        the ``source`` prefix keeps two sources' id-spaces from ever colliding. Core
+        vocabulary, like :attr:`stream_key`, so dedup stays source-agnostic.
+        """
+        return f"{self.source}:{self.delivery_id}"
+
+    @property
     def stream_key(self) -> str:
         """A stable id for the finest-grained wake sub-stream this event belongs to.
 

@@ -97,6 +97,10 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW=60       # rolling window, seconds
 # BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN=60     # halt seconds after a trip (auto-reset)
 # BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX=15   # per-(agent, timeline/issue) wakes per window; 0 disables
+#
+# Delivery dedup (collapse a duplicate webhook delivery into one wake, issue #133) — optional,
+# generous default; 0 disables:
+# BASECRADLE_ROUTER_DEDUP_TTL=600                # seconds a woken delivery id is remembered; 0 disables
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
@@ -143,6 +147,19 @@ cursor-paginated read API is the source of truth and push is best-effort — so 
 pauses its push until the loop is understood. The breaker is defense-in-depth with, and independent of,
 the harness's own per-timeline self-breaker (basecradle-harness#138): no shared protocol, each trips on
 its own view.
+
+**Delivery dedup** (issue #133) collapses a duplicate webhook delivery into a single wake. One logical
+event can reach the router as more than one delivery — e.g. two fleet GitHub Apps installed on a repo,
+both subscribed to the same event, each POSTing to the router — and GitHub stamps every such delivery of
+*one* event with the **same** `X-GitHub-Delivery` GUID. The per-agent lock serialises them (no collision),
+but without dedup each delivery wakes the agent independently, so N subscribed Apps cost N full agent
+sessions for one event. The router keeps a short-TTL "recently-**woke** delivery" cache keyed on
+`source:delivery_id`: checked inside the per-agent lock, ahead of the wake-lock and breaker, and marked
+**only after a wake actually succeeds** — so a duplicate serialised behind the original observes the mark
+and is collapsed to a visible `dedup`/`IGNORED`, while a *failed* original leaves the duplicate free to
+retry. Keying on the delivery GUID (not event content) can never over-collapse a *distinct* event — the
+dangerous direction — at worst it no-ops. `BASECRADLE_ROUTER_DEDUP_TTL` (default 600 s; `0` disables)
+tunes it.
 
 The **NOC wake-lock interlock** (issue #120, counterpart to basecradle-noc#38) keeps the router from
 waking an agent while the NOC is converging (upgrading) its harness — a wake landing on a half-installed
