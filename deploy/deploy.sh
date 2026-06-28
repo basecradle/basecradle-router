@@ -130,10 +130,10 @@ sudo -u router env HOME=/home/router /home/router/.local/bin/uv sync --project "
 # drifts from main -- exactly the merge!=deploy failure mode #54/#55/#56 cured for
 # the daemon code. Reinstalling it here, from the same trusted checkout, keeps it in
 # lockstep. (The sudoers rule is intentionally NOT auto-rewritten: it changes rarely
-# and a bad rule is dangerous -- it stays a documented manual step, README B2.)
-# Ensure the root-owned bin/ exists first (bootstrap creates it; recreating it here
-# with the same owner/mode is idempotent) so this step is self-sufficient and can
-# never abort an already-mutated deploy on a box missing the dir.
+# and a bad rule is dangerous -- it stays a documented manual step, README Part 2.)
+# Ensure the root-owned bin/ exists first (the box's provisioning lays it down, but
+# recreating it here with the same owner/mode is idempotent) so this step is
+# self-sufficient and can never abort an already-mutated deploy on a box missing the dir.
 sudo install -d -o root -g root -m 0755 /opt/basecradle-router/bin
 sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/bin/wake-runner" /opt/basecradle-router/bin/wake-runner
 # Install + enable the managed systemd units from the deployed tree, every deploy
