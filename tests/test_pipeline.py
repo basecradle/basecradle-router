@@ -409,6 +409,41 @@ def test_breaker_cooldown_restores_dispatch_through_the_pipeline() -> None:
     assert len(waker.calls) == 3
 
 
+# --- issue_comment re-wake flows through the same pipeline (#129) -----------
+
+
+def test_signed_comment_rewakes_the_agent_through_the_pipeline() -> None:
+    # A reply on a handoff issue re-wakes its agent end-to-end, the same path as
+    # the opening handoff — pointing the agent back at the issue to re-read it.
+    pipeline, waker = _pipeline()
+    result = pipeline.handle("github", _github_request(event="issue_comment", action="created"))
+
+    assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert len(waker.calls) == 1
+    woken_agent, woken_event = waker.calls[0]
+    assert woken_agent is NOVA
+    assert woken_event.wake_arg.startswith(f"Cross-repo handoff: work {ISSUE_URL}\n")
+
+
+def test_a_comment_storm_on_one_issue_trips_the_per_issue_breaker() -> None:
+    # The breaker's per-(agent, issue) scope (stream_key == issue url) caps a
+    # comment storm on a single handoff issue even while the agent's overall rate
+    # stays well under its cap — a reply loop is gated, not amplified (#129).
+    breaker = WakeRateBreaker(
+        BreakerConfig(max_wakes=20, window=60.0, cooldown=60.0, stream_max_wakes=2)
+    )
+    pipeline, waker = _pipeline(breaker=breaker)
+
+    def _comment():
+        return pipeline.handle("github", _github_request(event="issue_comment", action="created"))
+
+    for _ in range(2):
+        assert _comment().stages[-1] == (Stage.WAKE, Outcome.OK)
+    # The third comment on the same issue trips the per-stream cap — refused, no wake.
+    assert _comment().stages[-1] == (Stage.BREAKER, Outcome.IGNORED)
+    assert len(waker.calls) == 2
+
+
 # --- the NOC wake-lock interlock gates dispatch (basecradle-router#120) -----
 
 

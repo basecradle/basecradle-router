@@ -100,10 +100,26 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
-handoff only wakes an agent if the webhook `sender` — the actor who applied the `handoff` label — is on
-this allow-list of fleet actors (org members + fleet App bots). It is **required and non-empty**; the
-daemon refuses to start without it, so the check can never be silently off. List human org members by
-their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched case-insensitively.
+wake only fires if the webhook `sender` — the actor who applied the `handoff` label, or who left the
+comment — is on this allow-list of fleet actors (org members + fleet App bots). It is **required and
+non-empty**; the daemon refuses to start without it, so the check can never be silently off. List human
+org members by their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched
+case-insensitively.
+
+**The github route consumes two webhook events** (subscribe each agent's App to both — *Issues* **and**
+*Issue comment*):
+
+- **`issues`** (action `opened`/`labeled`) — a handoff issue filed or labeled `handoff`: the initial wake.
+- **`issue_comment`** (action `created`) — a **reply on a handoff issue re-wakes its agent** (issue #129).
+  Polling only covers an agent while it is awake and looping on an open issue; once it sleeps, a new
+  comment reaches no one, so a reply to a sleeping agent would be lost. Re-waking on the comment closes
+  that hole — pointing the agent back at the issue to re-read the full thread. Gates narrow it to "a fleet
+  peer replied to an in-flight handoff": the comment must be on a real **issue** (a comment on a *pull
+  request* — which GitHub also delivers as `issue_comment` — is not a handoff reply and is ignored) that
+  carries the `handoff` label, from a trusted actor (same gate as above), and the agent's **own** comment
+  never re-wakes it (the infinite-loop guard, run ahead of the trust gate — the router resolves the repo's
+  captain bot from `agents.json` and suppresses it). A comment storm on one issue is capped by the
+  breaker's per-`(agent, issue)` scope below.
 
 The **basecradle route** (issue #87) accepts signed BaseCradle platform events at
 `POST /webhooks/basecradle`. Enable it by adding `basecradle` to

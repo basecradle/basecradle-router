@@ -6,18 +6,37 @@ the per-route shared secret, and delivers the digest in the
 :meth:`GithubRoute.verify` is the security boundary: nothing unsigned,
 malformed, or tampered gets past it into the core pipeline.
 
-:meth:`GithubRoute.normalize` is the other half: it turns a verified ``issues``
-webhook into a core :class:`~basecradle_router.models.Event`, gating on the
-``handoff`` label so only a handoff issue wakes an agent — everything else is a
-well-formed *ignore*, not an error. As defense-in-depth it *also* gates on the
-webhook ``sender``: a handoff only wakes an agent if a **trusted fleet actor**
-applied the label. Because this check runs *after* :meth:`verify`, the ``sender``
-field is GitHub-attested and not attacker-spoofable.
+:meth:`GithubRoute.normalize` is the other half. It turns a verified webhook
+into a core :class:`~basecradle_router.models.Event`, gating so only a handoff
+wakes an agent — everything else is a well-formed *ignore*, not an error. Two
+event types are consumed:
+
+* ``issues`` (action ``opened``/``labeled``) — a handoff issue is filed or
+  labeled, the initial wake.
+* ``issue_comment`` (action ``created``) — a **reply** on a handoff issue
+  re-wakes its agent. Polling only covers an agent while it is awake and looping
+  on an open issue; once it finishes its wake and sleeps, a new comment reaches
+  no one, so a reply to a sleeping agent is otherwise lost. Re-waking on the
+  comment closes that hole — exactly what the App's "Issue comment" subscription
+  was always meant to drive (basecradle-router#129).
+
+As defense-in-depth both paths gate on the webhook ``sender``: a wake only fires
+if a **trusted fleet actor** triggered it (the label applier, or the commenter).
+Because that check runs *after* :meth:`verify`, the ``sender`` is GitHub-attested
+and not attacker-spoofable. The comment path adds one more gate the issue path
+does not need — the **self-comment guard**: a comment authored by the recipient
+agent's *own* bot never re-wakes it, or the agent would loop on its own replies.
+This route can suppress that loop *in-router* precisely because the ``sender`` is
+GitHub-attested and already read for the trust gate; the sibling ``basecradle``
+route deliberately stays actor-agnostic and leaves the equivalent self-filter to
+the harness (see its module docstring) because its events are timeline-scoped and
+it never reads ``actor_uuid``. Same problem class, two routes, two right answers
+for two different payload shapes.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from basecradle_router.models import Event, EventKind, IssueRef, Recipient
@@ -35,8 +54,14 @@ SIGNATURE_HEADER = "X-Hub-Signature-256"
 EVENT_HEADER = "X-GitHub-Event"
 DELIVERY_HEADER = "X-GitHub-Delivery"
 
+ISSUES_EVENT = "issues"
+ISSUE_COMMENT_EVENT = "issue_comment"
+
 HANDOFF_LABEL = "handoff"
 _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
+# Only a newly *created* comment re-wakes; an ``edited``/``deleted`` comment does
+# not (the re-wake re-reads the whole thread anyway, so an edit adds nothing).
+_ACTIONABLE_COMMENT_ACTION = "created"
 
 # The standing trust-boundary envelope wrapped around every handoff trigger
 # (basecradle-router#60, workstream 1).
@@ -81,8 +106,20 @@ class GithubRoute:
 
     name = "github"
 
-    def __init__(self, trusted_actors: Iterable[str]) -> None:
+    def __init__(
+        self,
+        trusted_actors: Iterable[str],
+        *,
+        bot_login_for_repo: Callable[[str], str | None] | None = None,
+    ) -> None:
         self._trusted_actors = frozenset(actor.lower() for actor in trusted_actors)
+        # Resolves a repo's captain bot login (e.g. ``basecradle-ruby-ai[bot]``)
+        # for the self-comment guard, or ``None`` for an unregistered repo. The
+        # composition root (:mod:`basecradle_router.app`) wires it from the agent
+        # registry — the authoritative source of each repo's bot identity. The
+        # default never identifies a self-comment, so a route built without it
+        # cannot suppress an own-comment loop; production always provides it.
+        self._bot_login_for_repo = bot_login_for_repo or (lambda _repo: None)
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
@@ -96,45 +133,103 @@ class GithubRoute:
         verify_hmac_sha256(request, secret, header=SIGNATURE_HEADER)
 
     def normalize(self, request: InboundRequest) -> Event | None:
-        """Turn a verified ``issues`` webhook into an :class:`Event`, or ignore it.
+        """Turn a verified webhook into an :class:`Event`, or ignore it.
 
-        Returns ``None`` (a well-formed ignore) for any webhook that is not a
-        handoff: a non-``issues`` event, a non-``opened``/``labeled`` action, or
-        an issue without the ``handoff`` label. Raises :class:`PayloadError` only
-        when an ``issues`` payload is structurally malformed, and
-        :class:`UntrustedSenderError` when a genuine handoff was triggered by an
-        actor who is not a trusted fleet member. Emits a structured decision line
-        for each quiet outcome (basecradle-router#91) so a deliberate ignore is
-        visible in observability, never indistinguishable from a silent drop.
+        Dispatches on the event type: an ``issues`` handoff (opened/labeled) or an
+        ``issue_comment`` reply on a handoff issue both normalize to the same
+        handoff :class:`Event`; every other event is a well-formed *ignore*.
+        Raises :class:`PayloadError` when an actionable payload is structurally
+        malformed and :class:`UntrustedSenderError` when a wake was triggered by
+        an actor who is not a trusted fleet member. Emits a structured decision
+        line for each quiet outcome (basecradle-router#91) so a deliberate ignore
+        is visible in observability, never indistinguishable from a silent drop.
         """
         event_type = request.header(EVENT_HEADER)
-        if event_type != "issues":
-            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
-            return None
+        if event_type == ISSUES_EVENT:
+            return self._normalize_issues(request, event_type)
+        if event_type == ISSUE_COMMENT_EVENT:
+            return self._normalize_comment(request, event_type)
+        return self._ignore(event_type)
 
+    def _normalize_issues(self, request: InboundRequest, event_type: str) -> Event | None:
+        """An ``issues`` webhook: a handoff issue opened or labeled — the initial wake."""
         data = parse_json_object(request.body)
         action = data.get("action")
         if action not in _ACTIONABLE_ACTIONS:
-            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
-            return None
+            return self._ignore(event_type)
 
-        issue = data.get("issue")
-        if not isinstance(issue, dict):
-            raise PayloadError("issues event is missing an 'issue' object")
-
+        issue = _require_issue(data)
         if not _is_handoff(action, issue, data):
-            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
-            return None
+            return self._ignore(event_type)
 
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
         # actor may actually trigger a wake. This runs after verify(), so the
         # sender is GitHub-attested. An untrusted (or unidentifiable) sender is a
         # rejection, not a wake — fail closed.
         self._require_trusted_sender(data)
+        return self._wake_event(request, data, issue, event_type)
 
+    def _normalize_comment(self, request: InboundRequest, event_type: str) -> Event | None:
+        """An ``issue_comment`` webhook: a reply on a handoff issue re-wakes its agent.
+
+        Gates that narrow the surface to exactly "a fleet peer replied to an
+        in-flight handoff": only a newly *created* comment, on a real **issue**
+        (not a PR), that carries the **handoff** label (**handoff scope**), is
+        **not** the recipient agent's own comment (**self-comment guard**, the
+        infinite-loop backstop), and is from a **trusted** sender (**sender
+        scope**, mirroring the label-wake gate). The breaker's per-(agent, issue)
+        scope caps a comment storm downstream (basecradle-router#129).
+        """
+        data = parse_json_object(request.body)
+        if data.get("action") != _ACTIONABLE_COMMENT_ACTION:
+            return self._ignore(event_type)
+
+        issue = _require_issue(data)
+        # GitHub fires issue_comment for comments on pull requests too — the issue
+        # object then carries a `pull_request` ref. A handoff is an *issue* and the
+        # agent reports back on the issue, never a PR thread, so a PR comment wakes
+        # no one (it would also re-wake on the agent's own auto-merging PR chatter).
+        if issue.get("pull_request") is not None:
+            return self._ignore(event_type)
+
+        # Handoff scope: a comment only re-wakes when it lands on a handoff issue,
+        # mirroring the issues path's handoff-label gate — a comment on an
+        # unrelated issue is not handed-off work and wakes no one.
+        if not _has_handoff_label(issue):
+            return self._ignore(event_type)
+
+        # Infinite-loop guard, *before* the trust gate: the agent commenting on its
+        # own handoff issue (a progress note, the completion report) fires
+        # issue_comment with its own bot as sender, and re-waking on that would
+        # loop. Suppressing it here — ahead of the trusted-sender check — makes a
+        # self-comment a clean IGNORED no-op regardless of the allow-list, so the
+        # loop backstop never depends on the agent's own bot being a trusted actor.
+        if self._is_recipient_own_comment(data):
+            return self._ignore(event_type)
+
+        # Sender scope: every other commenter must be a trusted fleet actor (the
+        # same gate as the label-wake path).
+        self._require_trusted_sender(data)
+        return self._wake_event(request, data, issue, event_type)
+
+    def _wake_event(
+        self,
+        request: InboundRequest,
+        data: dict[str, Any],
+        issue: dict[str, Any],
+        event_type: str,
+    ) -> Event:
+        """Build the handoff :class:`Event` shared by both wake paths.
+
+        Identical for an ``issues`` handoff and an ``issue_comment`` re-wake: the
+        wake points at the issue URL so the agent re-reads the full thread,
+        including any new comment, and the trust-boundary preamble is the same
+        verbatim envelope — the new comment is exactly the "untrusted thread
+        content" it already quarantines.
+        """
         repository = data.get("repository")
         if not isinstance(repository, dict):
-            raise PayloadError("issues event is missing a 'repository' object")
+            raise PayloadError("event payload is missing a 'repository' object")
 
         delivery_id = request.header(DELIVERY_HEADER)
         if not delivery_id:
@@ -156,26 +251,71 @@ class GithubRoute:
                 origin=origin,
             )
         except ValueError as exc:
-            raise PayloadError(f"malformed issues payload: {exc}") from exc
+            raise PayloadError(f"malformed {event_type} payload: {exc}") from exc
         log_delivery_decision(self.name, event_type, DeliveryDecision.WOKE, recipient=origin.repo)
         return event
+
+    def _ignore(self, event_type: str | None) -> None:
+        """Record a deliberate, *visible* ignore (never a silent drop) and return ``None``."""
+        log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
+        return None
+
+    def _is_recipient_own_comment(self, data: dict[str, Any]) -> bool:
+        """Whether the comment was authored by the recipient agent's own bot.
+
+        The recipient is the captain of the repo the issue is on; re-waking it on
+        its own comment loops. We compare the GitHub-attested ``sender`` against
+        the recipient's *registered* bot login (not a name derived by convention —
+        the registry is the authority). If the repo is unregistered the bot is
+        unknown and this returns ``False``; that is safe, because resolution will
+        then find no agent and run no wake, so there is no loop to break.
+        """
+        repository = data.get("repository")
+        repo = repository.get("full_name") if isinstance(repository, dict) else None
+        if not isinstance(repo, str) or not repo:
+            return False  # malformed repo: _wake_event raises on it, consistently
+        bot_login = self._bot_login_for_repo(repo)
+        if not bot_login:
+            return False
+        login = _sender_login(data)
+        return login is not None and login.lower() == bot_login.lower()
 
     def _require_trusted_sender(self, data: dict[str, Any]) -> None:
         """Raise :class:`UntrustedSenderError` unless the webhook's actor is trusted.
 
         The ``sender`` is the actor GitHub attributes the delivery to — who opened
-        the issue or applied the label. We can't identify the actor from a missing
-        or malformed ``sender``, so that fails closed (an untrusted sender), the
-        same as a known-but-not-allowed login.
+        the issue, applied the label, or left the comment. We can't identify the
+        actor from a missing or malformed ``sender``, so that fails closed (an
+        untrusted sender), the same as a known-but-not-allowed login.
         """
-        sender = data.get("sender")
-        login = sender.get("login") if isinstance(sender, dict) else None
-        if not isinstance(login, str) or not login:
+        login = _sender_login(data)
+        if login is None:
             raise UntrustedSenderError("handoff webhook has no identifiable sender")
         if login.lower() not in self._trusted_actors:
             raise UntrustedSenderError(
-                f"handoff label applied by untrusted actor {login!r}; not a fleet member"
+                f"wake triggered by untrusted actor {login!r}; not a fleet member"
             )
+
+
+def _require_issue(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the payload's ``issue`` object, or raise — both wake paths need it."""
+    issue = data.get("issue")
+    if not isinstance(issue, dict):
+        raise PayloadError("event payload is missing an 'issue' object")
+    return issue
+
+
+def _sender_login(data: dict[str, Any]) -> str | None:
+    """The GitHub-attested actor login on a webhook, or ``None`` if unidentifiable.
+
+    The single source for "who triggered this delivery", read by both the
+    trusted-actor gate and the self-comment guard — so the two security checks can
+    never disagree on what the sender is. A missing or malformed ``sender``, or an
+    empty login, is ``None`` (the callers fail closed on it).
+    """
+    sender = data.get("sender")
+    login = sender.get("login") if isinstance(sender, dict) else None
+    return login if isinstance(login, str) and login else None
 
 
 def _is_handoff(action: str, issue: dict[str, Any], data: dict[str, Any]) -> bool:
@@ -188,7 +328,11 @@ def _is_handoff(action: str, issue: dict[str, Any], data: dict[str, Any]) -> boo
     if action == "labeled":
         added = data.get("label")
         return isinstance(added, dict) and added.get("name") == HANDOFF_LABEL
+    return _has_handoff_label(issue)
 
+
+def _has_handoff_label(issue: dict[str, Any]) -> bool:
+    """Whether the issue currently carries the ``handoff`` label."""
     labels = issue.get("labels")
     if not isinstance(labels, list):
         return False
