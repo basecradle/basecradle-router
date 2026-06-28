@@ -7,11 +7,13 @@ auto-merge on its own PR; see issue #38). No network, model, or live agent.
 Test cast: John Doe (human) hands off; Nova Digital (``nova``, AI) is woken.
 """
 
+import itertools
 import json
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
+from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
@@ -40,6 +42,12 @@ JT = Agent(
 )
 ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
 TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
+# Well-formed UUIDv7 delivery ids for the dedup tests (an X-GitHub-Delivery value
+# is a UUID — CLAUDE.md: "UUIDs are real well-formed UUIDv7"). Two distinct ones
+# plus a shared one to stand in for "the same event delivered twice".
+DELIVERY_A = "0192f3a4-5b6c-7d8e-9f01-00000000000a"
+DELIVERY_B = "0192f3a4-5b6c-7d8e-9f01-00000000000b"
+DELIVERY_DUP = "0192f3a4-5b6c-7d8e-9f01-0000000d00f1"
 
 
 # --- doubles ---------------------------------------------------------------
@@ -78,6 +86,7 @@ def _pipeline(
     config: Config | None = None,
     locks=None,
     breaker: WakeRateBreaker | None = None,
+    deduper: DeliveryDeduper | None = None,
     wake_lock: WakeLockGuard | None = None,
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
@@ -91,6 +100,8 @@ def _pipeline(
         kwargs["locks"] = locks
     if breaker is not None:
         kwargs["breaker"] = breaker
+    if deduper is not None:
+        kwargs["deduper"] = deduper
     if wake_lock is not None:
         kwargs["wake_lock"] = wake_lock
     return Pipeline(**kwargs), waker
@@ -111,6 +122,13 @@ class _StubWakeLock:
         return WakeLockDecision(state, state.value)
 
 
+# Each call gets a distinct delivery id by default — a distinct GitHub delivery
+# is precisely a distinct ``X-GitHub-Delivery`` GUID, so this models reality and
+# keeps the new delivery-dedup (#133) from collapsing tests that fire many
+# *separate* events. A test exercising dedup passes an explicit shared ``delivery``.
+_delivery_seq = itertools.count(1)
+
+
 def _github_request(
     *,
     action: str = "opened",
@@ -118,9 +136,11 @@ def _github_request(
     repo: str = "basecradle/basecradle-python",
     event: str = "issues",
     sign: bool = True,
-    delivery: str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+    delivery: str | None = None,
     sender: str = HANDOFF_SENDER,
 ) -> InboundRequest:
+    if delivery is None:
+        delivery = f"0192f3a4-5b6c-7d8e-9f01-{next(_delivery_seq):012x}"
     payload = {
         "action": action,
         "issue": {
@@ -442,6 +462,91 @@ def test_a_comment_storm_on_one_issue_trips_the_per_issue_breaker() -> None:
     # The third comment on the same issue trips the per-stream cap — refused, no wake.
     assert _comment().stages[-1] == (Stage.BREAKER, Outcome.IGNORED)
     assert len(waker.calls) == 2
+
+
+# --- delivery dedup collapses a duplicate webhook delivery (#133) -----------
+
+
+def test_duplicate_delivery_is_collapsed_into_one_wake() -> None:
+    # One logical event delivered twice (same X-GitHub-Delivery GUID — e.g. two
+    # fleet Apps on the repo) wakes the agent ONCE: the second is a visible DEDUP
+    # ignore, not a second session.
+    pipeline, waker = _pipeline()
+    first = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    assert first.stages[-1] == (Stage.WAKE, Outcome.OK)
+
+    second = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    assert second.stages == [
+        (Stage.ROUTE, Outcome.OK),
+        (Stage.VERIFY, Outcome.OK),
+        (Stage.NORMALIZE, Outcome.OK),
+        (Stage.RESOLVE, Outcome.OK),
+        (Stage.LOCK, Outcome.OK),
+        (Stage.DEDUP, Outcome.IGNORED),
+    ]
+    assert len(waker.calls) == 1  # exactly one wake for the duplicated event
+
+
+def test_distinct_deliveries_each_wake() -> None:
+    # Two genuinely different events (distinct GUIDs) both wake — dedup never
+    # over-collapses, the dangerous direction.
+    pipeline, waker = _pipeline()
+    assert pipeline.handle("github", _github_request(delivery=DELIVERY_A)).stages[-1] == (
+        Stage.WAKE,
+        Outcome.OK,
+    )
+    assert pipeline.handle("github", _github_request(delivery=DELIVERY_B)).stages[-1] == (
+        Stage.WAKE,
+        Outcome.OK,
+    )
+    assert len(waker.calls) == 2
+
+
+def test_dedup_does_not_suppress_a_duplicate_when_the_first_wake_failed() -> None:
+    # Mark-after-success: a duplicate is collapsed only if the original actually
+    # woke. A failed original leaves the duplicate free to retry the work.
+    waker = _StubWaker(fail_times=99)  # the first delivery's wake never succeeds
+    pipeline, _ = _pipeline(waker=waker)
+    first = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    assert first.terminal is Outcome.FAILED
+
+    waker.fail_times = 0  # the box recovers; the duplicate now succeeds
+    second = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    assert second.stages[-1] == (Stage.WAKE, Outcome.OK)  # not suppressed
+
+
+def test_dedup_entry_expires_after_ttl_and_allows_a_rewake() -> None:
+    # The recently-woke window is bounded: past the TTL, the same delivery wakes
+    # afresh (a long-delayed redelivery is a fresh signal, not a duplicate).
+    clock = [0.0]
+    deduper = DeliveryDeduper(ttl=30.0, clock=lambda: clock[0])
+    pipeline, waker = _pipeline(deduper=deduper)
+
+    assert pipeline.handle("github", _github_request(delivery=DELIVERY_DUP)).stages[-1] == (
+        Stage.WAKE,
+        Outcome.OK,
+    )
+    assert pipeline.handle("github", _github_request(delivery=DELIVERY_DUP)).stages[-1] == (
+        Stage.DEDUP,
+        Outcome.IGNORED,
+    )  # within the TTL: collapsed
+    clock[0] = 31.0  # past the TTL
+    assert pipeline.handle("github", _github_request(delivery=DELIVERY_DUP)).stages[-1] == (
+        Stage.WAKE,
+        Outcome.OK,
+    )  # window cleared: wakes again
+    assert len(waker.calls) == 2
+
+
+def test_dedup_disabled_by_zero_ttl_lets_every_delivery_wake() -> None:
+    # TTL 0 disables dedup entirely — the escape hatch; every delivery wakes.
+    pipeline, waker = _pipeline(deduper=DeliveryDeduper(ttl=0.0))
+    for _ in range(3):
+        assert pipeline.handle("github", _github_request(delivery=DELIVERY_DUP)).stages[-1] == (
+            Stage.WAKE,
+            Outcome.OK,
+        )
+    assert len(waker.calls) == 3
 
 
 # --- the NOC wake-lock interlock gates dispatch (basecradle-router#120) -----

@@ -63,6 +63,22 @@ def test_event_origin_is_optional_for_sources_without_one() -> None:
     assert event.recipient.by == "recipient_uuid"
 
 
+def test_dedup_key_pairs_the_source_with_the_delivery_id() -> None:
+    # The dedup key is source-prefixed so two sources' id-spaces can't collide,
+    # and identical across duplicate deliveries of one event (same delivery_id).
+    assert _event().dedup_key == f"github:{DELIVERY_ID}"
+    basecradle_event = Event(
+        source="basecradle",
+        kind=EventKind.PLATFORM_EVENT,
+        recipient=Recipient(by="recipient_uuid", value=JT_UUID),
+        wake_arg="0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
+        delivery_id=DELIVERY_ID,
+    )
+    # Same delivery_id, different source → distinct keys (no cross-source collision).
+    assert basecradle_event.dedup_key == f"basecradle:{DELIVERY_ID}"
+    assert basecradle_event.dedup_key != _event().dedup_key
+
+
 def test_builder_agent_round_trips() -> None:
     agent = Agent(
         key="basecradle/basecradle-python",

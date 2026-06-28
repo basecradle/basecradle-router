@@ -11,6 +11,7 @@ from basecradle_router.config import (
     ConfigError,
     load_breaker_config,
     load_config,
+    load_dedup_ttl,
     load_github_trusted_actors,
 )
 
@@ -18,6 +19,7 @@ _BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
 _BREAKER_WINDOW_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW"
 _BREAKER_COOLDOWN_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX"
+_DEDUP_TTL_VAR = "BASECRADLE_ROUTER_DEDUP_TTL"
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -247,3 +249,22 @@ def test_breaker_config_non_numeric_value_fails_loudly() -> None:
 def test_breaker_config_out_of_range_value_fails_loudly() -> None:
     with pytest.raises(ConfigError, match="invalid wake breaker configuration"):
         load_breaker_config({_BREAKER_MAX_VAR: "0"})
+
+
+def test_dedup_ttl_defaults_when_unset() -> None:
+    assert load_dedup_ttl({}) == 600.0
+
+
+def test_dedup_ttl_reads_from_env_and_zero_disables() -> None:
+    assert load_dedup_ttl({_DEDUP_TTL_VAR: "120"}) == 120.0
+    assert load_dedup_ttl({_DEDUP_TTL_VAR: "0"}) == 0.0  # the disable switch
+
+
+def test_dedup_ttl_non_numeric_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError, match=f"{_DEDUP_TTL_VAR} must be a number"):
+        load_dedup_ttl({_DEDUP_TTL_VAR: "forever"})
+
+
+def test_dedup_ttl_negative_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError, match=f"{_DEDUP_TTL_VAR} must be >= 0"):
+        load_dedup_ttl({_DEDUP_TTL_VAR: "-5"})
