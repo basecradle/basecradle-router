@@ -1,9 +1,16 @@
-# Home-server provisioning spec & deployment roadmap
+# Router daemon — deploy & ops runbook
 
-> **Status:** approved design (issue #24, 2026-06-05). This document is the contract; the scripts and
-> units that implement it live in this `deploy/` directory. Phase A (provisioning) and the Phase B
-> deploy files are authored as ready-to-review artifacts; the Phase B files are **applied only once the
-> box exists** (per Drawk, 2026-06-05).
+> **Status:** approved design (issue #24, 2026-06-05). This document is the contract for how the router
+> **daemon** is deployed and operated on its box; the scripts and units that implement it live in this
+> `deploy/` directory.
+>
+> **Scope — daemon only.** This is the **router daemon's** runbook: its config, security boundary,
+> ingress, deploy loop, and ops. **Onboarding/provisioning a builder agent** — creating its OS user,
+> cloning its repo, seeding `~/.claude`, placing its `agent.env` and per-agent token minter — is the
+> **NOC's** job (the composable builder leaf, [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53)),
+> and the onboarding roster lives at [basecradle-noc#91](https://github.com/basecradle/basecradle-noc/issues/91).
+> The router daemon *wakes* agents; it does not onboard them, and nothing onboarding-related lives in this
+> repo.
 
 ## What this is
 
@@ -19,17 +26,6 @@ release.
 > doc, work marked *(router-AI)* is config the agent authors in this repo; anything that installs, runs,
 > or hardens on the box is the **capital/NOC's**, even where older wording below still reads as if one
 > actor did both.
->
-> **One caveat on "creates the per-agent OS users" — not yet true for *builder* agents.** The NOC's
-> fleet-ops provisions **harness personas** today (venv + `pip install basecradle-harness` + the `AI_*`
-> env); it cannot yet provision a **Claude-Code builder agent** (system `claude` + `ANTHROPIC_API_KEY`,
-> no venv). That capability is being **added** to the NOC as a composable *builder-leaf brick* in
-> [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53), ported from this repo's
-> `deploy/bootstrap.sh`. Until that leaf lands **and is verified live**, builder onboarding (creating the
-> builder OS user, seeding `~/.claude`, the per-agent token minter + memory dir) is done with
-> `deploy/bootstrap.sh` + out-of-band steps, run by the **capital/operator** as the interim mechanic —
-> **never by the router-AI**. So where this doc says the capital/NOC "creates the per-agent OS users,"
-> read it as **live for harness personas, in-flight for builders (noc#53)**.
 
 On that box the router runs as a `systemd` service, receives signed webhooks at a TLS endpoint, and —
 per inbound event — **wakes the target repo's agent by running its headless `claude -p` as that agent's
@@ -44,34 +40,13 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
 
 ---
 
-## Part 1 — Provisioning spec
+## Part 1 — The daemon on the box
 
-### The box
-| Property | Value | Why |
-|---|---|---|
-| Provider | AWS **Lightsail** (resizable to EC2 later) | Standing decision; cheapest always-on Ubuntu, painless resize-up path. |
-| OS | Ubuntu **24.04 LTS** | Current LTS, supported to 2029. |
-| Size (start) | **4 GB RAM / 2 vCPU / 80 GB SSD** (~$24/mo) | Each concurrent wake is a `claude -p` Node process (~hundreds of MB) plus a git worktree; the daemon itself is tiny. 4 GB is fleet-ready headroom for several concurrent wakes. |
-| Resize trigger | Sustained memory pressure as the 3rd–4th agent onboards | Resizing is the whole point of starting on Lightsail. |
-| Inbound firewall | **22** (SSH, key-only), **80** (ACME redirect), **443** (webhooks). Everything else denied. | Minimal attack surface on the box that holds the credentials. |
-| Static IP | Attached | DNS target for `ai.basecradle.com`. |
+### The security boundary — OS-user isolation + the wake-runner
 
-### OS-user layout — the security spine
-- **One unprivileged OS user per agent, named by the agent's fleet identity slug:**
-  `basecradle-ruby-ai`, `basecradle-python-ai`, `basecradle-harness-ai`, … (`basecradle-<repo>-ai`).
-  This is the **same slug** as the agent's GitHub bot (`basecradle-ruby-ai[bot]`) and its BaseCradle
-  platform handle — agent / bot / handle / OS-user all align under one identity; there is no separate
-  naming scheme. Home mode `700`; each holds only its own credentials, unreadable by siblings.
-  **basecradle AI (the capital) gets no OS user yet** — it stays on the founder's laptop + subscription
-  for the foreseeable future and is not migrated to the server now.
-  > **These builder slugs are the *target* layout, not the current roster.** Today only
-  > **`basecradle-ruby-ai`** actually exists on the box — and it was **hand-built** (via
-  > `deploy/bootstrap.sh` + out-of-band onboarding) before the NOC became sole deployer, not
-  > NOC-provisioned. **`basecradle-python-ai`, `basecradle-harness-ai`, …** are not yet provisioned:
-  > the NOC's fleet-ops can stand up **harness personas** but not **Claude-Code builders**, and that
-  > builder-provisioning capability is being added to the NOC as a composable builder-leaf brick in
-  > [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53). So a builder slug
-  > appearing in this layout means "this is where it *will* live," not "the NOC creates it today."
+The router wakes each agent **as that agent's own unprivileged OS user, in that agent's own repo clone**.
+The daemon enforces least privilege around that wake:
+
 - **One unprivileged `router` service user** runs the daemon. It does **not** run as root and
   **cannot read any agent's secrets**. This is deliberately a *minimal, non-agent* service account, kept
   separate from the fleet-slug agent users (router-AI's design call, per #26): the daemon is the dispatcher, never
@@ -86,7 +61,10 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   own administrative SSH, not as a fleet wake-user — it installs and operates the daemon. basecradle-router
   AI has **no** operator presence on the box: it authors this config in the repo and never logs in to deploy.
 
-### Filesystem & credential layout
+The agent OS users themselves — created, credentialed, and seeded by the NOC's onboarding (noc#91) — are
+the daemon's *wake targets*, resolved from the registry below. Provisioning them is not the daemon's job.
+
+### Daemon filesystem & config layout
 ```
 /opt/basecradle-router/            # ROOT-owned tree (router cannot write it)
   app/                             # the daemon: checked-out repo + uv venv, owned by `router`
@@ -96,10 +74,12 @@ The codebase was built for this: [`wake.py`](../src/basecradle_router/wake.py) a
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
                                    #   read-only (0640) — it is the wake-runner's trusted allowlist
                                    #   so the daemon must not be able to write it; NO secrets
-/home/basecradle-ruby-ai/          # mode 700, owned by basecradle-ruby-ai (the fleet slug)
-  repos/basecradle-ruby/           # the agent's own clone (cwd of its wake)
-  .config/basecradle/agent.env     # 0600 — the agent's secrets (see below)
 ```
+
+The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, synced by
+`deploy/deploy.sh` on each deploy. The daemon's only system dependency on the box is the privilege-drop
+chain (`sudo` → `wake-runner` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
+part of that agent's own onboarding, not the daemon's.
 
 **`router.env`** holds only the daemon's own non-agent config:
 ```
@@ -167,9 +147,10 @@ each layer on its own view.
 
 #### The registry (`agents.json`)
 
-A JSON object of **agent key → fields**. The key is the agent's stable slug: a GitHub builder's key is
-the `owner/name` repo it captains; a harness persona's key is its bare slug (e.g. `jt`). An entry's
-`kind` selects how it is read (absent ⇒ `github`); existing github entries are unchanged.
+A JSON object of **agent key → fields** — the daemon's wake-resolution table, maintained on the box by
+the operator (the daemon reads it; it never writes it). The key is the agent's stable slug: a GitHub
+builder's key is the `owner/name` repo it captains; a harness persona's key is its bare slug (e.g. `jt`).
+An entry's `kind` selects how it is read (absent ⇒ `github`); existing github entries are unchanged.
 
 ```jsonc
 {
@@ -196,41 +177,16 @@ The `wake-runner` reads the same registry: for a harness entry it launches **onl
 `wake_bin` (which must resolve inside that agent's `/home/<user>`), never a caller-supplied path — the
 same registry-is-the-only-authority rule that confines builders to the system `claude`.
 
-**`agent.env`** (per agent, loaded by the wrapper *as that user*) holds that agent's secrets — its
-`ANTHROPIC_API_KEY` and its GitHub App credentials, and later its BaseCradle token. This is the live
-implementation of `wake.py`'s `env_provider` seam: the env is resolved by the wrapper running as the
-agent, so the unprivileged `router` daemon never touches an agent secret. The file is parsed as
-**literal `KEY=VALUE` lines, never bash-`source`d** (#109): the value after the first `=` is taken
-verbatim (one layer of surrounding quotes stripped), so a secret containing `$`, a backtick, `$( )`,
-spaces, or quotes is loaded as data and never evaluated as shell. Quoting values is therefore optional,
-not load-bearing. The GitHub App credentials are:
-```
-ANTHROPIC_API_KEY=sk-ant-...
-GH_APP_SLUG=basecradle-ruby-ai
-GH_APP_ID=<github app id>
-GH_APP_BOT_USER_ID=<bot user id, for the commit-author email>
-GH_APP_PEM_B64=<base64 of the App private-key PEM>
-```
-The agent mints its own short-lived `<slug>[bot]` tokens from these with **`deploy/bin/gh-app-token`**
-(installed root-owned at `/usr/local/bin/gh-app-token`): `gh-app-token --token` / `--author` / `--remote`.
-It reads the creds from the environment (each box agent holds only its own) and signs the JWT via the
-`openssl` CLI, so it needs no extra runtime — the same shape as the laptop fleet helper. Each agent's
-Claude Code is defaulted (`~/.claude/settings.json`, by `bootstrap.sh`) to **Opus 4.8 High**
-(`model` + `effortLevel`) and **`permissions.defaultMode = bypassPermissions`** — a wake is headless
-(no human to approve prompts), so the agent must act autonomously; the security boundary is the
-per-OS-user isolation + the wake-runner wrapper, not Claude's interactive prompts.
+Each agent's own secrets live in a per-agent `agent.env` that the **wrapper** loads *as that user* after
+the privilege drop — the live implementation of `wake.py`'s `env_provider` seam, so the unprivileged
+`router` daemon never touches an agent secret. The file is parsed as **literal `KEY=VALUE` lines, never
+bash-`source`d** (#109): the value after the first `=` is taken verbatim (one layer of surrounding quotes
+stripped), so a secret containing `$`, a backtick, `$( )`, spaces, or quotes is loaded as data and never
+evaluated as shell. *Placing* that `agent.env` (its contents, the agent's API key and GitHub App
+credentials, its token minter) is the NOC's onboarding job (noc#91), not the daemon's.
 
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
-on the box out-of-band (a founder gate), `chmod 600`, never in git.
-
-### Installed software
-- **System-wide (root):** `git`, `gh` CLI (official apt repo), **Node.js LTS + Claude Code**
-  (`npm install -g`, so every agent user gets `claude`), **Caddy** (official apt repo). All by
-  `deploy/bootstrap.sh`.
-- **The `router` user:** **`uv`** (only the daemon needs it).
-- **Per-agent (in each agent's home):** that repo's language toolchain via its own version manager
-  (asdf/mise) — e.g. Ruby for `basecradle-ruby-ai` — matching how that repo actually builds.
-- **The daemon's own Python:** `uv`-managed venv under `/opt/basecradle-router/app`.
+on the box out-of-band, `chmod 600`, never in git.
 
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
@@ -252,26 +208,15 @@ on the box out-of-band (a founder gate), `chmod 600`, never in git.
 
 ---
 
-## Part 2 — Deployment roadmap
+## Part 2 — The daemon's deploy components
 
-Sequenced. The markers name the actor: *(founder)* a human gate; *(router-AI)* config
-basecradle-router AI **authors in this repo** (never runs on the box); *(capital/NOC)* an on-box action
-the **capital** runs today (the NOC once its fleet-ops ships). The router-AI never deploys — anything that
-installs, clones, runs, or hardens on the box is the capital/NOC's, even where an item also has authored
-config the router-AI wrote. Phase B files are **authored ahead as ready-to-review artifacts** (per Drawk,
-2026-06-05) but **applied only once the box exists**.
+The daemon's on-box artifacts, each **authored in this repo by the router-AI** and **installed/run on the
+box by the deployer** (the capital today; the NOC once its fleet-ops ships). The router-AI never deploys —
+anything that installs, runs, or hardens on the box is the capital/NOC's. (The first install of the
+root-owned wrapper + `sudoers` rule is a one-time on-box step; thereafter `deploy/deploy.sh` keeps the
+wrapper and the managed units in lockstep with `main` on every deploy.)
 
-### Phase A — Provisioning
-- **A1** *(founder)* Provision the Lightsail Ubuntu 24.04 box (4 GB/2 vCPU/80 GB), attach a static IP,
-  open firewall 22/80/443.
-- **A2** *(founder)* DNS: `ai.basecradle.com` **A →** static IP.
-- **A3** *(router-AI authors; capital/NOC runs)* `deploy/bootstrap.sh`: an **idempotent bash** setup script —
-  create the `router` + per-agent users, install the system toolchains, lay down the directories with
-  their modes/owners, install Caddy. Bash over Ansible: one box, "convention over configuration";
-  structured so it could become Ansible *if* the fleet ever goes multi-host (out of scope now).
-
-### Phase B — Daemon deploy *(authored ahead as ready-to-review files, per Drawk 2026-06-05; applied only once the box exists)*
-- **B1** ✅ **Authored (#36).** systemd unit `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
+- **The systemd unit** `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
   the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
   `Restart=on-failure`, `TimeoutStopSec` to let the app drain in-flight wakes on shutdown, bound to
   localhost (Caddy fronts it).
@@ -280,10 +225,10 @@ config the router-AI wrote. Phase B files are **authored ahead as ready-to-revie
   > be used: `NoNewPrivileges=yes` would block the `sudo`→wrapper escalation; `ProtectHome=yes` would
   > hide the agent's clone under `/home`; `ProtectSystem=strict` would make `/home` read-only; and
   > `MemoryDenyWriteExecute=yes` would kill Node's JIT. The real isolation is the per-OS-user
-  > separation + the wake-runner boundary (#28), not namespace sandboxing of the router. The unit
+  > separation + the wake-runner boundary, not namespace sandboxing of the router. The unit
   > applies only the wake-compatible directives (`ProtectSystem=full`, `PrivateTmp`, the kernel/cgroup
   > protections). Stronger per-wake isolation later: launch each wake in its own `systemd-run --scope`.
-- **B2** ✅ **Authored (#35).** the root-owned `wake-runner` wrapper (`deploy/bin/wake-runner`) + the `sudoers` rule
+- **The root-owned `wake-runner` wrapper** (`deploy/bin/wake-runner`) + the `sudoers` rule
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- <wake command>`,
   where the wake command is `claude -p "<trigger>"` for a builder or `<wake_bin> --timeline "<uuid>"`
@@ -300,45 +245,25 @@ config the router-AI wrote. Phase B files are **authored ahead as ready-to-revie
   `main` (it is code on the launch path, but lives root-owned outside the router-owned `app/` tree the
   app-rsync mirrors). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
   dangerous, so it stays this documented manual step.
-- **B3** ✅ **Done (#40).** `HomeServerWaker` in `wake.py` assembles the wrapper argv
-  (`--user`/`--cwd`/`--`); env is empty (the wrapper loads the agent's `agent.env` after the drop).
-- **B4** ✅ **Done (#30).** Fast-ack in `server.py`: `accept` runs inline → `202`, `execute` (the wake)
-  runs as a tracked background task drained on shutdown.
-- **B5** Caddyfile (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
+- **`HomeServerWaker`** in `wake.py` assembles the wrapper argv (`--user`/`--cwd`/`--`); env is empty
+  (the wrapper loads the agent's `agent.env` after the drop).
+- **Fast-ack** in `server.py`: `accept` runs inline → `202`, `execute` (the wake) runs as a tracked
+  background task drained on shutdown.
+- **The Caddyfile** (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
   reverse-proxy to the local uvicorn (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then
   `caddy validate` + `systemctl reload caddy`.
+- **The ASGI entrypoint** `basecradle_router.app:create_app` + the `uvicorn` dependency (#37) — the
+  composition root the systemd unit's `ExecStart` runs.
 
-> **Also shipped (not in the original B-list):** the ASGI **entrypoint** `basecradle_router.app:create_app`
-> + the `uvicorn` dependency (#37) — the composition root the systemd unit's `ExecStart` runs.
->
 > **The pipeline ends at the wake — the router never merges (#38, decided).** Auto-merge of a captain's
 > own green PR (Earned Autonomy) is done by **GitHub native auto-merge**: during its wake the agent opens
 > its PR and runs `gh pr merge --auto --squash` under its own bot identity, so the platform merges when
 > required checks pass. A router-side merger was rejected — it would have meant a standing merge-capable
 > token on the crown-jewels box, contradicting "the router holds no secret." Per-repo prerequisite:
 > branch protection with required status checks, **Allow auto-merge**, and **Automatically delete head
-> branches** all enabled (part of repo bootstrap).
+> branches** all enabled.
 
-### Phase C — Go-live (ruby-first canary)
-The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + router-wake loop end-to-end.
-- **C1** *(founder)* Create a per-agent **Anthropic API key** for basecradle-ruby AI; place ruby's
-  `agent.env` on the box.
-- **C2** *(capital/NOC)* Create `basecradle-ruby-ai`, clone `basecradle-ruby` into `/home/basecradle-ruby-ai/repos/basecradle-ruby`, register it in `agents.json` (an on-box action — the router-AI authors the registry shape, the operator applies it).
-- **C3** *(founder)* On **that agent's own GitHub App** (here `basecradle-ruby-ai`), enable the
-  **webhook** → `https://ai.basecradle.com/webhooks/github`, content-type `application/json`, SSL
-  verification on, signing secret matching `router.env`, subscribed to **Issues** events. Each agent's
-  App carries its own webhook — there is **no** central webhook App; the router reads *which* agent to
-  wake from the payload's `repository.full_name`, and the single `router.env` secret HMAC-verifies every
-  agent's App because they all share that one secret.
-- **C4** **Canary run:** file a trivial `handoff` issue on `basecradle-ruby` and confirm the **live**
-  loop — webhook → verify → wake ruby *as* `basecradle-ruby-ai` → PR → report. The first un-mocked end-to-end run.
-- **C5** On a green canary, onboard the remaining worker agents (python, harness, …) by repeating
-  **C1–C3** — each agent needs its own App webhook configured (C3), since webhooks are per-App, not
-  central. **basecradle AI last**, and only once the system is proven stable — and per the standing
-  decision it stays on the laptop for the foreseeable future, so it is effectively not migrated this
-  phase.
-
-### Phase D — Hardening (ongoing; capital/NOC operates, router-AI authors the config)
+### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
 clean-reboot mechanism in Part 4), retention for the pipeline's structured stage log, backup of
 `agents.json` with a documented rebuild, and liveness alerting on the systemd service. The router-AI
@@ -475,7 +400,7 @@ across DST; the box's systemd 255 supports this, vs. a fixed UTC value that woul
 `RandomizedDelaySec=15min`). `reboot-if-required.sh` no-ops unless a reboot is actually pending, so an
 actual reboot happens only on the days an OS update staged one. This is the founder's call (issue #66): the deferral was only until the mechanism existed and
 was verified working — now it is, so the box reboots itself to take security/kernel patches, and the
-recovery gate confirms it came back (or alarms). It pairs with the Phase D hardening duty
+recovery gate confirms it came back (or alarms). It pairs with the hardening duty
 (`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works
 (`systemctl start basecradle-router-reboot.service`, or `reboot-if-required.sh` by hand) for an
 out-of-window reboot.
@@ -574,18 +499,3 @@ offline, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p
 synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and a message carrying a
 `ghs_…`/`…/heartbeat/…` token must come back `[REDACTED_…]`. Re-test after a reboot:
 `systemctl status vector` active and Live Tail resumes.
-
----
-
-## Founder gates (in order)
-The human actions this phase needs. Surfaced here so they are never a surprise; the router-AI authors
-right up to each gate and pauses only at it, and the capital/NOC operates the box past it.
-
-1. **Provision** Lightsail Ubuntu 24.04, **4 GB / 2 vCPU / 80 GB**, static IP, firewall **22/80/443**.
-2. **DNS:** `ai.basecradle.com` **A →** `<static IP>`.
-3. **Anthropic API key:** one per agent — start with **basecradle-ruby AI**.
-4. **GitHub App webhook** — on **each agent's own App** (per-agent, not central) → `https://ai.basecradle.com/webhooks/github`,
-   content-type `application/json`, signing secret matched to `router.env`, subscribed to **Issues**.
-5. **Better Stack "AI" source token** (telemetry, Part 5) — the **capital** places it on-box at
-   `/etc/vector/betterstack.env` (chmod 640 root:vector), installs Vector + the version-controlled
-   config, and live-verifies. Never committed to the repo.
