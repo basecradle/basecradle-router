@@ -101,6 +101,13 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # Delivery dedup (collapse a duplicate webhook delivery into one wake, issue #133) — optional,
 # generous default; 0 disables:
 # BASECRADLE_ROUTER_DEDUP_TTL=600                # seconds a woken delivery id is remembered; 0 disables
+#
+# Per-wake wall-clock bound (issue #135) — optional, generous default; bounds a hung
+# claude so it cannot pin the agent lock / a worker thread forever. The wake-runner's
+# timeout(1) reaps the whole runuser→bash→claude tree at this bound. Enforced to stay
+# under the unit's TimeoutStopSec (max 100 = 120 s − the 20 s backstop margin) so a hang
+# is reaped before the drain deadline; to go higher, raise TimeoutStopSec too. 0 disables:
+# BASECRADLE_ROUTER_WAKE_TIMEOUT=90              # seconds a single wake may run; 0 = unbounded
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a

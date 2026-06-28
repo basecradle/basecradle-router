@@ -50,6 +50,7 @@ die() {
 
 user=""
 cwd=""
+timeout_secs=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--user)
@@ -60,6 +61,15 @@ while [[ $# -gt 0 ]]; do
 	--cwd)
 		[[ $# -ge 2 ]] || die "--cwd needs a value"
 		cwd="$2"
+		shift 2
+		;;
+	--timeout)
+		# An OPTIONAL wall-clock bound for the wake (seconds). The router sets it so
+		# a hung claude cannot pin the agent lock forever (basecradle-router#135);
+		# absent => unbounded, preserving the prior behaviour.
+		[[ $# -ge 2 ]] || die "--timeout needs a value"
+		[[ "$2" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "refusing: --timeout must be a positive number, got '$2'"
+		timeout_secs="$2"
 		shift 2
 		;;
 	--)
@@ -140,11 +150,22 @@ shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are
 # The inline script takes the cwd as $1 and the command (launch_bin + args) as
 # $2..; root never interpolates the trigger/timeline — it is passed as an inert
 # positional argument.
+# Optionally bound the wake's wall-clock with timeout(1). GNU timeout runs runuser
+# in its OWN process group and signals the whole group on expiry, so the entire
+# runuser→bash→claude tree is reaped — subprocess.run's timeout on the router side
+# kills only the direct `sudo` child and would orphan the tree (basecradle-router#135).
+# SIGTERM first (let claude exit cleanly), then SIGKILL after a 10s grace.
+launch=(runuser -u "$user" --)
+if [[ -n $timeout_secs ]]; then
+	command -v timeout >/dev/null 2>&1 || die "timeout(1) is required to bound the wake"
+	launch=(timeout --signal=TERM --kill-after=10 "$timeout_secs" "${launch[@]}")
+fi
+
 # SC2016 is intentional: the single quotes are load-bearing — $HOME/$1/$@ must
 # expand in the AGENT's bash after runuser, never in root's, so the untrusted
 # trigger is never evaluated in a privileged context.
 # shellcheck disable=SC2016
-exec runuser -u "$user" -- /bin/bash -c '
+exec "${launch[@]}" /bin/bash -c '
 	set -euo pipefail
 	# Lock the agent process to umask 077 before anything is written: every file
 	# the woken claude creates (memory, settings, scratch) then lands 600 and every
