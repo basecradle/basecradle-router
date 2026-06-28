@@ -13,7 +13,6 @@ from basecradle_router.config import (
     load_config,
     load_dedup_ttl,
     load_github_trusted_actors,
-    load_wake_timeout,
 )
 
 _BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
@@ -21,7 +20,6 @@ _BREAKER_WINDOW_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW"
 _BREAKER_COOLDOWN_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX"
 _DEDUP_TTL_VAR = "BASECRADLE_ROUTER_DEDUP_TTL"
-_WAKE_TIMEOUT_VAR = "BASECRADLE_ROUTER_WAKE_TIMEOUT"
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -270,41 +268,3 @@ def test_dedup_ttl_non_numeric_value_fails_loudly() -> None:
 def test_dedup_ttl_negative_value_fails_loudly() -> None:
     with pytest.raises(ConfigError, match=f"{_DEDUP_TTL_VAR} must be >= 0"):
         load_dedup_ttl({_DEDUP_TTL_VAR: "-5"})
-
-
-def test_wake_timeout_defaults_to_a_finite_bound() -> None:
-    # The whole point of #135: the default is finite, never None — a wake left
-    # unbounded pins the agent lock and a worker thread forever.
-    assert load_wake_timeout({}) == 90.0
-
-
-def test_wake_timeout_reads_from_env_and_zero_disables() -> None:
-    assert load_wake_timeout({_WAKE_TIMEOUT_VAR: "80"}) == 80.0
-    assert load_wake_timeout({_WAKE_TIMEOUT_VAR: "0"}) is None  # the explicit opt-out
-
-
-def test_wake_timeout_non_numeric_value_fails_loudly() -> None:
-    with pytest.raises(ConfigError, match=f"{_WAKE_TIMEOUT_VAR} must be a number"):
-        load_wake_timeout({_WAKE_TIMEOUT_VAR: "forever"})
-
-
-def test_wake_timeout_negative_value_fails_loudly() -> None:
-    with pytest.raises(ConfigError, match=f"{_WAKE_TIMEOUT_VAR} must be >= 0"):
-        load_wake_timeout({_WAKE_TIMEOUT_VAR: "-1"})
-
-
-def test_wake_timeout_non_finite_value_fails_loudly() -> None:
-    # `inf`/`nan` pass float() and survive a `< 0` check, then crash at format time
-    # and silently wedge EVERY wake — reject them loudly at load instead.
-    for bad in ("inf", "nan"):
-        with pytest.raises(ConfigError, match=f"{_WAKE_TIMEOUT_VAR} must be a finite number"):
-            load_wake_timeout({_WAKE_TIMEOUT_VAR: bad})
-
-
-def test_wake_timeout_above_the_stop_deadline_ceiling_fails_loudly() -> None:
-    # The bound + the 20 s backstop must finish before the unit's 120 s TimeoutStopSec,
-    # or a hung wake's drain is severed by systemd's SIGKILL — the #135 failure, via
-    # misconfiguration. The enforced ceiling is 100 s.
-    assert load_wake_timeout({_WAKE_TIMEOUT_VAR: "100"}) == 100.0  # the ceiling itself is allowed
-    with pytest.raises(ConfigError, match="raise TimeoutStopSec"):
-        load_wake_timeout({_WAKE_TIMEOUT_VAR: "115"})

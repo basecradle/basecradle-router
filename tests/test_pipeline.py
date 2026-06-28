@@ -655,27 +655,3 @@ def test_same_agent_is_locked_during_a_wake() -> None:
     worker.join(timeout=5)
     assert locks.acquire(NOVA.harness_key, blocking=False) is True  # released after the wake
     locks.release(NOVA.harness_key)
-
-
-def test_a_timed_out_wake_releases_the_lock_and_a_second_delivery_proceeds() -> None:
-    # #135: a timed-out wake surfaces as a WakeError (the boundary maps the
-    # subprocess timeout to one). The lock the hung wake held MUST be released, or
-    # that agent — and, once the thread pool saturates, the whole fleet — wedges.
-    from basecradle_router.concurrency import AgentLocks
-
-    locks = AgentLocks()
-    waker = _StubWaker(fail_times=99)  # every attempt raises, as a persistent timeout would
-    pipeline, _ = _pipeline(waker=waker, locks=locks)
-
-    first = pipeline.handle("github", _github_request())
-    assert first.stages[-1] == (Stage.WAKE, Outcome.FAILED)
-    # The lock is free again — the guard releases it even though the wake raised.
-    assert locks.acquire(NOVA.harness_key, blocking=False) is True
-    locks.release(NOVA.harness_key)
-
-    # A fresh delivery for the same agent is not blocked behind the dead wake: it
-    # reaches the wake stage and runs (no lingering hold from the timed-out one).
-    before = len(waker.calls)
-    second = pipeline.handle("github", _github_request())
-    assert second.stages[-1] == (Stage.WAKE, Outcome.FAILED)
-    assert len(waker.calls) > before

@@ -8,7 +8,6 @@ env var; the webhook secrets are read straight from the environment.
 from __future__ import annotations
 
 import json
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -16,7 +15,6 @@ from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig
 from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
-from basecradle_router.wake import WAKE_BACKSTOP_MARGIN
 
 _EMPTY: Mapping[str, Agent] = MappingProxyType({})
 
@@ -33,13 +31,6 @@ _BREAKER_COOLDOWN_VAR = f"{_BREAKER_PREFIX}COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = f"{_BREAKER_PREFIX}STREAM_MAX"
 
 _DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
-
-_WAKE_TIMEOUT_VAR = f"{ENV_PREFIX}WAKE_TIMEOUT"
-# Mirror of the systemd unit's TimeoutStopSec (deploy/systemd/basecradle-router.service).
-# A wake's total wall-clock — its bound plus the waker's subprocess backstop margin —
-# must stay under this, so a hung wake is reaped before systemd SIGKILLs the whole
-# control-group mid-drain (the #135 failure, in reverse). Kept in sync with the unit.
-_STOP_DEADLINE_SECONDS = 120.0
 
 
 class ConfigError(Exception):
@@ -305,51 +296,6 @@ def load_dedup_ttl(env: Mapping[str, str] | None = None) -> float:
     if ttl < 0:
         raise ConfigError(f"{_DEDUP_TTL_VAR} must be >= 0 (0 disables dedup), got {ttl!r}")
     return ttl
-
-
-def load_wake_timeout(env: Mapping[str, str] | None = None) -> float | None:
-    """The per-wake wall-clock bound in seconds, from ``BASECRADLE_ROUTER_WAKE_TIMEOUT``.
-
-    A wake runs *inside* the per-agent lock and is awaited by ``drain()`` on
-    shutdown, so a hung ``claude`` that runs unbounded pins a worker thread and the
-    agent lock forever — saturating the shared thread pool and stalling wakes for
-    every agent, and hanging a deploy/reboot drain until systemd SIGKILLs the whole
-    control-group mid-task (basecradle-router#135). Every wake therefore carries a
-    finite bound, set here at the composition root rather than left to a library
-    default of ``None``.
-
-    Optional with a generous default (90 s): well under the unit's
-    ``TimeoutStopSec`` so a hang is reaped before the drain deadline, yet generous
-    for a real multi-minute agent task (the wake-runner's OS-level ``timeout(1)``
-    reaps the whole ``runuser→bash→claude`` tree, and the subprocess timeout is the
-    Python-level backstop). ``0`` disables the bound (unbounded — a hang can then
-    pin a thread; opt in only deliberately).
-
-    Every other input fails loudly with a :class:`ConfigError` naming the variable,
-    never a silent fallback: a negative or non-finite (``inf``/``nan``) value, or a
-    value so large that the wake's total wall-clock (the bound plus the
-    :data:`~basecradle_router.wake.WAKE_BACKSTOP_MARGIN` subprocess backstop) would
-    not finish before the unit's ``TimeoutStopSec`` — which would re-open the very
-    drain-severance #135 closes, just via misconfiguration. To allow a longer wake,
-    raise ``TimeoutStopSec`` in the systemd unit (and ``_STOP_DEADLINE_SECONDS``).
-    """
-    env = os.environ if env is None else env
-    secs = _float_env(env, _WAKE_TIMEOUT_VAR, 90.0)
-    if not math.isfinite(secs):
-        raise ConfigError(f"{_WAKE_TIMEOUT_VAR} must be a finite number, got {secs!r}")
-    if secs < 0:
-        raise ConfigError(f"{_WAKE_TIMEOUT_VAR} must be >= 0 (0 disables the bound), got {secs!r}")
-    if secs == 0:
-        return None
-    ceiling = _STOP_DEADLINE_SECONDS - WAKE_BACKSTOP_MARGIN
-    if secs > ceiling:
-        raise ConfigError(
-            f"{_WAKE_TIMEOUT_VAR} must be <= {ceiling:g} (so the bound plus the "
-            f"{WAKE_BACKSTOP_MARGIN:g}s backstop stays under the unit's "
-            f"{_STOP_DEADLINE_SECONDS:g}s TimeoutStopSec); raise TimeoutStopSec to go higher, "
-            f"got {secs!r}"
-        )
-    return secs
 
 
 def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:

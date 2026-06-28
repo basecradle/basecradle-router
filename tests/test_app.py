@@ -136,20 +136,6 @@ def test_create_app_defaults_to_the_home_server_waker(tmp_path) -> None:
     assert isinstance(server.pipeline.waker, HomeServerWaker)
 
 
-def test_create_app_gives_the_production_waker_a_finite_timeout(tmp_path) -> None:
-    # #135: the production waker must carry a finite wall-clock bound — an unbounded
-    # wake pins the agent lock and a worker thread forever and stalls the fleet.
-    server = create_app(_env(tmp_path))
-    assert server.pipeline.waker.timeout == 90.0  # the configured default
-
-
-def test_create_app_honours_an_explicit_wake_timeout(tmp_path) -> None:
-    env = _env(tmp_path)
-    env["BASECRADLE_ROUTER_WAKE_TIMEOUT"] = "75"  # under the enforced 100 s ceiling
-    server = create_app(env)
-    assert server.pipeline.waker.timeout == 75.0
-
-
 def test_create_app_raises_config_error_when_config_is_missing() -> None:
     # No agent registry path set → a ConfigError naming the missing variable, not a crash.
     with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_AGENTS"):

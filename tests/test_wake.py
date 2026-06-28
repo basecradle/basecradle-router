@@ -322,57 +322,12 @@ def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> No
     assert runner.invocation.argv.count(nasty) == 1
 
 
-def test_home_server_waker_honours_a_custom_wrapper_path() -> None:
+def test_home_server_waker_honours_a_custom_wrapper_path_and_timeout() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner").wake(NOVA, EVENT)
+    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner", timeout=1800.0).wake(NOVA, EVENT)
     assert runner.invocation is not None
     assert runner.invocation.argv[1] == "/opt/x/wake-runner"
-
-
-def test_home_server_waker_omits_the_timeout_args_when_unbounded() -> None:
-    # With no bound the argv carries no --timeout and the subprocess stays unbounded,
-    # exactly as before #135 — the assemble tests above pin the rest of the shape.
-    runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner).wake(NOVA, EVENT)
-    assert runner.invocation is not None
-    assert "--timeout" not in runner.invocation.argv
-    assert runner.invocation.timeout is None
-
-
-def test_home_server_waker_passes_the_bound_to_the_wrapper_and_backstops_in_python() -> None:
-    # #135: the bound is handed to the wrapper as `--timeout <secs>` (before `--`)
-    # so its timeout(1) reaps the whole runuser→bash→claude tree; the subprocess.run
-    # bound is set a margin LONGER so the wrapper always fires first and Python is a
-    # pure backstop for a wedged wrapper (it would otherwise orphan the tree).
-    runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner, timeout=1800.0).wake(NOVA, EVENT)
-    assert runner.invocation is not None
-    argv = runner.invocation.argv
-    assert argv[:7] == (
-        "sudo",
-        WAKE_RUNNER,
-        "--user",
-        "nova",
-        "--cwd",
-        "/home/nova/basecradle-python",
-        "--timeout",
-    )
-    assert argv[7] == "1800"  # rendered for timeout(1): no trailing .0
-    assert argv[8] == "--"  # the bound sits before the command separator
-    assert runner.invocation.timeout > 1800.0  # the Python backstop runs longer
-
-
-def test_home_server_waker_renders_a_fractional_bound_without_sci_notation() -> None:
-    # The wrapper's numeric guard rejects scientific notation; a fractional bound must
-    # render as plain decimal digits (here 90.5), never `9.05e+01` or similar.
-    import re
-
-    runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner, timeout=90.5).wake(NOVA, EVENT)
-    assert runner.invocation is not None
-    rendered = runner.invocation.argv[runner.invocation.argv.index("--timeout") + 1]
-    assert rendered == "90.5"
-    assert re.fullmatch(r"[0-9]+([.][0-9]+)?", rendered)  # exactly what the wrapper accepts
+    assert runner.invocation.timeout == 1800.0
 
 
 def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
