@@ -324,12 +324,17 @@ The low-stakes canary that proves the per-OS-user + Claude-Code-on-server + rout
 - **C1** *(founder)* Create a per-agent **Anthropic API key** for basecradle-ruby AI; place ruby's
   `agent.env` on the box.
 - **C2** *(capital/NOC)* Create `basecradle-ruby-ai`, clone `basecradle-ruby` into `/home/basecradle-ruby-ai/repos/basecradle-ruby`, register it in `agents.json` (an on-box action — the router-AI authors the registry shape, the operator applies it).
-- **C3** *(founder)* Enable the **GitHub App webhook** → `https://ai.basecradle.com/webhooks/github`,
-  signing secret matching `router.env`.
+- **C3** *(founder)* On **that agent's own GitHub App** (here `basecradle-ruby-ai`), enable the
+  **webhook** → `https://ai.basecradle.com/webhooks/github`, content-type `application/json`, SSL
+  verification on, signing secret matching `router.env`, subscribed to **Issues** events. Each agent's
+  App carries its own webhook — there is **no** central webhook App; the router reads *which* agent to
+  wake from the payload's `repository.full_name`, and the single `router.env` secret HMAC-verifies every
+  agent's App because they all share that one secret.
 - **C4** **Canary run:** file a trivial `handoff` issue on `basecradle-ruby` and confirm the **live**
   loop — webhook → verify → wake ruby *as* `basecradle-ruby-ai` → PR → report. The first un-mocked end-to-end run.
 - **C5** On a green canary, onboard the remaining worker agents (python, harness, …) by repeating
-  C1–C2. **basecradle AI last**, and only once the system is proven stable — and per the standing
+  **C1–C3** — each agent needs its own App webhook configured (C3), since webhooks are per-App, not
+  central. **basecradle AI last**, and only once the system is proven stable — and per the standing
   decision it stays on the laptop for the foreseeable future, so it is effectively not migrated this
   phase.
 
@@ -579,8 +584,8 @@ right up to each gate and pauses only at it, and the capital/NOC operates the bo
 1. **Provision** Lightsail Ubuntu 24.04, **4 GB / 2 vCPU / 80 GB**, static IP, firewall **22/80/443**.
 2. **DNS:** `ai.basecradle.com` **A →** `<static IP>`.
 3. **Anthropic API key:** one per agent — start with **basecradle-ruby AI**.
-4. **GitHub App webhook** → `https://ai.basecradle.com/webhooks/github`, signing secret matched to
-   `router.env`.
+4. **GitHub App webhook** — on **each agent's own App** (per-agent, not central) → `https://ai.basecradle.com/webhooks/github`,
+   content-type `application/json`, signing secret matched to `router.env`, subscribed to **Issues**.
 5. **Better Stack "AI" source token** (telemetry, Part 5) — the **capital** places it on-box at
    `/etc/vector/betterstack.env` (chmod 640 root:vector), installs Vector + the version-controlled
    config, and live-verifies. Never committed to the repo.
