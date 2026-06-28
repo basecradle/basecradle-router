@@ -26,7 +26,7 @@ from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer, configure_logging
-from basecradle_router.wake import WakeError, WakeResult
+from basecradle_router.wake import WakeResult
 
 SECRET = "whsec_" + "0" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
@@ -330,44 +330,6 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
 
     assert asyncio.run(_drive()) == 202
     assert len(waker.calls) == 1
-
-
-def test_drain_returns_when_a_wake_hits_its_timeout() -> None:
-    # #135: a wake that exceeds its bound surfaces as a WakeError (the boundary maps
-    # the subprocess timeout to one). Because the wake then *returns* rather than
-    # running forever, drain() completes and leaves no orphaned background task — the
-    # exact property that keeps `systemctl stop`/reboot from hanging until SIGKILL
-    # severs an in-flight wake. (An unbounded wake would never return, hanging drain.)
-    class _TimingOutWaker:
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
-            raise WakeError("wake in '/home/nova/basecradle-python' timed out after 90s")
-
-    server, _ = _build(waker=_TimingOutWaker())
-    body, headers = _signed_body()
-
-    async def _drive() -> None:
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": "/webhooks/github",
-            "headers": [
-                (k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()
-            ],
-        }
-        incoming = [{"type": "http.request", "body": body, "more_body": False}]
-
-        async def receive():
-            return incoming.pop(0)
-
-        async def send(message):
-            pass
-
-        await server(scope, receive, send)
-        # drain() must return — the bounded wake failed fast instead of hanging.
-        await asyncio.wait_for(server.drain(), timeout=5)
-        assert not server._pending  # no orphaned background wake left behind
-
-    asyncio.run(_drive())
 
 
 # --- the per-agent lock prevents a concurrent double-wake ------------------

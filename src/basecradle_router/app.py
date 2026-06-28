@@ -27,7 +27,6 @@ from basecradle_router.config import (
     load_config,
     load_dedup_ttl,
     load_github_trusted_actors,
-    load_wake_timeout,
 )
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.pipeline import Pipeline
@@ -64,10 +63,7 @@ def create_app(
     pipeline = Pipeline(
         registry=registry,
         config=config,
-        # A finite wake bound is wired at the composition root, never left to the
-        # waker's ``None`` default — an unbounded wake pins the agent lock and a
-        # worker thread forever and stalls the fleet (basecradle-router#135).
-        waker=waker or HomeServerWaker(timeout=load_wake_timeout(env)),
+        waker=waker or HomeServerWaker(),
         breaker=WakeRateBreaker(load_breaker_config(env)),
         deduper=DeliveryDeduper(load_dedup_ttl(env)),
     )

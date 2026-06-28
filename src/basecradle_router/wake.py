@@ -188,30 +188,6 @@ class SubprocessWaker:
 # The root-owned wrapper the home-server waker escalates through (see deploy/).
 WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
 
-# The grace the wrapper's ``timeout(1)`` waits between SIGTERM and SIGKILL when a
-# wake overruns its bound; kept in sync with the ``--kill-after`` the wrapper uses.
-WAKE_WRAPPER_KILL_AFTER = 10.0
-# How much longer the Python-level ``subprocess.run`` bound runs than the wrapper's
-# own bound, so the wrapper's ``timeout(1)`` (which reaps the whole runuser→bash→
-# claude tree) always fires first and ``subprocess.run`` — which would kill only the
-# direct ``sudo`` child and orphan the tree — is a pure backstop for a wedged wrapper.
-# Public because the config loader caps a configured bound against this margin so the
-# total stays under the unit's TimeoutStopSec (basecradle-router#135).
-WAKE_BACKSTOP_MARGIN = WAKE_WRAPPER_KILL_AFTER + 10.0
-
-
-def _format_seconds(secs: float) -> str:
-    """Render a timeout for ``timeout(1)``: ``90`` not ``90.0``, ``90.5`` preserved.
-
-    Never emits scientific notation (``1e-06``/``1e+06``) — the wrapper's numeric
-    guard ``^[0-9]+([.][0-9]+)?$`` would reject it, hard-failing every wake. An
-    integral value renders as a plain int; otherwise a fixed-point form with trailing
-    zeros (and any float-repr noise) trimmed.
-    """
-    if secs == int(secs):
-        return str(int(secs))
-    return f"{secs:.6f}".rstrip("0").rstrip(".")
-
 
 @dataclass(frozen=True, slots=True)
 class HomeServerWaker:
@@ -233,21 +209,7 @@ class HomeServerWaker:
     timeout: float | None = None
 
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
-        """Assemble the sudo+wrapper command — pure, no I/O.
-
-        When a finite ``timeout`` is set, the bound is handed to the wrapper as
-        ``--timeout <secs>`` so its OS-level ``timeout(1)`` can reap the whole
-        ``runuser→bash→claude`` process tree (``subprocess.run``'s own timeout kills
-        only the direct ``sudo`` child and would orphan the rest). The
-        ``subprocess.run`` bound is set a margin *longer* than the wrapper's, so the
-        wrapper fires first and the Python side is only a backstop for a wedged
-        wrapper. With no bound (``timeout=None``) neither is applied (unbounded).
-        """
-        bound_args: tuple[str, ...] = ()
-        subprocess_timeout = self.timeout
-        if self.timeout is not None:
-            bound_args = ("--timeout", _format_seconds(self.timeout))
-            subprocess_timeout = self.timeout + WAKE_BACKSTOP_MARGIN
+        """Assemble the sudo+wrapper command — pure, no I/O."""
         return WakeInvocation(
             argv=(
                 "sudo",
@@ -256,7 +218,6 @@ class HomeServerWaker:
                 agent.os_user,
                 "--cwd",
                 agent.clone_path,
-                *bound_args,
                 "--",
                 *wake_command(agent, event),
             ),
@@ -266,7 +227,7 @@ class HomeServerWaker:
             cwd="/",
             env=MappingProxyType({}),
             run_as_user=agent.os_user,
-            timeout=subprocess_timeout,
+            timeout=self.timeout,
         )
 
     def wake(self, agent: Agent, event: Event) -> WakeResult:
