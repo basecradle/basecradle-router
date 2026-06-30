@@ -20,6 +20,11 @@ event types are consumed:
   comment closes that hole — exactly what the App's "Issue comment" subscription
   was always meant to drive (basecradle-router#129).
 
+Both paths also honor the fleet-wide **``Do Not Work``** brake: an issue carrying
+that label never wakes an agent, even when ``handoff`` is also present — ``Do Not
+Work`` wins, so a stale or accidental handoff on a parked issue can't trigger a
+wake (basecradle-router#146). The skip is logged with the issue URL, never silent.
+
 As defense-in-depth both paths gate on the webhook ``sender``: a wake only fires
 if a **trusted fleet actor** triggered it (the label applier, or the commenter).
 Because that check runs *after* :meth:`verify`, the ``sender`` is GitHub-attested
@@ -36,6 +41,7 @@ for two different payload shapes.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -50,6 +56,8 @@ from basecradle_router.routes.base import (
     verify_hmac_sha256,
 )
 
+logger = logging.getLogger("basecradle_router.routes.github")
+
 SIGNATURE_HEADER = "X-Hub-Signature-256"
 EVENT_HEADER = "X-GitHub-Event"
 DELIVERY_HEADER = "X-GitHub-Delivery"
@@ -58,6 +66,15 @@ ISSUES_EVENT = "issues"
 ISSUE_COMMENT_EVENT = "issue_comment"
 
 HANDOFF_LABEL = "handoff"
+# The fleet-wide do-not-pick-this-up signal (basecradle#376; constitution.md →
+# Earned Autonomy). It is a *brake on autonomous work-start*, and the router's
+# label-wake is one of the only two ways an agent starts work without a human
+# (the other, the self-selecting picker, is gated at the constitution level).
+# So the daemon refuses to wake an agent on an issue carrying this label, even
+# when a `handoff` label is also present: `Do Not Work` wins over `handoff`, so
+# a stale or accidental handoff on a parked issue can never trigger a wake
+# (basecradle-router#146).
+DO_NOT_WORK_LABEL = "Do Not Work"
 _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 # Only a newly *created* comment re-wakes; an ``edited``/``deleted`` comment does
 # not (the re-wake re-reads the whole thread anyway, so an edit adds nothing).
@@ -162,6 +179,12 @@ class GithubRoute:
         if not _is_handoff(action, issue, data):
             return self._ignore(event_type)
 
+        # `Do Not Work` wins over `handoff`: a parked issue never wakes an agent,
+        # even with a (stale or accidental) handoff label. Checked before the
+        # trust gate so a parked issue is a clean *skip*, not a sender rejection.
+        if _has_do_not_work_label(issue):
+            return self._skip_do_not_work(issue, event_type)
+
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
         # actor may actually trigger a wake. This runs after verify(), so the
         # sender is GitHub-attested. An untrusted (or unidentifiable) sender is a
@@ -197,6 +220,11 @@ class GithubRoute:
         # unrelated issue is not handed-off work and wakes no one.
         if not _has_handoff_label(issue):
             return self._ignore(event_type)
+
+        # `Do Not Work` wins over `handoff` on the re-wake path too: a reply on a
+        # parked handoff issue re-wakes no one while the brake label remains.
+        if _has_do_not_work_label(issue):
+            return self._skip_do_not_work(issue, event_type)
 
         # Infinite-loop guard, *before* the trust gate: the agent commenting on its
         # own handoff issue (a progress note, the completion report) fires
@@ -259,6 +287,24 @@ class GithubRoute:
         """Record a deliberate, *visible* ignore (never a silent drop) and return ``None``."""
         log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
         return None
+
+    def _skip_do_not_work(self, issue: dict[str, Any], event_type: str | None) -> None:
+        """Refuse a wake on a ``Do Not Work`` issue — the parked-issue brake (#146).
+
+        Logged loudly with the issue URL and the reason *before* the structured
+        ignore, so the skip is observable (never a silent drop) and an operator
+        can see exactly which parked issue the brake caught and why. The wake is
+        then recorded as the same ``IGNORED`` decision every other quiet outcome
+        emits — a parked issue is deliberately-not-actionable, not an error.
+        """
+        url = issue.get("html_url")
+        logger.info(
+            "skipping wake: issue %s carries %r, which wins over %r",
+            url if isinstance(url, str) and url else "<unknown>",
+            DO_NOT_WORK_LABEL,
+            HANDOFF_LABEL,
+        )
+        return self._ignore(event_type)
 
     def _is_recipient_own_comment(self, data: dict[str, Any]) -> bool:
         """Whether the comment was authored by the recipient agent's own bot.
@@ -333,10 +379,28 @@ def _is_handoff(action: str, issue: dict[str, Any], data: dict[str, Any]) -> boo
 
 def _has_handoff_label(issue: dict[str, Any]) -> bool:
     """Whether the issue currently carries the ``handoff`` label."""
+    return _has_label(issue, HANDOFF_LABEL)
+
+
+def _has_do_not_work_label(issue: dict[str, Any]) -> bool:
+    """Whether the issue currently carries the ``Do Not Work`` brake label.
+
+    Read from the webhook payload's ``labels`` array — the router holds no
+    GitHub credential by design, and the payload's issue object already carries
+    the issue's *current* labels (post-label state for ``issues.labeled``,
+    comment-time state for ``issue_comment``), so it is the authoritative,
+    self-contained source. Label names are case-sensitive on GitHub, so this
+    matches the exact fleet-canonical ``Do Not Work`` casing.
+    """
+    return _has_label(issue, DO_NOT_WORK_LABEL)
+
+
+def _has_label(issue: dict[str, Any], name: str) -> bool:
+    """Whether the issue's payload ``labels`` array contains a label named ``name``."""
     labels = issue.get("labels")
     if not isinstance(labels, list):
         return False
-    return any(isinstance(label, dict) and label.get("name") == HANDOFF_LABEL for label in labels)
+    return any(isinstance(label, dict) and label.get("name") == name for label in labels)
 
 
 def _text(obj: dict[str, Any], key: str, label: str) -> str:

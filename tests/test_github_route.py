@@ -321,6 +321,70 @@ def test_normalize_checks_sender_only_for_handoffs() -> None:
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
+# --- the `Do Not Work` brake (defense-in-depth, #146) ----------------------
+#
+# `Do Not Work` is the fleet-wide do-not-pick-this-up signal and wins over
+# `handoff`: a parked issue must never wake an agent, even with a stale handoff
+# label. The skip is observable (logged with the issue URL), never silent.
+
+DO_NOT_WORK = "Do Not Work"
+
+
+def test_normalize_opened_skips_a_do_not_work_handoff() -> None:
+    # Both `handoff` and `Do Not Work` present on an opened issue → no wake.
+    payload = _issues_payload(action="opened", labels=("handoff", DO_NOT_WORK))
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+
+
+def test_normalize_labeled_handoff_skips_when_do_not_work_present() -> None:
+    # The `handoff` label is the one just added, but `Do Not Work` already sits on
+    # the issue — applying handoff to a parked issue still wakes no one.
+    payload = _issues_payload(
+        action="labeled", labels=("handoff", DO_NOT_WORK), added_label="handoff"
+    )
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+
+
+def test_normalize_do_not_work_skip_beats_an_untrusted_sender() -> None:
+    # The brake is checked before the trust gate, so a parked issue is a clean
+    # *skip* (ignore), not a sender rejection — no exception is raised.
+    payload = _issues_payload(
+        action="labeled", labels=("handoff", DO_NOT_WORK), sender=UNTRUSTED_ACTOR
+    )
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+
+
+def test_normalize_wakes_once_do_not_work_is_removed() -> None:
+    # Removing `Do Not Work` (the payload no longer carries it) re-enables the wake.
+    payload = _issues_payload(action="opened", labels=("handoff",))
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+    assert event.kind is EventKind.HANDOFF
+
+
+def test_normalize_do_not_work_label_is_case_sensitive() -> None:
+    # GitHub label names are case-sensitive; only the exact canonical casing is the
+    # brake, so a differently-cased lookalike does not suppress a real handoff.
+    payload = _issues_payload(action="opened", labels=("handoff", "do not work"))
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+    assert event.kind is EventKind.HANDOFF
+
+
+def test_normalize_logs_the_do_not_work_skip_with_the_issue_url(caplog) -> None:
+    # The skip is observable: a line names the parked issue's URL and the reason,
+    # and the structured decision is the visible IGNORED (never a silent drop).
+    payload = _issues_payload(action="opened", labels=("handoff", DO_NOT_WORK))
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+    messages = [r.getMessage() for r in caplog.records]
+    skip_line = next(m for m in messages if "skipping wake" in m)
+    assert ISSUE_URL in skip_line
+    assert DO_NOT_WORK in skip_line
+    decision_line = next(m for m in messages if "delivery " in m)
+    assert f"decision={DeliveryDecision.IGNORED.value}" in decision_line
+
+
 # --- observability: the ignore-vs-act decision is logged (#91) --------------
 
 
@@ -424,6 +488,13 @@ def test_normalize_ignores_a_deleted_comment() -> None:
 def test_normalize_ignores_a_comment_on_a_non_handoff_issue() -> None:
     # Handoff scope: a comment on an unrelated issue is not handed-off work.
     payload = _comment_payload(labels=("bug", "question"))
+    assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_comment_skips_when_do_not_work_present() -> None:
+    # The brake applies to the re-wake path too: a reply on a parked handoff issue
+    # wakes no one while `Do Not Work` remains — even from a trusted peer.
+    payload = _comment_payload(labels=("handoff", DO_NOT_WORK), sender=PEER_BOT)
     assert _comment_route().normalize(_comment_request(payload)) is None
 
 
