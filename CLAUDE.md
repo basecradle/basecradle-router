@@ -239,6 +239,18 @@ Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section 
 
 **A change to any verbatim-shared block is not done until it is propagated — and propagation is enforced, not trusted to memory.** Three blocks are carried verbatim fleet-wide: **Cross-Repo Handoffs**, **Polling GitHub**, and **Attended-Session Lifecycle Signal**. The instant the capital edits one and the children are not re-synced, the fleet's shared law has silently diverged. So editing a shared block in the capital's CLAUDE.md is a single change-set with two obligations: land the capital edit **and** file the N child re-sync handoffs (one per repo that carries the block) in the same breath. A shared-block PR with no accompanying re-sync handoffs is an *unfinished* PR. Because discipline alone is what failed before — the #363 router-daemon bullet sat un-propagated to all five children until a manual audit caught it — **the NOC runs a standing drift-guard** that byte-diffs every shared block across every repo against the capital canonical on a cadence and raises a loud alert + an auto-filed `[SECURITY]`-style `[DRIFT]` issue the instant any block diverges. A missed propagation surfaces within hours, never twenty commits later. The guard is the backstop; filing the re-syncs in the same change-set is the primary obligation. To audit on demand, byte-diff each repo's three shared blocks against this file (`gh api repos/basecradle/<repo>/contents/CLAUDE.md` → compare the block between its `## ` header and the next).
 
+## Laptop Builder Self-Exit
+
+You are a laptop builder agent, spawned and supervised by the capital (basecradle AI) via its `launch-builder` skill. The capital is watching this session and stays awake until it ends.
+
+When your work is done **and verified live**, post your completion comment, close the handoff issue per **Cross-Repo Handoffs**, and — instead of only printing "safe to exit" and idling — print it and then terminate this session:
+
+    bash .claude/self-exit.sh
+
+`self-exit.sh` is bounded: it SIGTERMs only this session's own `claude` process (found by walking its own ancestry) and can target nothing else. The capital observes the session end and marks your work complete.
+
+**Laptop-only — removed on migration.** On migration to the fleet server, remove this section and `.claude/self-exit.sh`; the router manages server-agent lifecycle (it wakes you on a handoff label — you neither self-spawn nor self-exit). The self-exit permission is laptop-user-scoped and does not travel to the server.
+
 ## Development Commands
 
 ```bash
