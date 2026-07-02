@@ -76,8 +76,8 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   so the daemon must not be able to write it; NO secrets
 ```
 
-The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, synced by
-`deploy/deploy.sh` on each deploy. The daemon's only system dependency on the box is the privilege-drop
+The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
+deploy (the NOC's `deploy-router` op) on each run. The daemon's only system dependency on the box is the privilege-drop
 chain (`sudo` → `wake-runner` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
 part of that agent's own onboarding, not the daemon's.
 
@@ -244,10 +244,10 @@ on the box out-of-band, `chmod 600`, never in git.
 ## Part 2 — The daemon's deploy components
 
 The daemon's on-box artifacts, each **authored in this repo by the router-AI** and **installed/run on the
-box by the deployer** (the capital today; the NOC once its fleet-ops ships). The router-AI never deploys —
-anything that installs, runs, or hardens on the box is the capital/NOC's. (The first install of the
-root-owned wrapper + `sudoers` rule is a one-time on-box step; thereafter `deploy/deploy.sh` keeps the
-wrapper and the managed units in lockstep with `main` on every deploy.)
+box by the deployer** (the **NOC** — the fleet's sole deployer). The router-AI never deploys —
+anything that installs, runs, or hardens on the box is the NOC's. (The first install of the
+root-owned wrapper + `sudoers` rule is a one-time on-box step; thereafter the NOC's `deploy-router` op keeps
+the wrapper and the managed units in lockstep with `main` on every deploy.)
 
 - **The systemd unit** `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
   the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
@@ -273,10 +273,10 @@ wrapper and the managed units in lockstep with `main` on every deploy.)
   (literal `KEY=VALUE`, never sourced — #109) and execs the wake. **Install root-owned, in the root-owned `bin/`:**
   `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
   `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
-  (validate with `visudo -cf`). **After this first install, `deploy/deploy.sh` reinstalls the
+  (validate with `visudo -cf`). **After this first install, the NOC's `deploy-router` op reinstalls the
   wrapper from the deployed tree on every deploy**, so the live wrapper can never silently drift from
   `main` (it is code on the launch path, but lives root-owned outside the router-owned `app/` tree the
-  app-rsync mirrors). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
+  app-mirror covers). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
   dangerous, so it stays this documented manual step.
 - **`HomeServerWaker`** in `wake.py` assembles the wrapper argv (`--user`/`--cwd`/`--`); env is empty
   (the wrapper loads the agent's `agent.env` after the drop).
@@ -307,50 +307,74 @@ runs it on the box.
 
 ## Part 3 — Shipping: the deploy loop (the deployer's Definition of Done)
 
-> **The router-AI never runs this loop.** Deploying is the **capital/NOC's** job (CLAUDE.md → "Building
-> vs. Deploying — the router-AI never deploys", issue #122). `deploy/deploy.sh` carries a `DEPLOYER`
-> guard that refuses to run unless the deployer declares itself (`DEPLOYER=noc`). This section is the
-> **deployer's** runbook; the router-AI's only stake in it is keeping this config correct, green, and
-> merged.
+> **The router-AI never runs this loop.** Deploying is the **NOC's** job — the fleet's sole deployer
+> (CLAUDE.md → "Building vs. Deploying — the router-AI never deploys", issue #122; constitution → "One
+> deployer for the fleet's machines: the NOC"). This section is the **deployer's** runbook; the router-AI's
+> only stake in it is keeping this config correct, green, and merged, and keeping the on-box **contract**
+> below stable so the NOC's op stays in lockstep.
 
 **For the deployer, `merged` ≠ `done`.** The artifact is a running service; a merge to `main` changes
-nothing on the box until the code is rsynced there and the daemon restarts. Issue #54 was the proof:
+nothing on the box until the code lands there and the daemon restarts. Issue #54 was the proof:
 #50/#52/#53 sat merged but unrun for a day while the live daemon served pre-#52 code, because "done"
 silently meant "merged" and nothing redeployed. The deployer's Definition of Done is therefore the full
-loop, mirrored in `CLAUDE.md` ("Building vs. Deploying") and implemented here:
+loop, mirrored in `CLAUDE.md` ("Building vs. Deploying"):
 
 > **tested (offline) → deployed to the box → smoke-tested LIVE → confirmed.**
 
-### One command: `deploy/deploy.sh`
-Run by the deployer (capital/NOC) from a trusted local checkout, with `DEPLOYER=noc`. It *is* the loop, so
-a deploy can never silently half-finish:
-
-1. **Test (offline gate)** — refuses to proceed unless `ruff` + `pytest` pass locally **and** `HEAD ==
-   origin/main` with a clean tree (so you can only ship merged, current code; `FORCE=1` overrides for an
-   emergency).
-2. **Deploy** — rsyncs the checkout to staging on the box, `sudo rsync`s into `/opt/basecradle-router/app`,
-   `chown`s to `router`, `uv sync`s, reinstalls the root-owned `wake-runner` wrapper, **installs + enables
-   the managed systemd units** from the deployed tree (the daemon, drift `.{service,timer}`, recovery
-   `.service`, reboot `.{service,timer}` — `daemon-reload`, arm the timers, enable the recovery gate;
-   issue #71, so a merged unit can't be merged-but-not-installed), **stamps the deployed commit SHA** to
-   `/etc/basecradle-router/deployed-sha`, and restarts the service (asserting it comes back active).
-3. **Smoke (live)** — runs `deploy/smoke-test.sh` against the real endpoint, then asserts the
-   fleet-uniform liveness route `GET /up` is green over the public TLS path (Caddy → uvicorn); either
-   failure aborts the deploy loudly. *This deploy is not done unless both are green.*
-4. **Confirm** — prints the deployed SHA, the live trusted-actor list, and a drift check that must read
-   "in sync".
+### The deploy mechanism: the NOC's `deploy-router` op (basecradle-noc#134)
+Run by the NOC (the fleet's sole deployer), **not** basecradle-router AI:
 
 ```bash
-# deployer (capital/NOC) only, from a trusted checkout on a clean main:
-DEPLOYER=noc ROUTER_SSH_KEY=<path to the Lightsail key> deploy/deploy.sh
+basecradle-noc deploy-router <sha>
 ```
-Config via env: `DEPLOYER` (**required** — `noc`/`capital`; the deployer-acknowledgment guard, since the
-router-AI never deploys), `ROUTER_HOST` (default `ubuntu@ai.basecradle.com` — the public DNS name; **no
-infra IP lives in this repo**), `ROUTER_SSH_KEY`, `SMOKE_URL`, `FORCE=1`.
 
-> **Why rsync-from-laptop, not a token on the box?** The box holds the fleet's crown jewels, so it carries
-> no GitHub credential — code arrives by rsync from a trusted checkout, never by the box pulling. The daemon
-> just *runs* the code; it never pushes or pulls.
+The box **PULLS** the merged commit **anonymously from the public `basecradle-router` repo** by SHA (so the
+crown-jewels box carries **no GitHub credential** — a public repo needs no read token, strictly better than
+a scoped one) and runs the same Definition-of-Done loop **on-box**, plus a **rollback** to the prior good
+SHA on any failure. github.com TLS authenticates the source; the content-addressed SHA verifies the bytes;
+the driver's offline gate confirms that SHA is the tip of branch-protected, CI-gated `main`. This replaced
+the old capital-run `deploy/deploy.sh` rsync-from-laptop (basecradle#395). The op's steps mirror what
+deploy.sh did on-box — mirror into `/opt/basecradle-router/app` (protecting `.venv`) + `chown router`,
+`uv sync`, reinstall `wake-runner` + the systemd unit files, stamp the SHA, `daemon-reload` + restart +
+settle + `is-active`, then the live smoke test — and the NOC's driver adds the out-of-band `GET /up` check
+over the public TLS path (a broken `/up` after an on-box success is a FAIL).
+
+#### The on-box contract the op consumes — the router repo owns these (confirmed, basecradle#395)
+The router owns the **contract** (the *what* — stable paths, names, and artifacts); the NOC owns the deploy
+**mechanism** (the *how* — pulling, installing, restarting on the box). The `deploy-router` op reads these
+from the deployed tree / box, and they are this repo's to keep stable:
+
+| Contract | What the op does with it |
+|---|---|
+| `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. |
+| `deploy/bin/wake-runner` | reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/wake-runner` on every deploy. |
+| `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
+| `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
+| `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. |
+
+> **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The old deploy.sh
+> re-`enable`d `basecradle-router-recovery.service` on every run (belt-and-suspenders). The NOC op does not,
+> because it cannot distinguish a service that must be enabled from one that must stay timer-triggered — both
+> carry `[Install]`. This is harmless: an `enable` symlink **persists across a file reinstall**, so the
+> recovery gate enabled once at provisioning stays enabled. Adding a **new** non-timer service that must be
+> enabled directly (or a new root-owned file outside `app/` beyond `wake-runner`) is therefore a
+> **provisioning change**, not a routine deploy — out of the op's routine band by design. New **timers** and
+> new **unit files** are handled automatically (the timer arm-loop and the unit glob).
+
+> **Why the op globs units rather than a router-owned `deploy/apply.sh`?** Considered and declined
+> (basecradle#395). The unit glob already drift-proofs the common evolution (adding a unit), so an
+> `apply.sh` would protect only the rare provisioning-class changes above — for which it would add a
+> cross-repo NOC re-point PR and put a privileged install sequence in a repo whose agent has no on-box
+> presence. The contract-vs-mechanism split is the cleaner line: stable artifacts here, install logic in
+> the NOC's op.
+
+### `deploy/deploy.sh` is RETIRED (interim emergency fallback only)
+The old one-command rsync-from-laptop loop `deploy/deploy.sh` is **retired**, superseded by the op above. It
+refuses to run by default — for everyone, NOC and capital included — directing the deployer to
+`basecradle-noc deploy-router <sha>`. Its rsync body survives **only** as an emergency fallback for the
+transition window **before** the `deploy-router` wrapper is installed on the box; a deployer who genuinely
+needs it in that gap must opt in explicitly with `ROUTER_INTERIM_RSYNC_DEPLOY=1` (and still `DEPLOYER=noc`).
+Once the NOC path is live on the box, it is never used again, and this fallback can be deleted outright.
 
 ### The live smoke test: `deploy/smoke-test.sh`
 Proves the **running** daemon enforces the boundary — not that code merged, but that the bytes serving
@@ -364,27 +388,30 @@ traffic right now behave. Three synthetic, GitHub-shaped, HMAC-signed webhooks a
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secret
-and the trusted-actor list from `router.env` (root-readable only), so it runs on the box (`deploy.sh`
-invokes it over SSH; or `sudo deploy/smoke-test.sh` by hand). The same three status-code outcomes are pinned
-offline in `tests/test_server_e2e.py`, so the smoke test can't bit-rot against the route logic unnoticed.
+and the trusted-actor list from `router.env` (root-readable only), so it runs on the box (the `deploy-router`
+op runs it as root post-restart; or `sudo deploy/smoke-test.sh` by hand). It defaults `SMOKE_URL` to the
+live endpoint, so it needs no argument. The same three status-code outcomes are pinned offline in
+`tests/test_server_e2e.py`, so the smoke test can't bit-rot against the route logic unnoticed.
 
 ### Drift can never be silent: `deploy/drift-check.sh` + the timer
 `drift-check.sh` compares the stamped deployed SHA against the live tip of `origin/main`, fetched
 tokenlessly with `git ls-remote` (the repo is public, so the box needs no credential to ask "what is main
-now?"). It exits non-zero and prints loudly on drift (or a missing stamp). `deploy.sh` runs it as the final
-confirm step, and `deploy/systemd/basecradle-router-drift.{service,timer}` run it **hourly** as the `router`
-user — so a merge that never reached the box surfaces in `systemctl --failed` and the journal, instead of
-going unnoticed for a day. It only reads; it never auto-deploys.
+now?"). It exits non-zero and prints loudly on drift (or a missing stamp). The `deploy-router` op runs it
+as its final confirm step, and `deploy/systemd/basecradle-router-drift.{service,timer}` run it **hourly** as
+the `router` user — so a merge that never reached the box surfaces in `systemctl --failed` and the journal,
+instead of going unnoticed for a day. It only reads; it never auto-deploys.
 
-### Why not fully-automated CD (GitHub Actions → prod)?
-Deliberately not done. Auto-deploy-on-merge from a GitHub-hosted runner needs either an SSH key to the
-crown-jewels box stored in CI secrets, or the box's SSH opened to GitHub's shared runner ranges; a
-self-hosted runner means GitHub's runner agent executing workflow code *on* the box that holds every agent's
-credentials. Both regress the box's governing constraint ("least privilege everywhere"). The chosen model —
-a self-verifying **one-command deploy** from a trusted local checkout, plus a **drift alarm** that makes
-the merge≠deploy gap loud — closes the silent-drift root cause (#54) without that security trade. Revisit
-only if the manual deploy step ever becomes the bottleneck; the natural next step would be a pull-based,
-human-initiated deploy on the box, not unattended push from CI.
+### Why the box pulls, not a token on the box and not push-CD
+The box holds the fleet's crown jewels, so it carries **no GitHub credential** — and the deploy is a **box
+pull**, not a push. Auto-deploy-on-merge from a GitHub-hosted runner would need either an SSH key to the box
+in CI secrets or the box's SSH opened to GitHub's shared runner ranges; a self-hosted runner means GitHub's
+runner agent executing workflow code *on* the box that holds every agent's credentials. Both regress the
+box's governing constraint ("least privilege everywhere"). The chosen model — the NOC's `deploy-router` op
+where the **box pulls a validated `main` SHA anonymously from the public repo** and runs the self-verifying
+DoD loop on-box with rollback, plus a **drift alarm** that makes the merge≠deploy gap loud — closes the
+silent-drift root cause (#54) with no read token to leak anywhere. Only the box pulling by content-addressed
+SHA bounds a compromised deployer to code the offline gate already confirmed is on branch-protected `main`;
+rsync, a NOC-shipped tarball, or a git bundle would each let a leaked key ship arbitrary root code.
 
 ---
 
@@ -416,9 +443,13 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
   silently serving nothing.
 
 ### systemd units (`deploy/systemd/`)
-> Since issue #71, **`deploy/deploy.sh` installs + enables these from the deployed tree on every run** —
-> `daemon-reload`, arm the timers, enable the recovery gate. The `enable` commands below are the explicit
-> contract / first-time-by-hand fallback; you don't run them per deploy.
+> Since issue #71, the deploy **installs all of these unit files from the deployed tree on every run**
+> (the NOC's `deploy-router` op globs `deploy/systemd/*.{service,timer}`), then `daemon-reload`, **arms
+> every timer** (`enable --now`), and keeps `basecradle-router.service` enabled. It does **not** enable
+> `*.service` units generically — the recovery gate below is enabled **once at provisioning** and its
+> `enable` symlink persists across a file reinstall (see Part 3's contract note). The `enable` commands
+> below are the explicit contract / first-time-by-hand step; only the timers and the daemon are re-armed
+> per deploy.
 
 | Unit | Role | Enable? |
 |---|---|---|
@@ -484,8 +515,8 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 
 > **Division of labor (issue #116).** The router seat authors the version-controlled config here
 > (this repo, merged to `main`); the **capital** does the on-box install, creates the token file, and
-> live-verifies. The steps below are the capital's runbook — they are **not** run from this repo's
-> `deploy/deploy.sh` (which deploys only the router daemon).
+> live-verifies. The steps below are the capital's runbook — they are **not** part of the router-daemon
+> deploy (the NOC's `deploy-router` op, which deploys only the router daemon).
 
 ### Install / update (capital, on-box)
 
