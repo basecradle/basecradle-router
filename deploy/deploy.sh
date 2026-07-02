@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
 #
-# deploy/deploy.sh — the deployer's one-command deploy loop for the router daemon.
+# deploy/deploy.sh — RETIRED: the old rsync-from-laptop deploy loop for the router daemon.
 #
-# WHO RUNS THIS: the NOC — the capital, in the interim, until NOC fleet-ops ships.
-# NOT basecradle-router AI. Per the constitution ("One deployer for the fleet's
-# machines: the NOC … a captain builds and maintains software but never deploys
-# it", Operational Baselines / capital PR basecradle#363) and this repo's CLAUDE.md
-# ("Building vs. Deploying — the router-AI never deploys"), this agent authors and
-# maintains this script as code but never RUNS it against the box. The DEPLOYER
-# guard below enforces that: a bare `deploy/deploy.sh` refuses to run, so a reflexive
-# self-deploy can't happen again (the cleanup of issue #122).
+# SUPERSEDED by the NOC's structured deploy op (basecradle#395 / basecradle-noc#134):
 #
-# For the deployer, "merged" is not "done": the artifact is a running service, and a
-# merge to main does nothing to the box until the code is rsynced there and the
-# daemon is restarted. This script is the whole Definition-of-Done loop in one
-# place, so a deploy can never silently half-finish (the failure mode that produced
-# issue #54):
+#     basecradle-noc deploy-router <sha>
 #
+# The NOC is now the fleet's sole deployer for the router daemon. The box PULLS the
+# merged commit anonymously from the PUBLIC basecradle-router repo by SHA and runs
+# this same Definition-of-Done loop on-box (plus a rollback this script never had),
+# so the crown-jewels box needs no GitHub token and code arrives content-addressed
+# rather than rsync'd from a laptop. See deploy/README.md → Part 3.
+#
+# The on-box contract that op consumes is still THIS repo's to define and confirmed
+# in deploy/README.md: /opt/basecradle-router/app, deploy/bin/wake-runner,
+# deploy/systemd/*.{service,timer}, /etc/basecradle-router/deployed-sha, and
+# deploy/smoke-test.sh. The router owns the CONTRACT (the what); the NOC owns the
+# deploy MECHANISM (the how). This script — the laptop-side mechanism — is retired.
+#
+# WHO RUNS THIS: nobody, going forward. basecradle-router AI never deployed it (the
+# constitution's "One deployer for the fleet's machines: the NOC", capital PR
+# basecradle#363; this repo's CLAUDE.md "Building vs. Deploying"; issue #122). The
+# retirement guard below now refuses even for the NOC/capital, directing them to the
+# deploy-router op. The rsync body is retained ONLY as an interim emergency fallback
+# for the transition window BEFORE the deploy-router wrapper is installed on the box;
+# a deployer who genuinely needs it in that gap must opt in explicitly with
+# ROUTER_INTERIM_RSYNC_DEPLOY=1. Once the NOC path is live on the box, it is never
+# used again.
+#
+# The retained loop (interim fallback only):
 #   1. TEST (offline)  — refuse to deploy unless ruff + pytest are green locally
 #                        and HEAD is exactly origin/main (no dirty tree, no drift).
 #   2. DEPLOY          — rsync the checkout to the box, uv sync, stamp the deployed
@@ -26,11 +38,12 @@
 #   4. CONFIRM         — print the deployed SHA, the live trusted-actor list, and a
 #                        deployed-vs-main drift check (which must now read "in sync").
 #
-# It runs from a trusted local checkout (the deploy model is rsync-from-laptop, so
-# the crown-jewels box needs no GitHub token — see deploy/README.md). No infra IP
-# lives in this repo; the host is the public DNS name, overridable by env.
+# No infra IP lives in this repo; the host is the public DNS name, overridable by env.
 #
 # Config (env overrides):
+#   ROUTER_INTERIM_RSYNC_DEPLOY=1   REQUIRED to run at all — the retirement
+#                   acknowledgment: this path is superseded by `basecradle-noc
+#                   deploy-router <sha>`; only set this in the pre-wrapper interim gap.
 #   DEPLOYER        REQUIRED — must be `noc` or `capital`. The deployer-acknowledgment
 #                   guard: basecradle-router AI never deploys, so a bare run refuses.
 #   ROUTER_HOST     ssh target            (default ubuntu@ai.basecradle.com)
@@ -59,6 +72,19 @@ die() {
 	printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
 	exit 1
 }
+
+# --- RETIREMENT guard: this rsync-from-laptop path is superseded ------------
+# The router daemon's deploy is now the NOC's structured op `basecradle-noc
+# deploy-router <sha>` (basecradle#395 / basecradle-noc#134): the box pulls the merged
+# SHA anonymously from the public repo and runs this loop on-box, with rollback. This
+# laptop-side rsync mechanism is RETIRED, so it refuses by default — for everyone,
+# NOC and capital included. The rsync body survives ONLY as an interim emergency
+# fallback for the transition window before the deploy-router wrapper is installed on
+# the box; a deployer who truly needs it in that gap must opt in explicitly with
+# ROUTER_INTERIM_RSYNC_DEPLOY=1.
+if [[ "${ROUTER_INTERIM_RSYNC_DEPLOY:-}" != "1" ]]; then
+	die "This rsync-from-laptop deploy is RETIRED — superseded by the NOC op 'basecradle-noc deploy-router <sha>' (basecradle#395 / basecradle-noc#134). Use that. If the deploy-router wrapper is not yet installed on the box and you must deploy in the interim gap, re-run with ROUTER_INTERIM_RSYNC_DEPLOY=1. If you are the router-AI: stop — you never deploy (issue #122); hand a finding/handoff to the capital instead."
+fi
 
 # --- DEPLOYER guard: the router-AI never deploys ---------------------------
 # Only the NOC (the capital, in the interim) deploys the router daemon to the box.

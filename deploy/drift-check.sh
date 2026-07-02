@@ -4,7 +4,7 @@
 #
 # The root cause of issue #54 was SILENT drift: code merged to main but the box
 # kept running the old bytes, and nothing noticed. This makes drift loud. It
-# compares the commit SHA stamped at the last deploy (deploy.sh writes it) against
+# compares the commit SHA stamped at the last deploy (the deployer writes it) against
 # the live tip of origin/main, fetched tokenlessly with `git ls-remote` (the repo
 # is public, so the crown-jewels box needs no GitHub credential to ask "what is
 # main now?").
@@ -12,9 +12,9 @@
 # Exit 0 + green  => deployed == main, no drift.
 # Exit 1 + red    => drift (or no stamp at all) — the box is NOT running main.
 #
-# Runs ON THE BOX (it reads the local deploy stamp). deploy.sh runs it as the last
-# confirm step; a systemd timer (deploy/systemd/basecradle-router-drift.timer) runs
-# it on a schedule so drift surfaces even when no one is deploying.
+# Runs ON THE BOX (it reads the local deploy stamp). The deploy op runs it as its
+# final confirm step; a systemd timer (deploy/systemd/basecradle-router-drift.timer)
+# runs it on a schedule so drift surfaces even when no one is deploying.
 #
 set -euo pipefail
 
@@ -25,7 +25,7 @@ green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 red() { printf '\033[1;31m%s\033[0m\n' "$*"; }
 
 [[ -r "$STAMP" ]] || {
-	red "DRIFT: no deploy stamp at $STAMP — the deployed version is unknown. Deploy with deploy.sh."
+	red "DRIFT: no deploy stamp at $STAMP — the deployed version is unknown. Deploy with 'basecradle-noc deploy-router <sha>'."
 	exit 1
 }
 
@@ -49,5 +49,5 @@ fi
 red "DRIFT — the live daemon is NOT running main:"
 red "  deployed   : ${deployed}"
 red "  origin/main: ${main}"
-red "Redeploy with deploy/deploy.sh to close the gap."
+red "Redeploy with 'basecradle-noc deploy-router <sha>' to close the gap."
 exit 1
