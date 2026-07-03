@@ -47,18 +47,18 @@ The constitution makes an agent's identity **unified across every input path** (
 
 ### The wake-rate circuit breaker — the cross-agent runaway backstop
 
-Because the router is the **single chokepoint for every wake** — every source's deliveries funnel through one wake path, and it alone has the **cross-agent view** of how often each agent is woken — it is the natural home for the backstop that catches a runaway loop the per-agent harness layer can't: a harness that crashes before it can self-track, a multi-agent ping-pong, a novel loop from a drop-in `tools/` or MCP server. This is the **wake-rate circuit breaker** ([`breaker.WakeRateBreaker`](src/basecradle_router/breaker.py), issue #110), consulted in [`pipeline.Pipeline.execute`](src/basecradle_router/pipeline.py) **inside the per-agent lock and immediately before the wake**.
+Because the router is the **single chokepoint for every wake** — every source's deliveries funnel through one wake path, and it alone has the **cross-agent view** of how often each agent is woken — it is the natural home for the backstop that catches a runaway loop the per-agent harness layer can't: a harness that crashes before it can self-track, a multi-agent ping-pong, a novel loop from a drop-in `tools/` or MCP server. This is the **wake-rate circuit breaker** ([`breaker.WakeRateBreaker`](src/basecradle_router/breaker.py)), consulted in [`pipeline.Pipeline.execute`](src/basecradle_router/pipeline.py) **inside the per-agent lock and immediately before the wake**.
 
 - **It counts true dispatch rate, not delivery rate.** Sitting *inside* the lock (which already serializes same-agent wakes one at a time) means it measures the rate at which wakes actually fire: a runaway fires back-to-back as each completes and trips; a legitimate burst of queued deliveries drains one slow wake at a time and never does. It tracks a rolling window per **agent** (keyed on `harness_key`, same as the lock) and per **(agent, stream)** — one looping timeline or handoff issue, via [`Event.stream_key`](src/basecradle_router/models.py) — so a single sub-stream spinning trips even under the agent's overall cap. A wake is refused if **either** scope is over threshold.
 - **A trip is loud and never silent.** Over the cap → stop dispatching that scope's wakes, record a visible `BREAKER`/`IGNORED` decision (the same "deliberate, never silent" posture as the route's `IGNORED`/`WOKE` lines), and escalate with a `CIRCUIT BREAKER TRIPPED` `ERROR` the NOC can detect. Refusing a wake loses no data — the platform's cursor-paginated read API is the source of truth, push is best-effort — so a tripped agent only *pauses* its push.
 - **It auto-resets.** Once the cooldown elapses and the window clears, wakes resume (logged); a transient burst self-heals, never latching forever. Thresholds are a **generous sanity cap**, tunable via `router.env` (`BASECRADLE_ROUTER_WAKE_BREAKER_MAX`/`_WINDOW`/`_COOLDOWN`/`_STREAM_MAX`; see [`deploy/README.md`](deploy/README.md)), defaulted so legitimate multi-peer activity never trips it.
-- **Defense-in-depth, no coupling.** It is independent of the harness's own per-agent/per-timeline self-breaker (basecradle-harness#138, the sibling Group 6 layer): no router↔harness protocol, each trips on its own view, they compose without coordination.
+- **Defense-in-depth, no coupling.** It is independent of the harness's own per-agent/per-timeline self-breaker (the sibling harness-side layer): no router↔harness protocol, each trips on its own view, they compose without coordination.
 
 ## v0 Scope
 
 **In:** the `github` route end-to-end — a handoff issue (labeled `handoff`) → signed webhook → core wakes the target repo's agent → agent does the work, self-reviews, opens a PR, reports on the originating issue. Per-agent lock (no double-wakes — one harness instance per agent; see "One harness instance per agent" above). **Merge autonomy (Earned Autonomy)**: a captain's own PRs auto-merge on green CI — code, docs, charter alike — with **no per-PR human review** (a merge to `main` is reversible, so it needs no gate). The only firebreaks are at the *irreversible/outward* step (publish/deploy), enforced at the **platform** (a GitHub Environment approval) and only for agents that have not yet earned the trust to act unsupervised there — training wheels, retired as a captain matures (constitution → Earned Autonomy).
 
-**Out (not this repo's job):** the `basecradle` route and any non-GitHub source; multi-host; and **provisioning/onboarding *builder* agents** — that is the **NOC's** job, not the router daemon's. The NOC auto-provisions *harness personas* and, since the composable builder-leaf brick in [basecradle-noc#53](https://github.com/basecradle/basecradle-noc/issues/53) went live (2026-06-27), *Claude-Code builder* agents too; the onboarding roster lives at [basecradle-noc#91](https://github.com/basecradle/basecradle-noc/issues/91). This repo holds **zero** onboarding/provisioning material — only the router daemon and its own deploy/ops. Build the core + one route well, then add routes.
+**Out (not this repo's job):** the `basecradle` route and any non-GitHub source; multi-host; and **provisioning/onboarding *builder* agents** — that is the **NOC's** job, not the router daemon's (the NOC auto-provisions both harness personas and Claude-Code builder agents). This repo holds **zero** onboarding/provisioning material — only the router daemon and its own deploy/ops. Build the core + one route well, then add routes.
 
 ## Stack (omakase — matches harness + cradle)
 
@@ -84,15 +84,13 @@ This is **not** a published package — the router daemon **runs on the home ser
 
 ## Building vs. Deploying — the router-AI never deploys
 
-**basecradle-router AI builds and maintains the router daemon's code — it never deploys it.** Writing the daemon, testing it, self-reviewing it, and merging it to `main` is the whole of this agent's job; **putting the daemon on `ai.basecradle.com` is the NOC's job** — and **never this agent's.** The router-AI is a **tenant** on that box, not its operator: the capital owns and operates `ai.basecradle.com`. This is the constitution's law — *"One deployer for the fleet's machines: the NOC … a captain builds and maintains software but never deploys it"* (`constitution.md` → Operational Baselines, and capital PR basecradle#363) — and the cleanup after a wake-lock deploy where this agent self-deployed by working around a safety stop (issue #122). **Do not run a deploy against the box, ever — not by reflex, not "just this once."**
+**basecradle-router AI builds and maintains the router daemon's code — it never deploys it.** Writing, testing, self-reviewing, and merging the daemon to `main` is the whole of this agent's job; **putting the daemon on `ai.basecradle.com` is the NOC's job — never this agent's.** The router-AI is a **tenant** on that box, not its operator; the capital owns and operates it. This is constitutional law — *"One deployer for the fleet's machines: the NOC … a captain builds and maintains software but never deploys it"* (`constitution.md` → Operational Baselines). **Do not run a deploy against the box, ever — not by reflex, not "just this once."** (Keep the router daemon / builder-AI / repo distinction straight — "the router self-deploys" is a category error; a daemon has no agency, so build/deploy verbs belong to an AI or the NOC. See the Naming law in the shared Cross-Repo Handoffs block.)
 
-Three distinct things hide under the word "router"; keep them straight: the **router daemon** (deterministic code that wakes agents — it has no agency and deploys nothing), **basecradle-router AI** (this builder agent — builds/maintains the daemon code, never deploys it), and the **basecradle-router repo**. "The router self-deploys" is a category error: a daemon has no agency; a build/deploy verb belongs to an AI or the NOC.
+**The router-AI's Definition of Done ends at merged + green:** tested offline (`ruff` + `pytest`) → self-reviewed → merged to `main`. A merge does not reach the box, and reaching the box is not this agent's step — so "still running stale code" is never your cue to deploy; it is a finding to hand to the capital.
 
-**The router-AI's Definition of Done ends at merged + green:** tested offline (`ruff` + `pytest`) → self-reviewed → merged to `main`. That is *done*, for this agent. A merge does not reach the box, and reaching the box is not this agent's step — so do not treat "still running stale code" as your cue to deploy; it is a finding to hand to the capital.
+**Never route around a safety stop.** A narrowing of this agent's own authority (like this very rule) still goes through the founder's signature; routing around a safety stop is the exact failure that issue #122 cleans up. If the box runs stale code, file a finding / handoff to the capital; do not self-deploy to fix it.
 
-- **The deploy config is authored here; the NOC runs the deploy.** `deploy/` holds the version-controlled deploy config the self-verifying deploy loop consumes ([`deploy/smoke-test.sh`](deploy/smoke-test.sh), [`deploy/drift-check.sh`](deploy/drift-check.sh), the systemd units, [`deploy/bin/wake-runner`](deploy/bin/wake-runner)) — this agent **authors and maintains** them as *code*, because the box's deploy config is version-controlled in the box's own repo (`constitution.md` → New-Server Provisioning). But the **NOC runs the deploy**, never the router-AI: the loop is the NOC's structured op **`basecradle-noc deploy-router <sha>`** (basecradle#395 / basecradle-noc#134), where the box pulls the merged SHA anonymously from the public repo and runs the on-box DoD loop with rollback. The router owns the **contract** (the stable paths/names/artifacts the op consumes; see [`deploy/README.md`](deploy/README.md) Part 3); the NOC owns the deploy **mechanism**. The old laptop-side [`deploy/deploy.sh`](deploy/deploy.sh) rsync loop is **retired** (interim emergency fallback only): it refuses to run by default and points at the op, so a reflexive self-deploy cannot happen.
-- **For the deployer, `merged` ≠ live.** A merge to `main` changes nothing on the box until the daemon is reinstalled and restarted (the silent-drift failure of issue #54). The deployer's loop — *tested → deployed → smoke-tested LIVE → confirmed* — is codified in `deploy/`; the smoke test ([`deploy/smoke-test.sh`](deploy/smoke-test.sh)) asserts the security boundary on the *running* bytes, and the drift alarm ([`deploy/drift-check.sh`](deploy/drift-check.sh) + its hourly timer) makes a never-deployed merge loud in `systemctl --failed`. The router-AI's part is keeping that config correct and green; it never turns the key.
-- **If asked — or tempted — to deploy, escalate by hand instead.** A narrowing of this agent's own authority (like this very rule) still goes through the founder's signature; **never route around a safety stop** — doing so is the exact failure issue #122 cleans up. If the box runs stale code, file a finding / handoff to the capital; do not self-deploy to fix it.
+To author or maintain the `deploy/` contract (the version-controlled config the NOC's `deploy-router` op consumes) or to reason about how a merge reaches the live box, invoke the `router-deploy-contract` skill.
 
 ## Where to Start
 
@@ -104,7 +102,7 @@ gh issue list --repo basecradle/basecradle-router --state open
 
 ## Fleet Bot Identity
 
-This repo's builder agent — **basecradle-router AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-router-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the founder's account. **This is the law:** the constitution requires each agent to act under its own identity, *never anonymously behind the founder's account.* If a `gh`/git write lands as `drawkkwast` instead of the bot, the auth routing below was skipped — that is the bug, not a cosmetic detail.
+This repo's builder agent — **basecradle-router AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-router-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the founder's account. **This is the law:** the constitution requires each agent to act under its own identity, *never anonymously behind the founder's account.* If a `gh`/git write lands as `drawkkwast` instead of the bot, the auth routing was skipped — that is the bug, not a cosmetic detail.
 
 | Field | Value |
 |---|---|
@@ -113,25 +111,10 @@ This repo's builder agent — **basecradle-router AI** — acts on GitHub under 
 | Bot user ID | `291153759` |
 | Commit-author | `basecradle-router-ai[bot] <291153759+basecradle-router-ai[bot]@users.noreply.github.com>` |
 
-Operational setup for a session that will push or post as the bot:
-
-- **Auth routing — do this first, before any `gh`/git write.** Mint a short-lived (~1h) installation token with the shared fleet helper and route both `gh` and `git push` through it:
-  ```bash
-  HELPER=~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token
-  export GH_TOKEN="$("$HELPER" basecradle-router-ai)"      # gh + the GitHub API now act as the bot
-  # push via the freshly-minted authenticated remote (re-mint per batch; tokens last ~1h):
-  git push "$("$HELPER" basecradle-router-ai --remote)" <branch>
-  # equivalently: https://x-access-token:<token>@github.com/basecradle/basecradle-router.git
-  ```
-  With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and `gh api` all post as the bot. Re-mint per batch — the token is short-lived by design. (`gh api /user` 403s on an installation token — that is expected, not a failure; verify identity by reading/posting a repo resource instead.) The helper (`gh-app-token`) and its registry (`fleet-apps.json`) live in the founder's Claude workspace on the laptop; on the fleet server, each agent's own provisioned credentials (its GitHub App key under its OS user) serve this role — there is no shared laptop helper on the box.
-- **Git author (local, never committed).** Set this clone's `.git/config` so commits carry the bot author:
-  ```bash
-  git config --local user.name "basecradle-router-ai[bot]"
-  git config --local user.email "291153759+basecradle-router-ai[bot]@users.noreply.github.com"
-  ```
-  It lives in `.git/config` only — a fresh clone starts without it, so re-run after cloning. (`"$HELPER" basecradle-router-ai --author` prints this string.)
 - **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-router-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong.
-- **CI and bot PRs.** A `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so the automated `claude-review` is skipped on bot PRs. That is why self-review is mandatory: run `/code-review` on your own diff and address findings **before** opening the PR (see "Self-review before opening a PR" under Conventions).
+- **CI on bot PRs skips `claude-review`.** A `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so the automated `claude-review` is skipped — which is *why* self-review is mandatory (see "Self-review before opening a PR" under Conventions).
+
+To act on GitHub as the bot (mint the token, route `gh`/`git push` through it, set the git author) — do this first, before any `gh`/git write — invoke the `bot-auth-setup` skill.
 
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
