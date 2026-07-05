@@ -36,10 +36,20 @@
 # Even a fully-compromised router can therefore only do what it can already do
 # legitimately — wake a registered agent with that agent's own sanctioned command.
 #
+# The wake's stdout+stderr are routed into journald under the per-agent identifier
+# `basecradle-wake-<os_user>` (via systemd-cat, wrapping runuser) so the harness's
+# per-step ledger is attributable and survives a crash — see the systemd-cat block
+# below. It preserves every security invariant above (it only redirects fds and
+# exec's straight through to runuser); its one added dependency is that the journal
+# stream be openable at wake time — see that block for the deliberate consequences.
+#
 set -euo pipefail
 
 REGISTRY=/etc/basecradle-router/agents.json
 MIN_UID=1000
+# The one trusted PATH off which root-owned system binaries (claude, systemd-cat)
+# are resolved — never the caller's PATH, so a compromised router cannot plant one.
+TRUSTED_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 die() {
 	printf 'wake-runner: %s\n' "$*" >&2
@@ -110,8 +120,7 @@ github)
 	# Require the bare word and resolve the real binary ourselves, off a trusted
 	# PATH — root-owned `claude`, never anything the (compromised) router can plant.
 	[[ "$1" == claude ]] || die "refusing: command must be the bare word 'claude', got '$1'"
-	trusted_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-	launch_bin="$(PATH="$trusted_path" command -v claude)" || die "claude not found on the trusted PATH"
+	launch_bin="$(PATH="$TRUSTED_PATH" command -v claude)" || die "claude not found on the trusted PATH"
 	;;
 harness)
 	# A harness persona's wake CLI lives in its OWN venv (agent-writable), so it
@@ -135,6 +144,35 @@ harness)
 esac
 shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
 
+# Route the wake's stdout+stderr into journald under a PER-AGENT identifier, so the
+# harness's per-step ledger (`step N/M …`, `wake used X/N steps`) is attributable
+# and survives a crash — before this, the caller (the router) captured the wake's
+# output and dropped it, so none of it reached journald (basecradle-router#168).
+# systemd-cat runs HERE, as root, wrapping runuser: it dup2's the wake subtree's
+# fds 1/2 onto a journald stream and `execvp`s runuser (no fork), so the security
+# invariants above are untouched — the privilege drop, the inert argv, the env
+# discipline, and exit-code propagation (runuser's exit, i.e. the wake's, flows
+# straight back to the caller) are all byte-for-byte unchanged. The tag is the
+# agent's OS-user slug (its universal identity; `journalctl -t basecradle-wake-<slug>`
+# reads one persona's wake ledger). systemd-cat is resolved off the trusted PATH —
+# the same discipline as `claude` above — never the caller's.
+#
+# Three deliberate consequences, not bugs:
+#   1. The wake now depends on the journal stream being openable: systemd-cat exits
+#      non-zero *before* exec'ing runuser if it cannot attach, so a wake then FAILS
+#      rather than runs unlogged. Negligible on a healthy box — /run/systemd/journal/
+#      stdout is a socket unit that survives a journald restart — and a failure is a
+#      retryable non-zero exit that loses no data (the platform read API is the
+#      source of truth, push is best-effort).
+#   2. The router's own capture_output now sees EOF (the fds point at journald), so a
+#      failed wake's detail reads via `journalctl -t basecradle-wake-<slug>`, not the
+#      router's WakeError message (which degrades to "(no output)"). By design: the
+#      per-agent journal IS the wake's log now.
+#   3. Entries are stamped `_UID=0` (the stream is opened as root, pre-drop). Read
+#      the ledger by the -t identifier, never by `_UID`.
+journal_tag="basecradle-wake-$user"
+systemd_cat="$(PATH="$TRUSTED_PATH" command -v systemd-cat)" || die "systemd-cat not found on the trusted PATH"
+
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
 # router never reads it), cd into the clone, exec the registry-sanctioned binary.
 # The inline script takes the cwd as $1 and the command (launch_bin + args) as
@@ -144,7 +182,7 @@ shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are
 # expand in the AGENT's bash after runuser, never in root's, so the untrusted
 # trigger is never evaluated in a privileged context.
 # shellcheck disable=SC2016
-exec runuser -u "$user" -- /bin/bash -c '
+exec "$systemd_cat" --identifier="$journal_tag" -- runuser -u "$user" -- /bin/bash -c '
 	set -euo pipefail
 	# Lock the agent process to umask 077 before anything is written: every file
 	# the woken claude creates (memory, settings, scratch) then lands 600 and every

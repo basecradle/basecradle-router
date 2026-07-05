@@ -54,9 +54,13 @@ The daemon enforces least privilege around that wake:
 - **Privilege drop for a wake:** the `router` user escalates *only* through a **root-owned wrapper**,
   `/opt/basecradle-router/bin/wake-runner`, invoked via a locked `sudoers` rule that grants `router`
   exactly that one command and nothing else. The wrapper validates the requested agent against the
-  registry, then `exec`s `runuser -u basecradle-<repo>-ai -- claude -p "<trigger>"` in that agent's
-  clone. **The wrapper is the privilege boundary** — deliberately not argv-matching in `sudoers` (which
-  is brittle and bypassable). This keeps the long-running webhook daemon fully unprivileged.
+  registry, then `exec`s `systemd-cat --identifier=basecradle-wake-<os_user> -- runuser -u
+  basecradle-<repo>-ai -- claude -p "<trigger>"` in that agent's clone — the `systemd-cat` wrap routes
+  the wake's stdout+stderr into journald under a per-agent identifier (see *Reading a Wake's Ledger*
+  below) while `exec`-ing straight through to `runuser`, so the privilege drop and exit-code
+  propagation are unchanged. **The wrapper is the privilege boundary** — deliberately not argv-matching
+  in `sudoers` (which is brittle and bypassable). This keeps the long-running webhook daemon fully
+  unprivileged.
 - **The box's operator** (the capital today; the NOC once its fleet-ops ships) acts on the box over its
   own administrative SSH, not as a fleet wake-user — it installs and operates the daemon. basecradle-router
   AI has **no** operator presence on the box: it authors this config in the repo and never logs in to deploy.
@@ -78,8 +82,36 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
 
 The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
 deploy (the NOC's `deploy-router` op) on each run. The daemon's only system dependency on the box is the privilege-drop
-chain (`sudo` → `wake-runner` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
+chain (`sudo` → `wake-runner` → `systemd-cat` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
 part of that agent's own onboarding, not the daemon's.
+
+#### Reading a Wake's Ledger
+
+`wake-runner` routes each wake's stdout+stderr into journald under the identifier
+`basecradle-wake-<os_user>`, so one persona's wake output — including the harness's per-step ledger
+(`step N/M: tools=… (…s)`, `wake used X/N steps`) and its install/config warnings — is greppable on
+its own:
+
+```bash
+journalctl -t basecradle-wake-basecradle-glm-ai -n 100 --no-pager   # one agent's recent wakes
+journalctl -t basecradle-wake-basecradle-glm-ai -f                  # follow a wake live
+```
+
+The identifier is the agent's OS-user slug (its universal identity), so it is stable and needs no
+per-agent list. Grep by this `-t` identifier, **not** by `_UID`: `systemd-cat` opens the journal stream
+as root (before the privilege drop), so the entries are stamped `_UID=0` even though the wake runs as
+the agent — the identifier is the per-agent axis, the uid is not. Before this seam the router captured
+the wake's output and dropped it, so none of it reached journald at all (basecradle-router#168).
+
+Two properties worth knowing. **(1)** A failed wake's error detail now lives here, not in the router's
+own log — the router's `capture_output` sees EOF once the wake's fds point at journald, so its
+`WakeError` degrades to `(no output)`; the reason (`claude` stderr, an auth failure, etc.) is under this
+identifier at the same timestamp. **(2)** These entries ride the normal journald→telemetry path and are
+covered by `vector.yaml`'s `ai_scrub` redaction like every other log (Part 5) — they are **not** dropped
+(that rule targets the `sudo` identifier, not this one), and the harness never prints secrets, so no
+extra scrubbing layer is added. The wake does gain one dependency: `systemd-cat` aborts (and the wake
+fails, retryably) if it cannot open the journal stream — negligible on a healthy box, where the journal
+socket survives a journald restart.
 
 **`router.env`** holds only the daemon's own non-agent config:
 ```
