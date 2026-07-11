@@ -19,8 +19,17 @@
 #     line lands here; the router escalates a wake via `sudo -> wake-runner`, so this matters) and
 #     from Vector itself (its own logs can echo the sink token via component ids/config — this is
 #     how the source token leaked ~40x on the NOC box);
-#   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`)
-#     from the message as defense in depth.
+#   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`,
+#     and provider API keys — `sk-…`, `xai-…`, `AIza…` and kin) from the message as defense in depth.
+#
+# PRESENTATION (basecradle-router#170) — the `ai_scrub` transform also PREFIXES each shipped message
+# with its journald `SYSLOG_IDENTIFIER`, so a Better Stack Live Tail line reads `[basecradle-router] …`
+# or `[basecradle-wake-jt] …` and says which program on the box emitted it. Doing it HERE, once, is what
+# makes it uniform: every program on the box gets the prefix for free, whereas hand-prefixing `[Router]`
+# into the daemon's own log strings would cover only the daemon (never sshd, Caddy, or a wake) and would
+# bake a presentation concern into application code. The identifier is journald's, so it is only as good
+# as the program's name — which is why basecradle-router.service now sets `SyslogIdentifier=` (before
+# that, the daemon's lines were stamped `uv`, the name of its *launcher*).
 # The source ingest token is NOT in this file — it is interpolated from
 # ${BETTERSTACK_AI_SOURCE_TOKEN}, supplied to vector.service via the chmod-640 EnvironmentFile
 # /etc/vector/betterstack.env (a systemd drop-in), so the secret never lives in the repo or the
@@ -57,7 +66,26 @@ transforms:
       msg = replace(msg, r'(?i)bearer\s+[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       msg = replace(msg, r'https?://\S*/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
       msg = replace(msg, r'bc_uat_[A-Za-z0-9]+', "[REDACTED_BC_TOKEN]")
-      .message = msg
+      # Provider API keys. Harness agents and builder agents run with these in their env
+      # (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, …) and a wake's stdout+stderr — a traceback,
+      # a curl echo, a misconfigured debug print — now flows into journald under
+      # basecradle-wake-<slug> (#168), so it flows through here. Nothing is known to print one;
+      # this is the belt for the braces. The `sk-` rule covers the whole family that shares
+      # the prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one pattern.
+      msg = replace(msg, r'sk-[A-Za-z0-9_-]{16,}', "[REDACTED_API_KEY]")
+      msg = replace(msg, r'xai-[A-Za-z0-9]{16,}', "[REDACTED_API_KEY]")
+      msg = replace(msg, r'AIza[A-Za-z0-9_-]{20,}', "[REDACTED_API_KEY]")
+      msg = replace(msg, r'hf_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
+      msg = replace(msg, r'r8_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
+      # PRESENTATION — prefix the message with the emitting program's journald identifier, so a
+      # Live Tail line is self-describing: `[basecradle-router] stage=wake outcome=ok agent=… `.
+      # Fall back to the process comm, then to "unknown", so a line with no identifier (a kernel
+      # message) still gets a prefix rather than a bare `[] `. Prefixing AFTER redaction is
+      # deliberate: the prefix is not secret-bearing and must never itself be scanned or mangled.
+      ident = to_string(.SYSLOG_IDENTIFIER) ?? ""
+      if ident == "" { ident = to_string(."_COMM") ?? "" }
+      if ident == "" { ident = "unknown" }
+      .message = "[" + ident + "] " + msg
       # Better Stack reads the event timestamp from `dt` (mirrors the generated log parser).
       del(.source_type)
       .dt = del(.timestamp)

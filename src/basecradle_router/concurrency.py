@@ -119,6 +119,7 @@ def with_retry(
     attempts: int = 3,
     base_delay: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
+    on_retry: Callable[[int, int, TransientError], None] | None = None,
 ) -> T:
     """Run ``operation``, retrying on :class:`TransientError` up to ``attempts``.
 
@@ -127,6 +128,14 @@ def with_retry(
     injectable so tests stay deterministic. Raises :class:`RetryExhausted` (the
     last :class:`TransientError` chained) once the bound is reached; any
     non-:class:`TransientError` propagates immediately without a retry.
+
+    ``on_retry(failed_attempt, attempts, error)`` is called for each failure that
+    a retry will follow — so a caller can make the backoff *visible* instead of
+    silent (basecradle-router#170), which is why it is a hook rather than a log
+    call here: only the caller knows what the operation was for (which agent, which
+    delivery), and this primitive stays generic. It is not called for the final,
+    exhausting failure — :class:`RetryExhausted` is that signal, and the caller
+    logs it once.
     """
     if attempts < 1:
         raise ValueError(f"attempts must be >= 1, got {attempts}")
@@ -137,6 +146,8 @@ def with_retry(
         except TransientError as exc:
             if attempt >= attempts:
                 raise RetryExhausted(attempts) from exc
+            if on_retry is not None:
+                on_retry(attempt, attempts, exc)
             sleep(base_delay * 2 ** (attempt - 1))
 
     # Unreachable: the loop either returns or raises on every path.

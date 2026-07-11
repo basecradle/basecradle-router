@@ -9,13 +9,14 @@ Test cast: John Doe (human) hands off; Nova Digital (``nova``, AI) is woken.
 
 import itertools
 import json
+import shlex
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.models import Agent, Event, WakeKind
-from basecradle_router.pipeline import Outcome, Pipeline, Stage
+from basecradle_router.pipeline import Outcome, Pipeline, Stage, log_fields
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
@@ -88,6 +89,7 @@ def _pipeline(
     breaker: WakeRateBreaker | None = None,
     deduper: DeliveryDeduper | None = None,
     wake_lock: WakeLockGuard | None = None,
+    clock=None,
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     kwargs = dict(
@@ -104,7 +106,27 @@ def _pipeline(
         kwargs["deduper"] = deduper
     if wake_lock is not None:
         kwargs["wake_lock"] = wake_lock
+    if clock is not None:
+        kwargs["clock"] = clock
     return Pipeline(**kwargs), waker
+
+
+class _FakeClock:
+    """A monotonic clock that advances a fixed step per reading.
+
+    The pipeline reads it twice per wake attempt (before and after), so a ``step``
+    of N makes every attempt take exactly N "seconds" — a logged duration a test can
+    assert on exactly, with nothing real timed.
+    """
+
+    def __init__(self, step: float = 23.1) -> None:
+        self.step = step
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        reading = self.now
+        self.now += self.step
+        return reading
 
 
 class _StubWakeLock:
@@ -655,3 +677,145 @@ def test_same_agent_is_locked_during_a_wake() -> None:
     worker.join(timeout=5)
     assert locks.acquire(NOVA.harness_key, blocking=False) is True  # released after the wake
     locks.release(NOVA.harness_key)
+
+
+# --- observability: key=value stage lines, delivery correlation, duration (#170) ---
+#
+# The audit that produced #170 found the log stream machine-shippable but
+# human-opaque: the wake completion line (`stage=wake outcome=ok exit 0`) named
+# neither the agent nor the delivery, so two concurrent wakes interleaved
+# ambiguously in Live Tail; the wake's wall-clock was never recorded; and the retry
+# backoff swallowed transient failures until final exhaustion, so a flapping agent
+# read as healthy. These pin the fix.
+
+
+def _stage_line(caplog, stage: Stage) -> str:
+    """The pipeline's log line for ``stage`` — the message as it reaches journald."""
+    return next(
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "basecradle_router.pipeline" and f"stage={stage.value} " in r.getMessage()
+    )
+
+
+def test_log_fields_renders_key_value_dropping_empties_and_quoting_spaces() -> None:
+    # The one renderer behind every line the pipeline logs. `exit=0` must survive
+    # (0 is a value, not an absence) and an error message must stay ONE field, or a
+    # grep for the key after it would silently miss.
+    assert log_fields(agent="nova", exit=0) == "agent=nova exit=0"
+    assert log_fields(agent="nova", error=None, reason="") == "agent=nova"
+    assert log_fields(error="wake of x exited 1: boom") == 'error="wake of x exited 1: boom"'
+    # A newline in a value cannot break the line into two.
+    assert "\n" not in log_fields(error="line one\nline two")
+
+
+def test_the_wake_line_identifies_the_agent_the_delivery_the_exit_and_the_duration(caplog) -> None:
+    # The headline of #170: the wake completion line must fully identify its wake.
+    pipeline, _ = _pipeline(clock=_FakeClock(step=23.1))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    line = _stage_line(caplog, Stage.WAKE)
+    assert "outcome=ok" in line
+    assert f"agent={NOVA.harness_key}" in line  # the OS-user slug: joins to the wake's own journal
+    assert f"delivery={DELIVERY_A}" in line
+    assert "exit=0" in line
+    assert "duration=23.1s" in line
+
+
+def test_every_stage_line_from_normalize_onward_carries_the_delivery_id(caplog) -> None:
+    # `delivery=<id>` must select ONE delivery's whole trip out of a Live Tail of
+    # interleaved concurrent deliveries. Route and verify run before the route has
+    # read the source's delivery header, so they are the deliberate exception.
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    correlated = (Stage.NORMALIZE, Stage.RESOLVE, Stage.LOCK, Stage.WAKE)
+    for stage in correlated:
+        assert f"delivery={DELIVERY_A}" in _stage_line(caplog, stage), f"{stage} lost the delivery"
+
+
+def test_stage_lines_are_key_value_with_no_bare_trailing_detail(caplog) -> None:
+    # The defect: `stage=wake outcome=ok exit 0` — a bare, positional trailing value
+    # that no log query could address. EVERY token is now a named key. Both a clean
+    # wake and a failing one are driven, because the failing path is the one that logs
+    # a free-text error, and a quoted error must stay ONE field rather than decaying
+    # into bare tokens — which is exactly what shlex.split (not str.split) checks.
+    for waker in (_StubWaker(), _StubWaker(fail_times=99)):
+        pipeline, _ = _pipeline(waker=waker)
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            pipeline.handle("github", _github_request())
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "basecradle_router.pipeline"]
+    assert any("outcome=failed" in line for line in lines)  # the free-text error path ran
+    for line in lines:
+        for token in shlex.split(line):
+            assert "=" in token, f"bare positional token {token!r} in: {line}"
+
+
+def test_a_transient_wake_failure_is_logged_as_it_happens_not_only_at_exhaustion(caplog) -> None:
+    # The silent-backoff fix: attempts 1 and 2 fail, attempt 3 succeeds. The wake is
+    # a success — but a flapping agent must NOT read as healthy, so each retried
+    # failure is a WARNING naming the attempt, the agent, the delivery, and the error.
+    pipeline, waker = _pipeline(waker=_StubWaker(fail_times=2), clock=_FakeClock(step=5.0))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    assert result.terminal is Outcome.OK  # it did eventually wake
+    assert len(waker.calls) == 3
+
+    retries = [r for r in caplog.records if "event=wake_retry" in r.getMessage()]
+    assert len(retries) == 2  # the two failures a retry FOLLOWED; the 3rd succeeded
+    assert all(r.levelname == "WARNING" for r in retries)
+    assert "attempt=1/3" in retries[0].getMessage()
+    assert "attempt=2/3" in retries[1].getMessage()
+    for message in (r.getMessage() for r in retries):
+        assert f"agent={NOVA.harness_key}" in message
+        assert f"delivery={DELIVERY_A}" in message
+        assert "transient blip" in message
+        assert "duration=5.0s" in message  # each failed attempt's own wall-clock
+
+
+def test_an_exhausted_wake_records_the_agent_delivery_attempts_and_error(caplog) -> None:
+    pipeline, _ = _pipeline(waker=_StubWaker(fail_times=99), clock=_FakeClock(step=2.0))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_B))
+
+    assert result.terminal is Outcome.FAILED
+    line = _stage_line(caplog, Stage.WAKE)
+    assert "outcome=failed" in line
+    assert f"agent={NOVA.harness_key}" in line
+    assert f"delivery={DELIVERY_B}" in line
+    assert "attempts=3" in line
+    assert "duration=2.0s" in line
+    assert "transient blip" in line
+
+
+def test_the_dedup_ignore_line_names_the_agent_and_the_delivery(caplog) -> None:
+    # A collapsed duplicate must say WHICH delivery it collapsed, or the ignore is
+    # visible in name only.
+    pipeline, _ = _pipeline(deduper=DeliveryDeduper(ttl=600.0))
+    pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+
+    assert (Stage.DEDUP, Outcome.IGNORED) in result.stages
+    line = _stage_line(caplog, Stage.DEDUP)
+    assert f"agent={NOVA.harness_key}" in line
+    assert f"delivery={DELIVERY_DUP}" in line
+    assert "reason=duplicate_delivery" in line
+
+
+def test_the_breaker_ignore_line_names_the_agent_and_the_delivery(caplog) -> None:
+    # Same for a breaker refusal: the wake it refused is identified, not just counted.
+    breaker = WakeRateBreaker(BreakerConfig(max_wakes=1, window=60.0, cooldown=60.0))
+    pipeline, _ = _pipeline(breaker=breaker)
+    pipeline.handle("github", _github_request())  # fills the window
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_B))
+
+    assert (Stage.BREAKER, Outcome.IGNORED) in result.stages
+    line = _stage_line(caplog, Stage.BREAKER)
+    assert f"agent={NOVA.harness_key}" in line
+    assert f"delivery={DELIVERY_B}" in line

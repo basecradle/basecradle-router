@@ -15,6 +15,8 @@ will consume :attr:`WakeInvocation.run_as_user` to execute as that OS user.
 
 from __future__ import annotations
 
+import logging
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -22,6 +24,28 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from basecradle_router.models import Agent, Event, WakeKind
+
+logger = logging.getLogger("basecradle_router.wake")
+
+#: The delivery id is handed to the wake child in its environment under this name,
+#: so the woken harness can stamp its *own* lifecycle lines with the same id the
+#: router's stage lines carry (basecradle-router#170). One `delivery=<id>` grep then
+#: spans the router's journal and the agent's — the two halves of one wake, which
+#: are otherwise separate identifiers (`basecradle-router` and
+#: `basecradle-wake-<slug>`) with nothing in common. The harness treats it as
+#: optional-when-absent, so the two sides ship independently.
+DELIVERY_ID_ENV = "BASECRADLE_DELIVERY_ID"
+
+# The delivery id is observability, never authority — but it *is* source-supplied,
+# and on the home-server path it crosses a `sudo` boundary as an argv element. So
+# it is shape-checked here, at the router's edge, and pinned to the inert charset
+# every real source's id already lives in (a GitHub delivery GUID, a BaseCradle
+# event id). The fail-direction is deliberate and asymmetric: an id that does not
+# match is *dropped* (the wake still runs — see :func:`_delivery_args`), because an
+# observability field must never be able to cost a wake; whereas the root-owned
+# wake-runner, whose caller is by then guaranteed to send only a matching id,
+# *refuses* one that does not — a mismatch there means the argv was tampered with.
+_SAFE_DELIVERY_ID = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 
 
 def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
@@ -37,6 +61,28 @@ def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
     if agent.wake_kind is WakeKind.HARNESS:
         return (agent.wake_bin, "--timeline", event.wake_arg)
     return ("claude", "-p", event.wake_arg)
+
+
+def _correlation_id(event: Event) -> str | None:
+    """``event``'s delivery id if it is inert enough to hand the child, else ``None``.
+
+    The single gate both wakers pass the id through, so the shape check and the
+    warning cannot diverge between them. An unsafe id is *dropped*, loudly and never
+    silently: the wake proceeds without the correlation value rather than failing
+    over a field that exists only to be read in a log. Unreachable for every source
+    shipped today (both mint UUID-shaped ids); it is the guard that keeps a future
+    source's odd id-space from being able to cost a wake.
+    """
+    if _SAFE_DELIVERY_ID.match(event.delivery_id):
+        return event.delivery_id
+    logger.warning(
+        "event=unsafe_delivery_id source=%s delivery=%r; omitting %s from the wake "
+        "environment — correlation is lost for this wake, which still runs",
+        event.source,
+        event.delivery_id,
+        DELIVERY_ID_ENV,
+    )
+    return None
 
 
 class WakeError(Exception):
@@ -165,6 +211,10 @@ class SubprocessWaker:
     wall-clock — left ``None`` (unbounded) in v0 so a legitimately long agent is
     never killed mid-task; production should set a bound so a hung ``claude``
     cannot pin a worker thread forever.
+
+    The child's environment is the provider's, plus :data:`DELIVERY_ID_ENV` — the
+    one variable the *router* contributes. It carries no authority and no secret;
+    the provider still owns everything that does.
     """
 
     runner: Runner = _run_subprocess
@@ -173,10 +223,14 @@ class SubprocessWaker:
 
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
         """Assemble the command to wake ``agent`` for ``event`` — pure, no I/O."""
+        env = dict(self.env_provider(agent))
+        delivery = _correlation_id(event)
+        if delivery is not None:
+            env[DELIVERY_ID_ENV] = delivery
         return WakeInvocation(
             argv=wake_command(agent, event),
             cwd=agent.clone_path,
-            env=MappingProxyType(dict(self.env_provider(agent))),
+            env=MappingProxyType(env),
             run_as_user=agent.os_user,
             timeout=self.timeout,
         )
@@ -193,8 +247,8 @@ WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
 class HomeServerWaker:
     """The deployable :class:`Waker` — runs the wake through the wake-runner wrapper.
 
-    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> -- <wake command>``
-    and runs it, where the wake command is the agent-kind-specific
+    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> --delivery <id> --
+    <wake command>`` and runs it, where the wake command is the agent-kind-specific
     :func:`wake_command` (``claude -p "<trigger>"`` for a builder, ``<wake_bin>
     --timeline "<uuid>"`` for a harness persona). The root-owned wrapper validates
     the request, drops to the agent's own OS user, and (as the agent) sources that
@@ -202,6 +256,11 @@ class HomeServerWaker:
     holds a secret. The event value rides as a single ``argv`` element, never a
     shell string, so it is never re-interpreted. ``runner`` is the same injectable
     seam tests replace; ``wrapper`` is overridable for tests.
+
+    ``--delivery`` is how the delivery id reaches the child *given* that the router
+    passes no environment: the wrapper exports it as :data:`DELIVERY_ID_ENV` after
+    the privilege drop. It sits before the ``--`` because everything after ``--`` is
+    the inert wake command the wrapper pins against its registry.
     """
 
     runner: Runner = _run_subprocess
@@ -210,6 +269,7 @@ class HomeServerWaker:
 
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
         """Assemble the sudo+wrapper command — pure, no I/O."""
+        delivery = _correlation_id(event)
         return WakeInvocation(
             argv=(
                 "sudo",
@@ -218,6 +278,7 @@ class HomeServerWaker:
                 agent.os_user,
                 "--cwd",
                 agent.clone_path,
+                *(() if delivery is None else ("--delivery", delivery)),
                 "--",
                 *wake_command(agent, event),
             ),

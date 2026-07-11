@@ -167,7 +167,15 @@ check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.js
 # decision line (recipient = the unregistered repo) before resolve drops it. Assert
 # that INFO line actually reached journald — the live observability check (#91).
 assert_journal_has "github decision line emitted (#91)" \
-	"delivery source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
+	"event=delivery_decision source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
+
+# The same line must carry the DELIVERY ID (#170) — the key that joins this route
+# decision to the core's stage lines and to the wake's own journal. Asserted against
+# the exact id this smoke run POSTed, so a passing regex proves the id is threaded
+# through from the header, not merely that some `delivery=` field exists.
+assert_journal_has "delivery id threaded onto the decision line (#170)" \
+	"event=delivery_decision source=github .*delivery=smoke-00000000-0000-0000-0000-000000000000" \
+	"$obs_since"
 
 # --- basecradle route (only once the capital has wired it) -----------------
 #
@@ -227,7 +235,8 @@ else
 		# unregistered recipient. Assert the basecradle route's INFO observability
 		# reaches journald too — this is the route the #91 silent-drop was found on.
 		assert_journal_has "basecradle decision line emitted (#91)" \
-			"delivery source=basecradle .*decision=woke .*recipient=${UNREGISTERED_RECIPIENT}" "$obs_since"
+			"event=delivery_decision source=basecradle .*decision=woke .*recipient=${UNREGISTERED_RECIPIENT}" \
+			"$obs_since"
 	fi
 fi
 

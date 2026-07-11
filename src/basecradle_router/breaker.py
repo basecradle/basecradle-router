@@ -174,6 +174,13 @@ class WakeRateBreaker:
 
     @property
     def config(self) -> BreakerConfig:
+        """The thresholds this breaker is running with — read-only.
+
+        Exposed so the daemon's startup banner can state the *live* thresholds
+        rather than restate the defaults (basecradle-router#170): the whole point of
+        the banner is to answer "what config did this running router boot with?"
+        from the log alone, which a hard-coded restatement could not.
+        """
         return self._config
 
     def admit(self, agent_key: str, stream_key: str | None = None) -> BreakerOutcome:

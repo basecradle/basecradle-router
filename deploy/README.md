@@ -113,6 +113,53 @@ extra scrubbing layer is added. The wake does gain one dependency: `systemd-cat`
 fails, retryably) if it cannot open the journal stream — negligible on a healthy box, where the journal
 socket survives a journald restart.
 
+#### Reading the Router's Own Log (basecradle-router#170)
+
+The daemon logs to stdout under `uv run uvicorn`, so until #170 journald stamped every one of its lines
+`SYSLOG_IDENTIFIER=uv` — the router's log was attributed to its *launcher*. The unit now sets
+`SyslogIdentifier=basecradle-router`, so the daemon is addressable the same way a wake is:
+
+```bash
+journalctl -t basecradle-router -n 100 --no-pager    # the daemon (as -t basecradle-wake-<slug> is one agent)
+journalctl -u basecradle-router -f                   # by unit — also fine; the unit and identifier agree
+```
+
+**Every line is `key=value`.** The vocabulary, in the order one delivery produces it:
+
+| Line | Carries |
+|---|---|
+| `event=startup …` | one INFO at boot: `version=`, **`sha=`** (the deployed commit, read from `/etc/basecradle-router/deployed-sha`), `routes=`, `dedup_ttl=`, `wake_attempts=`, `breaker_*=`. The running daemon *states its own config* — so a Live Tail that looks wrong is first checked here: absent (it never started), stale `sha=` (the merged≠live gap, #54), or thresholds you did not expect. |
+| `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. |
+| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. |
+| `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. |
+
+**`delivery=<id>` is the join key.** Every line from `normalize` onward carries it (`route`/`verify` run
+before the route has read the source's delivery header — the deliberate exception), and the wake child is
+handed the *same* id in its environment as **`BASECRADLE_DELIVERY_ID`** (`wake-runner --delivery <id>`,
+exported after the privilege drop). So one grep spans both identifiers — the router's half of a wake and
+the agent's — which are otherwise two unrelated journals:
+
+```bash
+journalctl -t basecradle-router -t basecradle-wake-basecradle-glm-ai --since -1h --no-pager \
+  | grep 0192f3a4-5b6c-7d8e-9f01-00000000000a     # one delivery's whole trip, both halves
+```
+
+The wake completion line is the one that matters most, and it now identifies the wake fully:
+
+```
+stage=wake outcome=ok agent=basecradle-glm-ai delivery=0192f3a4-… exit=0 duration=23.1s
+```
+
+`agent=` is the OS-user slug — the same slug the wake's own entries are tagged with
+(`basecradle-wake-<slug>`), which is what makes the two joinable. `duration=` is the wake subprocess's
+wall-clock (the *last* attempt's, on every line that reports one — never the retry backoff's).
+
+**`GET /up` is not logged.** Better Stack's uptime monitor probes it about once a minute, forever; those
+access lines were the largest single source of volume in the journal and in Live Tail, and pure noise. A
+filter on uvicorn's access logger drops exactly that path and nothing else (`/upload` still logs, and so
+does every webhook). If uvicorn ever changes its access-record shape the filter *keeps* the record — the
+fail-direction for a log filter is to log too much, never to silently swallow.
+
 **`router.env`** holds only the daemon's own non-agent config:
 ```
 BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
@@ -527,8 +574,23 @@ Caddy, no database) and has three load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
    (the argv leak path) and from Vector itself (the self-logged-token path), and **redacts**
-   secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`) as defense in
-   depth. The drop + redaction rules are byte-faithful to NOC's `noc_scrub`; do not weaken them.
+   secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`, and **provider API
+   keys** — `sk-…` covering the whole `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`,
+   `hf_…`, `r8_…`) as defense in depth. The provider-key rules are the belt for the braces
+   (basecradle-router#170): agents run with those keys in their env, and a wake's stdout+stderr now
+   flows into journald (#168) and therefore through here — nothing is *known* to print one, and a
+   traceback that did would otherwise ship it. The drop + redaction rules are byte-faithful to NOC's
+   `noc_scrub` plus these additions; do not weaken them.
+   **It also PREFIXES each shipped message with the emitting program's journald identifier**, so a
+   Live Tail line reads `[basecradle-router] stage=wake outcome=ok …` or `[basecradle-wake-jt] step
+   3/12 …` and says which program on the box emitted it (basecradle-router#170). Doing this in Vector,
+   once, is what makes it *uniform*: every program gets it for free — sshd, Caddy, a wake, a timer —
+   whereas hand-prefixing `[Router]` into the daemon's own log strings would cover only the daemon and
+   would bake a presentation concern into application code. **Do not do that.** The prefix is applied
+   *after* redaction (it is not secret-bearing and must never be scanned), and falls back to `_COMM`
+   then `unknown`, so a kernel line with no identifier still reads `[kernel] …` rather than `[] …`.
+   The prefix is only as good as the program's *name*, which is why `basecradle-router.service` sets
+   `SyslogIdentifier=` — without it the daemon's lines would ship as `[uv] …`, its launcher's name.
 2. **`host_metrics` → metrics sink**, direct (CPU/mem/disk/load/network). The scrub guards the
    **journald** path only — by design, mirroring NOC. `host_metrics` events are numeric gauges with
    metric-name/host tags; they carry **no** `message`, no `sudo` argv, no `SYSLOG_IDENTIFIER` — there

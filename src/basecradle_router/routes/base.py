@@ -135,6 +135,7 @@ def log_delivery_decision(
     decision: DeliveryDecision,
     *,
     recipient: str | None = None,
+    delivery: str | None = None,
 ) -> None:
     """Emit the one uniform, structured line recording a delivery's ignore-vs-act fate.
 
@@ -152,13 +153,21 @@ def log_delivery_decision(
     per-recipient). ``decision`` is the *router's* dispatch choice, not the wake's
     eventual exit code: a ``WOKE`` whose later resolve/wake fails is recorded
     loudly and separately by the pipeline.
+
+    ``delivery`` is the source's per-delivery id, read from a *header* — so unlike
+    ``recipient`` the route knows it even for an ignore that never parses the body,
+    and it is logged on **every** decision line (basecradle-router#170). It is the
+    same key the pipeline's stage lines carry, so ``delivery=<id>`` selects one
+    delivery's whole trip — route decision, every stage, and the wake — out of a
+    Live Tail of interleaved concurrent deliveries.
     """
     logger.info(
-        "delivery source=%s event_type=%s decision=%s recipient=%s",
+        "event=delivery_decision source=%s event_type=%s decision=%s recipient=%s delivery=%s",
         source,
         event_type or "<none>",
         decision.value,
         recipient or "<unknown>",
+        delivery or "<unknown>",
     )
 
 

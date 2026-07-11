@@ -33,8 +33,9 @@ import json
 import logging
 import sys
 
+from basecradle_router import __version__
 from basecradle_router.models import Agent, Event
-from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
+from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
 from basecradle_router.routes import InboundRequest
 
 WEBHOOK_PREFIX = "/webhooks/"
@@ -43,6 +44,53 @@ WEBHOOK_PREFIX = "/webhooks/"
 # records and the routes' ignore-vs-act decision lines (#91) all log under it.
 _ROOT_LOGGER = "basecradle_router"
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+#: uvicorn's HTTP access logger — the one we filter ``/up`` out of (see
+#: :class:`_SuppressLivenessAccessLog`). Not our package, so it is configured by
+#: uvicorn and only *adjusted* here.
+_ACCESS_LOGGER = "uvicorn.access"
+
+logger = logging.getLogger("basecradle_router.server")
+
+#: Where the NOC's ``deploy-router`` op stamps the commit it deployed (world-readable
+#: ``0644``, part of the on-box contract in ``deploy/README.md`` — the same file
+#: ``drift-check.sh`` reads). The startup banner quotes it, so the log *itself* says
+#: which bytes the running daemon is: the merged≠live gap (#54) made visible at boot.
+DEPLOYED_SHA_FILE = "/etc/basecradle-router/deployed-sha"
+
+
+def deployed_sha(path: str = DEPLOYED_SHA_FILE) -> str:
+    """The deployed commit from the stamp file, or ``"unknown"``.
+
+    Never raises: the daemon runs on a laptop and in tests too, where the stamp does
+    not exist, and no observability nicety may be able to stop the daemon booting.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+class _SuppressLivenessAccessLog(logging.Filter):
+    """Drop uvicorn's access line for ``GET /up`` — and only that one (#170).
+
+    Better Stack's uptime monitor probes ``/up`` about once a minute, forever, so its
+    access lines are the single largest source of volume in the journal and in Live
+    Tail — pure noise that buries the lines an operator actually reads. Every *other*
+    access line is kept.
+
+    uvicorn logs access as ``('%s - "%s %s HTTP/%s" %d', client, method, path, ver,
+    status)``, so the path is ``args[2]``. If that shape ever changes the filter
+    **keeps the record** rather than guessing — the fail-direction for a log filter is
+    to log too much, never to silently swallow.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 3 or not isinstance(args[2], str):
+            return True
+        return args[2].split("?", 1)[0] != LIVENESS_PATH
 
 
 def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
@@ -57,12 +105,17 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
     the package logger at INFO is what makes those lines actually reach the
     operator's journal.
 
+    Also installs the ``/up`` access-log filter on uvicorn's access logger — done
+    here because this is the one function that runs inside the *live* daemon, after
+    uvicorn has built its loggers, and never in a unit test.
+
     Called from the ASGI lifespan startup, so it configures the *running daemon*
     and never the unit tests (which drive the HTTP path, never lifespan). It is
     idempotent — a second startup re-uses the existing handler instead of stacking
     a duplicate — and leaves ``propagate`` on, so a caplog-based test still sees
     records through the root.
     """
+    _suppress_liveness_access_log()
     pkg = logging.getLogger(_ROOT_LOGGER)
     pkg.setLevel(level)
     for existing in pkg.handlers:
@@ -74,6 +127,21 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
     handler.setFormatter(logging.Formatter(_LOG_FORMAT))
     handler._basecradle_router = True  # tag our own handler so re-config is idempotent
     pkg.addHandler(handler)
+
+
+def _suppress_liveness_access_log() -> None:
+    """Attach :class:`_SuppressLivenessAccessLog` to uvicorn's access logger, once.
+
+    Tagged and re-checked so a second lifespan startup does not stack a duplicate
+    filter, exactly as the stdout handler above is.
+    """
+    access = logging.getLogger(_ACCESS_LOGGER)
+    for existing in access.filters:
+        if getattr(existing, "_basecradle_router", False):
+            return
+    log_filter = _SuppressLivenessAccessLog()
+    log_filter._basecradle_router = True
+    access.addFilter(log_filter)
 
 
 # The fleet-uniform liveness path (constitution → Operational Baselines). Served
@@ -160,6 +228,34 @@ class WebhookServer:
         if self._pending:
             await asyncio.gather(*tuple(self._pending), return_exceptions=True)
 
+    def log_startup_banner(self) -> None:
+        """State, in one INFO line, what config this running router booted with (#170).
+
+        The config a *live* router is running under was previously unknowable from its
+        logs: which routes it accepts, how long it dedups, where the breaker trips,
+        and — the one that matters most — *which commit it is*. All of it had to be
+        inferred from the box. So the daemon now says it at boot, read from the live
+        collaborators (not restated defaults), which makes the banner the natural first
+        thing to read when a Live Tail looks wrong: it is either absent (the daemon did
+        not start), stale (`sha=` is not the merged one — the #54 merged≠live gap), or
+        it disagrees with what you expected to be configured.
+        """
+        breaker = self.pipeline.breaker.config
+        logger.info(
+            "event=startup %s",
+            log_fields(
+                version=__version__,
+                sha=deployed_sha(),
+                routes=",".join(sorted(self.pipeline.config.enabled_routes)),
+                dedup_ttl=f"{self.pipeline.deduper.ttl:.0f}s",
+                wake_attempts=self.pipeline.wake_attempts,
+                breaker_max=breaker.max_wakes,
+                breaker_stream_max=breaker.stream_max_wakes,
+                breaker_window=f"{breaker.window:.0f}s",
+                breaker_cooldown=f"{breaker.cooldown:.0f}s",
+            ),
+        )
+
     async def _lifespan(self, receive, send) -> None:
         while True:
             message = await receive()
@@ -169,6 +265,9 @@ class WebhookServer:
                 # without mutating global logging state during unit tests (which
                 # drive the HTTP path, never the lifespan protocol). See #91.
                 configure_logging()
+                # Strictly after configure_logging, or the banner would be the one
+                # line the daemon drops on the floor at the root's default WARNING.
+                self.log_startup_banner()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart

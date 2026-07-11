@@ -24,6 +24,14 @@ Group=router
 WorkingDirectory=/opt/basecradle-router/app
 EnvironmentFile=/etc/basecradle-router/router.env
 
+# NAME THE PROGRAM (#170). The daemon logs to stdout under `uv run uvicorn`, so
+# without this journald stamps every line SYSLOG_IDENTIFIER=uv — the router's own
+# log was attributed to its *launcher*. `journalctl -t basecradle-router` now reads
+# the daemon (as `-t basecradle-wake-<slug>` reads one agent's wake), and the
+# identifier is what deploy/vector.yaml prefixes each shipped line with, so a Better
+# Stack Live Tail line says which program on the box emitted it.
+SyslogIdentifier=basecradle-router
+
 # SINGLE WORKER — load-bearing, never add --workers. The per-repo threading.Lock
 # only serializes wakes within one process; multiple worker processes would each
 # hold their own locks and could double-wake a repo's clone. Bind to localhost
