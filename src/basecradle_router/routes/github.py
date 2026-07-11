@@ -162,37 +162,46 @@ class GithubRoute:
         is visible in observability, never indistinguishable from a silent drop.
         """
         event_type = request.header(EVENT_HEADER)
+        # Read once, up front, and thread it through every path: the delivery id is
+        # a *header*, so it is known even for an ignore that never parses the body,
+        # and it is the key that joins this route's decision line to the core's
+        # stage lines and the wake's own journal (basecradle-router#170).
+        delivery = request.header(DELIVERY_HEADER)
         if event_type == ISSUES_EVENT:
-            return self._normalize_issues(request, event_type)
+            return self._normalize_issues(request, event_type, delivery)
         if event_type == ISSUE_COMMENT_EVENT:
-            return self._normalize_comment(request, event_type)
-        return self._ignore(event_type)
+            return self._normalize_comment(request, event_type, delivery)
+        return self._ignore(event_type, delivery)
 
-    def _normalize_issues(self, request: InboundRequest, event_type: str) -> Event | None:
+    def _normalize_issues(
+        self, request: InboundRequest, event_type: str, delivery: str | None
+    ) -> Event | None:
         """An ``issues`` webhook: a handoff issue opened or labeled — the initial wake."""
         data = parse_json_object(request.body)
         action = data.get("action")
         if action not in _ACTIONABLE_ACTIONS:
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         issue = _require_issue(data)
         if not _is_handoff(action, issue, data):
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         # `Do Not Work` wins over `handoff`: a parked issue never wakes an agent,
         # even with a (stale or accidental) handoff label. Checked before the
         # trust gate so a parked issue is a clean *skip*, not a sender rejection.
         if _has_do_not_work_label(issue):
-            return self._skip_do_not_work(issue, event_type)
+            return self._skip_do_not_work(issue, event_type, delivery)
 
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
         # actor may actually trigger a wake. This runs after verify(), so the
         # sender is GitHub-attested. An untrusted (or unidentifiable) sender is a
         # rejection, not a wake — fail closed.
         self._require_trusted_sender(data)
-        return self._wake_event(request, data, issue, event_type)
+        return self._wake_event(data, issue, event_type, delivery)
 
-    def _normalize_comment(self, request: InboundRequest, event_type: str) -> Event | None:
+    def _normalize_comment(
+        self, request: InboundRequest, event_type: str, delivery: str | None
+    ) -> Event | None:
         """An ``issue_comment`` webhook: a reply on a handoff issue re-wakes its agent.
 
         Gates that narrow the surface to exactly "a fleet peer replied to an
@@ -205,7 +214,7 @@ class GithubRoute:
         """
         data = parse_json_object(request.body)
         if data.get("action") != _ACTIONABLE_COMMENT_ACTION:
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         issue = _require_issue(data)
         # GitHub fires issue_comment for comments on pull requests too — the issue
@@ -213,18 +222,18 @@ class GithubRoute:
         # agent reports back on the issue, never a PR thread, so a PR comment wakes
         # no one (it would also re-wake on the agent's own auto-merging PR chatter).
         if issue.get("pull_request") is not None:
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         # Handoff scope: a comment only re-wakes when it lands on a handoff issue,
         # mirroring the issues path's handoff-label gate — a comment on an
         # unrelated issue is not handed-off work and wakes no one.
         if not _has_handoff_label(issue):
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         # `Do Not Work` wins over `handoff` on the re-wake path too: a reply on a
         # parked handoff issue re-wakes no one while the brake label remains.
         if _has_do_not_work_label(issue):
-            return self._skip_do_not_work(issue, event_type)
+            return self._skip_do_not_work(issue, event_type, delivery)
 
         # Infinite-loop guard, *before* the trust gate: the agent commenting on its
         # own handoff issue (a progress note, the completion report) fires
@@ -233,19 +242,19 @@ class GithubRoute:
         # self-comment a clean IGNORED no-op regardless of the allow-list, so the
         # loop backstop never depends on the agent's own bot being a trusted actor.
         if self._is_recipient_own_comment(data):
-            return self._ignore(event_type)
+            return self._ignore(event_type, delivery)
 
         # Sender scope: every other commenter must be a trusted fleet actor (the
         # same gate as the label-wake path).
         self._require_trusted_sender(data)
-        return self._wake_event(request, data, issue, event_type)
+        return self._wake_event(data, issue, event_type, delivery)
 
     def _wake_event(
         self,
-        request: InboundRequest,
         data: dict[str, Any],
         issue: dict[str, Any],
         event_type: str,
+        delivery: str | None,
     ) -> Event:
         """Build the handoff :class:`Event` shared by both wake paths.
 
@@ -259,8 +268,7 @@ class GithubRoute:
         if not isinstance(repository, dict):
             raise PayloadError("event payload is missing a 'repository' object")
 
-        delivery_id = request.header(DELIVERY_HEADER)
-        if not delivery_id:
+        if not delivery:
             raise PayloadError(f"missing {DELIVERY_HEADER} header")
 
         try:
@@ -275,20 +283,28 @@ class GithubRoute:
                 kind=EventKind.HANDOFF,
                 recipient=Recipient(by="repo", value=origin.repo),
                 wake_arg=_HANDOFF_TRIGGER.format(url=origin.url),
-                delivery_id=delivery_id,
+                delivery_id=delivery,
                 origin=origin,
             )
         except ValueError as exc:
             raise PayloadError(f"malformed {event_type} payload: {exc}") from exc
-        log_delivery_decision(self.name, event_type, DeliveryDecision.WOKE, recipient=origin.repo)
+        log_delivery_decision(
+            self.name,
+            event_type,
+            DeliveryDecision.WOKE,
+            recipient=origin.repo,
+            delivery=delivery,
+        )
         return event
 
-    def _ignore(self, event_type: str | None) -> None:
+    def _ignore(self, event_type: str | None, delivery: str | None) -> None:
         """Record a deliberate, *visible* ignore (never a silent drop) and return ``None``."""
-        log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
+        log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED, delivery=delivery)
         return None
 
-    def _skip_do_not_work(self, issue: dict[str, Any], event_type: str | None) -> None:
+    def _skip_do_not_work(
+        self, issue: dict[str, Any], event_type: str | None, delivery: str | None
+    ) -> None:
         """Refuse a wake on a ``Do Not Work`` issue — the parked-issue brake (#146).
 
         Logged loudly with the issue URL and the reason *before* the structured
@@ -299,12 +315,13 @@ class GithubRoute:
         """
         url = issue.get("html_url")
         logger.info(
-            "skipping wake: issue %s carries %r, which wins over %r",
+            'event=do_not_work_skip issue=%s delivery=%s reason="%s wins over %s"',
             url if isinstance(url, str) and url else "<unknown>",
+            delivery or "<unknown>",
             DO_NOT_WORK_LABEL,
             HANDOFF_LABEL,
         )
-        return self._ignore(event_type)
+        return self._ignore(event_type, delivery)
 
     def _is_recipient_own_comment(self, data: dict[str, Any]) -> bool:
         """Whether the comment was authored by the recipient agent's own bot.

@@ -12,6 +12,7 @@ import pytest
 from basecradle_router import wake as wake_module
 from basecradle_router.models import Agent, Event, EventKind, IssueRef, Recipient, WakeKind
 from basecradle_router.wake import (
+    DELIVERY_ID_ENV,
     WAKE_RUNNER,
     HomeServerWaker,
     SubprocessWaker,
@@ -82,7 +83,8 @@ def test_wake_assembles_command_cwd_env_and_run_as_user() -> None:
     assert runner.invocation is not None
     assert runner.invocation.argv == ("claude", "-p", EVENT.wake_arg)
     assert runner.invocation.cwd == "/home/nova/basecradle-python"
-    assert runner.invocation.env == env
+    # The provider's env, plus the one variable the router itself contributes.
+    assert runner.invocation.env == {**env, DELIVERY_ID_ENV: EVENT.delivery_id}
     assert runner.invocation.run_as_user == "nova"
     assert result.ok
     assert result.stdout == "done"
@@ -116,14 +118,20 @@ def test_env_provider_receives_the_agent() -> None:
 
     assert seen == [NOVA]
     assert runner.invocation is not None
-    assert runner.invocation.env == {"BOT_SLUG": "basecradle-python-ai"}
+    assert runner.invocation.env == {
+        "BOT_SLUG": "basecradle-python-ai",
+        DELIVERY_ID_ENV: EVENT.delivery_id,
+    }
 
 
-def test_default_env_is_empty() -> None:
+def test_default_env_carries_only_the_delivery_id() -> None:
+    # The router contributes exactly one variable to the child — the delivery id, for
+    # log correlation (#170). It carries no authority and no secret: everything the
+    # agent needs to *act* still comes from the agent's own env, never from the router.
     runner = _FakeRunner(WakeResult(exit_code=0))
     SubprocessWaker(runner=runner).wake(NOVA, EVENT)
     assert runner.invocation is not None
-    assert runner.invocation.env == {}
+    assert runner.invocation.env == {DELIVERY_ID_ENV: EVENT.delivery_id}
 
 
 def test_invocation_for_is_pure_and_does_not_run() -> None:
@@ -192,7 +200,7 @@ def test_default_runner_invokes_subprocess_with_assembled_command(monkeypatch) -
 
     assert captured["argv"] == ["claude", "-p", EVENT.wake_arg]
     assert captured["kwargs"]["cwd"] == "/home/nova/basecradle-python"
-    assert captured["kwargs"]["env"] == env
+    assert captured["kwargs"]["env"] == {**env, DELIVERY_ID_ENV: EVENT.delivery_id}
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["check"] is False
@@ -253,7 +261,8 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
     result = HomeServerWaker(runner=runner).wake(NOVA, EVENT)
 
     assert runner.invocation is not None
-    # The exact contract: sudo <wrapper> --user U --cwd DIR -- claude -p TRIGGER.
+    # The exact contract:
+    #   sudo <wrapper> --user U --cwd DIR --delivery ID -- claude -p TRIGGER.
     assert runner.invocation.argv == (
         "sudo",
         WAKE_RUNNER,
@@ -261,6 +270,8 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
         "nova",
         "--cwd",
         "/home/nova/basecradle-python",
+        "--delivery",
+        EVENT.delivery_id,
         "--",
         "claude",
         "-p",
@@ -272,7 +283,7 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
 
 def test_home_server_waker_assembles_the_harness_wake_command() -> None:
     # A harness persona is woken via its registry-pinned wake CLI, not claude:
-    # sudo <wrapper> --user jt --cwd <home> -- <wake_bin> --timeline <uuid>.
+    # sudo <wrapper> --user jt --cwd <home> --delivery ID -- <wake_bin> --timeline <uuid>.
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
     result = HomeServerWaker(runner=runner).wake(JT, JT_EVENT)
 
@@ -284,6 +295,8 @@ def test_home_server_waker_assembles_the_harness_wake_command() -> None:
         "jt",
         "--cwd",
         "/home/jt/harness",
+        "--delivery",
+        JT_EVENT.delivery_id,
         "--",
         "/home/jt/venv/bin/basecradle-harness-wake",
         "--timeline",

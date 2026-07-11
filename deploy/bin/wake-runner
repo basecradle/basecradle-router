@@ -6,7 +6,8 @@
 # in a root-owned directory the `router` user cannot write). The unprivileged
 # `router` daemon invokes it through one locked sudoers rule:
 #
-#   sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone> -- claude -p "<trigger>"
+#   sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone> \
+#        [--delivery <id>] -- claude -p "<trigger>"
 #
 # It validates the request, drops to the agent's own OS user, and runs the wake
 # in the agent's clone with the agent's own credentials. The router never runs as
@@ -15,6 +16,12 @@
 # KEY=VALUE lines, never bash-sourced, so a secret containing a shell-special
 # character ($, backtick, $( ), spaces, quotes) is data and never code (#109).
 # This is the runtime contract the HomeServerWaker (#29) assembles against.
+#
+# The optional --delivery <id> is exported to the agent as BASECRADLE_DELIVERY_ID,
+# so the woken harness can stamp its own lifecycle lines with the same delivery id
+# the router's stage lines carry — one `delivery=<id>` grep then spans both journal
+# identifiers, `basecradle-router` and `basecradle-wake-<slug>` (#170). It is inert
+# observability: it confers no authority, and it is never evaluated as shell.
 #
 # Two agent kinds are wakeable, selected by the registry entry's `kind`:
 #   - a builder ("github", the default): only the trusted, system-installed
@@ -60,6 +67,7 @@ die() {
 
 user=""
 cwd=""
+delivery=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--user)
@@ -70,6 +78,11 @@ while [[ $# -gt 0 ]]; do
 	--cwd)
 		[[ $# -ge 2 ]] || die "--cwd needs a value"
 		cwd="$2"
+		shift 2
+		;;
+	--delivery)
+		[[ $# -ge 2 ]] || die "--delivery needs a value"
+		delivery="$2"
 		shift 2
 		;;
 	--)
@@ -83,6 +96,18 @@ done
 [[ -n $user ]] || die "missing --user"
 [[ -n $cwd ]] || die "missing --cwd"
 [[ $# -gt 0 ]] || die "missing command after '--' (expected: claude -p <trigger>)"
+
+# --delivery is OPTIONAL (a wake without it runs, just uncorrelated), but if given
+# it must be inert: the agent's bash exports it verbatim as BASECRADLE_DELIVERY_ID,
+# and it lands in the journal. The router only ever sends a source-attested id that
+# already matches this charset, so a value that does not match did not come from the
+# router's normal path — refuse it rather than pass it through. Same posture as every
+# other input here: validate, then refuse; a refused wake is retryable and loses no
+# data (the platform's read API is the source of truth, push is best-effort).
+if [[ -n $delivery ]]; then
+	[[ $delivery =~ ^[A-Za-z0-9_.:-]{1,128}$ ]] ||
+		die "refusing: --delivery must match [A-Za-z0-9_.:-]{1,128}"
+fi
 
 # The target must be a real agent login user — never root or a system account.
 id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
@@ -174,10 +199,10 @@ journal_tag="basecradle-wake-$user"
 systemd_cat="$(PATH="$TRUSTED_PATH" command -v systemd-cat)" || die "systemd-cat not found on the trusted PATH"
 
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
-# router never reads it), cd into the clone, exec the registry-sanctioned binary.
-# The inline script takes the cwd as $1 and the command (launch_bin + args) as
-# $2..; root never interpolates the trigger/timeline — it is passed as an inert
-# positional argument.
+# router never reads it), cd into the clone, export the delivery id, exec the
+# registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id
+# as $2, and the command (launch_bin + args) as $3..; root never interpolates the
+# trigger/timeline/delivery — each is passed as an inert positional argument.
 # SC2016 is intentional: the single quotes are load-bearing — $HOME/$1/$@ must
 # expand in the AGENT's bash after runuser, never in root's, so the untrusted
 # trigger is never evaluated in a privileged context.
@@ -235,5 +260,14 @@ exec "$systemd_cat" --identifier="$journal_tag" -- runuser -u "$user" -- /bin/ba
 	[[ -r $env_file ]] && load_agent_env "$env_file"
 	cd "$1"
 	shift
+	# The delivery id the router is waking for. Exported AFTER the env file loads, so
+	# the router value always wins over a stale one left in agent.env; empty means the
+	# router did not supply one, and the variable is then left UNSET rather than set
+	# empty -- the harness treats it as optional-when-absent, and an empty string would
+	# read as a real (blank) id. Assigned literally: the value is never re-parsed.
+	if [[ -n ${1:-} ]]; then
+		export BASECRADLE_DELIVERY_ID="$1"
+	fi
+	shift
 	exec "$@"
-' wake-runner "$real_cwd" "$launch_bin" "$@"
+' wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@"

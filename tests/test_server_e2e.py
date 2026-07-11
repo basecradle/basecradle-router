@@ -19,13 +19,15 @@ import logging
 import threading
 from types import MappingProxyType
 
+from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.concurrency import AgentLocks
 from basecradle_router.config import Config
+from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
-from basecradle_router.server import WebhookServer, configure_logging
+from basecradle_router.server import WebhookServer, configure_logging, deployed_sha
 from basecradle_router.wake import WakeResult
 
 SECRET = "whsec_" + "0" * 32
@@ -434,3 +436,123 @@ def test_lifespan_startup_configures_logging() -> None:
         assert any(getattr(h, "_basecradle_router", False) for h in pkg.handlers)
 
     _with_clean_package_logger(check)
+
+
+# --- observability: the startup banner and the /up access-log noise (#170) ---
+#
+# Two live-only defects the audit found. (1) The config a *running* router booted
+# with — its routes, its dedup TTL, its breaker thresholds, and above all WHICH
+# COMMIT it is — was unknowable from its own logs. (2) Better Stack's uptime monitor
+# probes `/up` about once a minute forever, and every probe landed in the journal and
+# in Live Tail as pure noise.
+
+
+def _with_clean_access_logger(fn):
+    """Snapshot/restore uvicorn's access-logger filters — configure_logging adds one."""
+    access = logging.getLogger("uvicorn.access")
+    saved = access.filters[:]
+    access.filters.clear()
+    try:
+        fn(access)
+    finally:
+        access.filters[:] = saved
+
+
+def _access_record(path: str) -> logging.LogRecord:
+    """A record shaped exactly as uvicorn's access logger emits one."""
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:1234", "GET", path, "1.1", 200),
+        exc_info=None,
+    )
+
+
+def test_configure_logging_suppresses_the_up_access_line_and_nothing_else() -> None:
+    def check(access: logging.Logger) -> None:
+        _with_clean_package_logger(lambda _pkg: configure_logging(stream=io.StringIO()))
+        assert access.filter(_access_record("/up")) is False  # the monitor's probe: dropped
+        assert access.filter(_access_record("/up?x=1")) is False  # query string and all
+        # Everything else still logs — this is a scalpel, not a mute button.
+        assert access.filter(_access_record("/webhooks/github")) is True
+        assert access.filter(_access_record("/upload")) is True  # a prefix match would be a bug
+
+    _with_clean_access_logger(check)
+
+
+def test_the_up_filter_keeps_a_record_it_cannot_parse() -> None:
+    # Fail-direction: if uvicorn ever changes its access-record shape, the filter must
+    # log too much, never silently swallow. A record with no args is kept.
+    def check(access: logging.Logger) -> None:
+        _with_clean_package_logger(lambda _pkg: configure_logging(stream=io.StringIO()))
+        odd = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="something uvicorn does not do today",
+            args=None,
+            exc_info=None,
+        )
+        assert access.filter(odd) is True
+
+    _with_clean_access_logger(check)
+
+
+def test_the_up_filter_is_installed_once_across_restarts() -> None:
+    def check(access: logging.Logger) -> None:
+        def configure_twice(_pkg: logging.Logger) -> None:
+            configure_logging(stream=io.StringIO())
+            configure_logging(stream=io.StringIO())
+
+        _with_clean_package_logger(configure_twice)
+        tagged = [f for f in access.filters if getattr(f, "_basecradle_router", False)]
+        assert len(tagged) == 1
+
+    _with_clean_access_logger(check)
+
+
+def test_the_startup_banner_states_the_live_config_the_router_booted_with(caplog) -> None:
+    breaker = WakeRateBreaker(
+        BreakerConfig(max_wakes=7, window=30.0, cooldown=90.0, stream_max_wakes=3)
+    )
+    pipeline = Pipeline(
+        registry=_registry(),
+        config=_config(),
+        waker=_RecordingWaker(),
+        breaker=breaker,
+        deduper=DeliveryDeduper(ttl=120.0),
+        sleep=lambda _d: None,
+    )
+    server = WebhookServer(pipeline)
+
+    with caplog.at_level("INFO", logger="basecradle_router.server"):
+        server.log_startup_banner()
+
+    line = next(r.getMessage() for r in caplog.records if "event=startup" in r.getMessage())
+    # The thresholds come from the LIVE collaborators, not a restatement of the
+    # defaults — a banner that could not disagree with the running config is useless.
+    assert "routes=github" in line
+    assert "dedup_ttl=120s" in line
+    assert "breaker_max=7" in line
+    assert "breaker_stream_max=3" in line
+    assert "breaker_window=30s" in line
+    assert "breaker_cooldown=90s" in line
+    assert "wake_attempts=3" in line
+    assert "sha=" in line  # "unknown" off-box; the deployed commit on it
+
+
+def test_deployed_sha_reads_the_stamp_and_never_raises_when_it_is_absent(tmp_path) -> None:
+    # The stamp is the NOC deploy op's, so the daemon must tolerate its absence: it
+    # runs on a laptop and in CI too, and no observability nicety may block a boot.
+    assert deployed_sha(str(tmp_path / "nope")) == "unknown"
+
+    stamp = tmp_path / "deployed-sha"
+    stamp.write_text("93bae15abc123\n")
+    assert deployed_sha(str(stamp)) == "93bae15abc123"
+
+    stamp.write_text("   \n")
+    assert deployed_sha(str(stamp)) == "unknown"  # an empty stamp is not a sha

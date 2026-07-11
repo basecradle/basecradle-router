@@ -125,13 +125,18 @@ class BasecradleRoute:
         *visible* deliberate ignore, never a silent drop.
         """
         event_type = request.header(EVENT_HEADER)
+        # A *header*, so it is known even on the ignore path that never parses the
+        # body — the key that joins this line to the core's stage lines and the
+        # wake's own journal (basecradle-router#170).
+        delivery_id = request.header(DELIVERY_HEADER)
         if event_type not in _ACTIONABLE_EVENTS:
-            log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED)
+            log_delivery_decision(
+                self.name, event_type, DeliveryDecision.IGNORED, delivery=delivery_id
+            )
             return None
 
         data = parse_json_object(request.body)
 
-        delivery_id = request.header(DELIVERY_HEADER)
         if not delivery_id:
             raise PayloadError(f"missing {DELIVERY_HEADER} header")
 
@@ -149,7 +154,11 @@ class BasecradleRoute:
         except ValueError as exc:
             raise PayloadError(f"malformed basecradle payload: {exc}") from exc
         log_delivery_decision(
-            self.name, event_type, DeliveryDecision.WOKE, recipient=recipient_uuid
+            self.name,
+            event_type,
+            DeliveryDecision.WOKE,
+            recipient=recipient_uuid,
+            delivery=delivery_id,
         )
         return event
 

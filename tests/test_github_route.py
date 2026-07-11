@@ -165,6 +165,13 @@ def _issues_request(
     return InboundRequest(headers=headers, body=body)
 
 
+def _decision_line(caplog) -> str:
+    """The one ``event=delivery_decision`` line the route emitted for this delivery."""
+    return next(
+        r.getMessage() for r in caplog.records if "event=delivery_decision" in r.getMessage()
+    )
+
+
 def test_normalize_opened_handoff_round_trips() -> None:
     event = GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
     assert event is not None
@@ -378,10 +385,11 @@ def test_normalize_logs_the_do_not_work_skip_with_the_issue_url(caplog) -> None:
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
     messages = [r.getMessage() for r in caplog.records]
-    skip_line = next(m for m in messages if "skipping wake" in m)
-    assert ISSUE_URL in skip_line
+    skip_line = next(m for m in messages if "event=do_not_work_skip" in m)
+    assert f"issue={ISSUE_URL}" in skip_line
     assert DO_NOT_WORK in skip_line
-    decision_line = next(m for m in messages if "delivery " in m)
+    assert f"delivery={DELIVERY}" in skip_line
+    decision_line = next(m for m in messages if "event=delivery_decision" in m)
     assert f"decision={DeliveryDecision.IGNORED.value}" in decision_line
 
 
@@ -393,11 +401,12 @@ def test_normalize_logs_the_woke_decision_for_a_handoff(caplog) -> None:
     # repo it resolved to — so observability can confirm the wake from logs alone.
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         GithubRoute(TRUSTED).normalize(_issues_request(_issues_payload(action="opened")))
-    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    line = _decision_line(caplog)
     assert "source=github" in line
     assert "event_type=issues" in line
     assert f"decision={DeliveryDecision.WOKE.value}" in line
     assert f"recipient={TARGET_REPO}" in line
+    assert f"delivery={DELIVERY}" in line
 
 
 def test_normalize_logs_the_ignored_decision_with_the_event_type(caplog) -> None:
@@ -405,10 +414,27 @@ def test_normalize_logs_the_ignored_decision_with_the_event_type(caplog) -> None
     # type so a whole class being dropped is discoverable from observability.
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         GithubRoute(TRUSTED).normalize(_issues_request(event="ping"))
-    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    line = _decision_line(caplog)
     assert "source=github" in line
     assert "event_type=ping" in line
     assert f"decision={DeliveryDecision.IGNORED.value}" in line
+
+
+def test_the_ignore_decision_still_carries_the_delivery_id(caplog) -> None:
+    # The delivery id rides a HEADER, so the route knows it even on the ignore path
+    # that never parses the body — which is what lets `delivery=<id>` select one
+    # delivery's whole trip, including the deliveries that woke nobody (#170).
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        GithubRoute(TRUSTED).normalize(_issues_request(event="ping"))
+    assert f"delivery={DELIVERY}" in _decision_line(caplog)
+
+
+def test_the_decision_line_says_unknown_when_the_delivery_header_is_absent(caplog) -> None:
+    # An unidentifiable delivery is named as such, never logged as a bare `delivery=`
+    # that a grep would silently mismatch against a real id.
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        GithubRoute(TRUSTED).normalize(_issues_request(event="ping", delivery=None))
+    assert "delivery=<unknown>" in _decision_line(caplog)
 
 
 # --- issue_comment re-wake (#129) ------------------------------------------
@@ -565,7 +591,8 @@ def test_normalize_rejects_a_comment_missing_the_delivery_header() -> None:
 def test_normalize_logs_woke_for_a_comment_rewake_naming_the_event_type(caplog) -> None:
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         _comment_route().normalize(_comment_request(_comment_payload()))
-    line = next(r.getMessage() for r in caplog.records if "delivery " in r.getMessage())
+    line = _decision_line(caplog)
     assert "event_type=issue_comment" in line
     assert f"decision={DeliveryDecision.WOKE.value}" in line
     assert f"recipient={TARGET_REPO}" in line
+    assert f"delivery={DELIVERY}" in line

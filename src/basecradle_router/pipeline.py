@@ -19,6 +19,17 @@ short-circuits cleanly as ``IGNORED``; a bad signature or malformed payload is
 ``REJECTED``; a stage that errors is ``FAILED`` and logged — the daemon never
 crashes on one bad event.
 
+**Every stage line is key=value, and carries the delivery id from the moment the
+core knows it** (basecradle-router#170). Before that the trailing detail was one
+bare positional value — ``stage=wake outcome=ok exit 0`` — which named neither the
+agent nor the delivery, so two concurrent wakes interleaved ambiguously in Live
+Tail and no line could be joined to any other. Now the delivery id (known from
+``normalize`` onward) and the agent's slug (from ``resolve`` onward) ride as named
+keys on every line that follows, so ``delivery=<id>`` selects one delivery's whole
+trip through the router — and, because the wake child is handed the same id in its
+environment (:data:`~basecradle_router.wake.DELIVERY_ID_ENV`), through the agent's
+own journal too.
+
 **The pipeline ends at the wake — the router never merges.** Auto-merge of a
 captain's own green PR (constitution → Earned Autonomy) is performed by **GitHub
 native auto-merge**: during its wake the agent opens its PR and runs
@@ -34,6 +45,7 @@ and rationale.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -65,6 +77,43 @@ from basecradle_router.wakelock import WakeLockGuard
 logger = logging.getLogger("basecradle_router.pipeline")
 
 
+def log_fields(**pairs: object) -> str:
+    """Render ``pairs`` as a ``key=value`` run, dropping the empty ones.
+
+    The one renderer behind every line this module logs, so a stage line, a retry
+    warning, and the startup banner cannot drift apart in shape. A value carrying
+    whitespace or a quote — an error message, always — is JSON-quoted, so it stays
+    a *single* field and a grep for the field after it still matches; a ``None`` or
+    ``""`` value is dropped rather than logged as ``key=`` (``0`` is a value, and is
+    kept). Public because the server's startup banner renders through it too.
+    """
+    parts = []
+    for key, value in pairs.items():
+        if value is None or value == "":
+            continue
+        text = str(value)
+        if any(char.isspace() for char in text) or '"' in text:
+            text = json.dumps(text)
+        parts.append(f"{key}={text}")
+    return " ".join(parts)
+
+
+def _seconds(elapsed: float) -> str:
+    """A wall-clock duration as a log value: ``23.1s``."""
+    return f"{elapsed:.1f}s"
+
+
+def _who(agent: Agent, event: Event) -> dict[str, str]:
+    """The identity keys every line of the slow half carries: which agent, which delivery.
+
+    ``agent`` is the OS-user slug (:attr:`~basecradle_router.models.Agent.harness_key`),
+    deliberately not the registry key: it is the same slug the wake's *own* journal
+    entries are tagged with (``basecradle-wake-<slug>``), so it is what makes the
+    router's half of a wake and the agent's half joinable.
+    """
+    return {"agent": agent.harness_key, "delivery": event.delivery_id}
+
+
 class Stage(Enum):
     """The ordered stages a webhook passes through."""
 
@@ -90,7 +139,13 @@ class Outcome(Enum):
 
 @dataclass(frozen=True, slots=True)
 class StageRecord:
-    """One stage's outcome — the unit of the router's structured status log."""
+    """One stage's outcome — the unit of the router's structured status log.
+
+    ``detail`` is the rendered ``key=value`` run for this stage (``agent=nova
+    delivery=… exit=0 duration=23.1s``) — the same string the log line carries, so
+    the in-memory record and the journal can never disagree about what a stage
+    said.
+    """
 
     stage: Stage
     outcome: Outcome
@@ -136,8 +191,9 @@ class Pipeline:
 
     All collaborators are injected so the whole pipeline is drivable offline:
     ``registry``/``config`` from the route + config layers, a ``waker`` (mocked
-    in tests), per-agent ``locks``, and a ``sleep`` used by the wake retry
-    (injected as a no-op in tests so nothing really waits).
+    in tests), per-agent ``locks``, a ``sleep`` used by the wake retry (injected
+    as a no-op in tests so nothing really waits), and a ``clock`` used to time the
+    wake subprocess (injected in tests so a logged duration is deterministic).
     """
 
     registry: RouteRegistry
@@ -149,6 +205,10 @@ class Pipeline:
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
+    # Monotonic by design: the wake's duration must not jump if the wall clock is
+    # stepped mid-wake (a wake runs for minutes; ntp can and does correct in that
+    # window), and it is a *duration*, never a timestamp.
+    clock: Callable[[], float] = time.monotonic
 
     def handle(self, source: str, request: InboundRequest) -> PipelineResult:
         """Run ``request`` for ``source`` synchronously, end to end; never raises.
@@ -178,7 +238,9 @@ class Pipeline:
         try:
             pending = self._accept(source, request, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
-            self._record(result, Stage.ROUTE, Outcome.FAILED, f"unexpected: {exc}")
+            self._record(
+                result, Stage.ROUTE, Outcome.FAILED, source=source, error=f"unexpected: {exc}"
+            )
             pending = None
         return AcceptResult(result=result, pending=pending)
 
@@ -234,27 +296,36 @@ class Pipeline:
         own PR and enables GitHub native auto-merge, so the router never merges (see
         the module docstring and issue #38).
         """
+        # On every line the slow half logs — so two concurrent wakes are trivially
+        # separable in Live Tail, which they were not before (#170).
+        who = _who(agent, event)
         try:
             with self.locks.guard(agent.harness_key):
-                self._record(result, Stage.LOCK, Outcome.OK, agent.harness_key)
+                self._record(result, Stage.LOCK, Outcome.OK, **who)
                 if self.deduper.seen(event.dedup_key):
                     # A duplicate delivery of an event we already woke for — a
                     # deliberate, visible collapse, never a silent drop. Checked
                     # ahead of the wake-lock and breaker so a duplicate consumes
                     # neither's budget.
-                    self._record(result, Stage.DEDUP, Outcome.IGNORED, event.dedup_key)
+                    self._record(
+                        result, Stage.DEDUP, Outcome.IGNORED, **who, reason="duplicate_delivery"
+                    )
                     return
                 decision = self.wake_lock.check(agent.harness_key)
                 if not decision.should_wake:
                     # The NOC holds a converge wake-lock for this agent — a
                     # deliberate, visible drop (the guard already logged it loudly).
-                    self._record(result, Stage.WAKE_LOCK, Outcome.IGNORED, decision.detail)
+                    self._record(
+                        result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
+                    )
                     return
                 outcome = self.breaker.admit(agent.harness_key, event.stream_key)
                 if not outcome.admitted:
                     # A trip/refusal is a deliberate, visible drop — recorded like the
                     # route's IGNORED decisions; the breaker already escalated loudly.
-                    self._record(result, Stage.BREAKER, Outcome.IGNORED, outcome.detail)
+                    self._record(
+                        result, Stage.BREAKER, Outcome.IGNORED, **who, reason=outcome.detail
+                    )
                     return
                 if self._wake(agent, event, result):
                     # Remember the delivery *only* once a wake actually succeeded, so
@@ -262,53 +333,78 @@ class Pipeline:
                     # leaves the duplicate free to retry the work (see dedup module).
                     self.deduper.mark(event.dedup_key)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
-            self._record(result, Stage.WAKE, Outcome.FAILED, f"unexpected: {exc}")
+            self._record(result, Stage.WAKE, Outcome.FAILED, **who, error=f"unexpected: {exc}")
 
     def _accept(
         self, source: str, request: InboundRequest, result: PipelineResult
     ) -> tuple[Agent, Event] | None:
         """Drive the accept stages; return ``(agent, event)`` iff there is a wake to run."""
-        # Route: find the source's module. Unknown source is a rejection.
+        # Route: find the source's module. Unknown source is a rejection. The core
+        # cannot know the delivery id yet — the header carrying it is the *source's*
+        # vocabulary, which only the route reads — so the accept stages ahead of
+        # normalize are keyed by `source` alone. That is the "from the point it is
+        # known" boundary; the route logs its own decision line with the id.
         try:
             route = self.registry.get(source)
         except UnknownRouteError as exc:
-            self._record(result, Stage.ROUTE, Outcome.REJECTED, str(exc))
+            self._record(result, Stage.ROUTE, Outcome.REJECTED, source=source, error=str(exc))
             return None
-        self._record(result, Stage.ROUTE, Outcome.OK, source)
+        self._record(result, Stage.ROUTE, Outcome.OK, source=source)
 
         # Verify: the security boundary. A missing secret is our misconfiguration,
         # not a bad request — fail the stage rather than reject the caller.
         try:
             route.verify(request, self.config.webhook_secret(source))
         except SignatureError as exc:
-            self._record(result, Stage.VERIFY, Outcome.REJECTED, str(exc))
+            self._record(result, Stage.VERIFY, Outcome.REJECTED, source=source, error=str(exc))
             return None
         except ConfigError as exc:
-            self._record(result, Stage.VERIFY, Outcome.FAILED, str(exc))
+            self._record(result, Stage.VERIFY, Outcome.FAILED, source=source, error=str(exc))
             return None
-        self._record(result, Stage.VERIFY, Outcome.OK)
+        self._record(result, Stage.VERIFY, Outcome.OK, source=source)
 
         # Normalize: payload → Event, or a clean ignore. A malformed payload or a
         # handoff from an untrusted actor is a rejection (logged, no wake).
         try:
             event = route.normalize(request)
         except (PayloadError, UntrustedSenderError) as exc:
-            self._record(result, Stage.NORMALIZE, Outcome.REJECTED, str(exc))
+            self._record(result, Stage.NORMALIZE, Outcome.REJECTED, source=source, error=str(exc))
             return None
         if event is None:
-            self._record(result, Stage.NORMALIZE, Outcome.IGNORED)
+            self._record(result, Stage.NORMALIZE, Outcome.IGNORED, source=source)
             return None
         result.event = event
-        self._record(result, Stage.NORMALIZE, Outcome.OK, event.delivery_id)
+        self._record(
+            result,
+            Stage.NORMALIZE,
+            Outcome.OK,
+            source=source,
+            delivery=event.delivery_id,
+            kind=event.kind.value,
+        )
 
         # Resolve: which agent owns the target repo.
         try:
             agent = resolve_agent(event, self.config)
         except ConfigError as exc:
-            self._record(result, Stage.RESOLVE, Outcome.FAILED, str(exc))
+            self._record(
+                result,
+                Stage.RESOLVE,
+                Outcome.FAILED,
+                source=source,
+                delivery=event.delivery_id,
+                error=str(exc),
+            )
             return None
         result.agent = agent
-        self._record(result, Stage.RESOLVE, Outcome.OK, agent.key)
+        self._record(
+            result,
+            Stage.RESOLVE,
+            Outcome.OK,
+            source=source,
+            delivery=event.delivery_id,
+            agent=agent.harness_key,
+        )
 
         return agent, event
 
@@ -317,28 +413,78 @@ class Pipeline:
 
         The boolean drives delivery dedup: the caller marks the delivery as woken
         only on success, so a failed wake never suppresses the duplicate.
+
+        Each attempt is timed, and ``duration`` is always *the last attempt's*
+        wall-clock — the wake subprocess's own, never the retry backoff's — so the
+        key means one thing on the OK line, the FAILED line, and every retry
+        warning between them. A **transient failure is logged as it happens**
+        (basecradle-router#170): the backoff used to swallow attempts 1..n-1
+        entirely, so a flapping agent that eventually succeeded looked perfectly
+        healthy, and one that did not showed a single failure where there had been
+        three. Only exhaustion was ever visible.
         """
+        who = _who(agent, event)
+        last_duration = 0.0
 
         # A wake failure is retryable transient by policy here (the boundary
         # reports it as a plain WakeError); the bound stops a permanent fault.
         def attempt() -> WakeResult:
+            nonlocal last_duration
+            started = self.clock()
             try:
                 return self.waker.wake(agent, event)
             except WakeError as exc:
                 raise TransientError(str(exc)) from exc
+            finally:
+                last_duration = self.clock() - started
+
+        def on_retry(failed: int, of: int, exc: Exception) -> None:
+            logger.warning(
+                "event=wake_retry %s",
+                log_fields(
+                    attempt=f"{failed}/{of}",
+                    **who,
+                    duration=_seconds(last_duration),
+                    error=str(exc),
+                ),
+            )
 
         try:
-            woke = with_retry(attempt, attempts=self.wake_attempts, sleep=self.sleep)
+            woke = with_retry(
+                attempt, attempts=self.wake_attempts, sleep=self.sleep, on_retry=on_retry
+            )
         except RetryExhausted as exc:
-            self._record(result, Stage.WAKE, Outcome.FAILED, str(exc.__cause__ or exc))
+            self._record(
+                result,
+                Stage.WAKE,
+                Outcome.FAILED,
+                **who,
+                attempts=self.wake_attempts,
+                duration=_seconds(last_duration),
+                error=str(exc.__cause__ or exc),
+            )
             return False
-        self._record(result, Stage.WAKE, Outcome.OK, f"exit {woke.exit_code}")
+        self._record(
+            result,
+            Stage.WAKE,
+            Outcome.OK,
+            **who,
+            exit=woke.exit_code,
+            duration=_seconds(last_duration),
+        )
         return True
 
     def _record(
-        self, result: PipelineResult, stage: Stage, outcome: Outcome, detail: str = ""
+        self, result: PipelineResult, stage: Stage, outcome: Outcome, **detail: object
     ) -> None:
-        record = StageRecord(stage=stage, outcome=outcome, detail=detail)
+        rendered = log_fields(**detail)
+        record = StageRecord(stage=stage, outcome=outcome, detail=rendered)
         result.records.append(record)
         level = logging.WARNING if outcome in (Outcome.REJECTED, Outcome.FAILED) else logging.INFO
-        logger.log(level, "stage=%s outcome=%s %s", stage.value, outcome.value, detail)
+        logger.log(
+            level,
+            "stage=%s outcome=%s%s",
+            stage.value,
+            outcome.value,
+            f" {rendered}" if rendered else "",
+        )
