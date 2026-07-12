@@ -591,13 +591,24 @@ Caddy, no database) and has three load-bearing properties:
    then `unknown`, so a kernel line with no identifier still reads `[kernel] …` rather than `[] …`.
    The prefix is only as good as the program's *name*, which is why `basecradle-router.service` sets
    `SyslogIdentifier=` — without it the daemon's lines would ship as `[uv] …`, its launcher's name.
-2. **`host_metrics` → metrics sink**, direct (CPU/mem/disk/load/network). The scrub guards the
-   **journald** path only — by design, mirroring NOC. `host_metrics` events are numeric gauges with
-   metric-name/host tags; they carry **no** `message`, no `sudo` argv, no `SYSLOG_IDENTIFIER` — there
-   is nothing for the log-shaped `ai_scrub` remap to drop or redact, and routing them through it would
-   *corrupt* them (it rewrites `.timestamp`→`.dt` and reads log-only fields). So "scrub before the
-   sink" is meaningful only for logs; the secret-leak class (basecradle#338) lives entirely in the
-   journald stream, and that is what `ai_scrub` gates.
+2. **`host_metrics` → metrics sink**, direct (CPU/mem/disk/filesystem/load/host/network). The scrub
+   guards the **journald** path only — by design, mirroring NOC. `host_metrics` events are numeric
+   gauges with metric-name/host tags; they carry **no** `message`, no `sudo` argv, no
+   `SYSLOG_IDENTIFIER` — there is nothing for the log-shaped `ai_scrub` remap to drop or redact, and
+   routing them through it would *corrupt* them (it rewrites `.timestamp`→`.dt` and reads log-only
+   fields). So "scrub before the sink" is meaningful only for logs; the secret-leak class
+   (basecradle#338) lives entirely in the journald stream, and that is what `ai_scrub` gates.
+   **It does not scrape what it cannot read** (basecradle#414): the `filesystem` collector stats every
+   mount in `/proc/mounts`, and the unprivileged `vector` user cannot reach `/sys/kernel/debug/tracing`
+   (tracefs, under a `0700` debugfs) — so every 30s scrape logged a `statvfs` permission-denied
+   **ERROR**, ~2,880/day into this box's journal. That noise never left the box (`ai_scrub` drops
+   Vector's own events, per #338), but a permanent error carpet in the crown-jewels box's journal is
+   how an operator learns to skim past ERROR in an incident. `filesystem.filesystems.excludes:
+   ["tracefs", "debugfs"]` fixes it: Vector checks the excludes **before** the `statvfs`, so the
+   syscall is never attempted. Excluding by filesystem *type* rather than by mountpoint path is
+   deliberate (tracefs is mounted at both `/sys/kernel/tracing` and `/sys/kernel/debug/tracing`, and
+   the type is the durable fact). The collector itself **stays on** — a full disk is how this box dies,
+   so disk-usage metrics are the point; an excludes-only list still collects every real filesystem.
 3. **The ingest token is not in the YAML** — `${BETTERSTACK_AI_SOURCE_TOKEN}` is interpolated from
    the chmod-640 `/etc/vector/betterstack.env`, supplied to `vector.service` by the systemd drop-in
    [`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`](systemd/vector.service.d/10-ai-betterstack-env.conf).

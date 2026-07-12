@@ -121,3 +121,40 @@ def test_the_pre_existing_scrub_rules_survive() -> None:
     for pattern in ("REDACTED_GH_TOKEN", "REDACTED_HEARTBEAT_URL", "REDACTED_BC_TOKEN"):
         assert pattern in source
     assert 'SYSLOG_IDENTIFIER == "sudo"' in source  # the whole-event drop for argv leaks
+
+
+# --- 4. host_metrics does not scrape what it cannot read -------------------
+
+
+def _host_metrics_source() -> str:
+    """The body of the `ai_host_metrics` source — the box's metrics collector."""
+    text = VECTOR.read_text()
+    start = text.index("ai_host_metrics:")
+    return text[start : text.index("transforms:", start)]
+
+
+def test_host_metrics_excludes_the_pseudo_filesystems_it_cannot_read() -> None:
+    # The `filesystem` collector stats every mount in /proc/mounts, and the unprivileged
+    # `vector` user cannot reach /sys/kernel/debug/tracing (tracefs, under a 0700 debugfs):
+    # every 30s scrape logged a `statvfs` permission-denied ERROR — ~2,880/day into the
+    # crown-jewels box's journal, which is exactly how a human learns to skim past ERROR
+    # (basecradle#414). Vector checks these excludes BEFORE the statvfs, so the syscall is
+    # never attempted. Dropping them re-arms the error carpet, and the router-AI never
+    # deploys — nobody would notice until the NOC read the box.
+    source = _host_metrics_source()
+    for fs in ("tracefs", "debugfs"):
+        assert re.search(rf"""excludes:.*["']{fs}["']""", source), (
+            f"host_metrics must exclude the unreadable pseudo-filesystem {fs!r}"
+        )
+
+
+def test_host_metrics_still_collects_real_filesystems() -> None:
+    # The other way to silence the ERROR was to drop the `filesystem` collector entirely —
+    # rejected, because disk-usage metrics are the point (a full disk is how this box dies).
+    # The fix must stay surgical: exclude the pseudo-filesystems, keep the collector. An
+    # excludes-only list includes everything else, so every real filesystem is still scraped.
+    source = _host_metrics_source()
+    assert "filesystem," in source or "filesystem]" in source, (
+        "the `filesystem` collector must remain enabled — the fix is to exclude "
+        "unreadable pseudo-filesystems, not to stop collecting disk usage"
+    )

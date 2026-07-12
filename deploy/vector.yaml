@@ -44,6 +44,19 @@ sources:
     type: "host_metrics"
     scrape_interval_secs: 30
     collectors: [cpu, disk, filesystem, load, host, memory, network]
+    # Don't scrape what we cannot read (basecradle#414). The `filesystem` collector stats every
+    # mount in /proc/mounts, and `/sys/kernel/debug/tracing` (tracefs, under a 0700 debugfs) is
+    # unreadable by the unprivileged `vector` user — so every 30s scrape logged an ERROR
+    # (`statvfs`: permission denied), ~2,880/day, training a human reading the box's journal in an
+    # incident to skim past ERROR. Excluding by filesystem *type* rather than by mountpoint path
+    # is deliberate: tracefs is mounted at both /sys/kernel/tracing and /sys/kernel/debug/tracing,
+    # and the type is the durable fact — these are pseudo-filesystems with no capacity to report,
+    # so their usage metrics were never wanted. The exclude is checked before the statvfs, so the
+    # syscall is never attempted; every real filesystem is still collected (an excludes-only list
+    # includes everything else).
+    filesystem:
+      filesystems:
+        excludes: ["tracefs", "debugfs"]
 
 transforms:
   ai_scrub:
