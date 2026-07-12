@@ -67,16 +67,61 @@ die() {
 
 [[ -r "$ROUTER_ENV_FILE" ]] || die "cannot read $ROUTER_ENV_FILE (run with sudo / as root)"
 
-# Pull only the two values we need; do not source arbitrary lines into the shell.
-# `|| true` so a missing key yields an empty string and the friendly die() below
-# fires — without it, grep's exit 1 under `set -o pipefail` would abort with no message.
-secret="$(grep -E '^BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
-actors="$(grep -E '^BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+# Pull only the values we need; do not source arbitrary lines into the shell. Value
+# of the first `KEY=` line, or empty if absent — so the friendly die() below fires.
+#
+# Pure bash, deliberately: no pipeline, so no stage can short-circuit a producer into
+# a SIGPIPE that `pipefail` would promote to the whole pipeline's status. That class
+# of bug rejected a healthy daemon in #172; `tests/test_shell_pipeline_safety.py`
+# now bans the shape across this repo's shell scripts.
+#
+# The markers let tests/test_smoke_test_assertions.py run these EXACT shipped bodies
+# offline, so a regression here fails in CI rather than on the box.
+# >>> env_parsers >>>
+#
+# Both end in an explicit `return 0`: a missing key must yield "" and let the friendly
+# die() below fire. Without it the function would return its last command's status, and
+# a future edit ending on a false test would abort the whole gate under `set -e` with no
+# message — the same silent-status class as #172 itself. (The old code bought this with
+# a trailing `|| true`.)
+env_value() {
+	local key=$1 line
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if [[ "$line" == "${key}="* ]]; then
+			printf '%s' "${line#"${key}="}"
+			return 0
+		fi
+	done <"$ROUTER_ENV_FILE"
+	return 0
+}
+
+# First non-empty, trimmed entry of a comma-separated list.
+first_entry() {
+	local raw=$1 entry
+	local -a entries=()
+	IFS=',' read -ra entries <<<"$raw" || true
+	# `${a[@]+"${a[@]}"}` is the portable empty-array expansion: a bare `"${a[@]}"` is an
+	# "unbound variable" error under `set -u` on bash < 4.4 (macOS ships 3.2), so an empty
+	# list would kill the gate rather than reach its die().
+	for entry in ${entries[@]+"${entries[@]}"}; do
+		entry="${entry#"${entry%%[![:space:]]*}"}"
+		entry="${entry%"${entry##*[![:space:]]}"}"
+		if [[ -n "$entry" ]]; then
+			printf '%s' "$entry"
+			return 0
+		fi
+	done
+	return 0
+}
+# <<< env_parsers <<<
+
+secret="$(env_value BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET)"
+actors="$(env_value BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS)"
 [[ -n "$secret" ]] || die "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET not set in $ROUTER_ENV_FILE"
 [[ -n "$actors" ]] || die "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS not set in $ROUTER_ENV_FILE"
 
 # First non-empty, trimmed trusted actor — a real fleet login the gate must admit.
-trusted_login="$(printf '%s' "$actors" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -m1 . || true)"
+trusted_login="$(first_entry "$actors")"
 [[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
 
 workdir="$(mktemp -d)"
@@ -128,11 +173,24 @@ check() {
 # capability read as healthy. This proves the INFO record reached the operator's
 # journal. A short retry absorbs journald ingestion lag (the record is written
 # synchronously during the request, but ingestion is a beat behind the HTTP ack).
+#
+# The journal is CAPTURED first, then matched — never piped straight into a matcher
+# that short-circuits. Piping a live `journalctl` into an early-exiting consumer
+# kills the producer with SIGPIPE (141) the moment the match is found, and `pipefail`
+# then promotes that 141 to the pipeline's status: the assertion reads FALSE even
+# though the line is present. It is position-dependent, so it looked like a real
+# failure — a match near the END of the stream passed (nothing left to write) while
+# a match EARLIER in it always failed. That is what rejected a healthy #170 daemon
+# and rolled it back (#172). Matching a captured string has no live producer to kill.
+#
+# tests/test_smoke_test_assertions.py runs this EXACT body against a fake journal that
+# keeps writing after the match — the case that failed on the box.
+# >>> assert_journal_has >>>
 assert_journal_has() {
-	local name=$1 pattern=$2 since=$3
+	local name=$1 pattern=$2 since=$3 journal
 	for _ in 1 2 3 4 5; do
-		if journalctl -u basecradle-router --since "$since" --no-pager 2>/dev/null |
-			grep -qE "$pattern"; then
+		journal="$(journalctl -u basecradle-router --since "$since" --no-pager 2>/dev/null || true)"
+		if grep -qE "$pattern" <<<"$journal"; then
 			green "  PASS  ${name}: decision line present in journald"
 			return 0
 		fi
@@ -142,6 +200,7 @@ assert_journal_has() {
 	red "        decision logging is wired but NOT emitting at the deployed level (#91)"
 	rc=1
 }
+# <<< assert_journal_has <<<
 
 log "Smoke-testing live daemon at ${SMOKE_URL}"
 log "Trusted actor under test: ${trusted_login}"
@@ -189,7 +248,7 @@ BC_URL="${BC_URL:-${SMOKE_URL%/*}/basecradle}"
 UNREGISTERED_RECIPIENT="00000000-0000-7000-8000-000000000000"
 SMOKE_TIMELINE="00000000-0000-7000-8000-0000000000aa"
 
-bc_secret="$(grep -E '^BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=' "$ROUTER_ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+bc_secret="$(env_value BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET)"
 
 bc_payload() {
 	local recipient=$1
