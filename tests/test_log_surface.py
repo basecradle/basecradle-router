@@ -78,11 +78,28 @@ def test_the_delivery_id_is_passed_as_an_inert_positional_never_interpolated() -
 # --- 3. Vector presentation + scrub ----------------------------------------
 
 
+def _component(component_id: str) -> str:
+    """The YAML body of one vector.yaml component, bounded by the next key at its own indent.
+
+    Bounding a component's body with a *named sibling* is a trap this file already fell into:
+    `_host_metrics_source` used to slice to `transforms:`, and inserting `ai_internal_metrics`
+    ahead of it silently widened the slice so a sibling component could satisfy an assertion
+    meant for this one. Naming the new sibling instead would only move the bug one component
+    along, and a slice whose end lands *before* its start collapses to `""` — where every
+    `not in` assertion passes vacuously and the test dies silently. The next same-indent key
+    is the real boundary, whatever it happens to be called.
+    """
+    text = VECTOR.read_text()
+    key = re.search(rf"^(?P<indent> *){re.escape(component_id)}:[ \t]*$", text, re.MULTILINE)
+    assert key, f"vector.yaml defines no component {component_id!r}"
+    body = text[key.end() :]
+    end = re.search(rf"^ {{0,{len(key.group('indent'))}}}\S", body, re.MULTILINE)
+    return body[: end.start()] if end else body
+
+
 def _scrub_source() -> str:
     """The body of the `ai_scrub` remap — the transform every shipped log passes."""
-    text = VECTOR.read_text()
-    start = text.index("ai_scrub:")
-    return text[start : text.index("sinks:", start)]
+    return _component("ai_scrub")
 
 
 def test_every_shipped_line_is_prefixed_with_the_emitting_programs_identifier() -> None:
@@ -128,9 +145,7 @@ def test_the_pre_existing_scrub_rules_survive() -> None:
 
 def _host_metrics_source() -> str:
     """The body of the `ai_host_metrics` source — the box's metrics collector."""
-    text = VECTOR.read_text()
-    start = text.index("ai_host_metrics:")
-    return text[start : text.index("transforms:", start)]
+    return _component("ai_host_metrics")
 
 
 def test_host_metrics_excludes_the_pseudo_filesystems_it_cannot_read() -> None:
@@ -157,4 +172,73 @@ def test_host_metrics_still_collects_real_filesystems() -> None:
     assert "filesystem," in source or "filesystem]" in source, (
         "the `filesystem` collector must remain enabled — the fix is to exclude "
         "unreadable pseudo-filesystems, not to stop collecting disk usage"
+    )
+
+
+# --- 5. Vector's own health is visible to the NOC (basecradle#419) ----------
+#
+# Vector is the transport that ships this box's entire log stream, and it is the one
+# component nothing watches: its own logs are deliberately DROPPED from the stream
+# (they echo the sink token — basecradle#338), and `introspect-vector` reads only
+# "installed and running", which a running-but-BROKEN Vector satisfies perfectly. A VRL
+# aborting 100% of events logs nothing, passes `vector validate`, and shows `active`
+# while the sink receives zero. These counters are the only thing that sees that.
+
+
+def test_the_health_component_ids_are_a_contract_with_the_noc() -> None:
+    # NOT cosmetic, and the reason `_component` anchors on the YAML key rather than searching
+    # the file for the bare string: the NOC's wrapper carries a reviewed allow-list and will
+    # never name an id that is not on it — because on a Better Stack *generated* config the
+    # component id IS the ingest token (that is how it leaked ~40x). Renaming either id here
+    # does not fail loudly; it surfaces on the box as an `unknown_components` finding and
+    # needs a change in a repo we do not own to clear. A comment that merely mentions the id
+    # must not be able to satisfy this.
+    for component_id in ("ai_internal_metrics", "ai_vector_health_exporter"):
+        assert _component(component_id), (
+            f"{component_id!r} is allow-listed by the NOC's introspect-vector-health op — "
+            "renaming it silently strands the guard (basecradle-noc#215)"
+        )
+
+
+def test_vector_exports_its_own_health_counters() -> None:
+    # The source of truth for received/sent/discarded. Without it the exporter below has
+    # nothing to serve and the NOC's guard reads `endpoint_reachable: false` forever.
+    assert re.search(r"""type:\s*["']internal_metrics["']""", _component("ai_internal_metrics")), (
+        "`ai_internal_metrics` must be an `internal_metrics` source"
+    )
+
+
+def test_the_health_exporter_is_bound_to_localhost_only() -> None:
+    # This is not a network service. The only reader is a root-owned wrapper op on this same
+    # machine, pulling out-of-band. Binding 0.0.0.0 would publish the box's internals to the
+    # internet — the box holds the fleet's crown jewels.
+    exporter = _component("ai_vector_health_exporter")
+    assert re.search(r"""address:\s*["']127\.0\.0\.1:9598["']""", exporter), (
+        "the health exporter must bind 127.0.0.1 — never 0.0.0.0"
+    )
+
+
+def test_the_health_counters_are_pulled_out_of_band_not_shipped() -> None:
+    # A Vector whose SINK is broken cannot ship the metric that says its sink is broken — a
+    # self-report through the failing channel is not a monitor. So the counters are exposed
+    # on localhost and PULLED by the NOC over a channel independent of the pipe under test.
+    # Routing them into a Better Stack sink would make the guard blind in the exact case it
+    # exists to catch.
+    exporter = _component("ai_vector_health_exporter")
+    assert re.search(r"""inputs:\s*\[["']ai_internal_metrics["']\]""", exporter), (
+        "the exporter must serve the `ai_internal_metrics` counters"
+    )
+    for sink in ("better_stack_logs", "better_stack_metrics"):
+        assert "ai_internal_metrics" not in _component(sink), (
+            f"the health counters must not be shipped through {sink} — a broken transport "
+            "cannot report its own breakage through itself (basecradle-noc#215)"
+        )
+
+
+def test_the_health_counters_never_enter_the_log_scrub() -> None:
+    # `ai_scrub` is log-shaped: it rewrites `.timestamp` -> `.dt` and reads log-only fields.
+    # These are METRIC events; routing them through it would corrupt them. Same reasoning
+    # already applies to `ai_host_metrics`, which is likewise kept out of the scrub.
+    assert "ai_internal_metrics" not in _scrub_source(), (
+        "`ai_internal_metrics` is metric events — the log scrub would corrupt them"
     )
