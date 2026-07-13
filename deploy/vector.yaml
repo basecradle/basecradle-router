@@ -8,10 +8,13 @@
 # Tailored to this box (a webhook daemon + Caddy, no database), so the generated kitchen-sink config
 # (apache/nginx/mysql/mongo/redis/postgres log + metric sources scraping absent localhost endpoints)
 # is replaced with exactly what this box has:
-#   * journald     — ALL system logs AND the router's own software: the basecradle-router.service
-#                    uvicorn daemon and the drift/reboot/recovery units all log to the journal via
-#                    stdout/stderr. journald (not a /var/log/*.log tail) catches /var/log/syslog too.
-#   * host_metrics — CPU / memory / disk / load / network.
+#   * journald         — ALL system logs AND the router's own software: the basecradle-router.service
+#                        uvicorn daemon and the drift/reboot/recovery units all log to the journal via
+#                        stdout/stderr. journald (not a /var/log/*.log tail) catches /var/log/syslog too.
+#   * host_metrics     — CPU / memory / disk / load / network.
+#   * internal_metrics — Vector's OWN health counters (basecradle-noc#215), exposed on a localhost-only
+#                        prometheus endpoint and PULLED out-of-band by the NOC. Never shipped to Better
+#                        Stack: a broken transport cannot ship the metric that says it is broken.
 #
 # SECURITY — never ship raw journald to an external store (basecradle-noc#33 / basecradle#338).
 # The `ai_scrub` transform runs before the logs sink and:
@@ -57,6 +60,17 @@ sources:
     filesystem:
       filesystems:
         excludes: ["tracefs", "debugfs"]
+
+  # Vector's own health (basecradle-noc#215) — the transport that ships this box's log stream is the
+  # one component nothing watches. Its own logs are DROPPED from the stream (they echo the sink
+  # token — basecradle#338), so Better Stack cannot see it; `introspect-vector` reads only
+  # "installed and running", which a running-but-broken Vector satisfies perfectly.
+  #
+  # These counters are the ONLY thing that sees a SILENT drop: a VRL aborting 100% of events logs
+  # NOTHING, yet these read received=N, sent=0, discarded=N.
+  ai_internal_metrics:
+    type: "internal_metrics"
+    scrape_interval_secs: 30
 
 transforms:
   ai_scrub:
@@ -127,3 +141,17 @@ sinks:
       strategy: "bearer"
       token: "${BETTERSTACK_AI_SOURCE_TOKEN}"
     inputs: ["ai_host_metrics"]
+
+  # Vector's health counters, exposed for the NOC to READ OFF THE BOX (basecradle-noc#215).
+  #
+  # DELIBERATELY NOT SHIPPED TO BETTER STACK. A Vector whose SINK is broken cannot ship the metric
+  # that says its sink is broken — a self-report through the failing channel is not a monitor. So the
+  # counters are exposed here and PULLED out-of-band by the NOC's `introspect-vector-health` op, over
+  # a channel (ssh -> fleet-deploy-runner -> localhost) independent of the pipe under test.
+  #
+  # BOUND TO 127.0.0.1 — this is not a network service. Nothing off-box can reach it; the only reader
+  # is a root-owned wrapper op on this same machine, which returns counts and never log text.
+  ai_vector_health_exporter:
+    type: "prometheus_exporter"
+    inputs: ["ai_internal_metrics"]
+    address: "127.0.0.1:9598"
