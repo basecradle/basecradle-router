@@ -100,6 +100,13 @@ The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency
 gh issue list --repo basecradle/basecradle-router --state open
 ```
 
+## An Issue Is a Commitment to Work, Never an Escape From It
+
+An issue exists so work is never **forgotten** — never so it can be **avoided**. Filing one buys no relief from the work; it obligates *more* of it, *sooner*. The failure this forecloses is the plausible-looking session: work the issue, ticket every surprise found along the way, close the original, report success — half-finished work with a paper trail, a growing backlog, and nothing actually landed. (`constitution.md` → How We Build carries the principle; these are the procedures here.)
+
+- **"Do it now" means in this SESSION, not this instant.** Work you discover *while working* an issue is **part of finishing that issue** — adjust the plan and do it, in-session. Filing a separate issue instead is legitimate for exactly **two** reasons: (a) you genuinely **cannot** do it now (blocked on a credential, a founder decision, another repo), or (b) it **deserves a fresh context window**. Nothing else. And filing obligates **dispatch, not deferral** — a fresh-window issue is worked as soon as the capital can start that session, so say so plainly on the issue you are working — with the routing label (`needs-capital`, or `needs-human` for a real human gate) when it is a blocker — instead of leaving it as silent backlog.
+- **Finishing an issue means finishing everything it took to get that issue done — sub-issues included.** Before you stop, sweep the related issues (`gh issue list --repo basecradle/basecradle-router --state open`): what did this work touch, and what else belongs in this context window? **An arc that ends with more issues open than it began is not done.**
+
 ## Fleet Bot Identity
 
 This repo's builder agent — **basecradle-router AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-router-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the founder's account. **This is the law:** the constitution requires each agent to act under its own identity, *never anonymously behind the founder's account.* If a `gh`/git write lands as `drawkkwast` instead of the bot, the auth routing was skipped — that is the bug, not a cosmetic detail.
