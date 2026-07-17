@@ -330,8 +330,8 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 
 - **The systemd unit** `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
   the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
-  `Restart=on-failure`, `TimeoutStopSec` to let the app drain in-flight wakes on shutdown, bound to
-  localhost (Caddy fronts it).
+  `Restart=on-failure`, `KillMode=mixed` + a generous `TimeoutStopSec` (30min) to let the app drain
+  its (unbounded) in-flight wakes on shutdown, bound to localhost (Caddy fronts it).
   > **Sandboxing is constrained by the in-process wake.** The wake (`sudo`→`runuser`→`claude`) runs as a
   > *child* of this service and inherits its namespace, so the strong filesystem directives **cannot**
   > be used: `NoNewPrivileges=yes` would block the `sudo`→wrapper escalation; `ProtectHome=yes` would

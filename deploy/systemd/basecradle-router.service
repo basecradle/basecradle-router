@@ -41,9 +41,24 @@ ExecStart=/home/router/.local/bin/uv run --project /opt/basecradle-router/app \
 
 Restart=on-failure
 RestartSec=2s
-# The app drains in-flight wakes on lifespan shutdown; give it room before SIGKILL
-# on stop/restart (each wake is also bounded by its own configured timeout).
-TimeoutStopSec=120s
+# GRACEFUL DRAIN OF IN-FLIGHT WAKES on stop/restart (and on the pre-reboot drain in
+# deploy/reboot-if-required.sh). Two directives make the drain real:
+#   KillMode=mixed — SIGTERM at stop goes to the MAIN process ONLY, so uvicorn's
+#     lifespan shutdown can drain `self._pending` while the wake subtree
+#     (sudo -> wake-runner -> runuser -> claude) keeps running. NOTE: the main process
+#     is `uv run`, not uvicorn itself, so this relies on `uv` forwarding SIGTERM to its
+#     uvicorn child (recent uv does) — verify the drain actually fires on a live stop,
+#     not just that the directive is set. The systemd default (control-group) SIGTERMs
+#     every process in the cgroup at t=0 — severing the very wakes the drain exists to
+#     protect. SIGKILL still sweeps the whole cgroup at the stop timeout as the backstop.
+#   TimeoutStopSec=30min — wakes are deliberately UNBOUNDED (HomeServerWaker timeout=None)
+#     and real agent turns run up to ~15 min, so the drain must tolerate a full-length
+#     wake rather than SIGKILL it. Sized >=2x that worst case; a genuinely hung wake is
+#     still cut at 30 min so a stop/reboot can never stall unbounded. Any consumer that
+#     waits on `systemctl stop` (the reboot orchestrator's TimeoutStartSec) must stay
+#     above this bound.
+KillMode=mixed
+TimeoutStopSec=30min
 
 # --- Hardening -------------------------------------------------------------
 # The wake (sudo -> runuser -> claude) runs as a CHILD of this service and so

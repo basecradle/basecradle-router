@@ -20,8 +20,9 @@ Documentation=https://github.com/basecradle/basecradle-router
 [Service]
 Type=oneshot
 # The drain (systemctl stop basecradle-router) blocks until in-flight wakes finish,
-# bounded by that unit's TimeoutStopSec (120s). Keep this start timeout above that so
+# bounded by that unit's TimeoutStopSec (30min — wakes are unbounded, so the drain
+# tolerates a full-length agent turn). Keep this start timeout above that bound so
 # systemd never kills the orchestrator mid-drain (which would skip the reboot and
 # mark the unit failed). Once it reaches `exec systemctl reboot`, the box goes down.
-TimeoutStartSec=300
+TimeoutStartSec=35min
 ExecStart=/opt/basecradle-router/app/deploy/reboot-if-required.sh
