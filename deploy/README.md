@@ -180,6 +180,11 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # Delivery dedup (collapse a duplicate webhook delivery into one wake, issue #133) — optional,
 # generous default; 0 disables:
 # BASECRADLE_ROUTER_DEDUP_TTL=600                # seconds a woken delivery id is remembered; 0 disables
+#
+# Wake concurrency (the per-agent-fair scheduler's pool size, issue #182) — optional,
+# fixed default (8), NOT derived from cpu_count. A busy agent holds exactly one lane, so
+# this binds only when that many DISTINCT agents wake at once; size it to the box's memory:
+# BASECRADLE_ROUTER_WAKE_LANES=8                 # max concurrent wakes across all agents; must be >= 1
 ```
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
@@ -226,6 +231,18 @@ cursor-paginated read API is the source of truth and push is best-effort — so 
 pauses its push until the loop is understood. The breaker is defense-in-depth with, and independent of,
 the harness's own per-timeline self-breaker (basecradle-harness#138): no shared protocol, each trips on
 its own view.
+
+The **wake scheduler** (issue #182) decides *which* pending wake runs *when*. Each accepted webhook is
+fast-acked and its slow wake handed to a per-agent-fair thread pool sized by `BASECRADLE_ROUTER_WAKE_LANES`
+(default 8). It runs **at most one wake in flight per agent** — serialising an agent's stream by
+*scheduling*, so a worker thread never blocks waiting on the per-agent lock — and dispatches **fairly**
+across agents, so one busy agent's deep backlog can no longer starve an idle agent's wake (the Fleet
+Transport incident, 2026-07-17, where a chatty two-peer timeline starved the NOC's own transport probe).
+`WAKE_LANES` is the ceiling on *total* concurrent wakes across all agents, deliberately **not** derived
+from the box's `cpu_count` (that implicit sizing was half the incident); because a busy agent holds
+exactly one lane, it binds only when that many *distinct* agents wake at once. Size it to the box's
+memory. The daemon logs the saturated↔not-saturated edge, so "raise `WAKE_LANES`" is a signal the NOC can
+read off the box; the startup banner states the live `wake_lanes=` it booted with.
 
 **Delivery dedup** (issue #133) collapses a duplicate webhook delivery into a single wake. One logical
 event can reach the router as more than one delivery — e.g. two fleet GitHub Apps installed on a repo,

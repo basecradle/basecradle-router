@@ -8,11 +8,13 @@ import json
 import pytest
 
 from basecradle_router.config import (
+    DEFAULT_WAKE_LANES,
     ConfigError,
     load_breaker_config,
     load_config,
     load_dedup_ttl,
     load_github_trusted_actors,
+    load_wake_lanes,
 )
 
 _BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
@@ -20,6 +22,7 @@ _BREAKER_WINDOW_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW"
 _BREAKER_COOLDOWN_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX"
 _DEDUP_TTL_VAR = "BASECRADLE_ROUTER_DEDUP_TTL"
+_WAKE_LANES_VAR = "BASECRADLE_ROUTER_WAKE_LANES"
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -268,3 +271,24 @@ def test_dedup_ttl_non_numeric_value_fails_loudly() -> None:
 def test_dedup_ttl_negative_value_fails_loudly() -> None:
     with pytest.raises(ConfigError, match=f"{_DEDUP_TTL_VAR} must be >= 0"):
         load_dedup_ttl({_DEDUP_TTL_VAR: "-5"})
+
+
+def test_wake_lanes_defaults_when_unset() -> None:
+    # A fixed, box-independent default — deliberately NOT derived from cpu_count
+    # (that implicit sizing was half of basecradle-router#182's starvation).
+    assert load_wake_lanes({}) == DEFAULT_WAKE_LANES
+
+
+def test_wake_lanes_reads_from_env() -> None:
+    assert load_wake_lanes({_WAKE_LANES_VAR: "16"}) == 16
+
+
+def test_wake_lanes_non_integer_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError, match=f"{_WAKE_LANES_VAR} must be an integer"):
+        load_wake_lanes({_WAKE_LANES_VAR: "plenty"})
+
+
+def test_wake_lanes_below_one_fails_loudly() -> None:
+    # 0 lanes would dispatch nothing — a loud misconfiguration, never a silent no-op.
+    with pytest.raises(ConfigError, match=f"{_WAKE_LANES_VAR} must be >= 1"):
+        load_wake_lanes({_WAKE_LANES_VAR: "0"})

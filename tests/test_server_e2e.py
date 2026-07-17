@@ -527,7 +527,7 @@ def test_the_startup_banner_states_the_live_config_the_router_booted_with(caplog
         deduper=DeliveryDeduper(ttl=120.0),
         sleep=lambda _d: None,
     )
-    server = WebhookServer(pipeline)
+    server = WebhookServer(pipeline, lanes=6)
 
     with caplog.at_level("INFO", logger="basecradle_router.server"):
         server.log_startup_banner()
@@ -541,6 +541,7 @@ def test_the_startup_banner_states_the_live_config_the_router_booted_with(caplog
     assert "breaker_stream_max=3" in line
     assert "breaker_window=30s" in line
     assert "breaker_cooldown=90s" in line
+    assert "wake_lanes=6" in line  # the live scheduler's lane count, not the default
     assert "wake_attempts=3" in line
     assert "sha=" in line  # "unknown" off-box; the deployed commit on it
 

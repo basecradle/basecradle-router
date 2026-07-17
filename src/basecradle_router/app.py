@@ -27,6 +27,7 @@ from basecradle_router.config import (
     load_config,
     load_dedup_ttl,
     load_github_trusted_actors,
+    load_wake_lanes,
 )
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.pipeline import Pipeline
@@ -67,7 +68,7 @@ def create_app(
         breaker=WakeRateBreaker(load_breaker_config(env)),
         deduper=DeliveryDeduper(load_dedup_ttl(env)),
     )
-    return WebhookServer(pipeline)
+    return WebhookServer(pipeline, lanes=load_wake_lanes(env))
 
 
 def _bot_login_for_repo(config: Config) -> Callable[[str], str | None]:

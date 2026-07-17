@@ -32,6 +32,15 @@ _BREAKER_STREAM_MAX_VAR = f"{_BREAKER_PREFIX}STREAM_MAX"
 
 _DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
 
+_WAKE_LANES_VAR = f"{ENV_PREFIX}WAKE_LANES"
+#: Concurrent-wake ceiling across *all* agents (the wake scheduler's pool size,
+#: basecradle-router#182). Deliberately a fixed default, not derived from
+#: ``os.cpu_count()`` — the incident's starvation came exactly from capacity being an
+#: implicit artifact of the box's vCPU count. A busy agent holds exactly one lane, so
+#: this binds only when this many *distinct* agents wake at once; 8 is generous
+#: headroom over the current fleet, and the NOC tunes it to the box's memory.
+DEFAULT_WAKE_LANES = 8
+
 
 class ConfigError(Exception):
     """Configuration is missing or malformed. The message names the fix."""
@@ -296,6 +305,23 @@ def load_dedup_ttl(env: Mapping[str, str] | None = None) -> float:
     if ttl < 0:
         raise ConfigError(f"{_DEDUP_TTL_VAR} must be >= 0 (0 disables dedup), got {ttl!r}")
     return ttl
+
+
+def load_wake_lanes(env: Mapping[str, str] | None = None) -> int:
+    """The wake scheduler's concurrent-wake ceiling, from ``BASECRADLE_ROUTER_WAKE_LANES``.
+
+    Optional with a fixed, box-independent default (:data:`DEFAULT_WAKE_LANES`): the
+    number of wakes that may run at once across all agents (basecradle-router#182). It
+    is a *total* ceiling, not a per-agent limit — the scheduler already runs at most one
+    wake per agent — so it only binds when that many distinct agents wake concurrently.
+    Must be ``>= 1``; a non-integer or out-of-range value is a loud :class:`ConfigError`
+    naming the variable, never a silent fallback to the default.
+    """
+    env = os.environ if env is None else env
+    lanes = _int_env(env, _WAKE_LANES_VAR, DEFAULT_WAKE_LANES)
+    if lanes < 1:
+        raise ConfigError(f"{_WAKE_LANES_VAR} must be >= 1, got {lanes}")
+    return lanes
 
 
 def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:
