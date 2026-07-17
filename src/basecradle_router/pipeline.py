@@ -253,7 +253,11 @@ class Pipeline:
         where the constitution's unified-identity rule lands in the core: every
         input source for an agent funnels through this one lock into a single
         ordered stream the lone harness instance drains, so a future input module
-        can never fan a second parallel session onto the same agent.
+        can never fan a second parallel session onto the same agent. In production
+        the :class:`~basecradle_router.scheduler.WakeScheduler` already guarantees a
+        single in-flight wake per agent, so this guard is acquired *uncontended* — it
+        is the last-line correctness net for the invariant, not the thing a thread
+        blocks on (that blocking was basecradle-router#182's starvation).
 
         Inside the lock, **delivery dedup** is the first gate
         (basecradle-router#133): a single logical event can arrive as two webhook

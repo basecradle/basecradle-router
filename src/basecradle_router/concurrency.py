@@ -22,8 +22,16 @@ both source-agnostic and independent of any wake's specifics:
   may fail transiently. Only :class:`TransientError` is retried; anything else
   propagates at once. The clock is injectable so tests never really sleep.
 
-The thread pool that actually runs wakes concurrently is assembled by the core
-pipeline (a later step); this module is just the primitives it stands on.
+The thread pool that actually runs wakes concurrently — and the per-agent FIFO
+queues that decide *which* wake runs *when* — live in
+:mod:`~basecradle_router.scheduler`; this module is just the primitives it stands
+on. The scheduler guarantees at most one wake in flight per agent, so
+:class:`AgentLocks` is never actually contended in production: it stays in
+:meth:`~basecradle_router.pipeline.Pipeline.execute` as the last-line guarantee of the
+unified-identity invariant (and to serialise the direct, single-process ``handle``
+path the offline tests drive), always acquired uncontended. Serialising by *parking a
+pool thread on this lock* — rather than by scheduling — is exactly the starvation the
+scheduler was built to end (basecradle-router#182).
 """
 
 from __future__ import annotations

@@ -5,10 +5,16 @@ A deliberately tiny, framework-free ASGI app — one endpoint shape,
 the smallest surface we can manage: Python stdlib, no web framework.
 
 The app is async but the pipeline is synchronous and blocking (the threaded
-model: a wake is a minutes-long subprocess). The bridge is
-:func:`asyncio.to_thread`, which runs the blocking pipeline on a worker thread
-and leaves the event loop free — and lets the per-agent ``threading.Lock``
-serialize same-agent wakes (from any source) across those threads.
+model: a wake is a minutes-long subprocess). The bridge is the
+:class:`~basecradle_router.scheduler.WakeScheduler` — an explicitly-sized,
+per-agent-fair thread pool that runs each wake off the event loop. It replaced a
+naive :func:`asyncio.to_thread` hand-off onto the *implicit default executor*,
+whose ``cpu_count``-derived size and global-FIFO queue let one busy agent's
+backlog starve every other agent's wakes — including the NOC's transport probe
+(basecradle-router#182). The scheduler serialises an agent's wakes by *scheduling*
+(one in flight per agent) rather than by parking a pool thread on a blocking lock,
+and dispatches fairly across agents, so a hot timeline can no longer monopolise the
+pool. See its module docstring for the full incident and design.
 
 **Fast-ack.** A wake takes minutes; GitHub abandons a webhook after ~10s. So the
 server runs only the pipeline's fast :meth:`~basecradle_router.pipeline.Pipeline.accept`
@@ -22,8 +28,9 @@ source, ``400`` malformed payload, ``200`` ignored or logged-failure. The wake's
 own outcome is not in the response — it lands in the structured log, and the
 woken agent reports separately by commenting on the issue.
 
-In-flight background wakes are tracked so they are not garbage-collected
-mid-flight and so :meth:`WebhookServer.drain` can await them on shutdown.
+In-flight and queued wakes are owned by the scheduler, so
+:meth:`WebhookServer.drain` awaits *its* idle rather than tracking asyncio tasks —
+the drain the shutdown lifespan (and the tests) rely on to let a wake finish.
 """
 
 from __future__ import annotations
@@ -34,9 +41,11 @@ import logging
 import sys
 
 from basecradle_router import __version__
+from basecradle_router.config import DEFAULT_WAKE_LANES
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
 from basecradle_router.routes import InboundRequest
+from basecradle_router.scheduler import WakeScheduler
 
 WEBHOOK_PREFIX = "/webhooks/"
 
@@ -159,12 +168,16 @@ LIVENESS_BODY = b'<!DOCTYPE html><html><body style="background-color: green"></b
 class WebhookServer:
     """An ASGI application wrapping a :class:`~basecradle_router.pipeline.Pipeline`."""
 
-    def __init__(self, pipeline: Pipeline, *, prefix: str = WEBHOOK_PREFIX) -> None:
+    def __init__(
+        self, pipeline: Pipeline, *, prefix: str = WEBHOOK_PREFIX, lanes: int = DEFAULT_WAKE_LANES
+    ) -> None:
         self.pipeline = pipeline
         self.prefix = prefix
-        # Strong references to in-flight background wakes: without these the tasks
-        # could be garbage-collected mid-run, and drain() needs them on shutdown.
-        self._pending: set[asyncio.Task] = set()
+        # The wake scheduler owns the thread pool and the per-agent queues: it runs the
+        # pipeline's slow half fairly, one wake in flight per agent, on `lanes` threads
+        # (basecradle-router#182). `lanes` is injected from config by the app factory;
+        # the default keeps a bare WebhookServer(pipeline) runnable in tests.
+        self._scheduler = WakeScheduler(pipeline.execute, lanes=lanes)
 
     async def __call__(self, scope: dict, receive, send) -> None:
         scope_type = scope["type"]
@@ -212,21 +225,23 @@ class WebhookServer:
             await self._send(send, _status_for(accepted.result), _summary(accepted.result))
 
     def _spawn_wake(self, pending: tuple[Agent, Event], result: PipelineResult) -> None:
-        """Run the slow ``execute`` half in the background, tracked so it survives."""
+        """Hand the slow ``execute`` half to the scheduler; it runs it off the loop.
+
+        Returns at once — the scheduler enqueues the wake and dispatches it onto a free
+        lane, one in flight per agent, so the ack (already sent) never waits and a busy
+        agent's backlog never parks the pool.
+        """
         agent, event = pending
-        task = asyncio.create_task(asyncio.to_thread(self.pipeline.execute, agent, event, result))
-        self._pending.add(task)
-        task.add_done_callback(self._pending.discard)
+        self._scheduler.submit(agent, event, result)
 
     async def drain(self) -> None:
-        """Await all in-flight background wakes — called on shutdown, and by tests.
+        """Await all queued and in-flight wakes — called on shutdown, and by tests.
 
-        A snapshot is taken because each task's done-callback mutates ``_pending``
-        as it completes. ``return_exceptions`` keeps one failed wake from
-        cancelling the others' drain (the pipeline already records failures).
+        Blocks (off the event loop) until the scheduler is idle. Idempotent: it does
+        not close the pool, so a caller may drain then submit again (the tests do); the
+        shutdown lifespan closes the pool after its final drain.
         """
-        if self._pending:
-            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+        await asyncio.to_thread(self._scheduler.wait_idle)
 
     def log_startup_banner(self) -> None:
         """State, in one INFO line, what config this running router booted with (#170).
@@ -248,6 +263,7 @@ class WebhookServer:
                 sha=deployed_sha(),
                 routes=",".join(sorted(self.pipeline.config.enabled_routes)),
                 dedup_ttl=f"{self.pipeline.deduper.ttl:.0f}s",
+                wake_lanes=self._scheduler.lanes,
                 wake_attempts=self.pipeline.wake_attempts,
                 breaker_max=breaker.max_wakes,
                 breaker_stream_max=breaker.stream_max_wakes,
@@ -272,8 +288,11 @@ class WebhookServer:
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart
                 # never severs an agent mid-task. (A wake's own timeout, plus the
-                # service's stop timeout, bound how long this can take.)
+                # service's stop timeout, bound how long this can take.) uvicorn has
+                # already stopped accepting connections, so no new wake is submitted
+                # between the drain and the pool teardown that follows it.
                 await self.drain()
+                await asyncio.to_thread(self._scheduler.shutdown)
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
