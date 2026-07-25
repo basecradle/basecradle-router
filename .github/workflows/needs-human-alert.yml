@@ -1,0 +1,13 @@
+name: Needs-Human Alert
+
+on:
+  issues:
+    types: [ labeled ]
+
+permissions: {}
+
+jobs:
+  notify:
+    if: github.event.label.name == 'needs-human'
+    uses: basecradle/.github/.github/workflows/needs-human-ntfy.yml@main
+    secrets: inherit
