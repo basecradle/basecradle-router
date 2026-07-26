@@ -497,6 +497,40 @@ as its final confirm step, and `deploy/systemd/basecradle-router-drift.{service,
 the `router` user — so a merge that never reached the box surfaces in `systemctl --failed` and the journal,
 instead of going unnoticed for a day. It only reads; it never auto-deploys.
 
+#### The gap is classified, not just measured (issue #189)
+**Differing SHAs are not by themselves drift.** This repo carries four of the fleet's five
+verbatim-shared artifacts, so every fleet-wide re-sync — routine, expected, frequent — lands a
+**docs-only** commit on `main` that changes nothing the box runs. Reddening a production alarm on those
+trains the operator to read red as "probably just docs again", which is precisely how the one genuine
+stale-daemon alarm gets waved through. An alarm that cries wolf on a schedule converts a *hard* signal
+into a *judgment call*.
+
+So when the SHAs differ, the check fetches **just those two commits** (`--filter=blob:none --depth=1`,
+a few hundred KB, still tokenless, into a throwaway dir) and asks *which files* differ:
+
+| Gap contains | Result |
+|---|---|
+| any **daemon-relevant** path | **red, exit 1** — `DRIFT`, naming the offending files. Unchanged behaviour. |
+| only **inert** paths (`*.md`, `.claude/**`, `.github/**`, `.gitignore`) | **green, exit 0** — `IN SYNC (daemon)`, stating out loud that main is ahead by docs only and naming those files. |
+| nothing classifiable (network down, deployed SHA no longer on the remote) | **red, exit 1** — an unclassifiable gap is drift. |
+
+Two properties keep the tolerance from becoming a **false negative**, which would be the worse failure —
+a hidden stale wake daemon:
+
+- **Fail-closed by construction.** The inert set is a narrow explicit allow-list; *everything* else is
+  daemon-relevant, so a newly-added directory, config file, or unit is loud without anyone remembering
+  to classify it. `.claude/**` is inert on the box because a woken agent runs in its own clone under
+  `/home/<agent>` — `wake-runner` refuses any cwd outside it — never in `/opt/basecradle-router/app`.
+  `tests/` and every non-`.md` file under `deploy/` are deliberately **not** inert.
+- **Pinned to the real tree by an offline test.** The path model is a second model of what a deploy
+  ships and could drift from it, so `tests/test_drift_check.py` runs the shipped classifier over every
+  path `git ls-files` reports and every path the Part 3 contract table consumes — globbed from
+  `deploy/systemd/`, `deploy/bin/`, and `src/` rather than hand-listed, so a new unit file or module is
+  covered automatically — and runs the whole script end to end against a local fixture repo.
+
+**It never passes silently**: the green docs-only case prints both SHAs and the exact files in the gap,
+because silence is what a broken checker looks like.
+
 ### Why the box pulls, not a token on the box and not push-CD
 The box holds the fleet's crown jewels, so it carries **no GitHub credential** — and the deploy is a **box
 pull**, not a push. Auto-deploy-on-merge from a GitHub-hosted runner would need either an SSH key to the box

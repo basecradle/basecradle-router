@@ -1,11 +1,15 @@
 # BaseCradle router — deployed-vs-main drift check (oneshot, run by the .timer).
 #
-# Makes drift loud instead of silent (issue #54): if the box stops matching
-# origin/main, this unit FAILS, so it shows up in `systemctl --failed` and the
-# journal instead of going unnoticed. It only reads — it never auto-deploys; the
-# steward redeploys with deploy/deploy.sh after seeing the failure. (Auto-pulling
-# from the internet onto the crown-jewels box, unattended, is a security trade we
-# deliberately do NOT make — see deploy/README.md Part 3.)
+# Makes drift loud instead of silent (issue #54): if the box stops running main's
+# DAEMON code, this unit FAILS, so it shows up in `systemctl --failed` and the
+# journal instead of going unnoticed. A gap confined to docs, skills, .github/, or
+# CLAUDE.md passes green and says so in the journal (issue #189) — those change
+# nothing the box runs, and an alarm that is routinely red for a harmless reason is
+# the one that gets waved through when it finally matters. It only reads — it never
+# auto-deploys; the NOC redeploys with `basecradle-noc deploy-router <sha>` after
+# seeing the failure. (Auto-pulling from the internet onto the crown-jewels box,
+# unattended, is a security trade we deliberately do NOT make — see
+# deploy/README.md Part 3.)
 #
 # Install to /etc/systemd/system/, then:
 #   systemctl daemon-reload && systemctl enable --now basecradle-router-drift.timer
