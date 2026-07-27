@@ -72,12 +72,17 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
 ```
 /opt/basecradle-router/            # ROOT-owned tree (router cannot write it)
   app/                             # the daemon: checked-out repo + uv venv, owned by `router`
+  app/deploy/bin/router-admin      # the admin CLI wrapper the NOC's converge + probes call
   bin/wake-runner                  # root-owned (root:root, 0755) privilege-drop wrapper
 /etc/basecradle-router/
   router.env                       # daemon config (owner router, 0600) — see below
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
                                    #   read-only (0640) — it is the wake-runner's trusted allowlist
                                    #   so the daemon must not be able to write it; NO secrets
+/var/lib/basecradle-router/        # systemd StateDirectory, owned by `router` (0755)
+  evidence.json                    # what the router has demonstrably done — the NOC ledger's
+                                   #   evidence source (0644, NO secrets). The DAEMON is its only
+                                   #   writer; the admin CLI only ever reads it.
 ```
 
 The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
@@ -185,7 +190,22 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # fixed default (8), NOT derived from cpu_count. A busy agent holds exactly one lane, so
 # this binds only when that many DISTINCT agents wake at once; size it to the box's memory:
 # BASECRADLE_ROUTER_WAKE_LANES=8                 # max concurrent wakes across all agents; must be >= 1
+#
+# Green-while-absent instrument (issue #198) — both optional, both stated in the startup
+# banner so a live daemon says which it booted with:
+# BASECRADLE_ROUTER_WAKE_LOCK_DIR=/run/basecradle-noc/wake-locks   # the NOC freeze surface
+# BASECRADLE_ROUTER_EVIDENCE_FILE=/var/lib/basecradle-router/evidence.json  # "none" = memory only
 ```
+
+`BASECRADLE_ROUTER_WAKE_LOCK_DIR` is the NOC wake-lock (freeze) directory the daemon reads. It
+defaults to the capital-pinned path and should stay there — it is settable because **a router
+reading a different directory than the NOC writes to has a freeze that silently never fires**, and
+a hard-coded constant cannot be compared against the NOC's. Now it can: the banner logs it and
+`selftest freeze` reports it.
+
+`BASECRADLE_ROUTER_EVIDENCE_FILE` is where the daemon records what it has demonstrably done. Leave
+it at the default on the box — the literal value `none` disables persistence and is for a laptop
+run only; on the box it would make every proven capability read as never-proven after each deploy.
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
 wake only fires if the webhook `sender` — the actor who applied the `handoff` label, or who left the
@@ -317,6 +337,70 @@ credentials, its token minter) is the NOC's onboarding job (noc#91), not the dae
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
 on the box out-of-band, `chmod 600`, never in git.
 
+### Proving what the router claims — the NOC's ledger interface (#198)
+
+Fleet observability catches failures that **happen**. The night of 2026-07-26→27 produced five
+failures where nothing happened at all — a capability was silently **absent**, and absence emits no
+signal (`basecradle/basecradle#460`). Three of those classes are the router's surface, so the daemon
+now emits **claims** and records **evidence** for the NOC's claims-vs-evidence ledger
+(`basecradle-noc#406`). The router emits; the NOC judges — we never grade our own homework.
+
+**The admin CLI is the whole interface**, reached through one wrapper the deploy installs. It does
+the privilege drop and sources `router.env` itself, so the NOC schedules one stable path:
+
+```bash
+/opt/basecradle-router/app/deploy/bin/router-admin claims                 # Contract v1 manifests (JSON array)
+/opt/basecradle-router/app/deploy/bin/router-admin claims --out-dir DIR   # one single-subject file per subject
+/opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json # the freeze-readability probe
+/opt/basecradle-router/app/deploy/bin/router-admin evidence               # the raw evidence document
+```
+
+**Run the probe as the daemon's user — the wrapper does this for you.** Root bypasses file
+permissions, so a probe run as root would pass on a box where the daemon itself is locked out, which
+is exactly the failure it exists to catch. Run as root the wrapper re-execs itself via `runuser`; run
+as `router` it proceeds directly. The probe reports its own effective user (`ran_as`), so a drop that
+silently failed is still visible in the output.
+
+**Exit codes** (the contract the NOC schedules against):
+
+| Code | Meaning |
+|---|---|
+| `0` | **proven** — the surface is readable and would be honoured |
+| `1` | **proven broken** — unreadable or malformed; the check names the exact file |
+| `2` | **could not prove** — the lock dir does not exist, a lock is stale, or the probe ran as root |
+| `3` | **config error** — the router's own config would not load (the daemon could not boot on it either) |
+
+`2` is deliberately distinct from `1`: a fresh box whose wake-lock directory the NOC has not created
+yet must not look identical to a box whose freeze surface is unreadable. **If `/run/basecradle-noc/wake-locks`
+is created at converge, the probe reads `ok` on an idle box** — otherwise expect `degraded` with
+`dir_absent` until the NOC first takes a lock.
+
+**The three claims and what each closes:**
+
+| Claim | Subject | Class / TTL | Closes |
+|---|---|---|---|
+| `wake-edge:webhook-route` | `agent:<slug>` | `rare` / 168 h | **A parked builder with no re-wake path.** `detail.edges` lists every path that could wake the agent now (an armed webhook route, a queued wake); `evidence` is its last `stage=wake outcome=ok`. `edge_count: 0` **and** `evidence: null` is the gap, in one row. |
+| `freeze-surface:readable` | `box:<host>` | `rare` / 24 h | **The control that existed but could not be read.** A `probe` claim, not a pointer: readability is not a fact you look up, it is one you demonstrate with the daemon's own credentials. |
+| `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. |
+
+Each claim also carries a `detail` object beside Contract v1's pinned
+`claim`/`class`/`prove`/`evidence`/`ttl_hours` keys — the one additive extension, because the emitter
+must report not just whether an edge ever fired but whether one *exists*. A consumer reading only the
+pinned keys is unaffected.
+
+**The evidence document** (`/var/lib/basecradle-router/evidence.json`, `0644`, no secrets) is what the
+daemon writes and the emitter reads — they are different processes, so a file is the only channel.
+The unit's `StateDirectory=basecradle-router` creates the parent owned by `router` before the daemon
+starts. **Only the daemon writes it**: the CLI is strictly read-only, so a probe run under the wrong
+identity can never take ownership of the daemon's own state file away from it.
+
+The **boot check** runs the same probe at daemon startup and logs it loudly
+(`event=freeze_selftest status=…`) — but it never aborts startup. That is deliberate: the wake-lock
+guard's fail-direction is to keep waking when a lock cannot be read (wedging every wake on a
+permissions typo would be far worse), so a boot check that refused to start would silently invert
+that decision. **Fail-closed is the converge's job** — the NOC runs this probe at Layer 1 and turns
+the converge red. Loud here, closed there.
+
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
   the local ASGI app. One-block Caddyfile; only 80/443 exposed.
@@ -383,6 +467,14 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   `caddy validate` + `systemctl reload caddy`.
 - **The ASGI entrypoint** `basecradle_router.app:create_app` + the `uvicorn` dependency (#37) — the
   composition root the systemd unit's `ExecStart` runs.
+- **The admin CLI wrapper** (`deploy/bin/router-admin`, #198) — the one stable path the NOC's converge
+  and its Layer-3 synthetic-exercise scheduler call for the claims manifests and the freeze probe. It
+  lives inside the `app/` tree (so the app-mirror keeps it in lockstep with `main`, no separate root
+  install), re-execs itself as `router` via `runuser` when invoked as root, sources `router.env` after
+  the drop, and prefers the venv's python over `uv run` so a scheduled probe never re-syncs the
+  daemon's dependencies underneath it. It is **read-only**: it never writes the evidence document,
+  so a probe run under the wrong identity cannot take that file's ownership from the daemon. Details
+  and exit codes: *Proving what the router claims* in Part 1.
 
 > **The pipeline ends at the wake — the router never merges (#38, decided).** Auto-merge of a captain's
 > own green PR (Earned Autonomy) is done by **GitHub native auto-merge**: during its wake the agent opens

@@ -91,10 +91,21 @@ class WakeLockDecision:
     ``detail`` is a compact one-line reason for the pipeline's stage record; the
     guard logs the loud, filterable line itself (so the pipeline only records the
     stage), exactly as the wake-rate breaker does.
+
+    The remaining fields are the decision's *raw* parts, kept beside the composed
+    ``detail`` so a second consumer can render them its own way rather than parse
+    the sentence back apart: ``reason`` is the bare cause of an ``UNREADABLE`` or
+    ``UNPARSEABLE`` verdict, and ``lock_reason``/``expires_at`` are the NOC's own
+    stated converge reason and TTL from a lock that parsed. The freeze
+    self-test (:mod:`basecradle_router.selftest`) reports on these; :meth:`check`
+    logs from them.
     """
 
     state: WakeLockState
     detail: str = ""
+    reason: str = ""
+    lock_reason: str = ""
+    expires_at: str = ""
 
     @property
     def should_wake(self) -> bool:
@@ -103,6 +114,15 @@ class WakeLockDecision:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _unparseable(reason: str) -> WakeLockDecision:
+    # Present but unreadable as a lock: honour ``Present = locked`` and refuse. The
+    # loud line is emitted by ``check`` so the NOC contract violation surfaces in Live
+    # Tail on the wake path, and stays silent on the self-test's read-only pass.
+    return WakeLockDecision(
+        WakeLockState.UNPARSEABLE, f"wake_lock_unparseable: {reason}", reason=reason
+    )
 
 
 def _parse_iso8601(value: object) -> datetime | None:
@@ -142,69 +162,105 @@ class WakeLockGuard:
     lock_dir: str = DEFAULT_LOCK_DIR
     now: Callable[[], datetime] = _utc_now
 
-    def check(self, slug: str) -> WakeLockDecision:
-        """Decide the wake's fate for ``slug`` against its NOC lock file.
+    def path_for(self, slug: str) -> str:
+        """The lock file this guard would read for ``slug`` — what the self-test names.
 
-        Returns a :class:`WakeLockDecision`; the guard emits the loud, filterable
-        log line for every non-``ABSENT`` outcome (the happy path stays silent).
+        Public because a report about the freeze surface is useless unless it names
+        the exact file, and the *guard's* view of that path (its configured
+        ``lock_dir``) is the only one that matters: a router pointed at a different
+        directory than the NOC writes is precisely the "the control existed but was
+        never read" failure the self-test exists to catch.
+        """
+        return os.path.join(self.lock_dir, f"{slug}.lock")
+
+    def check(self, slug: str) -> WakeLockDecision:
+        """Decide the wake's fate for ``slug``, logging the decision. The wake path.
+
+        :meth:`inspect` makes the decision; this adds the loud, filterable log line
+        for every non-``ABSENT`` outcome (the happy path stays silent). The split
+        exists because the freeze self-test must exercise the *same* read-and-decide
+        code the daemon uses — that is what makes it a proof rather than a
+        re-implementation — without emitting ``event=wake_refused`` lines for wakes
+        that were never attempted.
+        """
+        decision = self.inspect(slug)
+        state = decision.state
+        if state is WakeLockState.UNREADABLE:
+            logger.error("event=wake_lock_unreadable agent=%s detail=%s", slug, decision.reason)
+        elif state is WakeLockState.HELD:
+            logger.warning(
+                "event=wake_refused reason=wake_lock_held agent=%s lock_reason=%s expires_at=%s",
+                slug,
+                decision.lock_reason,
+                decision.expires_at,
+            )
+        elif state is WakeLockState.STALE:
+            logger.warning(
+                "event=wake_lock_stale agent=%s expires_at=%s", slug, decision.expires_at
+            )
+        elif state is WakeLockState.UNPARSEABLE:
+            logger.warning(
+                "event=wake_refused reason=wake_lock_unparseable agent=%s detail=%s",
+                slug,
+                decision.reason,
+            )
+        return decision
+
+    def inspect(self, slug: str) -> WakeLockDecision:
+        """Read and decide ``slug``'s lock **without logging** — total, never raises.
+
+        The pure half of :meth:`check`: same file, same parse, same fail-directions,
+        no side effects. The freeze self-test calls this so it can report on every
+        registered agent's lock in one pass without polluting the journal with
+        refusals that did not happen.
         """
         # The slug is the agent's OS-user name from the root-owned registry (trusted
         # config), but a path-separator in it would escape the lock dir — guard it
         # cheaply and fail open rather than ever reading an arbitrary path.
         if slug != os.path.basename(slug) or slug in ("", ".", ".."):
-            logger.error("event=wake_lock_unreadable agent=%s detail=unsafe-slug", slug)
-            return WakeLockDecision(WakeLockState.UNREADABLE, f"unsafe slug {slug!r}")
+            return WakeLockDecision(
+                WakeLockState.UNREADABLE, f"unsafe slug {slug!r}", reason="unsafe-slug"
+            )
 
-        path = os.path.join(self.lock_dir, f"{slug}.lock")
         try:
-            with open(path, encoding="utf-8") as handle:
+            with open(self.path_for(slug), encoding="utf-8") as handle:
                 raw = handle.read()
         except FileNotFoundError:
             return WakeLockDecision(WakeLockState.ABSENT)
         except (OSError, ValueError) as exc:
             # Permission denied or any other read fault is a deployment problem, not
             # a per-agent one: fail open (wake) but escalate loudly. ValueError covers
-            # an embedded-NUL slug (``open`` raises it, not OSError) so ``check`` is
+            # an embedded-NUL slug (``open`` raises it, not OSError) so this is
             # total — it never raises, whatever the slug, and the guard stays the sole
             # decision point rather than leaking into the pipeline's last-resort catch.
-            logger.error("event=wake_lock_unreadable agent=%s detail=%s", slug, exc)
-            return WakeLockDecision(WakeLockState.UNREADABLE, f"unreadable: {exc}")
+            return WakeLockDecision(WakeLockState.UNREADABLE, f"unreadable: {exc}", reason=str(exc))
 
-        return self._decide(slug, raw)
+        return self._decide(raw)
 
-    def _decide(self, slug: str, raw: str) -> WakeLockDecision:
+    def _decide(self, raw: str) -> WakeLockDecision:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            return self._unparseable(slug, f"invalid JSON: {exc}")
+            return _unparseable(f"invalid JSON: {exc}")
         if not isinstance(data, dict):
-            return self._unparseable(slug, "lock is not a JSON object")
+            return _unparseable("lock is not a JSON object")
 
         expires_at = _parse_iso8601(data.get("expires_at"))
         if expires_at is None:
-            return self._unparseable(slug, "missing or invalid expires_at")
+            return _unparseable("missing or invalid expires_at")
 
+        until = expires_at.isoformat()
         if self.now() < expires_at:
             # A valid, live lock: the NOC is converging this agent. Refuse the wake.
             reason = data.get("reason")
-            logger.warning(
-                "event=wake_refused reason=wake_lock_held agent=%s lock_reason=%s expires_at=%s",
-                slug,
-                reason if isinstance(reason, str) else "",
-                expires_at.isoformat(),
+            return WakeLockDecision(
+                WakeLockState.HELD,
+                f"wake_lock_held until {until}",
+                lock_reason=reason if isinstance(reason, str) else "",
+                expires_at=until,
             )
-            until = expires_at.isoformat()
-            return WakeLockDecision(WakeLockState.HELD, f"wake_lock_held until {until}")
 
         # Expired: the NOC died mid-converge (or the TTL elapsed). Wake, but flag it.
-        until = expires_at.isoformat()
-        logger.warning("event=wake_lock_stale agent=%s expires_at=%s", slug, until)
-        return WakeLockDecision(WakeLockState.STALE, f"wake_lock_stale (expired {until})")
-
-    def _unparseable(self, slug: str, detail: str) -> WakeLockDecision:
-        # Present but unreadable as a lock: honour ``Present = locked`` and refuse,
-        # loudly, so the NOC contract violation surfaces in Live Tail.
-        logger.warning(
-            "event=wake_refused reason=wake_lock_unparseable agent=%s detail=%s", slug, detail
+        return WakeLockDecision(
+            WakeLockState.STALE, f"wake_lock_stale (expired {until})", expires_at=until
         )
-        return WakeLockDecision(WakeLockState.UNPARSEABLE, f"wake_lock_unparseable: {detail}")

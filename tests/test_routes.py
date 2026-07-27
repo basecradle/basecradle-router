@@ -23,6 +23,10 @@ class FakeRoute:
     """A minimal conforming route: a fixed-header signature and a handoff marker."""
 
     name = "fake"
+    # Part of the Route protocol: the Recipient.by tag this source resolves by, so
+    # the wake-edge claims emitter can ask the registry which agents a route can
+    # actually reach without ever naming a source itself.
+    recipient_kind = "repo"
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         if request.header("X-Fake-Signature") != secret:

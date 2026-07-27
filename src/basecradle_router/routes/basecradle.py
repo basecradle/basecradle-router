@@ -102,6 +102,10 @@ class BasecradleRoute:
     """The BaseCradle webhook route. ``name`` is the source key the registry uses."""
 
     name = "basecradle"
+    #: A harness persona is addressed by its BaseCradle user uuid, so its events
+    #: resolve by ``Recipient(by="recipient_uuid", …)`` — see
+    #: :class:`~basecradle_router.routes.base.Route`.
+    recipient_kind = "recipient_uuid"
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.

@@ -46,6 +46,7 @@ from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
 from basecradle_router.routes import InboundRequest
 from basecradle_router.scheduler import WakeScheduler
+from basecradle_router.selftest import log_freeze_selftest, run_freeze_selftest
 
 WEBHOOK_PREFIX = "/webhooks/"
 
@@ -176,8 +177,12 @@ class WebhookServer:
         # The wake scheduler owns the thread pool and the per-agent queues: it runs the
         # pipeline's slow half fairly, one wake in flight per agent, on `lanes` threads
         # (basecradle-router#182). `lanes` is injected from config by the app factory;
-        # the default keeps a bare WebhookServer(pipeline) runnable in tests.
-        self._scheduler = WakeScheduler(pipeline.execute, lanes=lanes)
+        # the default keeps a bare WebhookServer(pipeline) runnable in tests. Its queue
+        # depths feed the evidence store, so an emitted wake-edge claim can report a
+        # wake that is queued right now as the live edge it is.
+        self._scheduler = WakeScheduler(
+            pipeline.execute, lanes=lanes, on_queue_change=pipeline.evidence.record_queue_depth
+        )
 
     async def __call__(self, scope: dict, receive, send) -> None:
         scope_type = scope["type"]
@@ -269,8 +274,42 @@ class WebhookServer:
                 breaker_stream_max=breaker.stream_max_wakes,
                 breaker_window=f"{breaker.window:.0f}s",
                 breaker_cooldown=f"{breaker.cooldown:.0f}s",
+                # Both load-bearing and both previously invisible: a router reading a
+                # different wake-lock directory than the NOC writes has a freeze that
+                # silently never fires, and one whose evidence is memory-only reports
+                # every proven capability as never-proven after a restart.
+                wake_lock_dir=self.pipeline.wake_lock.lock_dir,
+                evidence=self.pipeline.evidence.path or "(in-memory)",
             ),
         )
+
+    def run_boot_selftest(self) -> None:
+        """Prove the freeze control surface is readable, at boot, and say so loudly.
+
+        The daemon's half of the green-while-absent instrument (instance 2: the
+        control that existed but could not be read). It **does not abort startup**,
+        and that is deliberate: the wake-lock guard's whole fail-direction is to keep
+        waking when a lock cannot be read, because wedging every wake on a
+        permissions typo would be far worse than the interlock being temporarily
+        disabled. A boot check that refused to start would silently invert that
+        decision. Refusing to proceed is the *converge's* job — the NOC runs this
+        same probe at Layer 1 and turns the converge red — so the two layers compose:
+        loud here, fail-closed there.
+
+        Never raises. The result is also recorded as the freeze claim's evidence, so
+        a box that has booted has an age-of-proof even before the NOC exercises it.
+        """
+        try:
+            result = run_freeze_selftest(
+                self.pipeline.wake_lock,
+                {agent.harness_key for agent in self.pipeline.config.agents.values()},
+            )
+            log_freeze_selftest(result)
+            self.pipeline.evidence.record_freeze_selftest(result.status, result.summary())
+        except Exception as exc:  # noqa: BLE001 — a self-test must never stop the daemon
+            # exc_info: this branch only fires on a defect in the self-test itself, and
+            # the traceback is the whole diagnosis.
+            logger.error("event=freeze_selftest status=error detail=%s", exc, exc_info=True)
 
     async def _lifespan(self, receive, send) -> None:
         while True:
@@ -284,6 +323,9 @@ class WebhookServer:
                 # Strictly after configure_logging, or the banner would be the one
                 # line the daemon drops on the floor at the root's default WARNING.
                 self.log_startup_banner()
+                # Then prove the freeze surface is readable — for the same reason the
+                # banner exists: state it at boot rather than discover it mid-incident.
+                self.run_boot_selftest()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart

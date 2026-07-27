@@ -173,9 +173,20 @@ def log_delivery_decision(
 
 @runtime_checkable
 class Route(Protocol):
-    """One event source's module. ``name`` is the source key the registry uses."""
+    """One event source's module. ``name`` is the source key the registry uses.
+
+    ``recipient_kind`` is the :attr:`~basecradle_router.models.Recipient.by` tag
+    this route stamps on the events it normalizes — ``"repo"``, ``"recipient_uuid"``,
+    or whatever a future source resolves by. It is declared here, on the route, so
+    that asking *"can any enabled route reach this agent?"* stays a question the
+    core can answer without naming a single source: the wake-edge claims emitter
+    (:mod:`basecradle_router.claims`) reads it off the registry rather than
+    carrying a hard-coded source→agent-kind map, which would have made adding a
+    route touch the emitter. Adding a source is still implementing one route.
+    """
 
     name: str
+    recipient_kind: str
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` if the request is unsigned or tampered."""

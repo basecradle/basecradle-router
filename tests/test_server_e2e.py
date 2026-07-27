@@ -23,12 +23,14 @@ from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.concurrency import AgentLocks
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
+from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer, configure_logging, deployed_sha
 from basecradle_router.wake import WakeResult
+from basecradle_router.wakelock import WakeLockGuard
 
 SECRET = "whsec_" + "0" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
@@ -544,6 +546,68 @@ def test_the_startup_banner_states_the_live_config_the_router_booted_with(caplog
     assert "wake_lanes=6" in line  # the live scheduler's lane count, not the default
     assert "wake_attempts=3" in line
     assert "sha=" in line  # "unknown" off-box; the deployed commit on it
+    # Both previously invisible and both load-bearing: a router reading a different
+    # wake-lock directory than the NOC writes has a freeze that silently never fires,
+    # and one with memory-only evidence reports every proven capability as
+    # never-proven after a restart (basecradle/basecradle#460).
+    assert "wake_lock_dir=/run/basecradle-noc/wake-locks" in line
+    assert "evidence=(in-memory)" in line
+
+
+def test_the_boot_selftest_proves_the_freeze_surface_and_records_it(tmp_path, caplog) -> None:
+    # The daemon's half of the green-while-absent instrument: state at boot whether
+    # the freeze control can be read, rather than discover it mid-incident.
+    evidence = EvidenceStore(None)
+    pipeline = Pipeline(
+        registry=_registry(),
+        config=_config(),
+        waker=_RecordingWaker(),
+        wake_lock=WakeLockGuard(lock_dir=str(tmp_path)),
+        evidence=evidence,
+        sleep=lambda _d: None,
+    )
+
+    with caplog.at_level("INFO", logger="basecradle_router.selftest"):
+        WebhookServer(pipeline).run_boot_selftest()
+
+    assert "event=freeze_selftest status=ok" in caplog.text
+    assert evidence.snapshot().freeze_selftest.status == "ok"
+
+
+def test_an_unreadable_freeze_is_loud_at_boot_but_never_stops_the_daemon(tmp_path, caplog) -> None:
+    # Deliberate, and not a softening: the wake-lock guard's whole fail-direction is
+    # to keep waking when a lock cannot be read, so a boot check that refused to start
+    # would turn a permissions typo into a fleet-wide outage. Refusing to proceed is
+    # the converge's job (NOC Layer 1) — loud here, fail-closed there.
+    (tmp_path / "nova.lock").write_text("{ not json", encoding="utf-8")
+    pipeline = Pipeline(
+        registry=_registry(),
+        config=_config(),
+        waker=_RecordingWaker(),
+        wake_lock=WakeLockGuard(lock_dir=str(tmp_path)),
+        sleep=lambda _d: None,
+    )
+
+    with caplog.at_level("ERROR", logger="basecradle_router.selftest"):
+        WebhookServer(pipeline).run_boot_selftest()  # returns; does not raise
+
+    assert "event=freeze_selftest status=failed" in caplog.text
+    assert "nova.lock" in caplog.text
+
+
+def test_a_broken_selftest_can_never_stop_the_daemon_booting(caplog) -> None:
+    # The instrument must not be able to break the thing it instruments, even by a
+    # defect of its own.
+    pipeline = Pipeline(
+        registry=_registry(), config=_config(), waker=_RecordingWaker(), sleep=lambda _d: None
+    )
+    server = WebhookServer(pipeline)
+    object.__setattr__(pipeline, "wake_lock", None)  # force the self-test to explode
+
+    with caplog.at_level("ERROR", logger="basecradle_router.server"):
+        server.run_boot_selftest()
+
+    assert "event=freeze_selftest status=error" in caplog.text
 
 
 def test_deployed_sha_reads_the_stamp_and_never_raises_when_it_is_absent(tmp_path) -> None:
