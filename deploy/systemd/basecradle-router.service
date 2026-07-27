@@ -24,6 +24,17 @@ Group=router
 WorkingDirectory=/opt/basecradle-router/app
 EnvironmentFile=/etc/basecradle-router/router.env
 
+# THE EVIDENCE STATE DIR (/var/lib/basecradle-router), created by systemd owned by
+# this unit's User before the daemon starts — so the daemon never needs to mkdir in
+# /var/lib and never runs as root to do it. It holds evidence.json: what the router
+# has demonstrably done (deliveries verified, agents woken), which the NOC's
+# claims-vs-evidence ledger reads (basecradle/basecradle#460). /var/lib, NOT /run:
+# an age-of-proof that reset on every restart would report every proven capability
+# as never-proven after each deploy. 0755 because the document holds no secrets and
+# the NOC's converge must read it without a privilege grant.
+StateDirectory=basecradle-router
+StateDirectoryMode=0755
+
 # NAME THE PROGRAM (#170). The daemon logs to stdout under `uv run uvicorn`, so
 # without this journald stamps every line SYSLOG_IDENTIFIER=uv — the router's own
 # log was attributed to its *launcher*. `journalctl -t basecradle-router` now reads

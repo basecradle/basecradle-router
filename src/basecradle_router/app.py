@@ -26,16 +26,20 @@ from basecradle_router.config import (
     load_breaker_config,
     load_config,
     load_dedup_ttl,
+    load_evidence_path,
     load_github_trusted_actors,
     load_wake_lanes,
+    load_wake_lock_dir,
 )
 from basecradle_router.dedup import DeliveryDeduper
+from basecradle_router.evidence import EvidenceStore
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer
 from basecradle_router.wake import HomeServerWaker, Waker
+from basecradle_router.wakelock import WakeLockGuard
 
 
 def create_app(
@@ -49,9 +53,32 @@ def create_app(
     :class:`~basecradle_router.wake.HomeServerWaker`.
     """
     config = load_config(env)
+    pipeline = Pipeline(
+        registry=build_registry(config, env),
+        config=config,
+        waker=waker or HomeServerWaker(),
+        breaker=WakeRateBreaker(load_breaker_config(env)),
+        deduper=DeliveryDeduper(load_dedup_ttl(env)),
+        wake_lock=WakeLockGuard(lock_dir=load_wake_lock_dir(env)),
+        evidence=EvidenceStore(load_evidence_path(env)),
+    )
+    return WebhookServer(pipeline, lanes=load_wake_lanes(env))
+
+
+def build_registry(config: Config, env: Mapping[str, str] | None = None) -> RouteRegistry:
+    """The enabled routes, wired with their own source-specific config.
+
+    Split out of :func:`create_app` because the claims emitter needs the same
+    registry the daemon runs — it asks each route which recipient kind it delivers
+    by, to decide whether an agent's wake edge is actually armed. Building it the
+    one way keeps the emitter honest: if the daemon could not start with this
+    config, neither can the emitter, so the manifest can never describe a router
+    that does not exist.
+
+    A route is registered only when its source is enabled, so each route's own
+    required config (the github trust allow-list) is demanded only when in use.
+    """
     registry = RouteRegistry()
-    # Register a route only when its source is enabled, so each route's own
-    # required config (the github trust allow-list) is demanded only when in use.
     if "github" in config.enabled_routes:
         registry.register(
             GithubRoute(
@@ -61,14 +88,7 @@ def create_app(
         )
     if "basecradle" in config.enabled_routes:
         registry.register(BasecradleRoute())
-    pipeline = Pipeline(
-        registry=registry,
-        config=config,
-        waker=waker or HomeServerWaker(),
-        breaker=WakeRateBreaker(load_breaker_config(env)),
-        deduper=DeliveryDeduper(load_dedup_ttl(env)),
-    )
-    return WebhookServer(pipeline, lanes=load_wake_lanes(env))
+    return registry
 
 
 def _bot_login_for_repo(config: Config) -> Callable[[str], str | None]:

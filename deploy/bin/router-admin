@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# BaseCradle router — admin CLI wrapper: run a claims/probe command AS THE DAEMON.
+#
+# The NOC's converge and its Layer-3 synthetic-exercise scheduler call this one
+# stable path (it is what the emitted claim's `prove.cmd` names), so they never have
+# to reconstruct the privilege drop, the env file, or the venv:
+#
+#   /opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json
+#   /opt/basecradle-router/app/deploy/bin/router-admin claims
+#   /opt/basecradle-router/app/deploy/bin/router-admin evidence
+#
+# WHY THE PRIVILEGE DROP IS THE POINT, not a nicety. `selftest freeze` proves the
+# NOC wake-lock directory is readable *with the credentials the daemon actually
+# has*. Root bypasses file permissions, so a probe run as root would pass on a box
+# where the daemon itself is locked out — which is exactly the 2026-06-28
+# `root:router 640` failure it exists to catch. So: if we are not already the daemon
+# user, re-exec ourselves as it via `runuser` (root only) and let the child do the
+# rest. The probe reports its own effective user, so a drop that silently failed is
+# still visible in the output.
+#
+# READ-ONLY. Nothing here writes the router's state: the daemon is the sole writer
+# of /var/lib/basecradle-router/evidence.json, so a probe run under the wrong
+# identity can never take ownership of the daemon's own state file away from it.
+#
+# EXIT CODES (the probe contract the NOC schedules against):
+#   0  proven          — the surface is readable and would be honoured
+#   1  proven broken   — unreadable or malformed; the check names the exact file
+#   2  could not prove — dir absent, a stale lock, or the probe ran as root
+#   3  config error    — the router's own config would not load (the daemon could
+#                        not boot on it either, so this is a finding in its own right)
+
+set -euo pipefail
+
+APP_DIR=${BASECRADLE_ROUTER_APP_DIR:-/opt/basecradle-router/app}
+ENV_FILE=${BASECRADLE_ROUTER_ENV_FILE:-/etc/basecradle-router/router.env}
+RUN_AS=${BASECRADLE_ROUTER_USER:-router}
+
+# Re-exec as the daemon's user when we are not already it. Only root can, and only
+# root needs to: the daemon user running this reaches the `else` branch directly.
+if [ "$(id -un)" != "$RUN_AS" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "router-admin: must run as '$RUN_AS' or as root (am $(id -un))" >&2
+        exit 3
+    fi
+    exec runuser -u "$RUN_AS" -- "$0" "$@"
+fi
+
+# The daemon's own configuration, read the same way systemd reads it for the unit:
+# the emitter and the probe must see exactly the registry, routes, lock dir, and
+# evidence path the running daemon sees, or they would describe a router that does
+# not exist. router.env is 0600 and owned by the daemon user, which is why this is
+# read *after* the drop and never before it.
+#
+# PARSED LITERALLY, NEVER `source`d (#109) — the same rule wake-runner applies to an
+# agent's env file, and for the same reason: router.env holds the webhook signing
+# secret, and a credential is DATA, not code. `set -a; . "$ENV_FILE"` would evaluate
+# every value, so a secret containing `$` would be mangled (and abort under `set -u`)
+# and one containing `$( )` would EXECUTE as the daemon user. systemd's
+# EnvironmentFile= parses literally, so this is also what keeps the CLI's view of the
+# config byte-identical to the running daemon's.
+if [ ! -r "$ENV_FILE" ]; then
+    echo "router-admin: cannot read $ENV_FILE as $(id -un)" >&2
+    exit 3
+fi
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    line=${line#export }                       # tolerate an `export ` prefix
+    case "$line" in *=*) ;; *) continue ;; esac  # no `=` -> not an assignment
+    key=${line%%=*}                            # everything before the FIRST =
+    value=${line#*=}                           # the rest, verbatim
+    case "$key" in '' | *[!A-Za-z0-9_]*) continue ;; esac
+    # Strip ONE layer of matching surrounding quotes, as systemd does.
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    # `export NAME=VALUE` assigns the literal bytes — never re-parsed for expansion
+    # or command substitution.
+    export "$key=$value"
+done <"$ENV_FILE"
+
+# Prefer the venv's python directly: it is faster than `uv run` and, more to the
+# point, side-effect-free — a probe the NOC runs on a schedule must never re-sync
+# the daemon's dependencies underneath it. Fall back to `uv run` if the venv is not
+# where the deploy leaves it.
+if [ -x "$APP_DIR/.venv/bin/python" ]; then
+    exec "$APP_DIR/.venv/bin/python" -m basecradle_router "$@"
+fi
+exec "${UV_BIN:-$HOME/.local/bin/uv}" run --project "$APP_DIR" python -m basecradle_router "$@"

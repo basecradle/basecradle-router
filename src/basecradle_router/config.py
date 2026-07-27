@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig
+from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
 from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
+from basecradle_router.wakelock import DEFAULT_LOCK_DIR
 
 _EMPTY: Mapping[str, Agent] = MappingProxyType({})
 
@@ -31,6 +33,16 @@ _BREAKER_COOLDOWN_VAR = f"{_BREAKER_PREFIX}COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = f"{_BREAKER_PREFIX}STREAM_MAX"
 
 _DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
+
+_WAKE_LOCK_DIR_VAR = f"{ENV_PREFIX}WAKE_LOCK_DIR"
+_EVIDENCE_FILE_VAR = f"{ENV_PREFIX}EVIDENCE_FILE"
+_ADMIN_CMD_VAR = f"{ENV_PREFIX}ADMIN_CMD"
+
+#: Where the deploy installs the wrapper that runs a probe with the daemon's own
+#: runtime credentials — the path an emitted claim's ``prove.cmd`` names. Lives here
+#: rather than in :mod:`basecradle_router.claims` so every environment-derived
+#: setting has exactly one home.
+DEFAULT_ADMIN_CMD = "/opt/basecradle-router/app/deploy/bin/router-admin"
 
 _WAKE_LANES_VAR = f"{ENV_PREFIX}WAKE_LANES"
 #: Concurrent-wake ceiling across *all* agents (the wake scheduler's pool size,
@@ -92,6 +104,30 @@ class Config:
                 ) from None
         raise ConfigError(f"unknown recipient kind {recipient.by!r}")
 
+    def resolvable_by(self, agent: Agent) -> frozenset[str]:
+        """The :class:`Recipient` tags under which ``agent`` can actually be resolved.
+
+        The inverse of :meth:`agent_for_recipient`, and derived from the very same
+        two indexes rather than from the agent's kind — so it cannot drift out of
+        step with what resolution really does, and it names no event source. The
+        wake-edge claims emitter pairs this with each enabled route's
+        :attr:`~basecradle_router.routes.base.Route.recipient_kind` to answer *"is a
+        webhook edge armed for this agent?"* — the question a parked builder with no
+        re-wake path (basecradle/basecradle#460, instance 4) answers ``no`` to while
+        looking perfectly healthy.
+
+        A ``"repo"`` entry requires the key to be repo-shaped as well as present:
+        every agent is in ``agents``, but a harness persona is keyed by a bare slug
+        that no ``Recipient(by="repo", …)`` can ever carry.
+        """
+        kinds = set()
+        if self.agents.get(agent.key) is agent and _is_repo_key(agent.key):
+            kinds.add("repo")
+        uuid = agent.recipient_uuid
+        if uuid and self.recipient_index.get(uuid) is agent:
+            kinds.add("recipient_uuid")
+        return frozenset(kinds)
+
     def webhook_secret(self, route: str) -> str:
         try:
             return self.webhook_secrets[route]
@@ -99,6 +135,14 @@ class Config:
             raise ConfigError(
                 f"no webhook secret for route {route!r}; set {_route_secret_var(route)}"
             ) from None
+
+
+def _is_repo_key(key: str) -> bool:
+    try:
+        _require_repo(key, "agent key")
+    except ValueError:
+        return False
+    return True
 
 
 def _route_secret_var(route: str) -> str:
@@ -322,6 +366,56 @@ def load_wake_lanes(env: Mapping[str, str] | None = None) -> int:
     if lanes < 1:
         raise ConfigError(f"{_WAKE_LANES_VAR} must be >= 1, got {lanes}")
     return lanes
+
+
+def load_wake_lock_dir(env: Mapping[str, str] | None = None) -> str:
+    """The NOC wake-lock directory, from ``BASECRADLE_ROUTER_WAKE_LOCK_DIR``.
+
+    Optional, defaulting to the capital-pinned
+    :data:`~basecradle_router.wakelock.DEFAULT_LOCK_DIR`. It is configurable for two
+    reasons: the freeze-readability self-test must be demonstrable against a
+    throwaway directory rather than the live locks, and — the load-bearing one — a
+    router reading a *different* directory than the NOC writes to is the exact
+    "the control existed but was never read" failure (basecradle/basecradle#460,
+    instance 2). A silent hard-coded constant cannot be compared against the NOC's;
+    a named, banner-logged, self-test-reported setting can.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(_WAKE_LOCK_DIR_VAR) or "").strip()
+    return raw or DEFAULT_LOCK_DIR
+
+
+def load_admin_cmd(env: Mapping[str, str] | None = None) -> str:
+    """The admin CLI wrapper's on-box path, from ``BASECRADLE_ROUTER_ADMIN_CMD``.
+
+    Optional, defaulting to :data:`DEFAULT_ADMIN_CMD`. It is what an emitted claim's
+    ``prove.cmd`` names, so the NOC schedules one stable path and never reconstructs
+    the privilege drop, the env file, or the venv itself; the override exists for a
+    box whose tree is not at the standard location.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(_ADMIN_CMD_VAR) or "").strip()
+    return raw or DEFAULT_ADMIN_CMD
+
+
+def load_evidence_path(env: Mapping[str, str] | None = None) -> str | None:
+    """The evidence document's path, from ``BASECRADLE_ROUTER_EVIDENCE_FILE``.
+
+    Optional, defaulting to :data:`~basecradle_router.evidence.DEFAULT_EVIDENCE_FILE`.
+    Setting it to the literal ``"none"`` (or an explicit empty value) disables
+    persistence entirely and keeps evidence in memory for the process's lifetime —
+    the escape hatch for a laptop or throwaway run, never for the fleet box, where a
+    ledger that resets on restart would report every proven capability as
+    never-proven after a deploy.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(_EVIDENCE_FILE_VAR)
+    if raw is None:
+        return DEFAULT_EVIDENCE_FILE
+    stripped = raw.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    return stripped
 
 
 def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozenset[str]:

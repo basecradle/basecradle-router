@@ -14,6 +14,20 @@ harness instance per agent`. A new source routes to the agent's *existing* insta
 serialize behind every other source's — never a second instance, never two parallel sessions over one
 memory. See [`CLAUDE.md`](CLAUDE.md) → "One harness instance per agent."
 
+Because the router is the fleet's wake edge, it also has to **prove** its own claims: an agent can be
+registered, healthy, and permanently unreachable while every dashboard stays green. So the daemon
+emits Claims Manifest Contract v1 claims and records the evidence behind them for the NOC's
+claims-vs-evidence ledger, and it proves the NOC's freeze control is readable rather than assuming it:
+
+```bash
+python -m basecradle_router claims             # wake-edge, freeze and delivery-sink claims
+python -m basecradle_router selftest freeze     # prove the freeze surface is readable right now
+python -m basecradle_router evidence            # what this router has demonstrably done
+```
+
+See [`CLAUDE.md`](CLAUDE.md) → "Proving the router's own claims" and
+[`deploy/README.md`](deploy/README.md) for the on-box invocation and the probe's exit codes.
+
 - **Charter / conventions:** [`CLAUDE.md`](CLAUDE.md)
 - **Requirements spec:** `basecradle/basecradle#277`
 - **Stack:** Python · uv · ruff · pytest

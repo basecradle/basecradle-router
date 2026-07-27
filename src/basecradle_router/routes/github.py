@@ -122,6 +122,9 @@ class GithubRoute:
     """
 
     name = "github"
+    #: A github builder is keyed by the repo it captains, so its events resolve by
+    #: ``Recipient(by="repo", …)`` — see :class:`~basecradle_router.routes.base.Route`.
+    recipient_kind = "repo"
 
     def __init__(
         self,

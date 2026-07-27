@@ -8,14 +8,20 @@ import json
 import pytest
 
 from basecradle_router.config import (
+    DEFAULT_ADMIN_CMD,
     DEFAULT_WAKE_LANES,
     ConfigError,
+    load_admin_cmd,
     load_breaker_config,
     load_config,
     load_dedup_ttl,
+    load_evidence_path,
     load_github_trusted_actors,
     load_wake_lanes,
+    load_wake_lock_dir,
 )
+from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
+from basecradle_router.wakelock import DEFAULT_LOCK_DIR
 
 _BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
 _BREAKER_WINDOW_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_WINDOW"
@@ -23,6 +29,9 @@ _BREAKER_COOLDOWN_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_COOLDOWN"
 _BREAKER_STREAM_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_STREAM_MAX"
 _DEDUP_TTL_VAR = "BASECRADLE_ROUTER_DEDUP_TTL"
 _WAKE_LANES_VAR = "BASECRADLE_ROUTER_WAKE_LANES"
+_WAKE_LOCK_DIR_VAR = "BASECRADLE_ROUTER_WAKE_LOCK_DIR"
+_EVIDENCE_FILE_VAR = "BASECRADLE_ROUTER_EVIDENCE_FILE"
+_ADMIN_CMD_VAR = "BASECRADLE_ROUTER_ADMIN_CMD"
 
 REGISTRY = {
     "basecradle/basecradle-python": {
@@ -292,3 +301,47 @@ def test_wake_lanes_below_one_fails_loudly() -> None:
     # 0 lanes would dispatch nothing — a loud misconfiguration, never a silent no-op.
     with pytest.raises(ConfigError, match=f"{_WAKE_LANES_VAR} must be >= 1"):
         load_wake_lanes({_WAKE_LANES_VAR: "0"})
+
+
+def test_wake_lock_dir_defaults_to_the_capital_pinned_path() -> None:
+    assert load_wake_lock_dir({}) == DEFAULT_LOCK_DIR
+
+
+def test_wake_lock_dir_reads_from_env() -> None:
+    # Configurable for two reasons: the freeze self-test must be demonstrable against
+    # a throwaway directory rather than the live locks, and — the load-bearing one — a
+    # router reading a DIFFERENT directory than the NOC writes is the exact "the
+    # control existed but was never read" failure (basecradle/basecradle#460).
+    assert (
+        load_wake_lock_dir({_WAKE_LOCK_DIR_VAR: "/run/test/wake-locks"}) == "/run/test/wake-locks"
+    )
+
+
+def test_a_blank_wake_lock_dir_falls_back_to_the_pinned_path() -> None:
+    assert load_wake_lock_dir({_WAKE_LOCK_DIR_VAR: "   "}) == DEFAULT_LOCK_DIR
+
+
+def test_evidence_path_defaults_to_the_state_dir() -> None:
+    assert load_evidence_path({}) == DEFAULT_EVIDENCE_FILE
+
+
+def test_evidence_path_reads_from_env() -> None:
+    assert load_evidence_path({_EVIDENCE_FILE_VAR: "/tmp/e.json"}) == "/tmp/e.json"
+
+
+@pytest.mark.parametrize("value", ["none", "NONE", "", "  "])
+def test_evidence_persistence_can_be_disabled_explicitly(value) -> None:
+    # The escape hatch for a laptop or throwaway run — never the fleet box, where a
+    # ledger that reset on restart would report every proven capability as
+    # never-proven after a deploy.
+    assert load_evidence_path({_EVIDENCE_FILE_VAR: value}) is None
+
+
+def test_admin_cmd_defaults_to_the_deploy_wrapper() -> None:
+    # The path an emitted claim's prove.cmd names, so the NOC schedules one stable
+    # entry point rather than reconstructing the privilege drop itself.
+    assert load_admin_cmd({}) == DEFAULT_ADMIN_CMD
+
+
+def test_admin_cmd_reads_from_env() -> None:
+    assert load_admin_cmd({_ADMIN_CMD_VAR: "/srv/router/admin"}) == "/srv/router/admin"

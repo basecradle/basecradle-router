@@ -61,6 +61,7 @@ from basecradle_router.concurrency import (
 )
 from basecradle_router.config import Config, ConfigError
 from basecradle_router.dedup import DeliveryDeduper
+from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -203,6 +204,11 @@ class Pipeline:
     breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
     deduper: DeliveryDeduper = field(default_factory=DeliveryDeduper)
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
+    # Durable proof of what this router has actually done, for the NOC's
+    # claims-vs-evidence ledger (basecradle/basecradle#460). Defaults to an
+    # in-memory store so a bare Pipeline stays constructible offline and no test
+    # ever writes to the box's state dir; the app factory injects the real path.
+    evidence: EvidenceStore = field(default_factory=lambda: EvidenceStore(None))
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
     # Monotonic by design: the wake's duration must not jump if the wall clock is
@@ -311,6 +317,7 @@ class Pipeline:
                     # deliberate, visible collapse, never a silent drop. Checked
                     # ahead of the wake-lock and breaker so a duplicate consumes
                     # neither's budget.
+                    self.evidence.record_wake_refused(agent.harness_key, "duplicate_delivery")
                     self._record(
                         result, Stage.DEDUP, Outcome.IGNORED, **who, reason="duplicate_delivery"
                     )
@@ -319,6 +326,7 @@ class Pipeline:
                 if not decision.should_wake:
                     # The NOC holds a converge wake-lock for this agent — a
                     # deliberate, visible drop (the guard already logged it loudly).
+                    self.evidence.record_wake_refused(agent.harness_key, decision.detail)
                     self._record(
                         result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
                     )
@@ -327,6 +335,7 @@ class Pipeline:
                 if not outcome.admitted:
                     # A trip/refusal is a deliberate, visible drop — recorded like the
                     # route's IGNORED decisions; the breaker already escalated loudly.
+                    self.evidence.record_wake_refused(agent.harness_key, outcome.detail)
                     self._record(
                         result, Stage.BREAKER, Outcome.IGNORED, **who, reason=outcome.detail
                     )
@@ -357,14 +366,25 @@ class Pipeline:
 
         # Verify: the security boundary. A missing secret is our misconfiguration,
         # not a bad request — fail the stage rather than reject the caller.
+        #
+        # This is also the delivery-sink evidence boundary (basecradle/basecradle#460,
+        # instance 5). Verification passing is what proves the integration is genuinely
+        # armed — that the secret on this box matches the one at the source — so it is
+        # `accepted`, whatever the route later decides to do with the payload. It is
+        # recorded only for a *known* route, deliberately: the webhook path is
+        # unauthenticated, and counting an unknown source would let anyone grow the
+        # evidence document one bogus `/webhooks/<anything>` at a time.
         try:
             route.verify(request, self.config.webhook_secret(source))
         except SignatureError as exc:
+            self.evidence.record_delivery_rejected(source, str(exc))
             self._record(result, Stage.VERIFY, Outcome.REJECTED, source=source, error=str(exc))
             return None
         except ConfigError as exc:
+            self.evidence.record_delivery_rejected(source, f"no secret configured: {exc}")
             self._record(result, Stage.VERIFY, Outcome.FAILED, source=source, error=str(exc))
             return None
+        self.evidence.record_delivery_accepted(source)
         self._record(result, Stage.VERIFY, Outcome.OK, source=source)
 
         # Normalize: payload → Event, or a clean ignore. A malformed payload or a
@@ -375,8 +395,10 @@ class Pipeline:
             self._record(result, Stage.NORMALIZE, Outcome.REJECTED, source=source, error=str(exc))
             return None
         if event is None:
+            self.evidence.record_delivery_decision(source, woke=False)
             self._record(result, Stage.NORMALIZE, Outcome.IGNORED, source=source)
             return None
+        self.evidence.record_delivery_decision(source, woke=True)
         result.event = event
         self._record(
             result,
@@ -458,6 +480,8 @@ class Pipeline:
                 attempt, attempts=self.wake_attempts, sleep=self.sleep, on_retry=on_retry
             )
         except RetryExhausted as exc:
+            error = str(exc.__cause__ or exc)
+            self.evidence.record_wake_failed(agent.harness_key, error)
             self._record(
                 result,
                 Stage.WAKE,
@@ -465,9 +489,13 @@ class Pipeline:
                 **who,
                 attempts=self.wake_attempts,
                 duration=_seconds(last_duration),
-                error=str(exc.__cause__ or exc),
+                error=error,
             )
             return False
+        # The evidence the whole wake-edge claim rests on: this agent was demonstrably
+        # woken, at this time, by this delivery. Nothing else in the router proves an
+        # agent is reachable rather than merely registered.
+        self.evidence.record_wake_ok(agent.harness_key, event.delivery_id)
         self._record(
             result,
             Stage.WAKE,

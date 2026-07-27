@@ -73,6 +73,14 @@ logger = logging.getLogger("basecradle_router.scheduler")
 #: so the scheduler treats it as a black box and only guards against a defect.
 WakeRunner = Callable[[Agent, Event, PipelineResult], None]
 
+#: Notified as ``(harness_key, pending)`` whenever an agent's pending-wake count
+#: changes — where ``pending`` counts the agent's queued jobs plus the one in flight,
+#: if any. The evidence store subscribes to this so an emitted wake-edge claim can say
+#: whether a wake is queued *right now* (a live, if transient, wake edge) rather than
+#: only that one happened once. Always called **outside** the scheduler's condition
+#: lock: an observer that writes to disk must never be able to stall dispatch.
+QueueObserver = Callable[[str, int], None]
+
 
 @dataclass(frozen=True, slots=True)
 class _Job:
@@ -98,11 +106,14 @@ class WakeScheduler:
     leaves no residue.
     """
 
-    def __init__(self, run: WakeRunner, *, lanes: int) -> None:
+    def __init__(
+        self, run: WakeRunner, *, lanes: int, on_queue_change: QueueObserver | None = None
+    ) -> None:
         if lanes < 1:
             raise ValueError(f"lanes must be >= 1, got {lanes}")
         self._run = run
         self._lanes = lanes
+        self._on_queue_change = on_queue_change
         # One lock for all scheduling state; it is also the drain condition's lock, so
         # a state change and the idle check can never interleave. Held only for a
         # dispatch decision (microseconds), never across a wake.
@@ -155,6 +166,8 @@ class WakeScheduler:
                 self._ready.append(key)
                 self._ready_set.add(key)
             self._pump_locked()
+            pending = self._pending_locked(key)
+        self._notify_queue_change(key, pending)
 
     def _pump_locked(self) -> None:
         """Dispatch ready agents onto free lanes, most-fair first. Caller holds ``_cv``.
@@ -204,8 +217,33 @@ class WakeScheduler:
                     self._ready.append(key)
                     self._ready_set.add(key)
                 self._pump_locked()
+                pending = self._pending_locked(key)
                 # Wake any drain() waiter: this completion may have made us idle.
                 self._cv.notify_all()
+            self._notify_queue_change(key, pending)
+
+    def _pending_locked(self, key: str) -> int:
+        """This agent's queued jobs plus its in-flight one. Caller holds ``_cv``.
+
+        The single-in-flight rule makes the running wake worth exactly one, so this
+        is the whole of what is still owed to the agent — the number a wake-edge
+        claim reports as its transient ``queued-wake`` edge.
+        """
+        return len(self._queues.get(key, ())) + (1 if key in self._inflight else 0)
+
+    def _notify_queue_change(self, key: str, pending: int) -> None:
+        """Tell the observer an agent's pending count changed. Never holds ``_cv``.
+
+        Guarded because the observer writes to disk: a slow or broken observer must
+        cost that one caller a moment, never the scheduler's ability to dispatch, and
+        a defect in it must not leak a lane or wedge a drain.
+        """
+        if self._on_queue_change is None:
+            return
+        try:
+            self._on_queue_change(key, pending)
+        except Exception:  # noqa: BLE001 — observability must never break scheduling
+            logger.exception("queue observer raised for agent=%s (scheduling unaffected)", key)
 
     def _note_saturation_locked(self) -> None:
         """Log the saturated↔not-saturated transition. Caller holds ``_cv``.

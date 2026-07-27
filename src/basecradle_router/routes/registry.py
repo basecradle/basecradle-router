@@ -42,5 +42,15 @@ class RouteRegistry:
     def names(self) -> frozenset[str]:
         return frozenset(self._routes)
 
+    def routes(self) -> tuple[Route, ...]:
+        """Every registered route, name-ordered — the registry's own enumeration.
+
+        The wake-edge claims emitter asks each registered route which
+        :attr:`~basecradle_router.routes.base.Route.recipient_kind` it delivers by,
+        so it can decide whether an agent is reachable without naming any source.
+        Ordered so a manifest built twice from the same registry is byte-identical.
+        """
+        return tuple(self._routes[name] for name in sorted(self._routes))
+
     def __contains__(self, name: object) -> bool:
         return name in self._routes
