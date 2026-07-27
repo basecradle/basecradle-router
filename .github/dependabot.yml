@@ -1,0 +1,17 @@
+version: 2
+updates:
+# The `uv` ecosystem, not `pip`: this repo's manifests are `pyproject.toml` +
+# a committed `uv.lock`, and CI installs with `uv sync --frozen`, which fails
+# outright when the lockfile is stale. `pip` would bump `pyproject.toml` alone
+# and red-CI every Dependabot PR; `uv` updates both together, and it is the
+# ecosystem that matches how the dev deps in `[dependency-groups]` resolve.
+- package-ecosystem: uv
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
