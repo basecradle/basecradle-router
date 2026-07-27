@@ -1,0 +1,14 @@
+name: Dependabot Auto-Merge
+
+on: pull_request
+
+permissions: {}
+
+jobs:
+  route:
+    if: github.actor == 'dependabot[bot]'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: basecradle/.github/.github/workflows/dependabot-auto-merge.yml@main
