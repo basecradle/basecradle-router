@@ -21,11 +21,17 @@ never-proven**. The router emits; the NOC judges. We never grade our own homewor
   *right now* (an armed webhook route, a queued or in-flight wake), and its
   evidence is the last ``stage=wake outcome=ok``. **``edge_count: 0`` with
   ``evidence: null`` is a parked builder with nothing in existence that will ever
-  re-wake it** — incident instance 4, in one machine-readable row. Each webhook-route
-  edge also carries **its own** last successful wake, so instance 5 can be read per
-  *recipient*: an armed edge that has never fired while that route's sink counts
-  hundreds of rejections is a broken integration for *this* agent, which the
-  agent-wide scalars cannot say (basecradle-noc#408).
+  re-wake it** — incident instance 4, in one machine-readable row.
+- ``wake-edge:webhook-route:<route>`` — one per **armed** webhook-route edge, same
+  ``agent:<slug>`` subject. The agent-wide row above says *something* reached the
+  agent; this one says whether **this route** did, which is the granularity instance
+  5 is actually asked at: an armed edge whose ``last_ok_at`` is ``null`` while that
+  route's sink counts hundreds of rejections is a broken integration for *this*
+  recipient, and no agent-wide or route-wide scalar can say so (basecradle-noc#408).
+  These are the per-recipient rows the NOC's eight hand-written
+  ``basecradle-platform@*`` delivery-sink rows retire in favour of
+  (basecradle-noc#417, step 3) — so there is one row per armed ``(agent, route)``
+  pair, and a route that is registered but not enabled gets none.
 - ``freeze-surface:readable`` — subject ``box:<host>``. Proven by *running* the
   freeze self-test (:mod:`basecradle_router.selftest`), because readability is not
   a fact you can look up; it is a fact you have to demonstrate with the daemon's
@@ -37,7 +43,28 @@ never-proven**. The router emits; the NOC judges. We never grade our own homewor
   silently rejected: incident instance 5) from ``accepted=0 rejected=0`` (a sink
   nobody has used).
 
-**Cadence classes.** All three are ``rare``: the normal state of a wake edge, a
+**Every pointer this emitter declares must resolve, and the shape is what makes it
+resolve.** An ``evidence``-kind claim's ``prove.source`` is a ``<path>#<dotted.field>``
+pointer, and the NOC resolves it **from the claim's own ``detail``, never from the
+file** — it has no shell on this box and no wrapper op reads ``/var/lib``, so the
+census (which returns each manifest's whole parsed body) is the transport. The rule
+the NOC shipped is one line: **the pointer's last segment is the field, and ``detail``
+is the object it lives in** (basecradle-noc#409). Anything it cannot land on is refused
+with a named reason and reads *unprovable* — loud, never green, but also never armed.
+
+So the emitter's obligation is structural: **each claim's ``detail`` is this emitter's
+projection of the exact sub-object its own pointer walks into**, flat, with the
+descriptive keys hung beside it rather than around it. ``agent_wakes.<key>.last_ok_at``
+is paired with a ``detail`` carrying ``last_ok_at`` at its top;
+``agent_wakes.<key>.by_route.<route>.last_ok_at`` gets its own claim whose ``detail`` is
+that per-route sub-object. Nesting the timestamp one level down — which is what the
+first cut of this emitter did — costs nothing at emit time and silently makes the claim
+unarmable (basecradle-noc#417, finding 2). :func:`_pointer` takes the container and the
+field separately for that reason, and
+``tests/test_claims.py::test_every_declared_evidence_pointer_resolves_from_its_own_detail``
+re-runs the NOC's rule over every emitted claim so the pairing cannot drift.
+
+**Cadence classes.** All of them are ``rare``: the normal state of a wake edge, a
 freeze surface, and a webhook sink is *silence*, so cadence monitoring cannot save
 us and only a TTL on the age of proof will. Wake edges and delivery sinks get a
 generous 7-day TTL — long enough that an ordinarily quiet week never cries wolf,
@@ -75,7 +102,12 @@ import re
 import socket
 
 from basecradle_router.config import DEFAULT_ADMIN_CMD, Config
-from basecradle_router.evidence import AgentWakeEvidence, DeliverySinkEvidence, EvidenceDocument
+from basecradle_router.evidence import (
+    AgentWakeEvidence,
+    DeliverySinkEvidence,
+    EvidenceDocument,
+    RouteWakeEvidence,
+)
 from basecradle_router.models import Agent
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.selftest import EXIT_CODES as FREEZE_EXIT_CODES
@@ -212,7 +244,7 @@ def _delivery_sink_claim(
         "class": "rare",
         "prove": {
             "kind": "evidence",
-            "source": _pointer(evidence_path, f"delivery_sinks.{route}.last_accepted_at"),
+            "source": _pointer(evidence_path, f"delivery_sinks.{route}", "last_accepted_at"),
         },
         "evidence": (
             f"{sink.accepted} delivery(s) verified, last at {sink.last_accepted_at}"
@@ -220,16 +252,26 @@ def _delivery_sink_claim(
             else None
         ),
         "ttl_hours": DELIVERY_SINK_TTL_HOURS,
-        "detail": {
-            "route": route,
-            "accepted": sink.accepted,
-            "rejected": sink.rejected,
-            "woke": sink.woke,
-            "ignored": sink.ignored,
-            "last_accepted_at": sink.last_accepted_at,
-            "last_rejected_at": sink.last_rejected_at,
-            "last_reject_reason": sink.last_reject_reason,
-        },
+        "detail": {"route": route, **_sink_scalars(sink)},
+    }
+
+
+def _sink_scalars(sink: DeliverySinkEvidence) -> dict:
+    """``delivery_sinks.<route>`` projected flat — the object the pointer walks into.
+
+    Written out field by field rather than ``asdict``-ed so the manifest's shape is a
+    decision made here and not a shadow of a dataclass's field order: this is a wire
+    contract a monitor on another box parses, and it must change only when someone
+    means to change it.
+    """
+    return {
+        "accepted": sink.accepted,
+        "rejected": sink.rejected,
+        "woke": sink.woke,
+        "ignored": sink.ignored,
+        "last_accepted_at": sink.last_accepted_at,
+        "last_rejected_at": sink.last_rejected_at,
+        "last_reject_reason": sink.last_reject_reason,
     }
 
 
@@ -244,17 +286,35 @@ def _agent_manifest(
     guard: WakeLockGuard,
     evidence_path: str | None,
 ) -> dict:
-    return _manifest(
-        f"agent:{agent.harness_key}",
-        [_wake_edge_claim(agent, config, registry, evidence, guard, evidence_path)],
-    )
+    """This agent's claims: the agent-wide wake edge, then one row per armed route.
+
+    Two granularities, because they answer different questions and each greens the
+    other's blind spot. The agent-wide row is instance 4's — *is there any way to
+    reach this agent at all, and did anything ever?* The per-route rows are instance
+    5's, per recipient — *can **this** source reach **this** agent?* A single wake by
+    a healthy route satisfies the first while the second stays honestly unproven,
+    which is the whole reason the NOC declined to arm its per-recipient rows on the
+    agent-wide scalars (basecradle-noc#408).
+
+    One row per armed edge, in the order :func:`_edges` already puts them — route name,
+    the same rule as the box's sinks — so the two views of the same set never read in
+    different orders.
+    """
+    wake = evidence.agent_wakes.get(agent.harness_key) or AgentWakeEvidence()
+    edges = _edges(agent, config, registry, wake)
+    claims = [_wake_edge_claim(agent, wake, edges, guard, evidence_path)]
+    claims += [
+        _route_wake_edge_claim(agent, wake, edge, evidence_path)
+        for edge in edges
+        if edge["kind"] == "webhook-route"
+    ]
+    return _manifest(f"agent:{agent.harness_key}", claims)
 
 
 def _wake_edge_claim(
     agent: Agent,
-    config: Config,
-    registry: RouteRegistry,
-    evidence: EvidenceDocument,
+    wake: AgentWakeEvidence,
+    edges: list[dict],
     guard: WakeLockGuard,
     evidence_path: str | None,
 ) -> dict:
@@ -264,15 +324,17 @@ def _wake_edge_claim(
     ``detail.edges`` is what could wake the agent from now on, ``evidence`` is what
     demonstrably did. Either alone lies — an agent woken last week may have lost its
     only edge since, and a freshly-armed edge has no history yet.
+
+    ``detail`` carries the projection of ``agent_wakes.<harness_key>`` **flat**, which
+    is what makes the pointer resolvable at all (see the module docstring): the
+    descriptive keys sit *beside* the evidence fields, never wrapped around them.
     """
-    wake = evidence.agent_wakes.get(agent.harness_key) or AgentWakeEvidence()
-    edges = _edges(agent, config, registry, wake)
     return {
         "claim": "wake-edge:webhook-route",
         "class": "rare",
         "prove": {
             "kind": "evidence",
-            "source": _pointer(evidence_path, f"agent_wakes.{agent.harness_key}.last_ok_at"),
+            "source": _pointer(evidence_path, f"agent_wakes.{agent.harness_key}", "last_ok_at"),
         },
         "evidence": (
             f"stage=wake outcome=ok at {wake.last_ok_at} delivery={wake.last_ok_delivery}"
@@ -288,31 +350,100 @@ def _wake_edge_claim(
             "edges": edges,
             "edge_count": len(edges),
             "wake_lock": _wake_lock_detail(agent, guard),
-            "wakes": {
-                "ok": wake.ok,
-                "failed": wake.failed,
-                "refused": wake.refused,
-                "last_ok_at": wake.last_ok_at,
-                "last_ok_delivery": wake.last_ok_delivery,
-                "last_ok_route": wake.last_ok_route,
-                "last_failed_at": wake.last_failed_at,
-                "last_failed_reason": wake.last_failed_reason,
-                "last_refused_at": wake.last_refused_at,
-                "last_refused_reason": wake.last_refused_reason,
-                # The complete per-(agent, route) record, including routes that are no
-                # longer armed — ``edges`` only carries the ones that are, and a route
-                # that used to work and has since been disabled is worth being able to
-                # see.
-                "by_route": {
-                    route: {
-                        "ok": proof.ok,
-                        "last_ok_at": proof.last_ok_at,
-                        "last_ok_delivery": proof.last_ok_delivery,
-                    }
-                    for route, proof in sorted(wake.by_route.items())
-                },
-            },
+            **_wake_scalars(wake),
         },
+    }
+
+
+def _route_wake_edge_claim(
+    agent: Agent, wake: AgentWakeEvidence, edge: dict, evidence_path: str | None
+) -> dict:
+    """One armed ``(agent, route)`` edge — the per-recipient row instance 5 is asked at.
+
+    Emitted only for routes that are armed **now**, because a claim states a capability
+    the router currently has: a route the box no longer enables cannot wake anyone, and
+    a row asserting otherwise would be the paper-armed integration this program exists
+    to catch, one level up. The historical record of a since-disabled route is not lost
+    — it stays in the agent-wide claim's ``detail.by_route``.
+
+    A never-fired armed edge resolves to ``null``, which the NOC reads as FAIL, not as
+    a miss: *the emitter publishes this field and nothing has ever landed in it*. That
+    is the correct and intended reading — never-proven is a state the ledger exists to
+    show, and an armed edge that has never once delivered is exactly what an integration
+    armed on paper looks like from here.
+    """
+    route = edge["source"]
+    proof = wake.by_route.get(route)
+    return {
+        "claim": f"wake-edge:webhook-route:{route}",
+        "class": "rare",
+        "prove": {
+            "kind": "evidence",
+            "source": _pointer(
+                evidence_path, f"agent_wakes.{agent.harness_key}.by_route.{route}", "last_ok_at"
+            ),
+        },
+        "evidence": (
+            f"stage=wake outcome=ok at {proof.last_ok_at} delivery={proof.last_ok_delivery} "
+            f"route={route}"
+            if proof and proof.last_ok_at
+            else None
+        ),
+        "ttl_hours": WAKE_EDGE_TTL_HOURS,
+        "detail": {
+            "harness_key": agent.harness_key,
+            "route": route,
+            "resolves_by": edge["resolves_by"],
+            **_route_scalars(proof),
+        },
+    }
+
+
+def _wake_scalars(wake: AgentWakeEvidence) -> dict:
+    """``agent_wakes.<harness_key>`` projected flat — the object the pointer walks into.
+
+    ``refused`` stays apart from ``failed`` for the reason the evidence store keeps them
+    apart: a refusal is the dedup cache, the converge lock or the breaker working, and an
+    agent whose whole history is refusals is *gated*, not unreachable.
+
+    ``by_route`` is the complete per-``(agent, route)`` record, including routes that are
+    no longer armed — ``edges`` and the per-route claims carry only the armed ones, and a
+    route that used to work and has since been disabled is precisely the parked-builder
+    shape, worth keeping visible.
+    """
+    return {
+        "ok": wake.ok,
+        "failed": wake.failed,
+        "refused": wake.refused,
+        "queued": wake.queued,
+        "last_ok_at": wake.last_ok_at,
+        "last_ok_delivery": wake.last_ok_delivery,
+        "last_ok_route": wake.last_ok_route,
+        "last_failed_at": wake.last_failed_at,
+        "last_failed_reason": wake.last_failed_reason,
+        "last_refused_at": wake.last_refused_at,
+        "last_refused_reason": wake.last_refused_reason,
+        "by_route": {route: _route_scalars(p) for route, p in sorted(wake.by_route.items())},
+    }
+
+
+def _route_scalars(proof: RouteWakeEvidence | None) -> dict:
+    """``agent_wakes.<harness_key>.by_route.<route>`` projected flat — ``None`` when absent.
+
+    Emitted as explicit nulls rather than omitted keys so an armed-but-never-proven edge
+    and an armed-and-proven one have the same shape: a consumer reads a value instead of
+    testing for a key's absence, and the NOC's resolver distinguishes *the field is not
+    there* (unprovable — refused) from *the field is null* (FAIL — never demonstrated),
+    which are very different findings.
+
+    One function, used by both the per-route claim's ``detail`` and the agent-wide
+    claim's ``edges``/``by_route`` views, so the several places this pair surfaces cannot
+    disagree about the same wake.
+    """
+    return {
+        "ok": proof.ok if proof else 0,
+        "last_ok_at": proof.last_ok_at if proof else None,
+        "last_ok_delivery": proof.last_ok_delivery if proof else None,
     }
 
 
@@ -328,12 +459,14 @@ def _edges(
     edge exists while the scheduler holds pending work for the agent: transient, but
     an edge, and the one that says a currently-silent agent is about to run.
 
-    Each webhook-route edge carries **its own** last successful wake, not the agent's.
-    That is the per-recipient arming gate the ledger's delivery-sink rows are asked
-    at: an edge that is armed but whose ``last_ok_at`` is ``null`` while that route's
-    sink counts hundreds of rejections is instance 5, for *this* agent, in one row —
-    a distinction the agent-wide scalars cannot draw, because a wake delivered by a
-    healthy route would green the broken one beside it.
+    Each webhook-route edge carries **its own** last successful wake, not the agent's,
+    and is also emitted as a claim of its own (:func:`_route_wake_edge_claim`) so the
+    ledger can arm it per recipient. The list is the human-readable half — one row that
+    says what could wake this agent and what each path has proven — in the route-name
+    order :meth:`~basecradle_router.routes.registry.RouteRegistry.routes` already
+    enumerates in, so a manifest built twice from unchanged inputs is byte-identical
+    without that resting on the order somebody happened to call ``register`` in. The
+    transient queued-wake edge goes last: it is not a route and has no name to sort by.
 
     An empty list is the other finding: nothing in existence will wake this agent.
     """
@@ -343,7 +476,7 @@ def _edges(
             "kind": "webhook-route",
             "source": route.name,
             "resolves_by": route.recipient_kind,
-            **_route_proof(wake, route.name),
+            **_route_scalars(wake.by_route.get(route.name)),
         }
         for route in registry.routes()
         if route.name in config.enabled_routes and route.recipient_kind in resolvable
@@ -351,20 +484,6 @@ def _edges(
     if wake.queued > 0:
         edges.append({"kind": "queued-wake", "pending": wake.queued})
     return edges
-
-
-def _route_proof(wake: AgentWakeEvidence, route: str) -> dict:
-    """This (agent, route) pair's last successful wake — ``None`` when it has none.
-
-    Emitted as explicit nulls rather than omitted keys so an armed-but-never-proven
-    edge and an armed-and-proven one have the same shape, and a consumer reads a
-    value instead of testing for a key's absence.
-    """
-    proof = wake.by_route.get(route)
-    return {
-        "last_ok_at": proof.last_ok_at if proof else None,
-        "last_ok_delivery": proof.last_ok_delivery if proof else None,
-    }
 
 
 def _wake_lock_detail(agent: Agent, guard: WakeLockGuard) -> dict:
@@ -399,15 +518,23 @@ def _manifest(subject: str, claims: list[dict]) -> dict:
     }
 
 
-def _pointer(evidence_path: str | None, field_path: str) -> str:
-    """A ``<file>#<dotted.field>`` pointer into the evidence document.
+def _pointer(evidence_path: str | None, container: str, field: str) -> str:
+    """A ``<file>#<dotted.container>.<field>`` pointer into the evidence document.
 
     A path plus the exact field, so the ledger reads one value rather than
     re-deriving it — and so a human reading the manifest during an incident can
     ``jq`` straight to the thing the claim says proves it. Falls back to the
     in-memory marker when persistence is disabled, which is itself worth surfacing:
     a box whose evidence is memory-only cannot prove anything across a restart.
+
+    ``container`` and ``field`` are separate parameters rather than one dotted string
+    because the NOC resolves the pointer's **last segment** against the claim's own
+    ``detail`` (basecradle-noc#409). Splitting them at the call site puts the field the
+    caller must also place in ``detail`` in its own argument, where it is hard to write
+    a pointer whose tail nothing publishes — the exact miss that made the first cut of
+    the wake-edge claim unarmable (basecradle-noc#417, finding 2).
     """
+    field_path = f"{container}.{field}"
     if evidence_path is None:
         return f"(in-memory evidence, not persisted)#{field_path}"
     return f"{evidence_path}#{field_path}"

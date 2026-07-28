@@ -404,13 +404,35 @@ tmpfs, so between a reboot and the first converge the directory can still be abs
 guarantee is a root-owned `tmpfiles.d` fragment riding `basecradle-noc#409` — NOC-side, nothing for
 this repo to do.
 
-**The three claims and what each closes:**
+**The four claims and what each closes:**
 
 | Claim | Subject | Class / TTL | Closes |
 |---|---|---|---|
 | `wake-edge:webhook-route` | `agent:<slug>` | `rare` / 168 h | **A parked builder with no re-wake path.** `detail.edges` lists every path that could wake the agent now (an armed webhook route, a queued wake); `evidence` is its last `stage=wake outcome=ok`. `edge_count: 0` **and** `evidence: null` is the gap, in one row. |
+| `wake-edge:webhook-route:<route>` | `agent:<slug>` | `rare` / 168 h | **An integration armed on paper, read per *recipient*.** One row per **armed** `(agent, route)` pair — the granularity instance 5 is actually asked at, and the rows the NOC's eight hand-written `basecradle-platform@*` rows retire in favour of (`basecradle-noc#417`). A route that is registered but not enabled gets no row: a claim states a capability the router has *now*. |
 | `freeze-surface:readable` | `box:<host>` | `rare` / 24 h | **The control that existed but could not be read.** A `probe` claim, not a pointer: readability is not a fact you look up, it is one you demonstrate with the daemon's own credentials. |
 | `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. |
+
+**Every pointer the emitter declares resolves from the claim's own `detail`.** An `evidence`-kind
+claim's `prove.source` is a `<path>#<dotted.field>` pointer, and the NOC resolves it from the
+manifest the census returns, **never by reading the file** — it has no shell on this box and no
+wrapper op reads `/var/lib`, so the census is the transport. The rule is one line: *the pointer's
+last segment is the field, and `detail` is the object it lives in* (`basecradle-noc#409`). So each
+claim's `detail` is the emitter's **flat projection of the exact sub-object its own pointer walks
+into**, with the descriptive keys beside those fields rather than wrapped around them:
+
+| Claim | Pointer | Resolves from `detail` |
+|---|---|---|
+| `wake-edge:webhook-route` | `…#agent_wakes.<slug>.last_ok_at` | `last_ok_at` |
+| `wake-edge:webhook-route:<route>` | `…#agent_wakes.<slug>.by_route.<route>.last_ok_at` | `last_ok_at` |
+| `delivery-sink:<route>` | `…#delivery_sinks.<route>.last_accepted_at` | `last_accepted_at` |
+
+A pointer the rule cannot land on is refused with a named reason and reads `unprovable` — loud and
+never green, but also **never armed**, which is a capability nobody is watching dressed as one that
+is. `tests/test_claims.py::test_every_declared_evidence_pointer_resolves_from_its_own_detail` re-runs
+the NOC's rule over every emitted claim so a new claim cannot ship with a pointer that misses. A
+resolved **`null` is not a miss** — it is the answer: the field exists, the emitter publishes it, and
+nothing has ever landed in it.
 
 Each claim also carries a `detail` object beside Contract v1's pinned
 `claim`/`class`/`prove`/`evidence`/`ttl_hours` keys — the one additive extension, because the emitter
@@ -423,10 +445,12 @@ operator. `"evidence": null` is explicitly legal. A consumer reading only the pi
 accept counter says the sink works for *somebody*, and an agent-wide "last woken" says *something*
 reached the agent — neither answers *"can this route reach this agent?"*, and each greens the other's
 blind spot: one healthy recipient covers for six dead ones, and a github wake covers for a basecradle
-integration that 401s every delivery to the same agent. So every `webhook-route` edge carries **its
-own** `last_ok_at`/`last_ok_delivery`, and `detail.wakes.by_route` carries the full record (including
-routes no longer armed, which `edges` by definition drops). An armed edge with `last_ok_at: null`
-beside a sink counting hundreds of rejections is instance 5, for that one agent, in one row.
+integration that 401s every delivery to the same agent. So every armed `(agent, route)` pair gets its
+**own claim row** (`wake-edge:webhook-route:<route>`, armable and proven on its own evidence), every
+`webhook-route` edge in `detail.edges` carries the same `last_ok_at`/`last_ok_delivery` for the
+operator's one-row view, and `detail.by_route` carries the full record — including routes no longer
+armed, which both of the others by definition drop. An armed edge with `last_ok_at: null` beside a
+sink counting hundreds of rejections is instance 5, for that one agent, in one row.
 
 **The evidence document** (`/var/lib/basecradle-router/evidence.json`, `0644`, no secrets) is what the
 daemon writes and the emitter reads — they are different processes, so a file is the only channel.

@@ -98,8 +98,11 @@ def test_claims_reads_the_evidence_the_daemon_wrote(box, capsys) -> None:
     main(["claims", "--host", "ai.basecradle.com"])
 
     agent = _json_out(capsys)[1]
-    assert "delivery=delivery-1" in agent["claims"][0]["evidence"]
-    assert "route=github" in agent["claims"][0]["evidence"]
+    claims = {c["claim"]: c for c in agent["claims"]}
+    assert "delivery=delivery-1" in claims["wake-edge:webhook-route"]["evidence"]
+    assert "route=github" in claims["wake-edge:webhook-route"]["evidence"]
+    # The per-recipient row reads the same wake through its own (agent, route) record.
+    assert "delivery=delivery-1" in claims["wake-edge:webhook-route:github"]["evidence"]
 
 
 # --- selftest freeze --------------------------------------------------------
