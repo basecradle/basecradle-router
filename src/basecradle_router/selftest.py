@@ -69,11 +69,23 @@ DEGRADED = "degraded"
 FAILED = "failed"
 _SEVERITY = (OK, DEGRADED, FAILED)
 
-#: Process exit codes for the CLI probe. ``2`` is deliberately distinct from ``1``
-#: so the NOC can treat *cannot prove* differently from *proven broken*: a fresh box
-#: whose wake-lock directory the NOC has not created yet must not look identical to a
-#: box whose freeze surface is unreadable.
-EXIT_CODES = {OK: 0, FAILED: 1, DEGRADED: 2}
+#: The probe contract's **inconclusive** sentinel: ``EX_TEMPFAIL`` from sysexits, the
+#: same vocabulary the NOC op family's ``64`` comes from. The ledger reads exactly
+#: three things — ``0`` PASS (the only evidence), this code ERROR/*unprovable* (**we
+#: never got an answer**), and any other non-zero FAIL (**we asked; the answer is
+#: no**). *Cannot prove* is therefore still red and still immediate: it is
+#: distinguished from FAIL by its name and its ledger row, never by being quieter. A
+#: softened "could not run" tier is the silent-death shape this whole program exists
+#: to kill (basecradle-noc#408, ruling 4).
+EXIT_UNPROVABLE = 75
+
+#: Process exit codes for the CLI probe. ``degraded`` maps to the inconclusive
+#: sentinel rather than a code of its own, because *no answer* is one state however it
+#: arose — a wake-lock directory the NOC has not created yet, a stale lock, a run as
+#: root. What must stay distinct is *no answer* from ``failed``: a fresh box must
+#: never look identical to a box whose freeze surface is genuinely unreadable. The
+#: cause rides on stderr, which the NOC forwards on any non-proven verdict.
+EXIT_CODES = {OK: 0, FAILED: 1, DEGRADED: EXIT_UNPROVABLE}
 
 _LOCK_SUFFIX = ".lock"
 

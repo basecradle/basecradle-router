@@ -21,7 +21,11 @@ never-proven**. The router emits; the NOC judges. We never grade our own homewor
   *right now* (an armed webhook route, a queued or in-flight wake), and its
   evidence is the last ``stage=wake outcome=ok``. **``edge_count: 0`` with
   ``evidence: null`` is a parked builder with nothing in existence that will ever
-  re-wake it** — incident instance 4, in one machine-readable row.
+  re-wake it** — incident instance 4, in one machine-readable row. Each webhook-route
+  edge also carries **its own** last successful wake, so instance 5 can be read per
+  *recipient*: an armed edge that has never fired while that route's sink counts
+  hundreds of rejections is a broken integration for *this* agent, which the
+  agent-wide scalars cannot say (basecradle-noc#408).
 - ``freeze-surface:readable`` — subject ``box:<host>``. Proven by *running* the
   freeze self-test (:mod:`basecradle_router.selftest`), because readability is not
   a fact you can look up; it is a fact you have to demonstrate with the daemon's
@@ -41,13 +45,22 @@ short enough that "nothing has woken this agent all month" surfaces while it sti
 means something. The freeze surface gets 24 h because proving it is a stat and a
 parse, so there is no reason to trust yesterday's answer.
 
-**One deliberate extension to Contract v1.** Each claim carries an extra ``detail``
-object beside the pinned ``claim``/``class``/``prove``/``evidence``/``ttl_hours``
-keys. Without it the emitter could report *whether* a wake edge had ever fired but
-not *whether one exists* — and the parked-builder detection needs both. It is
-purely additive, so a consumer reading only the pinned keys is unaffected. The NOC
-owns the contract, so the extension is raised upward for ratification rather than
-assumed (``needs-capital`` on basecradle-router#198).
+**One extension to Contract v1, now ratified.** Each claim carries an extra
+``detail`` object beside the pinned
+``claim``/``class``/``prove``/``evidence``/``ttl_hours`` keys. Without it the emitter
+could report *whether* a wake edge had ever fired but not *whether one exists* — and
+the parked-builder detection needs both. It is purely additive, so a consumer reading
+only the pinned keys is unaffected. The NOC owns the contract, so it was raised
+upward rather than assumed, and ratified as an **optional additive key**: parsed,
+validated as an object and nothing more, round-tripped, and deliberately never
+persisted to the ledger — it is for the reader and the operator
+(basecradle-noc#408, ruling 2).
+
+**Two subjects' worth of manifests, two surfaces.** The array on stdout is the
+lossless form; ``--out-dir`` writes the same manifests as one strict single-subject
+file each, named as the contract pins it (see :func:`manifest_filename`). Both are
+ratified and both are kept: stdout is what ``provision-claims`` reads per subject,
+the directory is what the census walks (ruling 1).
 
 **No source knowledge lives here.** Whether an agent is reachable is computed by
 pairing each enabled route's
@@ -65,6 +78,8 @@ from basecradle_router.config import DEFAULT_ADMIN_CMD, Config
 from basecradle_router.evidence import AgentWakeEvidence, DeliverySinkEvidence, EvidenceDocument
 from basecradle_router.models import Agent
 from basecradle_router.routes import RouteRegistry
+from basecradle_router.selftest import EXIT_CODES as FREEZE_EXIT_CODES
+from basecradle_router.selftest import EXIT_UNPROVABLE
 from basecradle_router.wakelock import WakeLockGuard
 
 #: The manifest schema version this emitter writes — the capital-pinned Contract v1.
@@ -172,7 +187,11 @@ def _freeze_claim(evidence: EvidenceDocument, guard: WakeLockGuard, admin_cmd: s
                 "at": last.at,
                 "detail": last.detail,
             },
-            "exit_codes": {"ok": 0, "failed": 1, "degraded": 2},
+            # Read from the probe itself rather than restated, so the manifest cannot
+            # describe a contract the probe does not implement. ``config_error`` shares
+            # the unprovable sentinel by contract — one state, *no answer* — and is
+            # named here anyway because it is a different finding, told apart on stderr.
+            "exit_codes": {**FREEZE_EXIT_CODES, "config_error": EXIT_UNPROVABLE},
         },
     }
 
@@ -257,6 +276,7 @@ def _wake_edge_claim(
         },
         "evidence": (
             f"stage=wake outcome=ok at {wake.last_ok_at} delivery={wake.last_ok_delivery}"
+            + (f" route={wake.last_ok_route}" if wake.last_ok_route else "")
             if wake.last_ok_at
             else None
         ),
@@ -274,10 +294,23 @@ def _wake_edge_claim(
                 "refused": wake.refused,
                 "last_ok_at": wake.last_ok_at,
                 "last_ok_delivery": wake.last_ok_delivery,
+                "last_ok_route": wake.last_ok_route,
                 "last_failed_at": wake.last_failed_at,
                 "last_failed_reason": wake.last_failed_reason,
                 "last_refused_at": wake.last_refused_at,
                 "last_refused_reason": wake.last_refused_reason,
+                # The complete per-(agent, route) record, including routes that are no
+                # longer armed — ``edges`` only carries the ones that are, and a route
+                # that used to work and has since been disabled is worth being able to
+                # see.
+                "by_route": {
+                    route: {
+                        "ok": proof.ok,
+                        "last_ok_at": proof.last_ok_at,
+                        "last_ok_delivery": proof.last_ok_delivery,
+                    }
+                    for route, proof in sorted(wake.by_route.items())
+                },
             },
         },
     }
@@ -286,7 +319,7 @@ def _wake_edge_claim(
 def _edges(
     agent: Agent, config: Config, registry: RouteRegistry, wake: AgentWakeEvidence
 ) -> list[dict]:
-    """Every path by which this agent could be woken from now on.
+    """Every path by which this agent could be woken from now on, and what each proved.
 
     A **webhook-route** edge exists for each registered route whose
     ``recipient_kind`` the agent is actually resolvable by *and* whose source is
@@ -295,17 +328,43 @@ def _edges(
     edge exists while the scheduler holds pending work for the agent: transient, but
     an edge, and the one that says a currently-silent agent is about to run.
 
-    An empty list is the finding: nothing in existence will wake this agent.
+    Each webhook-route edge carries **its own** last successful wake, not the agent's.
+    That is the per-recipient arming gate the ledger's delivery-sink rows are asked
+    at: an edge that is armed but whose ``last_ok_at`` is ``null`` while that route's
+    sink counts hundreds of rejections is instance 5, for *this* agent, in one row —
+    a distinction the agent-wide scalars cannot draw, because a wake delivered by a
+    healthy route would green the broken one beside it.
+
+    An empty list is the other finding: nothing in existence will wake this agent.
     """
     resolvable = config.resolvable_by(agent)
     edges = [
-        {"kind": "webhook-route", "source": route.name, "resolves_by": route.recipient_kind}
+        {
+            "kind": "webhook-route",
+            "source": route.name,
+            "resolves_by": route.recipient_kind,
+            **_route_proof(wake, route.name),
+        }
         for route in registry.routes()
         if route.name in config.enabled_routes and route.recipient_kind in resolvable
     ]
     if wake.queued > 0:
         edges.append({"kind": "queued-wake", "pending": wake.queued})
     return edges
+
+
+def _route_proof(wake: AgentWakeEvidence, route: str) -> dict:
+    """This (agent, route) pair's last successful wake — ``None`` when it has none.
+
+    Emitted as explicit nulls rather than omitted keys so an armed-but-never-proven
+    edge and an armed-and-proven one have the same shape, and a consumer reads a
+    value instead of testing for a key's absence.
+    """
+    proof = wake.by_route.get(route)
+    return {
+        "last_ok_at": proof.last_ok_at if proof else None,
+        "last_ok_delivery": proof.last_ok_delivery if proof else None,
+    }
 
 
 def _wake_lock_detail(agent: Agent, guard: WakeLockGuard) -> dict:
@@ -355,16 +414,29 @@ def _pointer(evidence_path: str | None, field_path: str) -> str:
 
 
 def manifest_filename(manifest: dict) -> str:
-    """The per-subject filename for ``--out-dir``: ``<component>.<subject>.json``.
+    """The per-subject filename for ``--out-dir``, exactly as the contract pins it.
 
-    Contract v1's discovery point is ``/etc/basecradle/claims.d/<component>.json``,
-    one file per component — but the router emits several subjects, so the subject
-    is folded into the name rather than losing the per-subject granularity the
-    ledger is built on. Non-filename characters in a subject (the ``:`` separator, a
-    hostname's dots) collapse to ``-`` so the name is safe on any filesystem.
+    ``basecradle-router.json`` for the box subject — the host is deliberately *not*
+    in the name: one box gets one box-manifest per component, and a second spelling
+    of a fact the body already carries is a thing that can later disagree with it.
+    Agent subjects get ``basecradle-router@<slug>.json``, where ``<slug>`` is the
+    agent's OS user.
+
+    This is a **constraint, not taste** (basecradle-noc#408, ruling 1): the NOC's
+    ``run-claim-probe`` resolves ``$CLAIMS_DIR/<component>@<os_user>.json`` before it
+    will run anything, so a file spelled any other way is a claim that can never be
+    proven. Non-filename characters in a slug collapse to ``-`` so the name stays
+    safe on any filesystem; an unrecognised subject kind raises rather than falling
+    back, because the plausible fallback (the bare component name) would silently
+    overwrite the box manifest.
     """
-    subject = _UNSAFE_IN_FILENAME.sub("-", manifest.get("subject", "unknown"))
-    return f"{COMPONENT}.{subject}.json"
+    subject = manifest.get("subject", "")
+    kind, _, name = subject.partition(":")
+    if kind == "agent" and name:
+        return f"{COMPONENT}@{_UNSAFE_IN_FILENAME.sub('-', name)}.json"
+    if kind == "box" and name:
+        return f"{COMPONENT}.json"
+    raise ValueError(f"no contract filename for claim subject {subject!r}")
 
 
 __all__ = [

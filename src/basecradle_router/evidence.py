@@ -26,6 +26,15 @@ Both fall out of the same primitive: **last demonstrable success + counters**,
 per subject, readable by a different process (the NOC's converge runs the claims
 emitter; the daemon writes this file).
 
+**And instance 5 is asked per *recipient*, not per route.** A route-wide accept
+counter says the sink works for *somebody*; the ledger's rows ask whether it works
+for *this agent*. Neither the per-route counters nor the per-agent scalars can
+answer that alone — one healthy recipient would green six dead ones, and a wake
+delivered by one route would green another route that 401s every delivery to the
+same agent. So the wake proof is also kept at **(agent, route)** granularity
+(:class:`RouteWakeEvidence`), which is the granularity the question is asked at
+(basecradle-noc#408).
+
 **Design constraints, and how each is met.**
 
 - *A different process must read it.* One JSON document at
@@ -117,14 +126,38 @@ class DeliverySinkEvidence:
 
 
 @dataclass
+class RouteWakeEvidence:
+    """One **(agent, route)** pair's wake proof — the per-recipient arming gate.
+
+    The pair exists because neither of the two projections above it is sound, and
+    the NOC's ledger refused to arm its per-recipient delivery-sink rows on either
+    (basecradle-noc#408). Per-**route** alone (:class:`DeliverySinkEvidence`), one
+    healthy recipient greens every dead one on that route. Per-**agent** alone
+    (:class:`AgentWakeEvidence`'s scalars), a github-route wake greens a basecradle
+    integration that 401s every delivery to the same agent — instance 5 surviving
+    the very instrument built to catch it.
+
+    So the proof is recorded at the granularity the question is asked at: *has
+    **this** route ever demonstrably woken **this** agent, and when?* A route whose
+    entry is absent has never woken the agent, which is what a never-proven edge
+    means — kept as an absence rather than a zero row so "never tried" and "tried
+    and it worked" can never be confused.
+    """
+
+    ok: int = 0
+    last_ok_at: str | None = None
+    last_ok_delivery: str | None = None
+
+
+@dataclass
 class AgentWakeEvidence:
     """What one agent's wake edge has demonstrably done — the re-wake proof.
 
-    ``last_ok_at``/``last_ok_delivery`` are the ledger's evidence pointer: the
-    timestamp and delivery id of the last ``stage=wake outcome=ok``, joinable
-    straight back to both halves of that wake in journald. ``None`` means the
-    router has **never** successfully woken this agent — never-proven, the state
-    that makes a parked builder visible.
+    ``last_ok_at``/``last_ok_delivery``/``last_ok_route`` are the ledger's evidence
+    pointer: the timestamp, delivery id, and event source of the last ``stage=wake
+    outcome=ok``, joinable straight back to both halves of that wake in journald.
+    ``None`` means the router has **never** successfully woken this agent —
+    never-proven, the state that makes a parked builder visible.
 
     ``refused`` counts wakes the router deliberately declined (dedup, a held NOC
     wake-lock, a tripped breaker). It is kept apart from ``failed`` because the two
@@ -132,6 +165,12 @@ class AgentWakeEvidence:
     the wake path broken. An agent whose only recent activity is refusals is
     *gated*, not dead — and a ledger that conflated them would cry wolf on every
     converge.
+
+    ``by_route`` is the same proof at **(agent, route)** granularity — see
+    :class:`RouteWakeEvidence` for why the scalars above it are not enough on their
+    own. The three ``last_ok_*`` scalars describe one event (the most recent
+    successful wake, whatever route delivered it) and are written together in one
+    update, so they cannot drift apart from each other or from ``by_route``.
 
     ``queued`` is the scheduler's pending-wake depth for this agent as of the last
     change — the transient wake edge. Non-zero means a wake is queued or in flight
@@ -143,11 +182,13 @@ class AgentWakeEvidence:
     refused: int = 0
     last_ok_at: str | None = None
     last_ok_delivery: str | None = None
+    last_ok_route: str | None = None
     last_failed_at: str | None = None
     last_failed_reason: str | None = None
     last_refused_at: str | None = None
     last_refused_reason: str | None = None
     queued: int = 0
+    by_route: dict[str, RouteWakeEvidence] = field(default_factory=dict)
 
 
 @dataclass
@@ -179,7 +220,7 @@ class EvidenceDocument:
             "version": self.version,
             "updated_at": self.updated_at,
             "delivery_sinks": {k: asdict(v) for k, v in sorted(self.delivery_sinks.items())},
-            "agent_wakes": {k: asdict(v) for k, v in sorted(self.agent_wakes.items())},
+            "agent_wakes": {k: _wake_json(v) for k, v in sorted(self.agent_wakes.items())},
             "freeze_selftest": asdict(self.freeze_selftest),
         }
 
@@ -198,9 +239,37 @@ class EvidenceDocument:
         for name, fields in _items(raw.get("delivery_sinks")):
             doc.delivery_sinks[name] = _rebuild(DeliverySinkEvidence, fields)
         for name, fields in _items(raw.get("agent_wakes")):
-            doc.agent_wakes[name] = _rebuild(AgentWakeEvidence, fields)
+            doc.agent_wakes[name] = _rebuild_agent_wake(fields)
         doc.freeze_selftest = _rebuild(SelfTestEvidence, raw.get("freeze_selftest"))
         return doc
+
+
+def _wake_json(wake: AgentWakeEvidence) -> dict:
+    """One agent's wake evidence as JSON, with ``by_route`` in a stable order.
+
+    Sorted for the same reason the two outer maps are: the document is diffed by the
+    ledger and read by a human mid-incident, and a map that reorders between writes
+    shows churn where there was no change.
+    """
+    fields = asdict(wake)
+    fields["by_route"] = {r: asdict(e) for r, e in sorted(wake.by_route.items())}
+    return fields
+
+
+def _rebuild_agent_wake(fields: dict) -> AgentWakeEvidence:
+    """Rebuild one agent's wake evidence, including its nested per-route map.
+
+    :func:`_rebuild` alone would leave ``by_route`` holding the raw dicts it read
+    off disk, which every reader downstream would then have to defend against.
+    Rebuilding it here keeps the in-memory document uniformly typed whatever the
+    file said — the same tolerance the rest of :meth:`EvidenceDocument.from_json`
+    applies, one level down.
+    """
+    wake = _rebuild(AgentWakeEvidence, fields)
+    wake.by_route = {
+        route: _rebuild(RouteWakeEvidence, entry) for route, entry in _items(fields.get("by_route"))
+    }
+    return wake
 
 
 def _items(raw: object):
@@ -286,13 +355,31 @@ class EvidenceStore:
 
     # --- agent wake evidence (instance 4: parked with nothing to re-wake it) ---
 
-    def record_wake_ok(self, agent: str, delivery: str) -> None:
-        """The proof that matters: this agent's wake edge fired and succeeded."""
+    def record_wake_ok(self, agent: str, delivery: str, *, route: str) -> None:
+        """The proof that matters: this agent's wake edge fired and succeeded.
+
+        ``route`` is **required and keyword-only**, deliberately. It is the event
+        source that delivered the wake, and without it the record collapses to "some
+        route woke this agent" — which greens every *other* route wired to the same
+        agent, including one whose every delivery is being rejected. That is instance
+        5 surviving the instrument, so the field cannot be optional: a caller must
+        not be able to drop it by omission, and it must not be positionally
+        confusable with ``delivery``.
+
+        Both granularities are written here, in one update under one lock, so the
+        scalars and ``by_route`` can never disagree about the same wake.
+        """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
+            at = _iso(self._now())
             wake.ok += 1
-            wake.last_ok_at = _iso(self._now())
+            wake.last_ok_at = at
             wake.last_ok_delivery = delivery
+            wake.last_ok_route = route
+            per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
+            per_route.ok += 1
+            per_route.last_ok_at = at
+            per_route.last_ok_delivery = delivery
             self._flush_locked()
 
     def record_wake_failed(self, agent: str, reason: str) -> None:
