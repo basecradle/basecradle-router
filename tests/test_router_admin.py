@@ -14,11 +14,14 @@ agent, or network is touched; secrets are correctly-shaped fakes.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from basecradle_router.selftest import EXIT_UNPROVABLE
 
 ROUTER_ADMIN = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "router-admin"
 
@@ -97,9 +100,10 @@ def test_comments_and_non_assignments_are_skipped(tmp_path) -> None:
     assert result.stdout.strip() == "whsec_exported"
 
 
-def test_an_unreadable_env_file_is_the_config_error_exit_code(tmp_path) -> None:
-    # Exit 3 = "the router's own config would not load", which sends the NOC somewhere
-    # different from a broken freeze surface (1) or an unprovable one (2).
+def test_an_unreadable_env_file_is_the_unprovable_exit_code(tmp_path) -> None:
+    # 75 (EX_TEMPFAIL) = "we never got an answer" — the wrapper could not even reach the
+    # config the probe needs. It must not land in a different bucket than the tool it
+    # wraps, and it must never be a 0.
     result = subprocess.run(
         ["bash", str(ROUTER_ADMIN), "selftest", "freeze"],
         capture_output=True,
@@ -112,7 +116,7 @@ def test_an_unreadable_env_file_is_the_config_error_exit_code(tmp_path) -> None:
         },
     )
 
-    assert result.returncode == 3
+    assert result.returncode == 75
     assert "cannot read" in result.stderr
 
 
@@ -134,7 +138,7 @@ def test_a_non_root_caller_that_is_not_the_daemon_user_refuses_rather_than_prete
         },
     )
 
-    assert result.returncode == 3
+    assert result.returncode == 75
     assert "must run as" in result.stderr
 
 
@@ -145,3 +149,18 @@ def test_the_probe_command_the_claim_names_is_the_wrapper_that_ships() -> None:
 
     assert DEFAULT_ADMIN_CMD.endswith("/deploy/bin/router-admin")
     assert ROUTER_ADMIN.exists()
+
+
+def test_the_wrappers_unprovable_code_matches_the_probes() -> None:
+    """The one constant spelled in two languages — pinned so it cannot drift.
+
+    The wrapper's own refusals (wrong user, unreadable env file) are the same ledger
+    state as the probe's ``degraded`` — *we never got an answer* — so they must exit
+    the same code as the tool they wrap. Nothing else pins bash to Python here, and a
+    silent divergence would put the wrapper's failures in the FAIL bucket while the
+    probe's stayed in ERROR: two different NOC responses to one condition.
+    """
+    declared = re.search(r"^EXIT_UNPROVABLE=(\d+)$", ROUTER_ADMIN.read_text(), re.MULTILINE)
+
+    assert declared, "the wrapper must declare EXIT_UNPROVABLE as a literal assignment"
+    assert int(declared.group(1)) == EXIT_UNPROVABLE == 75

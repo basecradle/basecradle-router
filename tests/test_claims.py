@@ -14,6 +14,8 @@ Test cast: Nova Digital (``nova``, AI) and JT (``jt``, a harness persona).
 
 from types import MappingProxyType
 
+import pytest
+
 from basecradle_router.claims import (
     COMPONENT,
     CONTRACT_VERSION,
@@ -132,7 +134,14 @@ def test_enabling_the_route_arms_the_edge_that_was_missing(tmp_path) -> None:
     claim = _claim(_subject(manifests, "agent:jt"), "wake-edge:webhook-route")
 
     assert claim["detail"]["edges"] == [
-        {"kind": "webhook-route", "source": "basecradle", "resolves_by": "recipient_uuid"}
+        {
+            "kind": "webhook-route",
+            "source": "basecradle",
+            "resolves_by": "recipient_uuid",
+            # Armed, and honest that being armed proves nothing yet.
+            "last_ok_at": None,
+            "last_ok_delivery": None,
+        }
     ]
 
 
@@ -164,7 +173,7 @@ def test_a_queued_wake_is_reported_as_the_transient_edge_it_is(tmp_path) -> None
 
 def test_a_successful_wake_becomes_the_claims_evidence(tmp_path) -> None:
     evidence = EvidenceStore(None)
-    evidence.record_wake_ok("nova", DELIVERY)
+    evidence.record_wake_ok("nova", DELIVERY, route="github")
 
     claim = _claim(
         _subject(_build(tmp_path, evidence=evidence), "agent:nova"), "wake-edge:webhook-route"
@@ -172,10 +181,75 @@ def test_a_successful_wake_becomes_the_claims_evidence(tmp_path) -> None:
 
     assert "stage=wake outcome=ok" in claim["evidence"]
     assert DELIVERY in claim["evidence"]
+    assert "route=github" in claim["evidence"]
     assert claim["prove"] == {
         "kind": "evidence",
         "source": f"{EVIDENCE_PATH}#agent_wakes.nova.last_ok_at",
     }
+
+
+def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_path) -> None:
+    """Instance 5 read per *recipient*: both coarser projections read green here.
+
+    Nova is dual-wired — a builder that also holds a platform account, so both enabled
+    routes can reach it — and both routes' sinks have verified a delivery. So the
+    **per-route** projection is green for `basecradle` (its secret demonstrably
+    matches) and the **per-agent** projection is green for nova (something woke it).
+    What is actually true is narrower: `basecradle` has never woken *anyone*, and
+    nothing has ever woken JT.
+
+    Only the per-(agent, route) proof draws that line, which is why the NOC declined to
+    arm its per-recipient rows on either substitution (basecradle-noc#408).
+    """
+    nova_dual = Agent(
+        key=NOVA.key,
+        os_user=NOVA.os_user,
+        clone_path=NOVA.clone_path,
+        bot_slug=NOVA.bot_slug,
+        recipient_uuid="019e916c-7f45-700e-afc0-f45557b23800",
+    )
+    evidence = EvidenceStore(None)
+    evidence.record_delivery_accepted("github")
+    evidence.record_delivery_accepted("basecradle")  # the sink is armed and verified...
+    evidence.record_wake_ok("nova", DELIVERY, route="github")  # ...but never woke a soul
+
+    manifests = _build(
+        tmp_path,
+        config=_config(agents=(nova_dual, JT), routes=("github", "basecradle")),
+        routes=("github", "basecradle"),
+        evidence=evidence,
+    )
+
+    def edge(subject: str, source: str) -> dict:
+        edges = _claim(_subject(manifests, subject), "wake-edge:webhook-route")["detail"]["edges"]
+        return next(e for e in edges if e.get("source") == source)
+
+    assert edge("agent:nova", "github")["last_ok_delivery"] == DELIVERY
+    # Same agent, verified sink, the *other* route: armed, and never proven. The
+    # per-agent projection would have greened this off the github wake above.
+    assert edge("agent:nova", "basecradle")["last_ok_at"] is None
+    # Same route, a different recipient: also never proven. The per-route projection
+    # would have greened this off the basecradle accept above.
+    assert edge("agent:jt", "basecradle")["last_ok_at"] is None
+
+
+def test_the_per_route_wake_record_survives_a_route_being_disarmed(tmp_path) -> None:
+    # `edges` only carries routes armed *now*, so a route that used to wake the agent
+    # and has since been disabled would vanish without a trace. The raw per-route
+    # record keeps it — an agent whose only proof came from a route nobody enables any
+    # more is exactly the parked-builder shape, not a proven edge.
+    evidence = EvidenceStore(None)
+    evidence.record_wake_ok("nova", DELIVERY, route="basecradle")
+
+    detail = _claim(
+        _subject(_build(tmp_path, evidence=evidence, routes=("github",)), "agent:nova"),
+        "wake-edge:webhook-route",
+    )["detail"]
+
+    assert [e["source"] for e in detail["edges"]] == ["github"]
+    assert detail["edges"][0]["last_ok_at"] is None
+    assert detail["wakes"]["by_route"]["basecradle"]["ok"] == 1
+    assert detail["wakes"]["last_ok_route"] == "basecradle"
 
 
 def test_the_agents_current_freeze_state_rides_on_the_wake_edge_claim(tmp_path) -> None:
@@ -207,7 +281,15 @@ def test_the_freeze_claim_is_proven_by_running_the_probe(tmp_path) -> None:
     assert claim["prove"]["cmd"].endswith("selftest freeze --json")
     assert claim["ttl_hours"] == 24
     assert claim["detail"]["lock_dir"] == str(tmp_path)
-    assert claim["detail"]["exit_codes"] == {"ok": 0, "failed": 1, "degraded": 2}
+    # The contract's codes, pinned literally: 0 PASS, 1 FAIL, 75 (EX_TEMPFAIL) the one
+    # inconclusive sentinel — which a config error shares, because both mean "no
+    # answer" and the contract has no third non-zero tier (basecradle-noc#408).
+    assert claim["detail"]["exit_codes"] == {
+        "ok": 0,
+        "failed": 1,
+        "degraded": 75,
+        "config_error": 75,
+    }
 
 
 def test_the_last_selftest_is_the_freeze_claims_evidence(tmp_path) -> None:
@@ -331,11 +413,27 @@ def test_disabled_persistence_is_stated_in_the_evidence_pointer(tmp_path) -> Non
     assert source.startswith("(in-memory evidence, not persisted)")
 
 
-def test_the_per_subject_filename_is_filesystem_safe(tmp_path) -> None:
+def test_the_per_subject_filename_is_the_one_the_contract_pins(tmp_path) -> None:
+    """The names are a constraint, not taste — the NOC's probe resolves them literally.
+
+    ``run-claim-probe`` looks for ``$CLAIMS_DIR/<component>@<os_user>.json`` before it
+    will run anything, so a file spelled any other way is a claim that can never be
+    proven. The box manifest carries no host in its name: one box, one box-manifest
+    per component, and a second spelling of a fact the body already states is a thing
+    that can later disagree with it (basecradle-noc#408, ruling 1).
+    """
     manifests = _build(tmp_path)
 
-    assert manifest_filename(manifests[0]) == "basecradle-router.box-ai.basecradle.com.json"
-    assert manifest_filename(manifests[1]) == "basecradle-router.agent-nova.json"
+    assert manifest_filename(manifests[0]) == "basecradle-router.json"
+    assert manifest_filename(manifests[1]) == "basecradle-router@nova.json"
+
+
+def test_an_unrecognised_subject_raises_rather_than_colliding(tmp_path) -> None:
+    # The tempting fallback — the bare component name — is the box manifest's own
+    # filename, so a subject kind this function does not know would silently overwrite
+    # the box's claims with something else's. Loud beats a lost manifest.
+    with pytest.raises(ValueError, match="no contract filename"):
+        manifest_filename({"subject": "cluster:fleet"})
 
 
 def test_the_probe_command_follows_a_non_standard_deploy_tree(tmp_path) -> None:

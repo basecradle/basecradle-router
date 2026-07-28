@@ -22,14 +22,26 @@
 # of /var/lib/basecradle-router/evidence.json, so a probe run under the wrong
 # identity can never take ownership of the daemon's own state file away from it.
 #
-# EXIT CODES (the probe contract the NOC schedules against):
-#   0  proven          — the surface is readable and would be honoured
-#   1  proven broken   — unreadable or malformed; the check names the exact file
-#   2  could not prove — dir absent, a stale lock, or the probe ran as root
-#   3  config error    — the router's own config would not load (the daemon could
-#                        not boot on it either, so this is a finding in its own right)
+# EXIT CODES (the probe contract the NOC schedules against — basecradle-noc#408):
+#   0   proven          — the surface is readable and would be honoured. PASS, and the
+#                         only thing the ledger records as evidence.
+#   1   proven broken   — unreadable or malformed; the check names the exact file. FAIL:
+#                         we asked, and the answer is no.
+#   75  could not prove — EX_TEMPFAIL, the contract's one inconclusive sentinel: we
+#                         never got an answer. Dir absent, a stale lock, the probe ran
+#                         as root, or the router's own config would not load (a finding
+#                         in its own right — the daemon could not boot on it either).
+#                         Still red, still immediate; there is deliberately no quieter
+#                         tier. WHICH of those it was rides on STDERR, which the NOC
+#                         forwards on any non-proven verdict.
+# Any other non-zero reads as FAIL. Nothing here may exit 0 without having proven it.
 
 set -euo pipefail
+
+# Kept in lockstep with selftest.EXIT_UNPROVABLE — the wrapper's own failures are the
+# same state as the probe's ("we never got an answer"), so they must not land in a
+# different bucket than the tool they wrap.
+EXIT_UNPROVABLE=75
 
 APP_DIR=${BASECRADLE_ROUTER_APP_DIR:-/opt/basecradle-router/app}
 ENV_FILE=${BASECRADLE_ROUTER_ENV_FILE:-/etc/basecradle-router/router.env}
@@ -40,7 +52,7 @@ RUN_AS=${BASECRADLE_ROUTER_USER:-router}
 if [ "$(id -un)" != "$RUN_AS" ]; then
     if [ "$(id -u)" -ne 0 ]; then
         echo "router-admin: must run as '$RUN_AS' or as root (am $(id -un))" >&2
-        exit 3
+        exit "$EXIT_UNPROVABLE"
     fi
     exec runuser -u "$RUN_AS" -- "$0" "$@"
 fi
@@ -60,7 +72,7 @@ fi
 # config byte-identical to the running daemon's.
 if [ ! -r "$ENV_FILE" ]; then
     echo "router-admin: cannot read $ENV_FILE as $(id -un)" >&2
-    exit 3
+    exit "$EXIT_UNPROVABLE"
 fi
 while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in '' | '#'*) continue ;; esac

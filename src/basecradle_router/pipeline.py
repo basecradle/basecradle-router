@@ -493,9 +493,11 @@ class Pipeline:
             )
             return False
         # The evidence the whole wake-edge claim rests on: this agent was demonstrably
-        # woken, at this time, by this delivery. Nothing else in the router proves an
-        # agent is reachable rather than merely registered.
-        self.evidence.record_wake_ok(agent.harness_key, event.delivery_id)
+        # woken, at this time, by this delivery, **over this route**. Nothing else in
+        # the router proves an agent is reachable rather than merely registered — and
+        # without the route it proves only that *some* source reached the agent, which
+        # would green a sibling route rejecting every delivery to that same agent.
+        self.evidence.record_wake_ok(agent.harness_key, event.delivery_id, route=event.source)
         self._record(
             result,
             Stage.WAKE,

@@ -59,19 +59,33 @@ def test_claims_emits_contract_v1_manifests(box, capsys) -> None:
 
 
 def test_claims_out_dir_writes_one_strict_manifest_per_subject(box, tmp_path, capsys) -> None:
+    # The filenames are the contract's, and they are load-bearing: run-claim-probe
+    # resolves $CLAIMS_DIR/<component>@<os_user>.json before it will run anything, so a
+    # file spelled any other way is a claim that can never be proven.
     out = tmp_path / "claims.d"
 
     assert main(["claims", "--host", "ai.basecradle.com", "--out-dir", str(out)]) == 0
 
     written = sorted(p.name for p in out.iterdir())
-    assert written == [
-        "basecradle-router.agent-nova.json",
-        "basecradle-router.box-ai.basecradle.com.json",
-    ]
+    assert written == ["basecradle-router.json", "basecradle-router@nova.json"]
     # Each file is a single-subject manifest — the strict per-file contract shape.
-    one = json.loads((out / "basecradle-router.agent-nova.json").read_text(encoding="utf-8"))
+    one = json.loads((out / "basecradle-router@nova.json").read_text(encoding="utf-8"))
     assert one["subject"] == "agent:nova"
     assert one["contract"] == 1
+    # The box manifest carries the host in its body, never in its name.
+    box_manifest = json.loads((out / "basecradle-router.json").read_text(encoding="utf-8"))
+    assert box_manifest["subject"] == "box:ai.basecradle.com"
+
+
+def test_the_array_on_stdout_survives_alongside_the_per_subject_files(box, capsys) -> None:
+    # Two surfaces, not two spellings: stdout is provision-claims's per-subject
+    # surface, the directory is the census's. Ratifying the files did not retire the
+    # array, so dropping it would break the other consumer.
+    assert main(["claims", "--host", "ai.basecradle.com"]) == 0
+
+    manifests = _json_out(capsys)
+    assert isinstance(manifests, list)
+    assert [m["subject"] for m in manifests] == ["box:ai.basecradle.com", "agent:nova"]
 
 
 def test_claims_reads_the_evidence_the_daemon_wrote(box, capsys) -> None:
@@ -79,12 +93,13 @@ def test_claims_reads_the_evidence_the_daemon_wrote(box, capsys) -> None:
     # channel between them, and this is the property that makes it work.
     from basecradle_router.evidence import EvidenceStore
 
-    EvidenceStore(str(box.evidence)).record_wake_ok("nova", "delivery-1")
+    EvidenceStore(str(box.evidence)).record_wake_ok("nova", "delivery-1", route="github")
 
     main(["claims", "--host", "ai.basecradle.com"])
 
     agent = _json_out(capsys)[1]
     assert "delivery=delivery-1" in agent["claims"][0]["evidence"]
+    assert "route=github" in agent["claims"][0]["evidence"]
 
 
 # --- selftest freeze --------------------------------------------------------
@@ -96,17 +111,39 @@ def test_selftest_freeze_exits_zero_on_a_readable_surface(box, capsys) -> None:
 
 
 def test_selftest_freeze_exits_one_on_a_malformed_lock(box, capsys) -> None:
+    # 1 is FAIL in the ledger's vocabulary: *we asked; the answer is no.*
     (box.locks / "nova.lock").write_text("{ not json", encoding="utf-8")
 
     assert main(["selftest", "freeze"]) == 1
 
 
-def test_selftest_freeze_exits_two_when_it_cannot_prove(box, monkeypatch) -> None:
-    # Exit 2 is deliberately distinct from 1: a fresh box whose wake-lock directory
-    # the NOC has not created yet must not look like a broken freeze surface.
+def test_selftest_freeze_exits_seventy_five_when_it_cannot_prove(box, monkeypatch) -> None:
+    # 75 (EX_TEMPFAIL) is the contract's one inconclusive sentinel — *we never got an
+    # answer* — and it is still red, still immediate. It stays distinct from 1 because a
+    # fresh box whose wake-lock directory the NOC has not created yet must not look
+    # identical to a box whose freeze surface is genuinely unreadable.
     monkeypatch.setenv("BASECRADLE_ROUTER_WAKE_LOCK_DIR", str(box.locks / "not-created-yet"))
 
-    assert main(["selftest", "freeze"]) == 2
+    assert main(["selftest", "freeze"]) == 75
+
+
+def test_a_non_proven_verdict_states_itself_on_stderr(box, monkeypatch, capsys) -> None:
+    # A config error shares exit 75, so stderr is the only place the two are told
+    # apart — and it is the stream the NOC forwards on any non-proven verdict.
+    monkeypatch.setenv("BASECRADLE_ROUTER_WAKE_LOCK_DIR", str(box.locks / "not-created-yet"))
+
+    main(["selftest", "freeze"])
+
+    err = capsys.readouterr().err
+    assert "freeze-readability: degraded" in err
+    assert "not-created-yet" in err  # names the surface, as a failing check must
+
+
+def test_a_proven_verdict_says_nothing_on_stderr(box, capsys) -> None:
+    # The corollary: stderr is the non-proven channel. A green probe that wrote there
+    # would train the NOC to ignore the stream that carries the diagnosis.
+    assert main(["selftest", "freeze"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_selftest_freeze_json_is_the_shape_the_noc_parses(box, capsys) -> None:
@@ -149,16 +186,21 @@ def test_evidence_on_a_box_that_has_produced_none_is_empty_not_an_error(box, cap
 # --- the config-error exit code --------------------------------------------
 
 
-def test_a_config_the_daemon_could_not_boot_on_exits_three(box, monkeypatch, capsys) -> None:
-    # A distinct code, because "the router's own config is broken" sends the NOC
-    # somewhere different from "the surface this probe examines is broken".
+def test_a_config_the_daemon_could_not_boot_on_is_unprovable_not_a_pass(
+    box, monkeypatch, capsys
+) -> None:
+    # It shares the inconclusive sentinel with an unprovable probe, because from the
+    # ledger's side it is the same state: we never got an answer. What must never
+    # happen is a 0 — a config the CLI cannot load is a config the daemon cannot boot
+    # on, and that is a finding, not a pass. The two are told apart on stderr.
     monkeypatch.delenv("BASECRADLE_ROUTER_AGENTS")
 
-    assert main(["claims"]) == EXIT_CONFIG_ERROR
+    assert main(["claims"]) == 75
+    assert EXIT_CONFIG_ERROR == 75
     assert "configuration error" in capsys.readouterr().err
 
 
-def test_a_missing_trusted_actor_list_also_exits_three(box, monkeypatch) -> None:
+def test_a_missing_trusted_actor_list_is_also_unprovable(box, monkeypatch) -> None:
     # The emitter builds the same registry the daemon runs, so a config the daemon
     # would refuse to start on can never yield a manifest describing a live router.
     monkeypatch.delenv("BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS")

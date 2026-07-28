@@ -355,25 +355,54 @@ the privilege drop and sources `router.env` itself, so the NOC schedules one sta
 /opt/basecradle-router/app/deploy/bin/router-admin evidence               # the raw evidence document
 ```
 
+**Both claims surfaces are ratified, and they are not two spellings of one thing** (`basecradle-noc#408`,
+ruling 1): the **array on stdout** is what `provision-claims` reads per subject; the **`--out-dir`
+directory** is what the census walks. The filenames in that directory are a *constraint*, not a
+convention — `run-claim-probe` resolves `$CLAIMS_DIR/<component>@<os_user>.json` before it will run
+anything, so a file spelled any other way is a claim that can never be proven:
+
+| Subject | Filename |
+|---|---|
+| `box:<host>` | `basecradle-router.json` — no host in the name: one box gets one box-manifest per component, and a second spelling of a fact the body already carries is a thing that can later disagree with it |
+| `agent:<slug>` | `basecradle-router@<slug>.json`, where `<slug>` is the agent's OS user |
+
+> **Box-subject claims wait on `basecradle-noc#409`.** `provision-claims`/`run-claim-probe` are
+> agent-subject-only today — a probe run as any user other than the component's own daemon proves the
+> wrong principal, the same reasoning as this probe's own `ran_as_root → degraded`. The emitter writes
+> the box manifest regardless; just don't expect it to be *armed* before #409. The agent-subject
+> `wake-edge:*` claims are unaffected (evidence-kind, NOC-resolved).
+
 **Run the probe as the daemon's user — the wrapper does this for you.** Root bypasses file
 permissions, so a probe run as root would pass on a box where the daemon itself is locked out, which
 is exactly the failure it exists to catch. Run as root the wrapper re-execs itself via `runuser`; run
 as `router` it proceeds directly. The probe reports its own effective user (`ran_as`), so a drop that
 silently failed is still visible in the output.
 
-**Exit codes** (the contract the NOC schedules against):
+**Exit codes** (the contract the NOC schedules against — pinned by the contract owner in
+`basecradle-noc#408`, ruling 4). The ledger reads exactly three things:
 
-| Code | Meaning |
-|---|---|
-| `0` | **proven** — the surface is readable and would be honoured |
-| `1` | **proven broken** — unreadable or malformed; the check names the exact file |
-| `2` | **could not prove** — the lock dir does not exist, a lock is stale, or the probe ran as root |
-| `3` | **config error** — the router's own config would not load (the daemon could not boot on it either) |
+| Code | Ledger row | Meaning |
+|---|---|---|
+| `0` | **PASS** | **proven** — the surface is readable and would be honoured. The only thing recorded as evidence. |
+| `75` | **ERROR / unprovable** | **could not prove** — *we never got an answer.* `EX_TEMPFAIL`, the same sysexits vocabulary as the op family's `64`. The lock dir does not exist, a lock is stale, the probe ran as root, or the router's own config would not load. |
+| any other non-zero (`1` here) | **FAIL** | **proven broken** — *we asked; the answer is no.* Unreadable or malformed; the check names the exact file. |
 
-`2` is deliberately distinct from `1`: a fresh box whose wake-lock directory the NOC has not created
-yet must not look identical to a box whose freeze surface is unreadable. **If `/run/basecradle-noc/wake-locks`
-is created at converge, the probe reads `ok` on an idle box** — otherwise expect `degraded` with
-`dir_absent` until the NOC first takes a lock.
+**There is no warning tier, and `75` is not the quiet one.** *Cannot prove* is red and immediate; it is
+distinguished from FAIL by its name and its ledger row, never by being softer — a muffled "could not
+run" tier is the silent-death shape this whole program exists to kill. What still holds is that the two
+reds stay **distinct**: a fresh box must never look identical to a box whose freeze surface is
+genuinely unreadable.
+
+`75` is shared by the probe's `degraded` verdict and by a config the CLI could not load, because from
+the ledger's side those are one state. **The distinction rides on `stderr`** — one line naming the
+surface and the cause, which the NOC forwards (bounded tail) on any non-proven verdict. A green probe
+writes nothing there.
+
+**The wake-lock directory is created at converge** (`basecradle-noc#408`, ruling 3), so the probe reads
+`ok` on an idle converged box and `degraded`/`dir_absent` stays a genuinely abnormal signal. `/run` is
+tmpfs, so between a reboot and the first converge the directory can still be absent; the boot-time
+guarantee is a root-owned `tmpfiles.d` fragment riding `basecradle-noc#409` — NOC-side, nothing for
+this repo to do.
 
 **The three claims and what each closes:**
 
@@ -385,8 +414,19 @@ is created at converge, the probe reads `ok` on an idle box** — otherwise expe
 
 Each claim also carries a `detail` object beside Contract v1's pinned
 `claim`/`class`/`prove`/`evidence`/`ttl_hours` keys — the one additive extension, because the emitter
-must report not just whether an edge ever fired but whether one *exists*. A consumer reading only the
-pinned keys is unaffected.
+must report not just whether an edge ever fired but whether one *exists*. **Ratified as an optional
+additive key** (`basecradle-noc#408`, ruling 2): the NOC parses it, validates that it is an object and
+nothing more, and round-trips it, but never persists it to the ledger — it is for the reader and the
+operator. `"evidence": null` is explicitly legal. A consumer reading only the pinned keys is unaffected.
+
+**Instance 5 is asked per *recipient*, so the wake proof is kept per `(agent, route)`.** A route-wide
+accept counter says the sink works for *somebody*, and an agent-wide "last woken" says *something*
+reached the agent — neither answers *"can this route reach this agent?"*, and each greens the other's
+blind spot: one healthy recipient covers for six dead ones, and a github wake covers for a basecradle
+integration that 401s every delivery to the same agent. So every `webhook-route` edge carries **its
+own** `last_ok_at`/`last_ok_delivery`, and `detail.wakes.by_route` carries the full record (including
+routes no longer armed, which `edges` by definition drops). An armed edge with `last_ok_at: null`
+beside a sink counting hundreds of rejections is instance 5, for that one agent, in one row.
 
 **The evidence document** (`/var/lib/basecradle-router/evidence.json`, `0644`, no secrets) is what the
 daemon writes and the emitter reads — they are different processes, so a file is the only channel.

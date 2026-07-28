@@ -177,7 +177,10 @@ def test_a_stale_lock_is_degraded_not_failed(tmp_path) -> None:
     result = _run(tmp_path)
 
     assert result.status == DEGRADED
-    assert result.exit_code == 2
+    # The contract's one inconclusive sentinel (EX_TEMPFAIL) — still red, still
+    # immediate; distinguished from a FAIL by its name and its ledger row, never by
+    # being quieter (basecradle-noc#408, ruling 4).
+    assert result.exit_code == 75
     assert _check_for(result, f"{NOVA}.lock").state == "stale"
 
 

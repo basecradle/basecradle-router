@@ -27,11 +27,18 @@ instruments. The probe reports through its exit code and its JSON, and the NOC's
 ledger records what it ran; the ``evidence`` field in the emitted claim carries the
 daemon's own last self-test, which is exactly what a *pointer* should say.
 
-**Exit codes** are the probe contract: ``0`` proven, ``1`` proven broken, ``2``
-could not be proven (see :data:`~basecradle_router.selftest.EXIT_CODES`), and
-``3`` for a configuration error that stopped the command running at all — which is
-itself a finding, since a config the CLI cannot load is a config the daemon cannot
-boot on.
+**Exit codes** are the probe contract, and the contract owner pins three readings
+(basecradle-noc#408, ruling 4): ``0`` **proven** — the only thing that counts as
+evidence; ``75`` **unprovable** — we never got an answer; any other non-zero
+(``1`` here) **proven broken** — we asked, and the answer is no. See
+:data:`~basecradle_router.selftest.EXIT_UNPROVABLE`.
+
+A configuration error the CLI could not load shares the ``75`` code, because it is
+the same state: no answer. It is still a finding in its own right — a config the
+CLI cannot load is a config the daemon cannot boot on — so the *distinction* rides
+on **stderr**, which the NOC forwards on any non-proven verdict. There is
+deliberately no quieter "could not run" tier: a softened inconclusive is the
+silent-death shape this program exists to kill.
 """
 
 from __future__ import annotations
@@ -52,14 +59,18 @@ from basecradle_router.config import (
     load_wake_lock_dir,
 )
 from basecradle_router.evidence import read_evidence
-from basecradle_router.selftest import run_freeze_selftest
+from basecradle_router.selftest import EXIT_UNPROVABLE, OK, run_freeze_selftest
 from basecradle_router.wakelock import WakeLockGuard
 
-#: A configuration the CLI cannot load — distinct from every probe verdict, because
-#: "the router's own config is broken" is a different finding from "the surface this
-#: probe examines is broken", and a ledger that conflated them would send the NOC
-#: looking at the wrong thing.
-EXIT_CONFIG_ERROR = 3
+#: A configuration the CLI cannot load. It carries the contract's *unprovable*
+#: sentinel rather than a code of its own: from the ledger's side this is the same
+#: state as a probe that could not read its surface — **we never got an answer** —
+#: and the contract has no third non-zero tier to put it in. It is still a distinct
+#: *finding* ("the router's own config is broken" sends the NOC somewhere different
+#: from "the surface this probe examines is broken"), so the distinction is carried
+#: on **stderr**, where the NOC already forwards a bounded tail on any non-proven
+#: verdict.
+EXIT_CONFIG_ERROR = EXIT_UNPROVABLE
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -85,13 +96,19 @@ def _parser() -> argparse.ArgumentParser:
         description=(
             "Print a JSON array of Contract v1 manifests — one per subject: the box, "
             "then one per registered agent. With --out-dir, write each manifest to its "
-            "own single-subject file instead (the strict per-file contract shape)."
+            "own single-subject file instead (the strict per-file contract shape). The "
+            "two are different surfaces, not two spellings: stdout is what "
+            "provision-claims reads, the directory is what the census reads."
         ),
     )
     claims.add_argument(
         "--out-dir",
         metavar="DIR",
-        help="write one single-subject manifest file per subject into DIR",
+        help=(
+            "write one single-subject manifest file per subject into DIR, named as the "
+            "contract pins it: <component>.json for the box, <component>@<slug>.json "
+            "per agent"
+        ),
     )
     claims.add_argument("--host", help="override the box hostname used in the box subject")
     claims.set_defaults(handler=_cmd_claims)
@@ -106,7 +123,8 @@ def _parser() -> argparse.ArgumentParser:
         description=(
             "Read the wake-lock directory the way the daemon does and report whether the "
             "freeze control is readable, parseable, and would be honoured. Exit 0 proven, "
-            "1 proven broken, 2 could not be proven. Run as the daemon's user."
+            "1 proven broken, 75 could not be proven (the cause is on stderr). Run as "
+            "the daemon's user."
         ),
     )
     freeze.add_argument("--json", action="store_true", help="print the full result as JSON")
@@ -143,11 +161,13 @@ def _cmd_claims(args: argparse.Namespace) -> int:
 def _write_manifests(out_dir: str, manifests: list[dict]) -> None:
     """Write one strict single-subject manifest file per subject into ``out_dir``.
 
-    The array on stdout is the lossless form (many subjects, one component); this is
-    the form that drops straight into a ``claims.d``-style directory, one file per
-    ledger subject. Nothing here is atomic on purpose: the NOC's converge owns the
-    real discovery directory and its own write discipline — this is the convenience
-    path for an operator or a converge step that just wants the files.
+    The array on stdout and this directory are two **surfaces**, not two spellings of
+    one: stdout is what ``provision-claims`` reads per subject, the directory is what
+    the census walks. The filenames are the contract's, not ours — see
+    :func:`~basecradle_router.claims.manifest_filename`. Nothing here is atomic on
+    purpose: the NOC's converge owns the real discovery directory and its own write
+    discipline — this is the convenience path for an operator or a converge step that
+    just wants the files.
     """
     os.makedirs(out_dir, exist_ok=True)
     for manifest in manifests:
@@ -171,6 +191,16 @@ def _cmd_selftest_freeze(args: argparse.Namespace) -> int:
         print(f"  ran as: {result.ran_as}")
         for check in result.checks:
             print(f"  [{check.status}] {check.target}: {check.state} — {check.detail}")
+    if result.status != OK:
+        # The verdict on stderr, not only stdout. ``degraded`` and a config error share
+        # exit 75 by contract, so stderr is where the two are told apart — and it is the
+        # stream the NOC forwards on any non-proven verdict, whether or not --json was
+        # asked for. One line, naming the surface and the cause.
+        print(
+            f"freeze-readability: {result.status} "
+            f"(lock_dir={result.lock_dir} ran_as={result.ran_as}): {result.summary()}",
+            file=sys.stderr,
+        )
     return result.exit_code
 
 
