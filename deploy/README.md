@@ -654,7 +654,7 @@ the `router` user — so a merge that never reached the box surfaces in `systemc
 instead of going unnoticed for a day. It only reads; it never auto-deploys.
 
 #### The gap is classified, not just measured (issue #189)
-**Differing SHAs are not by themselves drift.** This repo carries four of the fleet's five
+**Differing SHAs are not by themselves drift.** This repo carries every one of the fleet's
 verbatim-shared artifacts, so every fleet-wide re-sync — routine, expected, frequent — lands a
 **docs-only** commit on `main` that changes nothing the box runs. Reddening a production alarm on those
 trains the operator to read red as "probably just docs again", which is precisely how the one genuine

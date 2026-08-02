@@ -1,7 +1,7 @@
 """The deployed-vs-main drift check — exercised offline against bash and a fixture repo.
 
 `deploy/drift-check.sh` is the alarm that makes a never-deployed merge loud. Issue #189
-was the alarm crying wolf on a schedule: this repo carries four of the fleet's five
+was the alarm crying wolf on a schedule: this repo carries every one of the fleet's
 verbatim-shared artifacts, so every fleet-wide re-sync lands a docs-only commit on main
 and reddened a production signal until someone ran a deploy that changed nothing. An
 alarm that is routinely red for a harmless reason converts a hard signal into a judgment
