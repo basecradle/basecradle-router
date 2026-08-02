@@ -9,8 +9,8 @@
 # is public, so the crown-jewels box needs no GitHub credential to ask "what is
 # main now?").
 #
-# The SHAs differing is NOT by itself drift (issue #189). This repo carries four of
-# the fleet's five verbatim-shared artifacts, so every fleet-wide re-sync — routine,
+# The SHAs differing is NOT by itself drift (issue #189). This repo carries every one
+# of the fleet's verbatim-shared artifacts, so every fleet-wide re-sync — routine,
 # expected, frequent — lands a docs-only commit on main that changes NOTHING the box
 # runs. Reddening on those trains the operator to read red as "probably just docs
 # again", which is exactly how the one genuine stale-daemon alarm gets waved through.
