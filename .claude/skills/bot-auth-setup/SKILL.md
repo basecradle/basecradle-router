@@ -19,7 +19,7 @@ git push "$("$HELPER" basecradle-router-ai --remote)" <branch>
 # equivalently: https://x-access-token:<token>@github.com/basecradle/basecradle-router.git
 ```
 
-With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and `gh api` all post as the bot. Re-mint per batch — the token is short-lived by design. (`gh api /user` 403s on an installation token — that is expected, not a failure; verify identity by reading/posting a repo resource instead.) The helper (`gh-app-token`) and its registry (`fleet-apps.json`) live in the founder's Claude workspace on the laptop; on the fleet server, each agent's own provisioned credentials (its GitHub App key under its OS user) serve this role — there is no shared laptop helper on the box.
+With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and `gh api` all post as the bot. Re-mint per batch — the token is short-lived by design. (`gh api /user` 403s on an installation token — that is expected, not a failure; verify identity by reading/posting a repo resource instead.) The helper (`gh-app-token`) and its registry (`fleet-apps.json`) live in @origin's Claude workspace on the laptop; on the fleet server, each agent's own provisioned credentials (its GitHub App key under its OS user) serve this role — there is no shared laptop helper on the box.
 
 ## Set the local git author (never committed)
 
