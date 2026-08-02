@@ -332,3 +332,69 @@ def test_wait_idle_times_out_while_a_wake_is_still_running() -> None:
         assert sched.wait_idle(timeout=5) is True
     finally:
         sched.shutdown()
+
+
+# --- a drain means the observer was told, too ------------------------------
+
+
+def test_a_drain_waits_for_the_queue_observer_to_be_told() -> None:
+    # The evidence store IS this observer, and it runs outside the scheduler's lock —
+    # so if `wait_idle` returned at lane-release, a drain-then-read would see the
+    # scheduler's published state mid-update: a `queued-wake` edge for an agent with
+    # nothing queued. That window is exactly what flaked test_probe.py twice (once on
+    # main), in both directions — a reader seeing `pending: 1` after the wake finished,
+    # and a late write moving the evidence file's mtime after the probe had returned.
+    #
+    # Gated on a real (if brief) sleep rather than an Event: the bug is a *race*, and a
+    # deterministic gate that made the observer slow enough to lose would also be slow
+    # enough to pass without the fix. The sleep makes the losing window wide enough that
+    # the pre-fix scheduler fails this every run, not one in a hundred.
+    delivered: list[tuple[str, int]] = []
+
+    def slow_observer(key: str, pending: int) -> None:
+        time.sleep(0.05)
+        delivered.append((key, pending))
+
+    sched = WakeScheduler(lambda *_a: None, lanes=1, on_queue_change=slow_observer)
+    try:
+        sched.submit(_agent("nova"), _event("nova", "go", 1), PipelineResult())
+        assert sched.wait_idle(timeout=5)
+        # Both notifications have LANDED by the time the drain returns — the settling
+        # `pending=0` above all, since that is the one a reader would miss. The exact
+        # ORDER is pinned too: they are the same agent's, so an inverted pair would
+        # leave the observer holding `pending=1` for an agent with an empty queue.
+        assert delivered == [("nova", 1), ("nova", 0)]
+    finally:
+        sched.shutdown()
+
+
+def test_an_observer_that_raises_cannot_wedge_a_drain() -> None:
+    # The claim is released in a `finally`, so a broken observer costs its caller a
+    # moment and nothing else — never a scheduler that can no longer report itself idle.
+    # Same posture as the existing guard one level in, which swallows the exception.
+    def broken_observer(_key: str, _pending: int) -> None:
+        raise RuntimeError("the evidence store is having a day")
+
+    sched = WakeScheduler(lambda *_a: None, lanes=1, on_queue_change=broken_observer)
+    try:
+        sched.submit(_agent("nova"), _event("nova", "go", 1), PipelineResult())
+        assert sched.wait_idle(timeout=5)
+    finally:
+        sched.shutdown()
+
+
+def test_a_drained_scheduler_keeps_no_per_agent_notification_state() -> None:
+    # The class promises a burst "leaves no residue". The delivery-order counters are
+    # per agent, so without the drop they would be one more dict growing by every agent
+    # ever scheduled — the unbounded-registry shape this scheduler is careful to avoid
+    # for `_queues`. Reaching into the internals is the point: the leak this pins is
+    # invisible from the public surface until the box has been up for months.
+    sched = WakeScheduler(lambda *_a: None, lanes=2, on_queue_change=lambda *_a: None)
+    try:
+        for n, slug in enumerate(("nova", "john", "nova", "pinky"), start=1):
+            sched.submit(_agent(slug), _event(slug, "go", n), PipelineResult())
+        assert sched.wait_idle(timeout=5)
+        assert sched._notify_seq == {}
+        assert sched._notify_turn == {}
+    finally:
+        sched.shutdown()
