@@ -52,6 +52,15 @@ runs lock-free on a worker thread. The condition doubles as the drain signal
 (:meth:`wait_idle`), so shutdown can block until every queued and in-flight wake has
 drained. The scheduler is framework-free (pure :mod:`threading`), so it is driven
 directly in offline tests without asyncio.
+
+Queue-change notifications run *outside* that lock (an observer writes to disk and must
+never stall dispatch), which leaves them needing two guarantees the lock would otherwise
+have given for free, and both are supplied explicitly: they are delivered **in the order
+their counts were read**, so the observer's last value is the current one rather than
+whichever thread won; and a **drain waits for them**, so "idle" means the published state
+says so too. Without the first, an agent can be left advertising a queued wake it does
+not have; without the second, anyone who drains and then reads gets a torn view. See
+:meth:`wait_idle`.
 """
 
 from __future__ import annotations
@@ -79,6 +88,15 @@ WakeRunner = Callable[[Agent, Event, PipelineResult], None]
 #: whether a wake is queued *right now* (a live, if transient, wake edge) rather than
 #: only that one happened once. Always called **outside** the scheduler's condition
 #: lock: an observer that writes to disk must never be able to stall dispatch.
+#:
+#: It does hold back a *drain*, though, and deliberately — see :meth:`WakeScheduler.wait_idle`.
+#: Dispatch has already happened by then (``_pump_locked`` runs inside the lock, before
+#: delivery), so a slow observer delays only the answer to "is everything finished?",
+#: which is the one question its own write is the evidence for.
+#:
+#: **An observer must not call back into the scheduler.** Deliveries for one agent are
+#: serialised in ticket order, so a re-entrant ``submit`` for that same agent would wait
+#: for a turn behind the delivery it is already inside. It is a sink for a count.
 QueueObserver = Callable[[str, int], None]
 
 
@@ -130,6 +148,35 @@ class WakeScheduler:
         # here is never also in `_ready`, so its next wake is not dispatched until this
         # one finishes.
         self._inflight: set[str] = set()
+        # Queue-change notifications decided but not yet DELIVERED to the observer.
+        # Claimed under `_cv` at the moment the count is read, released once the
+        # observer returns — so a drain cannot slip through the window in between.
+        # It is a counter, not a flag: several agents' notifications can be in flight
+        # at once (one per lane), and each must be settled before the box is idle.
+        self._notifying = 0
+        # Delivery order, PER AGENT. Each claim takes that agent's next `_notify_seq` as
+        # its ticket while holding `_cv` (so tickets are issued in the same order the
+        # counts were read), and delivers only once `_notify_turn` reaches it.
+        #
+        # Ordering is load-bearing, not tidiness: the observer records the LAST value it
+        # is handed, so a `pending=1` delivered after its own `pending=0` leaves the
+        # evidence document claiming a queued wake for an agent whose queue is empty —
+        # a phantom wake edge that survives until that agent is next woken. Both
+        # notifications for one agent genuinely can be in flight at once (an instant
+        # wake — a breaker refusal, a dedup hit — finishes while the submit that
+        # scheduled it is still inside the observer), so the race is reachable rather
+        # than theoretical.
+        #
+        # Keyed by agent rather than global BECAUSE `submit` runs on the event loop, and
+        # its notification is on the ack path (`server._spawn_wake` precedes the 202). A
+        # global order would make one agent's disk write able to delay another agent's
+        # ack — buying an ordering guarantee only ever needed within a single agent at
+        # the cost of coupling every agent to every other. Two agents never contend.
+        #
+        # Bounded like `_queues`: an agent's pair is dropped the moment its last
+        # outstanding notification is delivered, so a burst leaves no residue.
+        self._notify_seq: dict[str, int] = {}
+        self._notify_turn: dict[str, int] = {}
         # The number of wakes running == the number of lanes in use is exactly
         # `len(self._inflight)`: single-in-flight-per-agent means an agent key occupies
         # one lane while present here, so there is no separate active counter to keep in
@@ -167,7 +214,8 @@ class WakeScheduler:
                 self._ready_set.add(key)
             self._pump_locked()
             pending = self._pending_locked(key)
-        self._notify_queue_change(key, pending)
+            ticket = self._claim_notification_locked(key)
+        self._deliver_queue_change(key, pending, ticket)
 
     def _pump_locked(self) -> None:
         """Dispatch ready agents onto free lanes, most-fair first. Caller holds ``_cv``.
@@ -218,9 +266,12 @@ class WakeScheduler:
                     self._ready_set.add(key)
                 self._pump_locked()
                 pending = self._pending_locked(key)
-                # Wake any drain() waiter: this completion may have made us idle.
+                ticket = self._claim_notification_locked(key)
+                # Wake any drain() waiter: this completion may have made us idle. It
+                # will re-check and keep waiting until the notification below lands,
+                # because `_notifying` is part of the idle predicate.
                 self._cv.notify_all()
-            self._notify_queue_change(key, pending)
+            self._deliver_queue_change(key, pending, ticket)
 
     def _pending_locked(self, key: str) -> int:
         """This agent's queued jobs plus its in-flight one. Caller holds ``_cv``.
@@ -230,6 +281,46 @@ class WakeScheduler:
         claim reports as its transient ``queued-wake`` edge.
         """
         return len(self._queues.get(key, ())) + (1 if key in self._inflight else 0)
+
+    def _claim_notification_locked(self, key: str) -> int:
+        """Reserve ``key``'s next delivery slot and return its ticket. Holds ``_cv``.
+
+        Claiming here — in the same critical section that read ``pending`` — is what ties
+        the two together: the ticket order is the order the counts were taken, so
+        delivering in ticket order delivers the counts in the order they were true.
+        """
+        ticket = self._notify_seq.get(key, 0)
+        self._notify_seq[key] = ticket + 1
+        self._notifying += 1
+        return ticket
+
+    def _deliver_queue_change(self, key: str, pending: int, ticket: int) -> None:
+        """Wait for this ticket's turn, deliver it, then settle the drain accounting.
+
+        The caller has already claimed the slot under ``_cv``; this releases it in a
+        ``finally`` so a broken observer cannot wedge a drain — nor this agent's delivery
+        line behind it — forever. Same posture as :meth:`_notify_queue_change`'s own
+        guard, one level out.
+
+        The wait is on ``_cv`` but *releases* it (``wait_for``), so a thread waiting its
+        turn holds nothing and blocks no dispatch. Only same-agent deliveries serialise.
+        """
+        with self._cv:
+            self._cv.wait_for(lambda: self._notify_turn.get(key, 0) == ticket)
+        try:
+            self._notify_queue_change(key, pending)
+        finally:
+            with self._cv:
+                turn = ticket + 1
+                if turn == self._notify_seq.get(key):
+                    # Nothing else outstanding for this agent — drop the pair rather
+                    # than leave a counter per agent ever scheduled.
+                    del self._notify_seq[key]
+                    self._notify_turn.pop(key, None)
+                else:
+                    self._notify_turn[key] = turn
+                self._notifying -= 1
+                self._cv.notify_all()
 
     def _notify_queue_change(self, key: str, pending: int) -> None:
         """Tell the observer an agent's pending count changed. Never holds ``_cv``.
@@ -268,11 +359,22 @@ class WakeScheduler:
         self._saturated = saturated
 
     def _idle_locked(self) -> bool:
-        """True when nothing is running and nothing is queued. Caller holds ``_cv``."""
+        """True when nothing is running, nothing is queued, and every observer was told.
+
+        Caller holds ``_cv``.
+        """
         # No lane in use and nothing ready implies every `_queues` entry is drained: a
         # pending agent is always either in `_ready` or `_inflight`, so neither can hide
         # queued work once both are empty.
-        return not self._inflight and not self._ready
+        #
+        # `_notifying` is the third term, and it is what makes a drain mean the wake is
+        # *observable* as finished rather than merely finished. A queue-change observer
+        # runs outside `_cv` (below), so without it `wait_idle` could return in the
+        # window between a wake completing and its `pending -> 0` notification being
+        # delivered — and the evidence store IS that observer. A reader that drained
+        # first could then see a `queued-wake` edge for an agent with nothing queued,
+        # and on shutdown that phantom edge is what gets persisted.
+        return not self._inflight and not self._ready and not self._notifying
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until every queued and in-flight wake has finished; the server's drain.
@@ -281,6 +383,14 @@ class WakeScheduler:
         shut the pool down — it may be called repeatedly (each webhook test drains,
         then submits again), and on shutdown :meth:`shutdown` closes the pool after a
         final drain.
+
+        **"Finished" includes the queue-change notification.** A wake's last observable
+        act is telling the observer its agent is back to ``pending=0``, and that runs
+        outside ``_cv`` — so returning at lane-release would hand back a scheduler whose
+        published state still says a wake is queued. Anything that drains and then reads
+        the evidence document (the shutdown path, the claims emitter, every test that
+        asserts after a drain) would be reading a torn view. Waiting the extra
+        microseconds costs a drain nothing and makes "drained" mean what it says.
         """
         with self._cv:
             return self._cv.wait_for(self._idle_locked, timeout=timeout)
