@@ -37,6 +37,15 @@ _DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
 _WAKE_LOCK_DIR_VAR = f"{ENV_PREFIX}WAKE_LOCK_DIR"
 _EVIDENCE_FILE_VAR = f"{ENV_PREFIX}EVIDENCE_FILE"
 _ADMIN_CMD_VAR = f"{ENV_PREFIX}ADMIN_CMD"
+_SELF_URL_VAR = f"{ENV_PREFIX}SELF_URL"
+
+#: Where the synthetic-probe injector POSTs its signed test delivery: **the daemon's
+#: own loopback listener**, the same socket the systemd unit binds
+#: (``uvicorn --host 127.0.0.1 --port 8000``). Loopback and not the public hostname on
+#: purpose — the probe must exercise the daemon, not Caddy's TLS front end, and the
+#: injection point is deliberately not reachable from the internet (``deploy/caddy``
+#: answers ``/webhooks/probe`` with a 404).
+DEFAULT_SELF_URL = "http://127.0.0.1:8000"
 
 #: Where the deploy installs the wrapper that runs a probe with the daemon's own
 #: runtime credentials — the path an emitted claim's ``prove.cmd`` names. Lives here
@@ -66,14 +75,18 @@ class Config:
     builder, a bare slug for a harness persona) to the agent to wake;
     ``recipient_index`` maps a harness persona's BaseCradle user uuid to the same
     agent, so a basecradle event resolves by ``recipient_uuid`` while github
-    resolves by repo; ``webhook_secrets`` maps a route name to its signing secret;
-    ``enabled_routes`` is the set of routes the daemon will accept events for.
+    resolves by repo; ``harness_index`` maps every agent's ``harness_key`` (its OS
+    user — the universal identity) to it, which is how a source that addresses an
+    agent *as an agent* rather than through one platform's naming resolves;
+    ``webhook_secrets`` maps a route name to its signing secret; ``enabled_routes``
+    is the set of routes the daemon will accept events for.
     """
 
     agents: Mapping[str, Agent]
     enabled_routes: frozenset[str]
     webhook_secrets: Mapping[str, str]
     recipient_index: Mapping[str, Agent] = field(default_factory=lambda: _EMPTY)
+    harness_index: Mapping[str, Agent] = field(default_factory=lambda: _EMPTY)
 
     def agent_for(self, key: str) -> Agent:
         try:
@@ -88,9 +101,9 @@ class Config:
 
         Dispatches on the recipient's source-set tag without naming any source:
         ``"repo"`` is a direct key lookup (a github builder's key *is* its repo);
-        ``"recipient_uuid"`` consults the harness-persona index. An unknown tag or
-        an unregistered value is a loud :class:`ConfigError` (a registry gap),
-        never a silent miss.
+        ``"recipient_uuid"`` consults the harness-persona index; ``"harness_key"``
+        consults the by-OS-user index. An unknown tag or an unregistered value is a
+        loud :class:`ConfigError` (a registry gap), never a silent miss.
         """
         if recipient.by == "repo":
             return self.agent_for(recipient.value)
@@ -100,6 +113,14 @@ class Config:
             except KeyError:
                 raise ConfigError(
                     f"no agent registered for recipient_uuid {recipient.value!r}; "
+                    f"add it to the registry at {_AGENTS_VAR}"
+                ) from None
+        if recipient.by == "harness_key":
+            try:
+                return self.harness_index[recipient.value]
+            except KeyError:
+                raise ConfigError(
+                    f"no agent registered for harness_key {recipient.value!r}; "
                     f"add it to the registry at {_AGENTS_VAR}"
                 ) from None
         raise ConfigError(f"unknown recipient kind {recipient.by!r}")
@@ -119,6 +140,13 @@ class Config:
         A ``"repo"`` entry requires the key to be repo-shaped as well as present:
         every agent is in ``agents``, but a harness persona is keyed by a bare slug
         that no ``Recipient(by="repo", …)`` can ever carry.
+
+        ``"harness_key"`` is the tag every registered agent carries, builder and
+        persona alike — it is the OS user, the universal identity. It is still
+        checked against the index rather than assumed, for the same reason as the
+        other two: the answer must be *what resolution would actually do*, so that
+        two registry entries collapsing onto one harness instance report the tag for
+        the entry that owns it and not for its shadow.
         """
         kinds = set()
         if self.agents.get(agent.key) is agent and _is_repo_key(agent.key):
@@ -126,6 +154,8 @@ class Config:
         uuid = agent.recipient_uuid
         if uuid and self.recipient_index.get(uuid) is agent:
             kinds.add("recipient_uuid")
+        if self.harness_index.get(agent.harness_key) is agent:
+            kinds.add("harness_key")
         return frozenset(kinds)
 
     def webhook_secret(self, route: str) -> str:
@@ -154,14 +184,22 @@ def _split_csv(raw: str) -> frozenset[str]:
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
-    """Parse the registry into ``(agents-by-key, agents-by-recipient_uuid)``.
+def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent], dict[str, Agent]]:
+    """Parse the registry into ``(by-key, by-recipient_uuid, by-harness_key)``.
 
     An entry's ``kind`` selects how it is read: absent or ``"github"`` is a
     builder (keyed by its ``owner/name`` repo, woken via ``claude``); ``"harness"``
     is a non-builder persona (keyed by its bare slug, woken via its ``wake_bin``,
     resolved for basecradle events by its ``recipient_uuid``). Existing github
     entries — which carry no ``kind`` — therefore load unchanged.
+
+    The by-``harness_key`` index is built for **every** entry whatever its kind,
+    because the OS user is the one identity every agent has. Two entries sharing an
+    OS user are *one harness instance* by definition (constitution → unified
+    identity, and the reason the lock is keyed on it), so the first in registry
+    order wins rather than raising: unlike a duplicated ``recipient_uuid`` — which
+    would misroute one persona's events to another — a shared ``harness_key``
+    resolves to the same instance either way, which is the correct answer.
     """
     try:
         raw = json.loads(_read(path))
@@ -174,6 +212,7 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
 
     agents: dict[str, Agent] = {}
     by_recipient: dict[str, Agent] = {}
+    by_harness: dict[str, Agent] = {}
     for key, fields in raw.items():
         if not isinstance(fields, dict):
             raise ConfigError(f"agent entry for {key!r} must be a JSON object")
@@ -198,7 +237,8 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent]]:
                 "(expected 'github' or 'harness')"
             )
         agents[key] = agent
-    return agents, by_recipient
+        by_harness.setdefault(agent.harness_key, agent)
+    return agents, by_recipient, by_harness
 
 
 def _build_github_agent(key: str, fields: dict) -> Agent:
@@ -265,7 +305,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     agents_path = env.get(_AGENTS_VAR)
     if not agents_path:
         raise ConfigError(f"{_AGENTS_VAR} is required (path to the agent registry JSON)")
-    agents, by_recipient = _load_agents(agents_path)
+    agents, by_recipient, by_harness = _load_agents(agents_path)
 
     raw_routes = env.get(_ENABLED_ROUTES_VAR)
     if raw_routes is None:
@@ -289,6 +329,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         enabled_routes=enabled,
         webhook_secrets=MappingProxyType(secrets),
         recipient_index=MappingProxyType(by_recipient),
+        harness_index=MappingProxyType(by_harness),
     )
 
 
@@ -396,6 +437,23 @@ def load_admin_cmd(env: Mapping[str, str] | None = None) -> str:
     env = os.environ if env is None else env
     raw = (env.get(_ADMIN_CMD_VAR) or "").strip()
     return raw or DEFAULT_ADMIN_CMD
+
+
+def load_self_url(env: Mapping[str, str] | None = None) -> str:
+    """The daemon's own base URL, from ``BASECRADLE_ROUTER_SELF_URL``.
+
+    Optional, defaulting to :data:`DEFAULT_SELF_URL`. Read only by the
+    synthetic-probe injector (:mod:`basecradle_router.probe`), which POSTs a signed
+    test delivery back at the running daemon so the probe traverses the *real*
+    accept path — the HTTP front end, the registry lookup, the HMAC verify, the
+    normalize — rather than a library call that would prove none of it. The override
+    exists for a box whose daemon binds a different port; it must stay a loopback
+    address, because a probe routed through the public front end would prove Caddy's
+    liveness and quietly stop proving the daemon's.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(_SELF_URL_VAR) or "").strip()
+    return (raw or DEFAULT_SELF_URL).rstrip("/")
 
 
 def load_evidence_path(env: Mapping[str, str] | None = None) -> str | None:

@@ -37,6 +37,7 @@ from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
+from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.server import WebhookServer
 from basecradle_router.wake import HomeServerWaker, Waker
 from basecradle_router.wakelock import WakeLockGuard
@@ -88,6 +89,14 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
         )
     if "basecradle" in config.enabled_routes:
         registry.register(BasecradleRoute())
+    if ProbeRoute.name in config.enabled_routes:
+        # The router's own synthetic wake (basecradle-router#208). Registered exactly
+        # like a real source and behind the same enable-plus-secret gate, because that
+        # is the point: a probe is a genuine signed delivery through the genuine path,
+        # not a back door into the middle of it. A box that has not enabled it simply
+        # has no lever — the emitter then publishes no synthetic claim, so nothing
+        # advertises a capability this deployment does not have.
+        registry.register(ProbeRoute())
     return registry
 
 

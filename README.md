@@ -17,13 +17,20 @@ memory. See [`CLAUDE.md`](CLAUDE.md) → "One harness instance per agent."
 Because the router is the fleet's wake edge, it also has to **prove** its own claims: an agent can be
 registered, healthy, and permanently unreachable while every dashboard stays green. So the daemon
 emits Claims Manifest Contract v1 claims and records the evidence behind them for the NOC's
-claims-vs-evidence ledger, and it proves the NOC's freeze control is readable rather than assuming it:
+claims-vs-evidence ledger, proves the NOC's freeze control is readable rather than assuming it, and —
+for the one claim that only *using* the edge can settle — **exercises its own wake path** with a signed
+synthetic delivery, on-box, with no platform account and no trust edge with anyone:
 
 ```bash
 python -m basecradle_router claims             # wake-edge, freeze and delivery-sink claims
 python -m basecradle_router selftest freeze     # prove the freeze surface is readable right now
+<mint> | python -m basecradle_router probe wake --agent <slug>   # prove one agent's wake edge, by using it
 python -m basecradle_router evidence            # what this router has demonstrably done
 ```
+
+The synthetic wake is **token-free by construction** — the model binary is never started, and an agent
+with no probe secret armed is a refusal, never a fallback — and it reports `proven` only because the
+*daemon* recorded the wake, never because the probe itself exited zero.
 
 See [`CLAUDE.md`](CLAUDE.md) → "Proving the router's own claims" and
 [`deploy/README.md`](deploy/README.md) for the on-box invocation and the probe's exit codes.

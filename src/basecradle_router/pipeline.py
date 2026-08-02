@@ -312,12 +312,21 @@ class Pipeline:
         try:
             with self.locks.guard(agent.harness_key):
                 self._record(result, Stage.LOCK, Outcome.OK, **who)
+                # Every refusal below is tagged with the event's own source and
+                # provenance, so a probe refused by a gate is never mistaken for a
+                # production wake refused by it (and vice versa) — see
+                # :meth:`~basecradle_router.evidence.EvidenceStore.record_wake_refused`.
+                # Deliberately not named `origin`: an Event already has one, and it means
+                # something else entirely (the issue the agent reports back on).
+                provenance = {"route": event.source, "synthetic": event.synthetic}
                 if self.deduper.seen(event.dedup_key):
                     # A duplicate delivery of an event we already woke for — a
                     # deliberate, visible collapse, never a silent drop. Checked
                     # ahead of the wake-lock and breaker so a duplicate consumes
                     # neither's budget.
-                    self.evidence.record_wake_refused(agent.harness_key, "duplicate_delivery")
+                    self.evidence.record_wake_refused(
+                        agent.harness_key, "duplicate_delivery", **provenance
+                    )
                     self._record(
                         result, Stage.DEDUP, Outcome.IGNORED, **who, reason="duplicate_delivery"
                     )
@@ -326,7 +335,13 @@ class Pipeline:
                 if not decision.should_wake:
                     # The NOC holds a converge wake-lock for this agent — a
                     # deliberate, visible drop (the guard already logged it loudly).
-                    self.evidence.record_wake_refused(agent.harness_key, decision.detail)
+                    # A *probe* refused here is the freeze interlock working, and the
+                    # honest answer for that cycle is "we never got an answer", not a
+                    # dead edge — which is exactly what a refusal (never a failure)
+                    # tells the ledger.
+                    self.evidence.record_wake_refused(
+                        agent.harness_key, decision.detail, **provenance
+                    )
                     self._record(
                         result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
                     )
@@ -335,7 +350,9 @@ class Pipeline:
                 if not outcome.admitted:
                     # A trip/refusal is a deliberate, visible drop — recorded like the
                     # route's IGNORED decisions; the breaker already escalated loudly.
-                    self.evidence.record_wake_refused(agent.harness_key, outcome.detail)
+                    self.evidence.record_wake_refused(
+                        agent.harness_key, outcome.detail, **provenance
+                    )
                     self._record(
                         result, Stage.BREAKER, Outcome.IGNORED, **who, reason=outcome.detail
                     )
@@ -448,8 +465,17 @@ class Pipeline:
         entirely, so a flapping agent that eventually succeeded looked perfectly
         healthy, and one that did not showed a single failure where there had been
         three. Only exhaustion was ever visible.
+
+        **A synthetic probe gets exactly one attempt** (basecradle-router#208). Retry
+        exists so a flaky transport does not cost a real unit of work; a probe *is* the
+        measurement, and a measurement that retries reports the best of N rather than
+        the state of the system. Its two realistic failures argue the same way: an
+        agent with no probe secret armed refuses identically every time, so retrying
+        only triples the noise, and a genuinely transient fault is answered by the next
+        scheduled cycle — which is the honest place to answer it.
         """
         who = _who(agent, event)
+        attempts = 1 if event.synthetic else self.wake_attempts
         last_duration = 0.0
 
         # A wake failure is retryable transient by policy here (the boundary
@@ -476,18 +502,18 @@ class Pipeline:
             )
 
         try:
-            woke = with_retry(
-                attempt, attempts=self.wake_attempts, sleep=self.sleep, on_retry=on_retry
-            )
+            woke = with_retry(attempt, attempts=attempts, sleep=self.sleep, on_retry=on_retry)
         except RetryExhausted as exc:
             error = str(exc.__cause__ or exc)
-            self.evidence.record_wake_failed(agent.harness_key, error)
+            self.evidence.record_wake_failed(
+                agent.harness_key, error, route=event.source, synthetic=event.synthetic
+            )
             self._record(
                 result,
                 Stage.WAKE,
                 Outcome.FAILED,
                 **who,
-                attempts=self.wake_attempts,
+                attempts=attempts,
                 duration=_seconds(last_duration),
                 error=error,
             )
@@ -497,7 +523,12 @@ class Pipeline:
         # the router proves an agent is reachable rather than merely registered — and
         # without the route it proves only that *some* source reached the agent, which
         # would green a sibling route rejecting every delivery to that same agent.
-        self.evidence.record_wake_ok(agent.harness_key, event.delivery_id, route=event.source)
+        self.evidence.record_wake_ok(
+            agent.harness_key,
+            event.delivery_id,
+            route=event.source,
+            synthetic=event.synthetic,
+        )
         self._record(
             result,
             Stage.WAKE,

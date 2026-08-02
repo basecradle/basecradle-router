@@ -183,10 +183,21 @@ class Route(Protocol):
     (:mod:`basecradle_router.claims`) reads it off the registry rather than
     carrying a hard-coded source→agent-kind map, which would have made adding a
     route touch the emitter. Adding a source is still implementing one route.
+
+    ``synthetic`` says whether this route carries **manufactured** deliveries — a
+    probe the fleet fires at itself — rather than real traffic. It is declared for
+    the same reason ``recipient_kind`` is: the emitter must be able to leave a
+    synthetic route out of an agent's *production* wake edges without knowing any
+    route's name, or a probe would inflate ``edge_count`` and green the parked
+    builder it exists to expose (basecradle-router#208). Every route states its own
+    answer explicitly — there is no default, so the registry's ``isinstance`` gate
+    rejects a route that forgot to, and no source can be synthetic by accident or
+    real by omission.
     """
 
     name: str
     recipient_kind: str
+    synthetic: bool
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` if the request is unsigned or tampered."""

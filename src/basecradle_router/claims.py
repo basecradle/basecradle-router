@@ -32,6 +32,18 @@ never-proven**. The router emits; the NOC judges. We never grade our own homewor
   ``basecradle-platform@*`` delivery-sink rows retire in favour of
   (basecradle-noc#417, step 3) — so there is one row per armed ``(agent, route)``
   pair, and a route that is registered but not enabled gets none.
+- ``wake-edge:synthetic:<route>`` — one per **armed synthetic** route, same
+  ``agent:<slug>`` subject. The two rows above are proven only by something that
+  *happened*, and for a deliberately quiet agent nothing ever does — an
+  ``evidence``-kind claim cannot exercise itself, so its only remedy was a social one
+  (*"go message @pinky"*), which shared law now forbids outright: **a monitor never
+  depends on a consent or trust surface**. This row is the lever that replaces it — the
+  router firing a signed test delivery at its own real verify→wake path, on-box, with
+  no platform account and no relationship with anyone (`basecradle-noc#421`,
+  basecradle-router#208). It is proven by the *same* ``last_ok_at`` a real wake writes,
+  never by the probe process's own exit code, and it is deliberately **not** counted as
+  a wake edge: a probe is the fleet reaching an agent on purpose, not the world being
+  able to.
 - ``freeze-surface:readable`` — subject ``box:<host>``. Proven by *running* the
   freeze self-test (:mod:`basecradle_router.selftest`), because readability is not
   a fact you can look up; it is a fact you have to demonstrate with the daemon's
@@ -108,8 +120,8 @@ from basecradle_router.evidence import (
     EvidenceDocument,
     RouteWakeEvidence,
 )
-from basecradle_router.models import Agent
-from basecradle_router.routes import RouteRegistry
+from basecradle_router.models import Agent, WakeKind
+from basecradle_router.routes import Route, RouteRegistry
 from basecradle_router.selftest import EXIT_CODES as FREEZE_EXIT_CODES
 from basecradle_router.selftest import EXIT_UNPROVABLE
 from basecradle_router.wakelock import WakeLockGuard
@@ -154,7 +166,7 @@ def build_manifests(
     host = host or socket.gethostname()
     agents = sorted(_unique_agents(config), key=lambda a: a.harness_key)
     manifests = [
-        _box_manifest(config, evidence, guard, host, evidence_path, admin_cmd),
+        _box_manifest(config, registry, evidence, guard, host, evidence_path, admin_cmd),
     ]
     manifests += [
         _agent_manifest(agent, config, registry, evidence, guard, evidence_path) for agent in agents
@@ -181,18 +193,39 @@ def _unique_agents(config: Config) -> list[Agent]:
 
 def _box_manifest(
     config: Config,
+    registry: RouteRegistry,
     evidence: EvidenceDocument,
     guard: WakeLockGuard,
     host: str,
     evidence_path: str | None,
     admin_cmd: str,
 ) -> dict:
+    synthetic = _synthetic_route_names(registry)
     claims = [_freeze_claim(evidence, guard, admin_cmd)]
     claims += [
-        _delivery_sink_claim(route, evidence.delivery_sinks.get(route), evidence_path)
+        _delivery_sink_claim(
+            route,
+            evidence.delivery_sinks.get(route),
+            evidence_path,
+            synthetic=route in synthetic,
+        )
         for route in sorted(config.enabled_routes)
     ]
     return _manifest(f"box:{host}", claims)
+
+
+def _synthetic_route_names(registry: RouteRegistry) -> frozenset[str]:
+    """The registered routes that carry manufactured traffic, read off the registry.
+
+    Asked of the routes rather than spelled here, for the same reason
+    ``recipient_kind`` is: a hard-coded ``{"probe"}`` would make adding a second
+    synthetic source edit this file, and the core/routes split is the property the
+    whole daemon is shaped around. A route the registry does not hold is not synthetic
+    *as far as the emitter is concerned* — which is safe, because everything the
+    emitter tags this way is drawn from ``enabled_routes``, and an enabled route is by
+    construction registered (:func:`~basecradle_router.app.build_registry`).
+    """
+    return frozenset(route.name for route in registry.routes() if route.synthetic)
 
 
 def _freeze_claim(evidence: EvidenceDocument, guard: WakeLockGuard, admin_cmd: str) -> dict:
@@ -229,7 +262,11 @@ def _freeze_claim(evidence: EvidenceDocument, guard: WakeLockGuard, admin_cmd: s
 
 
 def _delivery_sink_claim(
-    route: str, sink: DeliverySinkEvidence | None, evidence_path: str | None
+    route: str,
+    sink: DeliverySinkEvidence | None,
+    evidence_path: str | None,
+    *,
+    synthetic: bool,
 ) -> dict:
     """This route's webhook sink has accepted a real delivery — instance 5's claim.
 
@@ -237,6 +274,14 @@ def _delivery_sink_claim(
     event which proves the shared secret on this box matches the one at the source.
     A sink with rejections and no accepts is a mismatched secret; one with neither
     has simply never been used, and the ledger must be able to tell them apart.
+
+    ``detail.synthetic`` says whether this sink carries manufactured traffic. The
+    probe route has a sink of its own — it is injected as a genuine signed delivery,
+    so it verifies and counts like any other — and the flag is what stops the ledger
+    from reading the fleet probing itself as evidence that an *external* integration
+    is armed. It is a distinct and useful row all the same: an injection point whose
+    accepts stop while its rejections climb is a rotated probe secret, told apart
+    from a dead prober exactly as any other sink is.
     """
     sink = sink or DeliverySinkEvidence()
     return {
@@ -248,11 +293,12 @@ def _delivery_sink_claim(
         },
         "evidence": (
             f"{sink.accepted} delivery(s) verified, last at {sink.last_accepted_at}"
+            + (" (synthetic — the router's own probe injection point)" if synthetic else "")
             if sink.last_accepted_at
             else None
         ),
         "ttl_hours": DELIVERY_SINK_TTL_HOURS,
-        "detail": {"route": route, **_sink_scalars(sink)},
+        "detail": {"route": route, "synthetic": synthetic, **_sink_scalars(sink)},
     }
 
 
@@ -299,6 +345,11 @@ def _agent_manifest(
     One row per armed edge, in the order :func:`_edges` already puts them — route name,
     the same rule as the box's sinks — so the two views of the same set never read in
     different orders.
+
+    Then, last, one row per armed **synthetic** exerciser (:func:`_synthetic_claim`).
+    Those are deliberately not part of the two views above: a probe is not a way the
+    world reaches this agent, it is the fleet reaching it on purpose, and counting it
+    as an edge would green the parked builder the first row exists to expose.
     """
     wake = evidence.agent_wakes.get(agent.harness_key) or AgentWakeEvidence()
     edges = _edges(agent, config, registry, wake)
@@ -307,6 +358,10 @@ def _agent_manifest(
         _route_wake_edge_claim(agent, wake, edge, evidence_path)
         for edge in edges
         if edge["kind"] == "webhook-route"
+    ]
+    claims += [
+        _synthetic_claim(agent, wake, route, evidence_path)
+        for route in _armed_routes(agent, config, registry, synthetic=True)
     ]
     return _manifest(f"agent:{agent.harness_key}", claims)
 
@@ -410,6 +465,13 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
     no longer armed — ``edges`` and the per-route claims carry only the armed ones, and a
     route that used to work and has since been disabled is precisely the parked-builder
     shape, worth keeping visible.
+
+    Each ``last_*`` trio carries its own ``route`` and ``synthetic`` flag, so this row
+    answers *what kind of traffic last proved this edge* without the reader having to
+    know which route names are the fleet's own probes. A ``last_ok_synthetic: true``
+    beside ``edge_count: 0`` is not a contradiction — it is the exact reading a parked
+    builder should produce: the terminus answers, and nothing in the world will ever
+    address it (basecradle-router#208).
     """
     return {
         "ok": wake.ok,
@@ -419,10 +481,15 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
         "last_ok_at": wake.last_ok_at,
         "last_ok_delivery": wake.last_ok_delivery,
         "last_ok_route": wake.last_ok_route,
+        "last_ok_synthetic": wake.last_ok_synthetic,
         "last_failed_at": wake.last_failed_at,
         "last_failed_reason": wake.last_failed_reason,
+        "last_failed_route": wake.last_failed_route,
+        "last_failed_synthetic": wake.last_failed_synthetic,
         "last_refused_at": wake.last_refused_at,
         "last_refused_reason": wake.last_refused_reason,
+        "last_refused_route": wake.last_refused_route,
+        "last_refused_synthetic": wake.last_refused_synthetic,
         "by_route": {route: _route_scalars(p) for route, p in sorted(wake.by_route.items())},
     }
 
@@ -436,15 +503,146 @@ def _route_scalars(proof: RouteWakeEvidence | None) -> dict:
     there* (unprovable — refused) from *the field is null* (FAIL — never demonstrated),
     which are very different findings.
 
-    One function, used by both the per-route claim's ``detail`` and the agent-wide
-    claim's ``edges``/``by_route`` views, so the several places this pair surfaces cannot
-    disagree about the same wake.
+    One function, used by the per-route claim's ``detail``, the synthetic claim's, and
+    the agent-wide claim's ``edges``/``by_route`` views, so the several places this row
+    surfaces cannot disagree about the same wake.
+
+    It carries all three outcomes, not only the successes: once one route is the fleet's
+    own probe, a row that reported only ``ok`` would leave "this edge has never been
+    exercised" and "every exercise of it was refused because the agent has no probe
+    secret armed" looking identical — the same *never tried* vs. *tried and it did not
+    work* confusion the per-route granularity was introduced to end.
     """
     return {
         "ok": proof.ok if proof else 0,
+        "failed": proof.failed if proof else 0,
+        "refused": proof.refused if proof else 0,
         "last_ok_at": proof.last_ok_at if proof else None,
         "last_ok_delivery": proof.last_ok_delivery if proof else None,
+        "last_failed_at": proof.last_failed_at if proof else None,
+        "last_failed_reason": proof.last_failed_reason if proof else None,
+        "last_refused_at": proof.last_refused_at if proof else None,
+        "last_refused_reason": proof.last_refused_reason if proof else None,
     }
+
+
+def _armed_routes(
+    agent: Agent, config: Config, registry: RouteRegistry, *, synthetic: bool
+) -> tuple[Route, ...]:
+    """The enabled, registered routes that can actually reach ``agent`` right now.
+
+    Three conditions that each fail independently — the route is registered, its
+    source is enabled on this box, and the agent is resolvable by the
+    ``recipient_kind`` it delivers by — which is why the check is structural rather
+    than "the agent is in the registry".
+
+    ``synthetic`` selects *which* population is being asked about, and the split is the
+    whole point: the real routes are the agent's production wake edges, and the
+    synthetic ones are levers the fleet can pull at that same terminus. Mixing them
+    would let a probe count as an edge, which would green a parked builder — the exact
+    reading (basecradle/basecradle#460, instance 4) the wake-edge claim exists to make
+    impossible. Name-ordered, like every other enumeration here, so a manifest built
+    twice from unchanged inputs is byte-identical.
+    """
+    resolvable = config.resolvable_by(agent)
+    return tuple(
+        route
+        for route in registry.routes()
+        if route.synthetic is synthetic
+        and route.name in config.enabled_routes
+        and route.recipient_kind in resolvable
+    )
+
+
+def _synthetic_claim(
+    agent: Agent, wake: AgentWakeEvidence, route: Route, evidence_path: str | None
+) -> dict:
+    """The router's own probe can wake this agent — the lever an ``evidence`` claim lacks.
+
+    Every other claim here is proven by something that *happened*: a delivery arrived, a
+    wake fired. For a deliberately quiet agent nothing ever does, and exercising an
+    ``evidence``-kind claim only re-reads the pointer — it cannot cause a wake. So a
+    healthy edge and a dead one are indistinguishable from outside, and the only
+    remedies left are social ones ("go message @pinky") — which is what shared law now
+    forbids: *a monitor never depends on a consent or trust surface*
+    (``constitution.md`` → Operational Baselines). This claim is the replacement lever
+    (`basecradle-noc#421`, basecradle-router#208).
+
+    **The probe's own verdict is deliberately not what proves it.** ``prove.kind`` is
+    ``evidence``, not ``probe``, and the pointer is the same ``last_ok_at`` a real wake
+    writes — so this row goes green only when the router itself recorded a successful
+    wake, which is the one fact the router can honestly state and the probe process
+    cannot fake by exiting zero.
+
+    ``detail.proves`` and ``detail.stops_before`` state the boundary plainly, because
+    the NOC decides what its ledger accepts as proof for which claim and must decide
+    knowing it: the probe traverses everything up to and including the privilege drop
+    into the agent's own context and the match of that agent's own probe secret, and
+    stops one step short of ``exec``-ing the model — the single step the fleet's
+    zero-token-at-rest constraint forbids. What it does not prove is that the model
+    binary *runs*; a wake that fails there is a failure that *happens*, which ordinary
+    telemetry already catches (``failed`` climbs, with the reason).
+    """
+    proof = wake.by_route.get(route.name)
+    return {
+        "claim": f"wake-edge:synthetic:{route.name}",
+        "class": "rare",
+        "prove": {
+            "kind": "evidence",
+            "source": _pointer(
+                evidence_path,
+                f"agent_wakes.{agent.harness_key}.by_route.{route.name}",
+                "last_ok_at",
+            ),
+        },
+        "evidence": (
+            f"synthetic wake acked at {proof.last_ok_at} delivery={proof.last_ok_delivery} "
+            f"route={route.name}"
+            if proof and proof.last_ok_at
+            else None
+        ),
+        "ttl_hours": WAKE_EDGE_TTL_HOURS,
+        "detail": {
+            "harness_key": agent.harness_key,
+            "route": route.name,
+            "resolves_by": route.recipient_kind,
+            "synthetic": True,
+            "proves": list(_PROBE_PROVES),
+            "stops_before": f"exec {_would_exec(agent)}",
+            **_route_scalars(proof),
+        },
+    }
+
+
+#: The stages a synthetic wake demonstrably traverses, in order — the honest inventory
+#: behind ``wake-edge:synthetic:<route>``. Every one of them is a real step of a real
+#: delivery, not a probe-only path: the probe is injected at the daemon's own front door
+#: precisely so that none of this is simulated.
+_PROBE_PROVES = (
+    "http_accept",
+    "signature_verify",
+    "normalize",
+    "resolve",
+    "agent_lock",
+    "delivery_dedup",
+    "noc_wake_lock",
+    "wake_rate_breaker",
+    "sudo_wake_runner",
+    "registry_pin",
+    "privilege_drop",
+    "agent_env_loaded",
+    "clone_cwd",
+    "probe_secret_match",
+)
+
+
+def _would_exec(agent: Agent) -> str:
+    """The binary a *real* wake would exec for this agent — what the probe stops before.
+
+    Named from the same registry field the wake-runner pins the launch against, so the
+    manifest cannot describe a boundary the wrapper does not actually draw.
+    """
+    return agent.wake_bin if agent.wake_kind is WakeKind.HARNESS else "claude"
 
 
 def _edges(
@@ -452,12 +650,18 @@ def _edges(
 ) -> list[dict]:
     """Every path by which this agent could be woken from now on, and what each proved.
 
-    A **webhook-route** edge exists for each registered route whose
-    ``recipient_kind`` the agent is actually resolvable by *and* whose source is
-    enabled — three conditions that can each fail independently, which is why the
-    check is structural rather than "the agent is in the registry". A **queued-wake**
-    edge exists while the scheduler holds pending work for the agent: transient, but
-    an edge, and the one that says a currently-silent agent is about to run.
+    A **webhook-route** edge exists for each registered, enabled route the agent is
+    resolvable by (:func:`_armed_routes`) that carries **real** traffic. A
+    **queued-wake** edge exists while the scheduler holds pending work for the agent:
+    transient, but an edge, and the one that says a currently-silent agent is about to
+    run.
+
+    A **synthetic** route is deliberately not an edge. Nothing in the world will wake an
+    agent through the router's own probe; only the fleet will, on purpose, to ask
+    whether the terminus answers. Counting it would put ``edge_count: 1`` on a builder
+    that no event can reach and quietly retire the parked-builder finding — the
+    instrument defeating itself. Its proof is emitted as its own claim instead
+    (:func:`_synthetic_claim`).
 
     Each webhook-route edge carries **its own** last successful wake, not the agent's,
     and is also emitted as a claim of its own (:func:`_route_wake_edge_claim`) so the
@@ -470,7 +674,6 @@ def _edges(
 
     An empty list is the other finding: nothing in existence will wake this agent.
     """
-    resolvable = config.resolvable_by(agent)
     edges = [
         {
             "kind": "webhook-route",
@@ -478,8 +681,7 @@ def _edges(
             "resolves_by": route.recipient_kind,
             **_route_scalars(wake.by_route.get(route.name)),
         }
-        for route in registry.routes()
-        if route.name in config.enabled_routes and route.recipient_kind in resolvable
+        for route in _armed_routes(agent, config, registry, synthetic=False)
     ]
     if wake.queued > 0:
         edges.append({"kind": "queued-wake", "pending": wake.queued})

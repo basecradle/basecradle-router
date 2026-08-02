@@ -72,7 +72,13 @@ def test_the_delivery_id_is_passed_as_an_inert_positional_never_interpolated() -
     # Same discipline as the trigger: root must never interpolate a caller-supplied
     # value into the shell it runs as the agent. It rides as a positional argument to
     # the single-quoted inner script, where it is only ever assigned, never evaluated.
-    assert '\' wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@"' in WAKE_RUNNER.read_text()
+    # The privilege drop is assembled once into `drop` and launched two ways (direct for
+    # a probe, journald-wrapped for a real wake — basecradle-router#208), so this pins
+    # the one assembly rather than each launch.
+    assert (
+        'drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" '
+        'wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@")'
+    ) in WAKE_RUNNER.read_text()
 
 
 # --- 3. Vector presentation + scrub ----------------------------------------

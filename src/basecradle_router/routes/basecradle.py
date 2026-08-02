@@ -106,6 +106,9 @@ class BasecradleRoute:
     #: resolve by ``Recipient(by="recipient_uuid", …)`` — see
     #: :class:`~basecradle_router.routes.base.Route`.
     recipient_kind = "recipient_uuid"
+    #: Real traffic: the platform delivers these because something happened on a
+    #: timeline the agent views.
+    synthetic = False
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.

@@ -92,7 +92,9 @@ def test_a_reject_reason_cannot_grow_the_document_without_bound(tmp_path) -> Non
 
 def test_a_successful_wake_records_the_ledgers_evidence_pointer(tmp_path) -> None:
     store = _store(tmp_path)
-    store.record_wake_ok(NOVA, "0192f3a4-5b6c-7d8e-9f01-00000000000a", route="github")
+    store.record_wake_ok(
+        NOVA, "0192f3a4-5b6c-7d8e-9f01-00000000000a", route="github", synthetic=False
+    )
 
     wake = store.snapshot().agent_wakes[NOVA]
     assert wake.ok == 1
@@ -111,8 +113,8 @@ def test_the_wake_proof_is_kept_per_route_not_only_per_agent(tmp_path) -> None:
     working one fired. That is the substitution the NOC declined (basecradle-noc#408).
     """
     store = _store(tmp_path)
-    store.record_wake_ok(NOVA, "delivery-1", route="github")
-    store.record_wake_ok(NOVA, "delivery-2", route="github")
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+    store.record_wake_ok(NOVA, "delivery-2", route="github", synthetic=False)
 
     wake = store.snapshot().agent_wakes[NOVA]
     assert wake.by_route["github"].ok == 2
@@ -126,10 +128,10 @@ def test_a_second_routes_first_wake_does_not_disturb_the_firsts_proof(tmp_path) 
     # another's timestamp, or a route that quietly stopped delivering would stay green
     # forever behind its healthy sibling.
     store = EvidenceStore(str(tmp_path / "evidence.json"), now=_Clock())
-    store.record_wake_ok(NOVA, "delivery-1", route="github")
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
 
     later = EvidenceStore(str(tmp_path / "evidence.json"), now=_Clock("2026-07-28T09:00:00+00:00"))
-    later.record_wake_ok(NOVA, "delivery-2", route="basecradle")
+    later.record_wake_ok(NOVA, "delivery-2", route="basecradle", synthetic=False)
 
     wake = later.snapshot().agent_wakes[NOVA]
     assert wake.by_route["github"].last_ok_at == "2026-07-27T12:00:00+00:00"
@@ -142,7 +144,9 @@ def test_the_per_route_record_round_trips_through_the_document(tmp_path) -> None
     # It is read by a different process than the one that wrote it, so the nested map
     # has to survive the file — and come back as objects, not the raw dicts on disk.
     path = str(tmp_path / "evidence.json")
-    EvidenceStore(path, now=_Clock()).record_wake_ok(NOVA, "delivery-1", route="github")
+    EvidenceStore(path, now=_Clock()).record_wake_ok(
+        NOVA, "delivery-1", route="github", synthetic=False
+    )
 
     reread = read_evidence(path).agent_wakes[NOVA].by_route["github"]
 
@@ -173,8 +177,10 @@ def test_a_refused_wake_is_never_confused_with_a_failed_one(tmp_path) -> None:
     # history is all refusals is suppressed, not unreachable — and the ledger must not
     # cry wolf over a converge.
     store = _store(tmp_path)
-    store.record_wake_refused(NOVA, "wake_lock_held until 2026-07-27T12:05:00+00:00")
-    store.record_wake_failed(NOVA, "claude exited 1")
+    store.record_wake_refused(
+        NOVA, "wake_lock_held until 2026-07-27T12:05:00+00:00", route="github", synthetic=False
+    )
+    store.record_wake_failed(NOVA, "claude exited 1", route="github", synthetic=False)
 
     wake = store.snapshot().agent_wakes[NOVA]
     assert (wake.ok, wake.refused, wake.failed) == (0, 1, 1)
@@ -186,7 +192,7 @@ def test_an_agent_never_woken_has_no_evidence_at_all(tmp_path) -> None:
     # The never-proven state the parked-builder detection reads. Silence in the
     # document is the finding, so it must be genuinely absent, not a zeroed row.
     store = _store(tmp_path)
-    store.record_wake_ok(JOHN, "delivery-1", route="github")
+    store.record_wake_ok(JOHN, "delivery-1", route="github", synthetic=False)
 
     assert NOVA not in store.snapshot().agent_wakes
 
@@ -226,11 +232,11 @@ def test_evidence_survives_the_daemon_restarting(tmp_path) -> None:
     # every proven capability read as never-proven.
     path = str(tmp_path / "evidence.json")
     first = EvidenceStore(path, now=_Clock())
-    first.record_wake_ok(NOVA, "delivery-1", route="github")
+    first.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
     first.record_delivery_accepted("github")
 
     revived = EvidenceStore(path, now=_Clock("2026-07-28T09:00:00+00:00"))
-    revived.record_wake_ok(NOVA, "delivery-2", route="github")
+    revived.record_wake_ok(NOVA, "delivery-2", route="github", synthetic=False)
 
     wake = revived.snapshot().agent_wakes[NOVA]
     assert wake.ok == 2  # counted on, not reset
@@ -240,7 +246,7 @@ def test_evidence_survives_the_daemon_restarting(tmp_path) -> None:
 
 def test_the_document_on_disk_is_the_documented_shape(tmp_path) -> None:
     store = _store(tmp_path)
-    store.record_wake_ok(NOVA, "delivery-1", route="github")
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
 
     written = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
     assert written["version"] == EVIDENCE_VERSION
@@ -252,7 +258,7 @@ def test_the_document_is_world_readable_for_the_nocs_converge(tmp_path) -> None:
     # The NOC's converge reads this without a privilege grant, and it holds no
     # secrets — so 0644, not mkstemp's default 0600.
     store = _store(tmp_path)
-    store.record_wake_ok(NOVA, "delivery-1", route="github")
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
 
     assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o644
 
@@ -260,7 +266,7 @@ def test_the_document_is_world_readable_for_the_nocs_converge(tmp_path) -> None:
 def test_a_flush_leaves_no_temp_files_behind(tmp_path) -> None:
     store = _store(tmp_path)
     for index in range(5):
-        store.record_wake_ok(NOVA, f"delivery-{index}", route="github")
+        store.record_wake_ok(NOVA, f"delivery-{index}", route="github", synthetic=False)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["evidence.json"]
 
@@ -275,7 +281,7 @@ def test_an_unwritable_store_degrades_to_memory_and_warns_once(tmp_path, caplog)
 
     with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
         for index in range(4):
-            store.record_wake_ok(NOVA, f"delivery-{index}", route="github")
+            store.record_wake_ok(NOVA, f"delivery-{index}", route="github", synthetic=False)
 
     assert store.snapshot().agent_wakes[NOVA].ok == 4  # still recorded in memory
     assert caplog.text.count("event=evidence_write_failed") == 1
@@ -330,7 +336,7 @@ def test_an_in_memory_store_never_touches_the_filesystem(tmp_path, monkeypatch) 
     monkeypatch.setattr("basecradle_router.evidence._atomic_write", explode)
     store = EvidenceStore(None, now=_Clock())
 
-    store.record_wake_ok(NOVA, "delivery-1", route="github")
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
 
     assert store.snapshot().agent_wakes[NOVA].ok == 1
 

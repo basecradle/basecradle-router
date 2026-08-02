@@ -74,6 +74,13 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
   app/                             # the daemon: checked-out repo + uv venv, owned by `router`
   app/deploy/bin/router-admin      # the admin CLI wrapper the NOC's converge + probes call
   bin/wake-runner                  # root-owned (root:root, 0755) privilege-drop wrapper
+  bin/probe-ack                    # root-owned (root:root, 0755) synthetic-wake verifier (#208).
+                                   #   Runs AS the agent (so it can read that agent's own
+                                   #   NOC_PROBE_SECRET) but must NOT be agent-writable, or the
+                                   #   account under test could rewrite its own verifier to
+                                   #   always ack. Root-owned outside app/ for the same reason
+                                   #   wake-runner is: a router-owned copy could be swapped for
+                                   #   one that exfiltrates the agent env it runs inside.
 /etc/basecradle-router/
   router.env                       # daemon config (owner router, 0600) — see below
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
@@ -174,6 +181,14 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 #   to also accept BaseCradle platform events (then the basecradle secret is required):
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the agent's BaseCradle integration_secret>
+#
+# The synthetic wake (issue #208) — add "probe" to enable the router's own lever for the
+# wake-edge claims. A route with no secret does not boot, deliberately: a probe is a
+# genuine signed delivery, not a back door into the middle of the path. Its injection
+# point is loopback-only (the Caddyfile 404s /webhooks/probe from the internet):
+# BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe
+# BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds the other copy>
+# BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000   # optional; must be the address uvicorn binds
 #
 # Wake-rate circuit breaker (the runaway-loop backstop, issue #110) — all optional,
 # generous defaults; only a genuine runaway should ever trip it:
@@ -353,6 +368,9 @@ the privilege drop and sources `router.env` itself, so the NOC schedules one sta
 /opt/basecradle-router/app/deploy/bin/router-admin claims --out-dir DIR   # one single-subject file per subject
 /opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json # the freeze-readability probe
 /opt/basecradle-router/app/deploy/bin/router-admin evidence               # the raw evidence document
+
+# the synthetic wake — marker on STDIN, minted by the NOC with that agent's own secret
+<mint> | /opt/basecradle-router/app/deploy/bin/router-admin probe wake --agent <slug> --json
 ```
 
 **Both claims surfaces are ratified, and they are not two spellings of one thing** (`basecradle-noc#408`,
@@ -404,14 +422,15 @@ tmpfs, so between a reboot and the first converge the directory can still be abs
 guarantee is a root-owned `tmpfiles.d` fragment riding `basecradle-noc#409` — NOC-side, nothing for
 this repo to do.
 
-**The four claims and what each closes:**
+**The five claims and what each closes:**
 
 | Claim | Subject | Class / TTL | Closes |
 |---|---|---|---|
 | `wake-edge:webhook-route` | `agent:<slug>` | `rare` / 168 h | **A parked builder with no re-wake path.** `detail.edges` lists every path that could wake the agent now (an armed webhook route, a queued wake); `evidence` is its last `stage=wake outcome=ok`. `edge_count: 0` **and** `evidence: null` is the gap, in one row. |
 | `wake-edge:webhook-route:<route>` | `agent:<slug>` | `rare` / 168 h | **An integration armed on paper, read per *recipient*.** One row per **armed** `(agent, route)` pair — the granularity instance 5 is actually asked at, and the rows the NOC's eight hand-written `basecradle-platform@*` rows retire in favour of (`basecradle-noc#417`). A route that is registered but not enabled gets no row: a claim states a capability the router has *now*. |
+| `wake-edge:synthetic:<route>` | `agent:<slug>` | `rare` / 168 h | **An evidence claim with no lever.** The two rows above go green only when something *happens*, and for a deliberately quiet agent nothing ever does. This row is the lever — the router's own synthetic wake — and it is proven by the *same* `last_ok_at` a real wake writes, never by the probe's own exit code. Emitted per **armed synthetic** route; deliberately **not** counted as a wake edge (see below). |
 | `freeze-surface:readable` | `box:<host>` | `rare` / 24 h | **The control that existed but could not be read.** A `probe` claim, not a pointer: readability is not a fact you look up, it is one you demonstrate with the daemon's own credentials. |
-| `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. |
+| `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. `detail.synthetic` marks the probe's own sink, so the fleet probing itself never reads as an external integration being armed. |
 
 **Every pointer the emitter declares resolves from the claim's own `detail`.** An `evidence`-kind
 claim's `prove.source` is a `<path>#<dotted.field>` pointer, and the NOC resolves it from the
@@ -425,6 +444,7 @@ into**, with the descriptive keys beside those fields rather than wrapped around
 |---|---|---|
 | `wake-edge:webhook-route` | `…#agent_wakes.<slug>.last_ok_at` | `last_ok_at` |
 | `wake-edge:webhook-route:<route>` | `…#agent_wakes.<slug>.by_route.<route>.last_ok_at` | `last_ok_at` |
+| `wake-edge:synthetic:<route>` | `…#agent_wakes.<slug>.by_route.<route>.last_ok_at` | `last_ok_at` |
 | `delivery-sink:<route>` | `…#delivery_sinks.<route>.last_accepted_at` | `last_accepted_at` |
 
 A pointer the rule cannot land on is refused with a named reason and reads `unprovable` — loud and
@@ -464,6 +484,90 @@ guard's fail-direction is to keep waking when a lock cannot be read (wedging eve
 permissions typo would be far worse), so a boot check that refused to start would silently invert
 that decision. **Fail-closed is the converge's job** — the NOC runs this probe at Layer 1 and turns
 the converge red. Loud here, closed there.
+
+### The synthetic wake — giving the wake-edge claim a lever (#208)
+
+The two `wake-edge:*` rows above are `evidence`-kind: they report the last time a wake demonstrably
+happened. For an agent nobody happens to address, nothing ever does, and *exercising* an
+`evidence` claim only re-reads its pointer — it cannot cause a wake. So a healthy edge and a
+permanently dead one are indistinguishable from outside, and the only remedy left was a social one
+(*"go message @pinky"*). Shared law closes that door: **a monitor never depends on a consent or trust
+surface**, and the system is never widened to make a monitor go green (`constitution.md` →
+Operational Baselines). The NOC's timeline-based prober is retired for every agent, @jt included
+(`basecradle-noc#421`). **The router owns the router→agent edge, so the router proves it.**
+
+**How it works, end to end.**
+
+1. The **NOC** mints a marker with *that agent's own* probe secret (`basecradle-noc#424`,
+   `mint-probe-secret`, one `0600` file per slug) and pipes it to the router's CLI on **stdin**.
+2. The **CLI**, running as the daemon's user, signs a probe body with **this box's `probe` route
+   secret** and POSTs it at the daemon's own **loopback** listener.
+3. The **daemon** treats it as the genuine delivery it is: HTTP front end → HMAC `verify` →
+   `normalize` → resolve → per-agent lock → dedup → **NOC wake-lock** → **wake-rate breaker** → wake.
+4. The **wake-runner** does everything a real wake does — validate against the root-owned registry,
+   resolve the exact binary this agent's kind sanctions, `runuser` to the agent, load its `agent.env`,
+   enter its clone — then execs the root-owned **`probe-ack`** verifier *as the agent*, which checks
+   the marker against that agent's own `NOC_PROBE_SECRET` and prints `BCNOC1-ACK <nonce>`.
+5. The daemon records `stage=wake outcome=ok`, so **`last_ok_at` moves** — the one fact only the
+   router can honestly state, and the thing the ledger reads.
+
+**Two secrets, two jobs, and neither is a trust edge.** The route secret authorises *injection into
+the router*; the agent's own secret proves the wake *arrived in that agent's context*. The router
+holds no agent secret and verifies nothing — which is exactly why a pass means something. Verification
+happens after the privilege drop, against a file only that agent can read, so a green probe says *the
+wake reached this account with this account's credentials loaded*. No platform account, no timeline,
+no relationship with anyone.
+
+**Token-free is structural, not a promise.** `claude -p "<marker>"` would *be* a model call, so there
+is no code path that can build a model command for a synthetic event — `wake_command` raises, and the
+wrapper's `--probe` mode is mutually exclusive with a command after `--`. An agent with **no**
+`NOC_PROBE_SECRET` armed is a **refusal** (exit `75`) with nothing launched; there is deliberately no
+fallback from an unarmed agent to a real wake.
+
+**What it proves, and what it stops before** — stated on the claim itself (`detail.proves`,
+`detail.stops_before`) so the NOC judges knowing it. It proves the whole router path plus the sudo
+boundary, the registry pin, the privilege drop, the agent's own env, its clone, and its probe secret.
+It stops one step short of `exec`-ing the model binary — the single step the zero-token-at-rest
+constraint forbids. It does **not** prove the model binary *runs*; a wake that fails there is a
+failure that *happens*, which ordinary telemetry already catches (`failed` climbs, with the reason).
+
+**A probe is a lever, never an edge.** Nothing in the world will wake an agent through the router's
+own probe, so it is excluded from `detail.edges` and `edge_count`. Counting it would put
+`edge_count: 1` on a builder no event can reach and quietly retire the parked-builder finding — the
+instrument defeating itself. A parked builder correctly reads `edge_count: 0` **with**
+`last_ok_synthetic: true`: the terminus answers, and nothing in the world will ever address it.
+
+**A synthetic never masquerades as real traffic.** It lands in its own `delivery_sinks.probe` and its
+own `agent_wakes.<slug>.by_route.probe`, and every `last_ok_*`/`last_failed_*`/`last_refused_*` trio
+records its `route` and a `synthetic` flag *at write time* — not derived at read time, where a route
+since disabled would silently answer "real".
+
+**Enabling it** (NOC-side config; the daemon will not boot on a route with no secret):
+
+```bash
+BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe
+BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds the other copy>
+# optional; must stay a loopback address the daemon actually binds:
+# BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000
+```
+
+Install `deploy/bin/probe-ack` root-owned beside the wrapper — it runs *as* the agent but must not be
+*writable* by it, or the account under test could rewrite its own verifier to always ack:
+
+```bash
+install -o root -g root -m 0755 deploy/bin/probe-ack /opt/basecradle-router/bin/
+```
+
+**Exit codes** are the same three readings as every probe here: `0` proven (the daemon recorded a
+successful wake for *this* delivery id), `1` proven broken (the injection was structurally refused, or
+the wake was dispatched and failed — including a probe secret that has drifted between the NOC's copy
+and the agent's), `75` could not prove (the route is not enabled, a gate *refused* the wake — a live
+converge freeze is the common one — or nothing was recorded before the deadline). The refused-vs-failed
+split the evidence store already draws maps exactly onto `unprovable`-vs-`broken`.
+
+**The injection point is not reachable from the internet.** The CLI posts over loopback, and the
+Caddyfile answers `/webhooks/probe` with a `404` — the same answer an unknown route gives, so it
+leaks nothing about whether the route exists.
 
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
@@ -600,6 +704,7 @@ from the deployed tree / box, and they are this repo's to keep stable:
 |---|---|
 | `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. |
 | `deploy/bin/wake-runner` | reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/wake-runner` on every deploy. |
+| `deploy/bin/probe-ack` | **NOT yet in the op's routine band — a one-time provisioning step (#208).** Install root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/probe-ack`. Until it is there, `probe wake` reports `75` / *unprovable* naming the exact `install` command, and no other path is affected. Ideally the op's `wake-runner` line becomes a `deploy/bin/*` glob, so the next root-owned helper is not a provisioning change either. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
 | `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. |
@@ -612,6 +717,12 @@ from the deployed tree / box, and they are this repo's to keep stable:
 > enabled directly (or a new root-owned file outside `app/` beyond `wake-runner`) is therefore a
 > **provisioning change**, not a routine deploy — out of the op's routine band by design. New **timers** and
 > new **unit files** are handled automatically (the timer arm-loop and the unit glob).
+>
+> **`deploy/bin/probe-ack` is the first case of that second clause** (#208): a new root-owned file outside
+> `app/`, so it needs one provisioning install. Its absence fails *safe and loud* — the wrapper refuses with
+> `75` naming the exact `install` command, and nothing else on the box changes — but it is worth turning the
+> op's single `wake-runner` line into a `deploy/bin/*` glob so root-owned helpers join units in the
+> handled-automatically column.
 
 > **Why the op globs units rather than a router-owned `deploy/apply.sh`?** Considered and declined
 > (basecradle#395). The unit glob already drift-proofs the common evolution (adding a unit), so an
@@ -630,13 +741,27 @@ Once the NOC path is live on the box, it is never used again, and this fallback 
 
 ### The live smoke test: `deploy/smoke-test.sh`
 Proves the **running** daemon enforces the boundary — not that code merged, but that the bytes serving
-traffic right now behave. Three synthetic, GitHub-shaped, HMAC-signed webhooks at the live endpoint:
+traffic right now behave. Synthetic, HMAC-signed webhooks at the live endpoint — three GitHub-shaped:
 
 | Case | Webhook | Asserted | Proves |
 |---|---|---|---|
 | 1 | bad signature | **401** | the HMAC verify boundary holds |
 | 2 | valid sig, **untrusted** sender | **400** | the #52 trusted-actor gate **rejects** strangers |
 | 3 | valid sig, **trusted** sender, **unregistered** repo | **200** | the gate **admits** the fleet — and no agent is woken (resolve finds none) |
+
+Cases 4–5 do the same for the `basecradle` route once the capital wires it (self-gated on the secret and
+on the running daemon actually serving the route). Cases 6–7 pin where the **synthetic wake's** injection
+point lives (#208):
+
+| Case | Request | Asserted | Proves |
+|---|---|---|---|
+| 6 | `POST` the **public** `/webhooks/probe` | **404** | the injection point is **not reachable from the internet** — Caddy denies it |
+| 7 | `POST` **loopback** `/webhooks/probe`, bad signature | **401** | the daemon serves it on-box, and the shared HMAC boundary rejects |
+
+**Case 6 is asserted unconditionally**, unlike every other route case, and that asymmetry is the point: the
+probe route can fire a wake at *any* registered agent, so its reachability from the internet must never
+quietly become true — not when the route is disabled, not when a Caddyfile is re-templated. Neither case
+carries a valid signature, so nothing is normalized and no agent is ever woken.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secret

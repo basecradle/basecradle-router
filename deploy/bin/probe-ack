@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""probe-ack — verify a NOC probe marker AS THE AGENT, and ack it without a model call.
+
+Installed ROOT-OWNED at /opt/basecradle-router/bin/probe-ack (root:root, 0755, in a
+root-owned directory no agent can write), and exec'd by wake-runner *after* it has
+dropped to the agent's own OS user and loaded that agent's `agent.env`. It is the last
+step of the router's synthetic wake (basecradle-router#208):
+
+    sudo wake-runner --user <slug> --cwd <clone> --probe "BCNOC1 <nonce> <hmac>"
+      -> validate against the root-owned registry, resolve the agent's sanctioned binary
+      -> runuser to <slug>, load agent.env, cd into the clone
+      -> exec THIS, which verifies the marker and prints an ack
+
+WHY IT RUNS AS THE AGENT. The secret is the agent's own `NOC_PROBE_SECRET`, delivered
+per agent by `basecradle-noc mint-probe-secret` into a 0600 file only that agent can
+read. Verifying here — as that account, from that file's contents — is what makes a pass
+mean *the wake reached this agent's own context with this agent's own credentials
+loaded*. The router never holds the secret and verifies nothing; the NOC holds the other
+copy and mints. Three parties, no trust edge, no platform identity, no timeline.
+
+WHY IT IS ROOT-OWNED. It runs as the agent but must not be *writable* by the agent, or
+the account under test could replace its own verifier with one that always acks — a
+monitor whose subject can forge its result is not a monitor.
+
+WHY IT NEVER TOUCHES THE MODEL. The fleet's one hard constraint is that nothing burns a
+token at rest. This program imports `hmac` and `sys` and prints one line; there is no
+path from here to a provider call, which is why "token-free" is a structural property of
+the router's probe rather than a promise some other program keeps. An agent with no
+secret armed exits 75 and NOTHING is launched — a refusal, never a fallback.
+
+EXIT CODES — the same three readings every probe in this repo reports:
+
+    0   acked           the marker verified; `BCNOC1-ACK <nonce>` on stdout
+    1   proven broken   the marker did NOT verify — the NOC's copy of this agent's
+                        probe secret and the agent's own copy have drifted apart
+    75  could not prove no NOC_PROBE_SECRET armed for this agent (EX_TEMPFAIL, the
+                        contract's one inconclusive sentinel)
+
+THE ACK IS NOT SIGNED, deliberately — its authenticity is *who produced it*, and the
+answer is "a process running as this agent, holding this agent's secret, reached by the
+router's real wake path". A signature would prove only that some secret-holder wrote a
+line, which says nothing about whether the wake arrived. Same reasoning as the harness's
+`_probe.ack_line` and the NOC's `marker.ack_line`, which this matches byte-for-byte.
+
+This is the verifying mirror of basecradle-noc's `src/basecradle_noc/marker.py`; the
+scheme is re-implemented rather than imported because repo sovereignty forbids reaching
+across, and it MUST agree with it byte-for-byte on the format.
+"""
+
+from __future__ import annotations
+
+import hmac
+import os
+import re
+import sys
+from hashlib import sha256
+
+SCHEME = "BCNOC1"
+ACK_TAG = f"{SCHEME}-ACK"
+PROBE_SECRET_ENV = "NOC_PROBE_SECRET"
+
+EXIT_ACKED = 0
+EXIT_BROKEN = 1
+#: EX_TEMPFAIL, the contract's inconclusive sentinel — kept in lockstep with
+#: selftest.EXIT_UNPROVABLE, router-admin, and wake-runner. "We never got an answer" is
+#: one state however it arose, and it is still red and still immediate.
+EXIT_UNPROVABLE = 75
+
+# Fully anchored, matching src/basecradle_router/marker.py: here the marker IS the whole
+# argument, so anything around it is a defect rather than surrounding context. The
+# wake-runner has already applied the same pattern; this is the innermost of three
+# independent checks, and it refuses on its own authority rather than trusting them.
+_MARKER_RE = re.compile(rf"\A{SCHEME} (?P<nonce>[A-Za-z0-9_-]{{1,128}}) (?P<hmac>[0-9a-f]{{64}})\Z")
+
+
+def _signature(nonce: str, secret: str) -> str:
+    """The hex HMAC-SHA256 over "SCHEME nonce", keyed by this agent's probe secret."""
+    return hmac.new(secret.encode(), f"{SCHEME} {nonce}".encode(), sha256).hexdigest()
+
+
+def main(argv: list[str]) -> int:
+    if not 1 <= len(argv) <= 2:
+        print(f"probe-ack: usage: probe-ack '{SCHEME} <nonce> <hmac>' [would-exec]", file=sys.stderr)
+        return EXIT_UNPROVABLE
+    marker = argv[0]
+    would_exec = argv[1] if len(argv) > 1 else "(unknown)"
+
+    match = _MARKER_RE.match(marker)
+    if match is None:
+        print(f"probe-ack: refusing: not a well-formed {SCHEME} marker", file=sys.stderr)
+        return EXIT_BROKEN
+
+    secret = os.environ.get(PROBE_SECRET_ENV, "")
+    if not secret:
+        # The refusal that keeps the fleet's zero-token-at-rest constraint true. It is
+        # reported as *unprovable* rather than broken because an agent nobody has armed
+        # is a configuration state, not a dead wake edge — and nothing was launched.
+        # "could not prove:" is a contract token, not prose: the router reads it back off
+        # the recorded failure reason to keep this refusal in the *unprovable* bucket
+        # rather than the *broken* one — see UNPROVABLE_MARKER in the router's probe.py.
+        # Reporting an un-armed agent as a broken wake edge would page for a
+        # configuration step. Keep the exact spelling when editing this message.
+        print(
+            f"probe-ack: could not prove: no {PROBE_SECRET_ENV} armed for "
+            f"{os.environ.get('USER') or os.environ.get('LOGNAME') or 'this agent'}; "
+            "arm it with `basecradle-noc mint-probe-secret --agent <slug>`. "
+            "Refusing rather than falling through to a real wake.",
+            file=sys.stderr,
+        )
+        return EXIT_UNPROVABLE
+
+    nonce = match.group("nonce")
+    if not hmac.compare_digest(_signature(nonce, secret), match.group("hmac")):
+        print(
+            f"probe-ack: proven broken: the marker does not verify against this agent's "
+            f"{PROBE_SECRET_ENV} — the NOC's copy and this agent's copy have drifted; "
+            "re-run `basecradle-noc mint-probe-secret`, which writes both.",
+            file=sys.stderr,
+        )
+        return EXIT_BROKEN
+
+    # The ack, plus the one fact only this side of the boundary can state: the wake
+    # reached this agent's own context, in its own clone, with its own env loaded — and
+    # stopped exactly here, before the binary a real wake would have run.
+    print(f"{ACK_TAG} {nonce}")
+    print(
+        f"probe-ack: acked as {os.environ.get('USER') or os.environ.get('LOGNAME') or '?'} "
+        f"in {os.getcwd()}; a real wake would have exec'd {would_exec}"
+    )
+    return EXIT_ACKED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
