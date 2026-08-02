@@ -27,6 +27,10 @@ class FakeRoute:
     # the wake-edge claims emitter can ask the registry which agents a route can
     # actually reach without ever naming a source itself.
     recipient_kind = "repo"
+    # Also part of the protocol: whether this source carries manufactured traffic. Every
+    # route states its own answer — there is no default, so a route that forgot is
+    # rejected by the registry rather than silently counted as real.
+    synthetic = False
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         if request.header("X-Fake-Signature") != secret:

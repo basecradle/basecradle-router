@@ -8,6 +8,13 @@
 #   /opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json
 #   /opt/basecradle-router/app/deploy/bin/router-admin claims
 #   /opt/basecradle-router/app/deploy/bin/router-admin evidence
+#   <mint> | .../router-admin probe wake --agent <slug> --json     # the synthetic wake (#208)
+#
+# `probe wake` needs the drop for a second reason on top of the one below: it reads the
+# `probe` route's signing secret out of router.env (0600, daemon-owned) to sign the
+# delivery it fires at the daemon's own loopback listener. Its BCNOC1 marker arrives on
+# STDIN — minted by the NOC with the recipient agent's own probe secret, which the router
+# never holds — and stdin survives the `runuser` re-exec below because `exec` keeps fds.
 #
 # WHY THE PRIVILEGE DROP IS THE POINT, not a nicety. `selftest freeze` proves the
 # NOC wake-lock directory is readable *with the credentials the daemon actually

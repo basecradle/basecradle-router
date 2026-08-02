@@ -2,9 +2,10 @@
 
     python -m basecradle_router claims            # the Contract v1 claims manifests
     python -m basecradle_router selftest freeze   # prove the freeze surface is readable
+    python -m basecradle_router probe wake …      # prove one agent's wake edge, by using it
     python -m basecradle_router evidence          # dump the raw evidence document
 
-Three subcommands, one purpose: everything the claims-vs-evidence ledger
+Four subcommands, one purpose: everything the claims-vs-evidence ledger
 (basecradle/basecradle#460, basecradle-noc#406) needs from this component, reached
 without the running daemon. That matters — the emitter and the probe run from the
 NOC's converge, in a *different process* from the daemon, which is why the daemon
@@ -26,6 +27,13 @@ probe accidentally run as root would leave the state file root-owned and lock th
 instruments. The probe reports through its exit code and its JSON, and the NOC's
 ledger records what it ran; the ``evidence`` field in the emitted claim carries the
 daemon's own last self-test, which is exactly what a *pointer* should say.
+
+That rule is what gives ``probe wake`` its integrity too, and it is worth stating in
+its own right: the synthetic wake reports ``proven`` **only** because the *daemon*
+recorded a successful wake carrying the delivery id this run minted. The probe
+process cannot write that record, so it cannot manufacture its own pass — which is
+the property the design was asked for (*"the probe's own PASS is not the proof;
+``last_ok_at`` moving is"* — `basecradle-noc#421`).
 
 **Exit codes** are the probe contract, and the contract owner pins three readings
 (basecradle-noc#408, ruling 4): ``0`` **proven** — the only thing that counts as
@@ -56,9 +64,12 @@ from basecradle_router.config import (
     load_admin_cmd,
     load_config,
     load_evidence_path,
+    load_self_url,
     load_wake_lock_dir,
 )
 from basecradle_router.evidence import read_evidence
+from basecradle_router.probe import DEFAULT_TIMEOUT, ProbeError, WakeProbe
+from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.selftest import EXIT_UNPROVABLE, OK, run_freeze_selftest
 from basecradle_router.wakelock import WakeLockGuard
 
@@ -129,6 +140,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     freeze.add_argument("--json", action="store_true", help="print the full result as JSON")
     freeze.set_defaults(handler=_cmd_selftest_freeze)
+
+    probe = sub.add_parser(
+        "probe", help="exercise a control surface by using it, and report what moved"
+    )
+    kinds = probe.add_subparsers(dest="kind", required=True)
+    wake = kinds.add_parser(
+        "wake",
+        help="prove one agent's wake edge by firing a signed synthetic delivery at it",
+        description=(
+            "Fire a signed test delivery at this daemon's own real verify->wake path for "
+            "one agent, then report whether the DAEMON recorded a successful wake for it. "
+            "The BCNOC1 marker is read from stdin (never argv) and is minted by the NOC "
+            "with that agent's own probe secret — the router holds no agent's secret and "
+            "verifies nothing. Exit 0 proven, 1 proven broken, 75 could not be proven."
+        ),
+    )
+    wake.add_argument(
+        "--agent",
+        required=True,
+        metavar="SLUG",
+        help="the recipient's harness_key (its OS-user slug — the agent's universal identity)",
+    )
+    wake.add_argument("--json", action="store_true", help="print the full result as JSON")
+    wake.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "how long to wait for the daemon to record an outcome "
+            f"(default {DEFAULT_TIMEOUT:.0f}s; a probe queued behind a live session waits)"
+        ),
+    )
+    wake.set_defaults(handler=_cmd_probe_wake)
 
     evidence = sub.add_parser(
         "evidence",
@@ -201,6 +246,51 @@ def _cmd_selftest_freeze(args: argparse.Namespace) -> int:
             f"(lock_dir={result.lock_dir} ran_as={result.ran_as}): {result.summary()}",
             file=sys.stderr,
         )
+    return result.exit_code
+
+
+def _cmd_probe_wake(args: argparse.Namespace) -> int:
+    """Fire one synthetic wake at ``--agent`` and report what the daemon's evidence said.
+
+    The marker is read from **stdin**, never argv: it is minted by the NOC with the
+    recipient's own probe secret, and a value on the command line would be visible in
+    ``ps`` to every account on the box. (A marker is not itself a secret — it is an HMAC
+    over a one-time nonce — but the discipline is the NOC's own for
+    ``mint-probe-secret``, and one exception is how a rule stops being a rule.)
+
+    A :class:`~basecradle_router.probe.ProbeError` is *not* a verdict about the wake
+    edge — it means the probe could not be attempted (an unusable marker, a daemon that
+    would not answer) — so it reports the contract's inconclusive sentinel with the cause
+    on stderr, exactly as a configuration error does.
+    """
+    config = load_config()
+    marker = sys.stdin.read().strip()
+    probe = WakeProbe(
+        secret=config.webhook_secret(ProbeRoute.name),
+        evidence_path=load_evidence_path(),
+        self_url=load_self_url(),
+        timeout=args.timeout,
+    )
+    try:
+        result = probe.run(args.agent, marker)
+    except ProbeError as exc:
+        print(f"synthetic-wake: unprovable: {exc}", file=sys.stderr)
+        return EXIT_UNPROVABLE
+
+    if args.json:
+        print(json.dumps(result.to_json(), indent=2))
+    else:
+        print(f"synthetic-wake: {result.status} (agent={result.harness_key} route={result.route})")
+        print(f"  delivery: {result.delivery_id} nonce={result.nonce}")
+        print(f"  injected: HTTP {result.injection.status} ({result.injection.terminal()})")
+        print(f"  before:   agent last_ok_at={result.before.agent_last_ok_at}")
+        print(f"  after:    agent last_ok_at={result.after.agent_last_ok_at}")
+        print(f"  {result.detail}")
+    if not result.proven:
+        # The verdict on stderr as well, for the same reason `selftest freeze` does it:
+        # `broken` and `unprovable` are what the NOC forwards, and it must be able to
+        # read the cause without having asked for --json.
+        print(f"synthetic-wake: {result.status}: {result.summary()}", file=sys.stderr)
     return result.exit_code
 
 

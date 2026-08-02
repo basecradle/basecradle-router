@@ -177,10 +177,18 @@ def test_enabling_the_route_arms_the_edge_that_was_missing(tmp_path) -> None:
             "kind": "webhook-route",
             "source": "basecradle",
             "resolves_by": "recipient_uuid",
-            # Armed, and honest that being armed proves nothing yet.
+            # Armed, and honest that being armed proves nothing yet — in all three
+            # outcomes, so "never exercised" and "exercised and refused every time"
+            # can never read alike (basecradle-router#208).
             "ok": 0,
+            "failed": 0,
+            "refused": 0,
             "last_ok_at": None,
             "last_ok_delivery": None,
+            "last_failed_at": None,
+            "last_failed_reason": None,
+            "last_refused_at": None,
+            "last_refused_reason": None,
         }
     ]
 
@@ -213,7 +221,7 @@ def test_a_queued_wake_is_reported_as_the_transient_edge_it_is(tmp_path) -> None
 
 def test_a_successful_wake_becomes_the_claims_evidence(tmp_path) -> None:
     evidence = EvidenceStore(None)
-    evidence.record_wake_ok("nova", DELIVERY, route="github")
+    evidence.record_wake_ok("nova", DELIVERY, route="github", synthetic=False)
 
     claim = _claim(
         _subject(_build(tmp_path, evidence=evidence), "agent:nova"), "wake-edge:webhook-route"
@@ -258,7 +266,9 @@ def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_p
     evidence = EvidenceStore(None)
     evidence.record_delivery_accepted("github")
     evidence.record_delivery_accepted("basecradle")  # the sink is armed and verified...
-    evidence.record_wake_ok("nova", DELIVERY, route="github")  # ...but never woke a soul
+    evidence.record_wake_ok(
+        "nova", DELIVERY, route="github", synthetic=False
+    )  # ...but never woke a soul
 
     manifests = _build(
         tmp_path,
@@ -324,7 +334,7 @@ def test_the_per_route_wake_record_survives_a_route_being_disarmed(tmp_path) -> 
     # record keeps it — an agent whose only proof came from a route nobody enables any
     # more is exactly the parked-builder shape, not a proven edge.
     evidence = EvidenceStore(None)
-    evidence.record_wake_ok("nova", DELIVERY, route="basecradle")
+    evidence.record_wake_ok("nova", DELIVERY, route="basecradle", synthetic=False)
 
     manifest = _subject(_build(tmp_path, evidence=evidence, routes=("github",)), "agent:nova")
     detail = _claim(manifest, "wake-edge:webhook-route")["detail"]
@@ -461,7 +471,7 @@ def _every_shape(tmp_path) -> list[dict]:
         recipient_uuid="019e916c-7f45-700e-afc0-f45557b23800",
     )
     evidence = EvidenceStore(None)
-    evidence.record_wake_ok("nova", DELIVERY, route="github")
+    evidence.record_wake_ok("nova", DELIVERY, route="github", synthetic=False)
     evidence.record_delivery_accepted("github")
     evidence.record_delivery_accepted("basecradle")
     evidence.record_delivery_rejected("basecradle", "signature does not match")

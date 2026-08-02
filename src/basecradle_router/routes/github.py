@@ -125,6 +125,8 @@ class GithubRoute:
     #: A github builder is keyed by the repo it captains, so its events resolve by
     #: ``Recipient(by="repo", …)`` — see :class:`~basecradle_router.routes.base.Route`.
     recipient_kind = "repo"
+    #: Real traffic: a delivery here is a genuine event a human or a bot caused.
+    synthetic = False
 
     def __init__(
         self,

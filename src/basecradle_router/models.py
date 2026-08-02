@@ -25,11 +25,23 @@ class EventKind(Enum):
 
     Each event source adds a member rather than reshaping :class:`Event`:
     ``HANDOFF`` is a GitHub handoff issue; ``PLATFORM_EVENT`` is a BaseCradle
-    timeline event (a new message on a timeline the agent views).
+    timeline event (a new message on a timeline the agent views);
+    ``SYNTHETIC_PROBE`` is the router's own signed test delivery, fired at the
+    real path to prove the wake edge without any real work to do.
     """
 
     HANDOFF = "handoff"
     PLATFORM_EVENT = "platform_event"
+    SYNTHETIC_PROBE = "synthetic_probe"
+
+
+#: The event kinds that are **synthetic** — deliberately manufactured to exercise the
+#: wake edge, never a real unit of work. One frozenset rather than an ``is`` check
+#: scattered through the core, because the property every consumer actually asks about
+#: is *"was this real traffic?"* and it must have exactly one definition: the evidence
+#: store tags what it records with it (so a synthetic proof can never masquerade as an
+#: accepted production delivery), and the pipeline reads it to decide the retry policy.
+_SYNTHETIC_KINDS = frozenset({EventKind.SYNTHETIC_PROBE})
 
 
 class WakeKind(Enum):
@@ -185,6 +197,26 @@ class Event:
         _require(self.delivery_id, "Event.delivery_id")
         if self.origin is not None and not isinstance(self.origin, IssueRef):
             raise ValueError(f"Event.origin must be an IssueRef or None, got {self.origin!r}")
+
+    @property
+    def synthetic(self) -> bool:
+        """Whether this event is a manufactured probe rather than real traffic.
+
+        The one question every recorder asks about an event's provenance, answered
+        from the event's own ``kind`` so it can never be set independently of what
+        the event *is*. It is the flag that keeps a synthetic proof from masquerading
+        as production traffic in the evidence (basecradle-router#208): the store
+        records it beside every outcome it writes, and the emitter surfaces it on the
+        claim, so a reader never has to know which route names happen to be synthetic.
+
+        It is recorded at **write** time rather than derived at read time on purpose.
+        Deriving it would mean asking the registry, at emit time, whether the route
+        that produced a past wake is synthetic — and a route since disabled or renamed
+        answers ``False``, silently turning a synthetic proof into an apparently real
+        one. That is the exact green-while-absent shape this instrument exists to
+        close, one level up.
+        """
+        return self.kind in _SYNTHETIC_KINDS
 
     @property
     def dedup_key(self) -> str:

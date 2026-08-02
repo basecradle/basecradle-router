@@ -14,6 +14,7 @@ from basecradle_router.routes.base import (
 )
 from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
+from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.routes.registry import RouteRegistry, UnknownRouteError
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "GithubRoute",
     "InboundRequest",
     "PayloadError",
+    "ProbeRoute",
     "Route",
     "RouteError",
     "RouteRegistry",

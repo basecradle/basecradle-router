@@ -26,6 +26,15 @@ Both fall out of the same primitive: **last demonstrable success + counters**,
 per subject, readable by a different process (the NOC's converge runs the claims
 emitter; the daemon writes this file).
 
+**And every outcome records whether it was real.** Since basecradle-router#208 the
+router can wake an agent with its own signed synthetic probe, which is what gives the
+wake edge a lever it otherwise lacks — an ``evidence``-kind claim cannot exercise
+itself. That lever is only safe if a synthetic proof can never be mistaken for
+production traffic, so provenance is recorded at write time beside every outcome:
+which ``route`` delivered it, and whether that delivery was ``synthetic``. A probe
+therefore lands in its own delivery sink and its own ``by_route`` row, and the
+agent-wide scalars say plainly which kind of traffic last proved the edge.
+
 **And instance 5 is asked per *recipient*, not per route.** A route-wide accept
 counter says the sink works for *somebody*; the ledger's rows ask whether it works
 for *this agent*. Neither the per-route counters nor the per-agent scalars can
@@ -142,11 +151,25 @@ class RouteWakeEvidence:
     entry is absent has never woken the agent, which is what a never-proven edge
     means — kept as an absence rather than a zero row so "never tried" and "tried
     and it worked" can never be confused.
+
+    All three outcomes are kept here, not just the successes (basecradle-router#208).
+    Once one route is **synthetic** — the probe firing at the fleet's own wake path —
+    a route-less failure or refusal counter would let a probe's outcome read as a
+    production one and vice versa, which is precisely the masquerade the synthetic is
+    forbidden to commit. Each row therefore stands alone: it says what *this* route
+    did to *this* agent, with the reason, so a reader never has to borrow a scalar
+    that might describe a different route's event.
     """
 
     ok: int = 0
+    failed: int = 0
+    refused: int = 0
     last_ok_at: str | None = None
     last_ok_delivery: str | None = None
+    last_failed_at: str | None = None
+    last_failed_reason: str | None = None
+    last_refused_at: str | None = None
+    last_refused_reason: str | None = None
 
 
 @dataclass
@@ -175,6 +198,15 @@ class AgentWakeEvidence:
     ``queued`` is the scheduler's pending-wake depth for this agent as of the last
     change — the transient wake edge. Non-zero means a wake is queued or in flight
     right now, so the agent will be woken again regardless of anything else.
+
+    Each ``last_*`` trio carries **which route** produced it and **whether it was
+    synthetic** (basecradle-router#208). ``last_ok_route`` alone was enough while every
+    route was real; it stopped being enough the moment the router could wake an agent
+    with its own probe, because a reader would then have to know which route names
+    happen to be synthetic — a fact that lives in the registry, changes with
+    deployment, and answers *no* for a route since removed, silently promoting a
+    synthetic proof to a real one. So provenance is recorded at write time, from the
+    event, where it is a fact rather than an inference.
     """
 
     ok: int = 0
@@ -183,10 +215,15 @@ class AgentWakeEvidence:
     last_ok_at: str | None = None
     last_ok_delivery: str | None = None
     last_ok_route: str | None = None
+    last_ok_synthetic: bool | None = None
     last_failed_at: str | None = None
     last_failed_reason: str | None = None
+    last_failed_route: str | None = None
+    last_failed_synthetic: bool | None = None
     last_refused_at: str | None = None
     last_refused_reason: str | None = None
+    last_refused_route: str | None = None
+    last_refused_synthetic: bool | None = None
     queued: int = 0
     by_route: dict[str, RouteWakeEvidence] = field(default_factory=dict)
 
@@ -355,16 +392,21 @@ class EvidenceStore:
 
     # --- agent wake evidence (instance 4: parked with nothing to re-wake it) ---
 
-    def record_wake_ok(self, agent: str, delivery: str, *, route: str) -> None:
+    def record_wake_ok(self, agent: str, delivery: str, *, route: str, synthetic: bool) -> None:
         """The proof that matters: this agent's wake edge fired and succeeded.
 
-        ``route`` is **required and keyword-only**, deliberately. It is the event
-        source that delivered the wake, and without it the record collapses to "some
-        route woke this agent" — which greens every *other* route wired to the same
-        agent, including one whose every delivery is being rejected. That is instance
-        5 surviving the instrument, so the field cannot be optional: a caller must
-        not be able to drop it by omission, and it must not be positionally
-        confusable with ``delivery``.
+        ``route`` and ``synthetic`` are **required and keyword-only**, deliberately.
+
+        ``route`` is the event source that delivered the wake, and without it the
+        record collapses to "some route woke this agent" — which greens every *other*
+        route wired to the same agent, including one whose every delivery is being
+        rejected. That is instance 5 surviving the instrument.
+
+        ``synthetic`` is whether the wake was a probe the fleet fired at itself rather
+        than real traffic (basecradle-router#208). It cannot be optional for the same
+        reason: a defaulted ``False`` is a caller's silence being recorded as the
+        assertion *this was real*, and a synthetic proof quietly reading as production
+        traffic is the one thing a synthetic must never be able to do.
 
         Both granularities are written here, in one update under one lock, so the
         scalars and ``by_route`` can never disagree about the same wake.
@@ -376,27 +418,48 @@ class EvidenceStore:
             wake.last_ok_at = at
             wake.last_ok_delivery = delivery
             wake.last_ok_route = route
+            wake.last_ok_synthetic = synthetic
             per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
             per_route.ok += 1
             per_route.last_ok_at = at
             per_route.last_ok_delivery = delivery
             self._flush_locked()
 
-    def record_wake_failed(self, agent: str, reason: str) -> None:
+    def record_wake_failed(self, agent: str, reason: str, *, route: str, synthetic: bool) -> None:
+        """The wake path is broken for this agent — over this route, really or synthetically.
+
+        Route- and provenance-tagged for the same reasons :meth:`record_wake_ok` is: an
+        untagged failure counter would let a probe's refusal read as a production
+        outage, and a production outage read as a probe's.
+        """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
+            at = _iso(self._now())
             wake.failed += 1
-            wake.last_failed_at = _iso(self._now())
+            wake.last_failed_at = at
             wake.last_failed_reason = _reason(reason)
+            wake.last_failed_route = route
+            wake.last_failed_synthetic = synthetic
+            per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
+            per_route.failed += 1
+            per_route.last_failed_at = at
+            per_route.last_failed_reason = _reason(reason)
             self._flush_locked()
 
-    def record_wake_refused(self, agent: str, reason: str) -> None:
+    def record_wake_refused(self, agent: str, reason: str, *, route: str, synthetic: bool) -> None:
         """A wake the router deliberately declined — gated, not broken (see the class)."""
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
+            at = _iso(self._now())
             wake.refused += 1
-            wake.last_refused_at = _iso(self._now())
+            wake.last_refused_at = at
             wake.last_refused_reason = _reason(reason)
+            wake.last_refused_route = route
+            wake.last_refused_synthetic = synthetic
+            per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
+            per_route.refused += 1
+            per_route.last_refused_at = at
+            per_route.last_refused_reason = _reason(reason)
             self._flush_locked()
 
     def record_queue_depth(self, agent: str, pending: int) -> None:

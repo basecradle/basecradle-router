@@ -15,6 +15,15 @@ ai.basecradle.com {
 		max_size 25MB
 	}
 
+	# The synthetic-wake injection point is ON-BOX ONLY (basecradle-router#208). The
+	# probe CLI posts to 127.0.0.1:8000 directly, so it never passes through here — and
+	# nothing legitimate ever arrives from the internet for this path. Answering 404 is
+	# the same answer an unknown route already gives, so this leaks nothing about
+	# whether the route is enabled; it only removes a fleet-wide wake trigger from the
+	# public surface, where its only remaining protection would be one shared secret.
+	@probe path /webhooks/probe /webhooks/probe/*
+	respond @probe 404
+
 	reverse_proxy 127.0.0.1:8000
 
 	# Access log to the journal; Caddy logs TLS/ACME there too.

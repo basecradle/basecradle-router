@@ -9,11 +9,13 @@ writes the daemon's state. No network, model, or live agent.
 Test cast: Nova Digital (``nova``, AI).
 """
 
+import io
 import json
 
 import pytest
 
 from basecradle_router.__main__ import EXIT_CONFIG_ERROR, main
+from basecradle_router.probe import Injection
 
 NOVA_ENTRY = {
     "os_user": "nova",
@@ -93,7 +95,9 @@ def test_claims_reads_the_evidence_the_daemon_wrote(box, capsys) -> None:
     # channel between them, and this is the property that makes it work.
     from basecradle_router.evidence import EvidenceStore
 
-    EvidenceStore(str(box.evidence)).record_wake_ok("nova", "delivery-1", route="github")
+    EvidenceStore(str(box.evidence)).record_wake_ok(
+        "nova", "delivery-1", route="github", synthetic=False
+    )
 
     main(["claims", "--host", "ai.basecradle.com"])
 
@@ -184,6 +188,99 @@ def test_evidence_dumps_the_document(box, capsys) -> None:
 def test_evidence_on_a_box_that_has_produced_none_is_empty_not_an_error(box, capsys) -> None:
     assert main(["evidence"]) == 0
     assert _json_out(capsys)["agent_wakes"] == {}
+
+
+# --- probe wake -------------------------------------------------------------
+
+
+def _arm_probe_route(monkeypatch) -> None:
+    monkeypatch.setenv("BASECRADLE_ROUTER_ENABLED_ROUTES", "github,probe")
+    monkeypatch.setenv("BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET", "whsec_" + "1" * 32)
+
+
+def _marker(nonce: str = "0" * 32) -> str:
+    # Shape only — the CLI carries markers and never verifies them, so a correctly-shaped
+    # fake is exactly what the router's own layer sees.
+    return f"BCNOC1 {nonce} {'a' * 64}"
+
+
+def test_probe_wake_reads_its_marker_from_stdin_never_argv(box, monkeypatch, capsys) -> None:
+    # The value is minted by the NOC with the recipient's own probe secret. argv is
+    # visible in `ps` to every account on the box, so the NOC's own discipline for
+    # mint-probe-secret carries here: stdin, and no --marker flag exists to tempt anyone.
+    _arm_probe_route(monkeypatch)
+    posted: list[tuple[str, bytes, dict]] = []
+
+    def fake_post(url, body, headers):
+        posted.append((url, body, headers))
+        return Injection(status=202, stages=(("resolve", "ok"),))
+
+    monkeypatch.setattr("basecradle_router.probe._post_over_http", fake_post)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_marker() + "\n"))
+
+    # No wake is ever recorded, so this is the honest "we never got an answer".
+    assert main(["probe", "wake", "--agent", "nova", "--timeout", "0"]) == 75
+
+    (url, body, headers) = posted[0]
+    assert url.endswith("/webhooks/probe")
+    assert json.loads(body) == {"harness_key": "nova", "marker": _marker()}
+    assert headers["X-BaseCradle-Probe-Signature"].startswith("sha256=")
+    assert "no outcome recorded" in capsys.readouterr().err
+
+
+def test_probe_wake_reports_proven_only_from_the_daemons_own_record(
+    box, monkeypatch, capsys
+) -> None:
+    # Requirement 5, at the CLI boundary: the probe cannot write the evidence, so it
+    # cannot manufacture its own pass. Here the "daemon" records the wake while the
+    # injection is in flight, exactly as the real one does.
+    from basecradle_router.evidence import EvidenceStore
+
+    _arm_probe_route(monkeypatch)
+    store = EvidenceStore(str(box.evidence))
+
+    def fake_post(url, body, headers):
+        store.record_wake_ok(
+            "nova", headers["X-BaseCradle-Probe-Delivery"], route="probe", synthetic=True
+        )
+        return Injection(status=202, stages=(("resolve", "ok"),))
+
+    monkeypatch.setattr("basecradle_router.probe._post_over_http", fake_post)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_marker()))
+
+    assert main(["probe", "wake", "--agent", "nova", "--json"]) == 0
+
+    result = _json_out(capsys)
+    assert result["status"] == "proven"
+    assert result["before"]["agent_last_ok_at"] is None
+    assert result["after"]["agent_last_ok_at"] is not None
+    assert result["after"]["agent_last_ok_synthetic"] is True
+
+
+def test_probe_wake_with_an_unusable_marker_is_unprovable_not_a_verdict(
+    box, monkeypatch, capsys
+) -> None:
+    # Not an answer about the wake edge — the probe could not be attempted at all — so
+    # it lands in the inconclusive bucket with the cause on stderr, and nothing is posted.
+    _arm_probe_route(monkeypatch)
+    monkeypatch.setattr(
+        "basecradle_router.probe._post_over_http",
+        lambda *_a: pytest.fail("nothing may be posted for an unusable marker"),
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO("not-a-marker"))
+
+    assert main(["probe", "wake", "--agent", "nova"]) == 75
+    assert "well-formed BCNOC1" in capsys.readouterr().err
+
+
+def test_probe_wake_needs_the_route_armed_on_this_box(box, monkeypatch, capsys) -> None:
+    # The probe route's secret is demanded like every other route's. Without it the
+    # daemon would not boot on this config either, so the CLI must not pretend otherwise.
+    monkeypatch.setenv("BASECRADLE_ROUTER_ENABLED_ROUTES", "github,probe")
+    monkeypatch.setattr("sys.stdin", io.StringIO(_marker()))
+
+    assert main(["probe", "wake", "--agent", "nova"]) == EXIT_CONFIG_ERROR
+    assert "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET" in capsys.readouterr().err
 
 
 # --- the config-error exit code --------------------------------------------

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
+from basecradle_router.marker import is_marker
 from basecradle_router.models import Agent, Event, WakeKind
 
 logger = logging.getLogger("basecradle_router.wake")
@@ -57,7 +58,22 @@ def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
     argv element, never a shell string, so it is never re-interpreted. The home
     server's wake-runner independently pins the binary against the registry, so a
     compromised router cannot substitute a different command here.
+
+    **A synthetic event has no command, and asking for one raises.** The fleet's one
+    hard constraint is that nothing burns a token at rest, and a probe delivered to
+    ``claude -p "<marker>"`` *is* a model call — the marker would be read as a prompt.
+    So the impossibility is enforced structurally rather than remembered: there is no
+    argv this function could return for a probe that would not start a session, so it
+    returns none. A probe travels the wrapper's own ``--probe`` mode instead
+    (:class:`HomeServerWaker`), where the model binary is never exec'd at all
+    (basecradle-router#208).
     """
+    if event.synthetic:
+        raise WakeError(
+            f"refusing to build a wake command for a synthetic {event.kind.value} event: "
+            "a probe must never launch the agent's model — it travels the wake-runner's "
+            "--probe mode, which acks after the privilege drop without exec'ing anything"
+        )
     if agent.wake_kind is WakeKind.HARNESS:
         return (agent.wake_bin, "--timeline", event.wake_arg)
     return ("claude", "-p", event.wake_arg)
@@ -242,6 +258,35 @@ class SubprocessWaker:
 # The root-owned wrapper the home-server waker escalates through (see deploy/).
 WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
 
+#: The wrapper flag that selects probe mode — verify the marker as the agent and ack,
+#: instead of exec'ing the agent's binary. One spelling, shared by the argv assembled
+#: here and the wrapper that parses it.
+PROBE_FLAG = "--probe"
+
+
+def _mode_args(agent: Agent, event: Event) -> tuple[str, ...]:
+    """The wrapper's mode-selecting tail: ``--probe <marker>``, or ``-- <wake command>``.
+
+    The two modes are disjoint by construction — a probe never carries a command and a
+    real wake never carries a marker — so the wrapper's own refusal of *both at once* is
+    a defence against a caller this function cannot be, not a case it has to handle.
+
+    The marker is re-checked here even though the route already refused a malformed one
+    (:mod:`basecradle_router.marker`), because this is the last point before it becomes
+    an ``argv`` element crossing ``sudo``. The fail-direction is a **refusal**, not the
+    delivery id's silent drop: a probe with no carryable marker has nothing left to
+    prove, and the one thing it must never do is degrade into something that wakes the
+    model.
+    """
+    if not event.synthetic:
+        return ("--", *wake_command(agent, event))
+    if not is_marker(event.wake_arg):
+        raise WakeError(
+            f"refusing to wake {agent.key}: probe delivery {event.delivery_id} carries a "
+            f"malformed BCNOC1 marker ({event.wake_arg!r})"
+        )
+    return (PROBE_FLAG, event.wake_arg)
+
 
 @dataclass(frozen=True, slots=True)
 class HomeServerWaker:
@@ -261,6 +306,17 @@ class HomeServerWaker:
     passes no environment: the wrapper exports it as :data:`DELIVERY_ID_ENV` after
     the privilege drop. It sits before the ``--`` because everything after ``--`` is
     the inert wake command the wrapper pins against its registry.
+
+    **A synthetic probe takes the wrapper's ``--probe`` mode instead of a command.**
+    The wrapper then performs every step a real wake performs — validate the request
+    against the root-owned registry, resolve the exact binary that agent's kind
+    sanctions, drop to the agent, load its ``agent.env``, enter its clone — and, as
+    the agent, verifies the marker against that agent's own ``NOC_PROBE_SECRET`` and
+    acks. It stops one step short of ``exec``, which is the only step it *must* skip:
+    exec'ing the model is what the fleet's zero-token-at-rest constraint forbids. The
+    two modes are mutually exclusive in the wrapper's own argv parsing, so a probe
+    cannot carry a command and a wake cannot carry a marker
+    (basecradle-router#208).
     """
 
     runner: Runner = _run_subprocess
@@ -279,8 +335,7 @@ class HomeServerWaker:
                 "--cwd",
                 agent.clone_path,
                 *(() if delivery is None else ("--delivery", delivery)),
-                "--",
-                *wake_command(agent, event),
+                *_mode_args(agent, event),
             ),
             # The wrapper cd's into the clone as the agent; the router's own cwd is
             # irrelevant, and "/" is always present. Env is empty by design — the

@@ -23,6 +23,43 @@
 # identifiers, `basecradle-router` and `basecradle-wake-<slug>` (#170). It is inert
 # observability: it confers no authority, and it is never evaluated as shell.
 #
+# PROBE MODE (--probe <marker>, mutually exclusive with a command after `--`; #208).
+# The router cannot prove an agent's wake edge is alive without using it, and using it
+# must never cost a token — that is the fleet's one hard constraint. So a synthetic wake
+# takes this mode, which performs EVERY step a real wake performs — validate against the
+# root-owned registry, resolve the exact binary this agent's kind sanctions, drop to the
+# agent, load its own agent.env, enter its clone — and then, as the agent, verifies the
+# signed BCNOC1 marker against that agent's OWN NOC_PROBE_SECRET and acks. It stops one
+# step short of `exec`, and only that step: exec'ing the model is the thing the
+# constraint forbids, so token-free here is STRUCTURAL (the model binary is never
+# started) rather than a promise some other program keeps.
+#
+# The verification runs as the AGENT, against a file only the agent can read, which is
+# what makes a pass mean "the wake reached this agent's own context with this agent's own
+# credentials loaded" — the property the retired timeline probe established socially,
+# now established by file permissions and no trust edge at all (basecradle-noc#421).
+# The router holds no agent's probe secret and verifies nothing; it only carries the
+# marker across this boundary.
+#
+# UNARMED IS A REFUSAL, NEVER A FALLBACK. An agent with no NOC_PROBE_SECRET exits 75
+# ("could not prove") and nothing is launched. There is deliberately no path from here
+# to a real wake: a probe that degraded into waking the model would turn a monitoring
+# cycle into a standing token burn at rest, which is precisely what this design exists
+# to make impossible.
+#
+# PROBE-MODE EXIT CODES (the same three readings as every probe in this repo):
+#   0   acked           — the marker verified against the agent's own secret.
+#   1   proven broken   — the marker did NOT verify: the NOC's copy of this agent's
+#                         probe secret and the agent's own copy have drifted.
+#   75  could not prove — no NOC_PROBE_SECRET armed for this agent, or the verifier
+#                         itself is unavailable. We never got an answer.
+#
+# Probe mode deliberately does NOT route its output through systemd-cat: the whole
+# value of a probe is a self-contained verdict returned to the caller that fired it,
+# and a refusal whose reason is only findable by grepping another journal identifier
+# fails this repo's standard that a failure names the exact thing to go fix. A real
+# wake still goes through systemd-cat — see that block below for why it must.
+#
 # Two agent kinds are wakeable, selected by the registry entry's `kind`:
 #   - a builder ("github", the default): only the trusted, system-installed
 #     `claude` may be launched, resolved off a root-owned PATH;
@@ -57,10 +94,37 @@ MIN_UID=1000
 # The one trusted PATH off which root-owned system binaries (claude, systemd-cat)
 # are resolved — never the caller's PATH, so a compromised router cannot plant one.
 TRUSTED_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The probe verifier, installed root-owned beside this wrapper in the same root-owned
+# directory. It is exec'd AS THE AGENT (so it can read that agent's own probe secret out
+# of the environment agent.env populated) but is not agent-writable, so the account being
+# probed cannot rewrite its own verifier into one that always acks.
+#
+# A CONSTANT, deliberately not overridable by the environment. The sudoers rule's
+# `env_reset` already scrubs the caller's environment, so an override would be
+# unreachable in practice — but "unreachable in practice" is not this file's standard,
+# and the failure it would allow is the sharp one: this path is exec-ed as the agent,
+# after agent.env has loaded, so a caller who could choose it could run a script of its
+# choosing inside the agent's own environment and read the secrets the whole privilege
+# boundary exists to keep the router away from.
+PROBE_ACK=/opt/basecradle-router/bin/probe-ack
+# The contract's inconclusive sentinel — kept in lockstep with selftest.EXIT_UNPROVABLE
+# and router-admin's copy: "we never got an answer", as distinct from "the answer is no".
+EXIT_UNPROVABLE=75
 
 die() {
 	printf 'wake-runner: %s\n' "$*" >&2
 	exit 1
+}
+
+# Refuse with an explicit code. Used only by probe mode, where a refusal must land in the
+# contract's *unprovable* bucket rather than looking like a broken wake edge: an agent
+# nobody has armed yet is not a fault of the edge, and reporting it as one would page for
+# a configuration step instead of a failure.
+refuse() {
+	local code=$1
+	shift
+	printf 'wake-runner: %s\n' "$*" >&2
+	exit "$code"
 }
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (via the sudoers rule)"
@@ -68,6 +132,7 @@ die() {
 user=""
 cwd=""
 delivery=""
+probe=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--user)
@@ -85,6 +150,11 @@ while [[ $# -gt 0 ]]; do
 		delivery="$2"
 		shift 2
 		;;
+	--probe)
+		[[ $# -ge 2 ]] || die "--probe needs a value"
+		probe="$2"
+		shift 2
+		;;
 	--)
 		shift
 		break
@@ -95,7 +165,24 @@ done
 
 [[ -n $user ]] || die "missing --user"
 [[ -n $cwd ]] || die "missing --cwd"
-[[ $# -gt 0 ]] || die "missing command after '--' (expected: claude -p <trigger>)"
+
+# The two modes are mutually exclusive, and the check is here rather than left implicit.
+# A caller that sent both would be asking for a wake and a probe at once, and there is no
+# safe way to guess which: acking would drop a real trigger on the floor, and running the
+# command would burn a token for a monitoring cycle. Refuse instead.
+if [[ -n $probe ]]; then
+	[[ $# -eq 0 ]] ||
+		die "refusing: --probe takes no command after '--' (got: $1)"
+	# The marker crosses into an inline bash script's positional arguments, so it is
+	# pinned to the same fully-anchored, inert charset the router pinned it to before
+	# sending it (src/basecradle_router/marker.py). Validate, then refuse — and refuse
+	# LOUDLY as a broken probe rather than as *unprovable*, because a malformed marker
+	# reaching this far means the router's own edge check did not hold.
+	[[ $probe =~ ^BCNOC1\ [A-Za-z0-9_-]{1,128}\ [0-9a-f]{64}$ ]] ||
+		die "refusing: --probe must be 'BCNOC1 <nonce> <64-hex-hmac>'"
+else
+	[[ $# -gt 0 ]] || die "missing command after '--' (expected: claude -p <trigger>)"
+fi
 
 # --delivery is OPTIONAL (a wake without it runs, just uncorrelated), but if given
 # it must be inert: the agent's bash exports it verbatim as BASECRADLE_DELIVERY_ID,
@@ -137,6 +224,13 @@ esac
 # Resolve the binary to launch from the REGISTRY's kind for this agent — never
 # from the caller's argv path verbatim. The launched program is whatever the
 # root-owned registry sanctions for this agent; argv[1] must match it.
+#
+# PROBE MODE RESOLVES THE SAME BINARY AND THEN DOES NOT RUN IT. That is deliberate,
+# not a shortcut: resolving is most of what there is to prove on this side of the
+# boundary — that the binary a real wake would exec is present, executable, and exactly
+# where the root-owned registry pins it. What the probe skips is only the `exec`. So the
+# resolution below is shared by both modes, and probe mode carries the resolved path
+# through to the ack so the verdict names what it stopped short of.
 case "$kind" in
 github)
 	# Only the trusted, system-installed `claude` may ever be launched. A basename
@@ -144,7 +238,9 @@ github)
 	# a binary literally named `claude` planted in an agent-writable dir would pass.
 	# Require the bare word and resolve the real binary ourselves, off a trusted
 	# PATH — root-owned `claude`, never anything the (compromised) router can plant.
-	[[ "$1" == claude ]] || die "refusing: command must be the bare word 'claude', got '$1'"
+	[[ -n $probe ]] ||
+		[[ "$1" == claude ]] ||
+		die "refusing: command must be the bare word 'claude', got '$1'"
 	launch_bin="$(PATH="$TRUSTED_PATH" command -v claude)" || die "claude not found on the trusted PATH"
 	;;
 harness)
@@ -155,11 +251,13 @@ harness)
 	# supplies argv[1] but cannot deviate from the pinned value; running it as the
 	# agent (below) confers no privilege the agent lacks over its own venv.
 	[[ -n $wake_bin ]] || die "refusing: harness agent $match has no wake_bin in the registry"
-	[[ "$1" == "$wake_bin" ]] || die "refusing: command must be the registered wake_bin '$wake_bin', got '$1'"
-	launch_bin="$(realpath -e -- "$1" 2>/dev/null)" || die "wake_bin does not exist: $1"
+	[[ -n $probe ]] ||
+		[[ "$1" == "$wake_bin" ]] ||
+		die "refusing: command must be the registered wake_bin '$wake_bin', got '$1'"
+	launch_bin="$(realpath -e -- "$wake_bin" 2>/dev/null)" || die "wake_bin does not exist: $wake_bin"
 	case "$launch_bin/" in
 	"/home/$user/"*) : ;;
-	*) die "refusing: wake_bin $1 resolves outside /home/$user" ;;
+	*) die "refusing: wake_bin $wake_bin resolves outside /home/$user" ;;
 	esac
 	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
 	;;
@@ -167,7 +265,32 @@ harness)
 	die "refusing: agent $match has unknown kind '$kind'"
 	;;
 esac
-shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
+
+if [[ -n $probe ]]; then
+	# Swap the launch for the root-owned verifier, and hand it the binary a real wake
+	# would have run so the ack states the boundary it stopped at. Nothing the agent
+	# controls is exec'd, and nothing that could reach a model is.
+	# "could not prove:" is the token the router reads back off the recorded failure
+	# reason to keep a refusal out of the *broken* bucket — see UNPROVABLE_MARKER in
+	# src/basecradle_router/probe.py. Both writers of it are root-owned files we ship.
+	[[ -x $PROBE_ACK ]] ||
+		refuse "$EXIT_UNPROVABLE" \
+			"could not prove: probe verifier is missing or not executable: $PROBE_ACK" \
+			"(install it root-owned: install -o root -g root -m 0755 deploy/bin/probe-ack" \
+			"/opt/basecradle-router/bin/)"
+	# Resolve the interpreter HERE, as root, off the trusted PATH — the same discipline
+	# as `claude` and `systemd-cat`, and for a sharper reason: the verifier is exec-ed
+	# AFTER agent.env has loaded, so honouring its shebang would resolve `python3`
+	# through whatever PATH that agent's env file happens to set. A root-owned verifier
+	# must not depend on the account it is verifying for its own interpreter.
+	probe_python="$(PATH="$TRUSTED_PATH" command -v python3)" ||
+		refuse "$EXIT_UNPROVABLE" "could not prove: python3 not found on the trusted PATH"
+	would_exec="$launch_bin"
+	launch_bin="$probe_python"
+	set -- "$PROBE_ACK" "$probe" "$would_exec"
+else
+	shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
+fi
 
 # Route the wake's stdout+stderr into journald under a PER-AGENT identifier, so the
 # harness's per-step ledger (`step N/M …`, `wake used X/N steps`) is attributable
@@ -195,19 +318,30 @@ shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are
 #      per-agent journal IS the wake's log now.
 #   3. Entries are stamped `_UID=0` (the stream is opened as root, pre-drop). Read
 #      the ledger by the -t identifier, never by `_UID`.
-journal_tag="basecradle-wake-$user"
-systemd_cat="$(PATH="$TRUSTED_PATH" command -v systemd-cat)" || die "systemd-cat not found on the trusted PATH"
+#
+# PROBE MODE SKIPS IT (#208), and only probe mode: a probe's whole product is a verdict
+# returned to the caller that fired it, so its output must flow BACK, not sideways into
+# a journal identifier the caller would then have to go grep. Consequence 2 above is
+# exactly what a probe must not inherit — "exited 75: (no output)" fails this repo's
+# standard that a refusal names the thing to go fix. Nothing else changes: same drop,
+# same env discipline, same inert argv, same exit-code propagation.
 
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
 # router never reads it), cd into the clone, export the delivery id, exec the
 # registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id
 # as $2, and the command (launch_bin + args) as $3..; root never interpolates the
 # trigger/timeline/delivery — each is passed as an inert positional argument.
+#
+# Held in a variable rather than written inline at the exec, so the two launch shapes
+# below (journald-wrapped for a real wake, direct for a probe) share ONE copy of the
+# privilege-drop payload. Two copies of a security boundary are two things that can
+# drift apart, and this is the last one we would want to.
+#
 # SC2016 is intentional: the single quotes are load-bearing — $HOME/$1/$@ must
 # expand in the AGENT's bash after runuser, never in root's, so the untrusted
 # trigger is never evaluated in a privileged context.
 # shellcheck disable=SC2016
-exec "$systemd_cat" --identifier="$journal_tag" -- runuser -u "$user" -- /bin/bash -c '
+AGENT_SCRIPT='
 	set -euo pipefail
 	# Lock the agent process to umask 077 before anything is written: every file
 	# the woken claude creates (memory, settings, scratch) then lands 600 and every
@@ -270,4 +404,16 @@ exec "$systemd_cat" --identifier="$journal_tag" -- runuser -u "$user" -- /bin/ba
 	fi
 	shift
 	exec "$@"
-' wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@"
+'
+
+# The privilege drop itself, identical in both modes.
+drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@")
+
+if [[ -n $probe ]]; then
+	# A probe returns its verdict to the caller — see the systemd-cat block above.
+	exec "${drop[@]}"
+fi
+
+journal_tag="basecradle-wake-$user"
+systemd_cat="$(PATH="$TRUSTED_PATH" command -v systemd-cat)" || die "systemd-cat not found on the trusted PATH"
+exec "$systemd_cat" --identifier="$journal_tag" -- "${drop[@]}"

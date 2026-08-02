@@ -37,6 +37,16 @@
 # running daemon does not yet serve the route, so a deploy made before the capital
 # enables basecradle stays green.
 #
+# Two more prove the synthetic wake's injection point is where it is supposed to be —
+# on the box and nowhere else (#208):
+#
+#   6. the PUBLIC /webhooks/probe         -> 404  (Caddy denies it; ALWAYS asserted)
+#   7. LOOPBACK, bad signature            -> 401  (served locally, HMAC rejects)
+#
+# Case 6 is a security assertion, not a liveness one, so unlike every other route case
+# it is asserted unconditionally: the probe route can fire a wake at any registered
+# agent, so its reachability from the internet must never quietly become true.
+#
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
 # router.env, which is root-readable only). deploy.sh invokes it over SSH after a
 # restart; you can also run it by hand:  sudo deploy/smoke-test.sh
@@ -296,6 +306,56 @@ else
 		assert_journal_has "basecradle decision line emitted (#91)" \
 			"event=delivery_decision source=basecradle .*decision=woke .*recipient=${UNREGISTERED_RECIPIENT}" \
 			"$obs_since"
+	fi
+fi
+
+# --- probe route: the synthetic wake's injection point (#208) ---------------
+#
+# Two cases, and the first is the one that matters most:
+#
+#   6. the PUBLIC endpoint            -> 404  (Caddy denies it; the injection point is
+#                                              on-box only, never internet-reachable)
+#   7. LOOPBACK, bad signature        -> 401  (the daemon serves it locally and the
+#                                              shared HMAC boundary rejects)
+#
+# Case 6 is a boundary assertion, not a liveness one: the probe route can fire a wake
+# at ANY registered agent, so the one thing that must never be true is that it is
+# reachable from the internet behind a single shared secret. It is asserted against the
+# same public URL every other case uses, so a Caddyfile that lost the deny fails here.
+#
+# Case 7 self-gates like basecradle's: skipped if the secret is unset, and skipped if
+# the running daemon does not serve the route (a bad-sig probe returns 404, not 401).
+# Both cases are safe against production — neither carries a valid signature, so
+# nothing is ever normalized and no agent is ever woken.
+PROBE_PUBLIC_URL="${PROBE_PUBLIC_URL:-${SMOKE_URL%/*}/probe}"
+PROBE_LOCAL_URL="${PROBE_LOCAL_URL:-http://127.0.0.1:8000/webhooks/probe}"
+
+probe_post() {
+	local url=$1
+	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+		-X POST "$url" \
+		-H 'Content-Type: application/json' \
+		-H 'X-BaseCradle-Probe-Event: probe.wake' \
+		-H 'X-BaseCradle-Delivery: smoke-probe' \
+		-H 'X-BaseCradle-Probe-Delivery: smoke-probe' \
+		-H 'X-BaseCradle-Probe-Signature: sha256=0000000000000000000000000000000000000000000000000000000000000000' \
+		--data-binary '{"harness_key":"__router-smoke-test-no-such-agent__","marker":"nope"}'
+}
+
+# Case 6 — ALWAYS asserted, secret or not: the public surface must deny this path
+# whether or not the route is enabled on the daemon behind it.
+check "probe injection point not reachable from the internet" 404 "$(probe_post "$PROBE_PUBLIC_URL")"
+
+probe_secret="$(env_value BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET)"
+if [[ -z "$probe_secret" ]]; then
+	log "probe route: secret not set in $ROUTER_ENV_FILE — not wired yet; skipping the loopback case"
+else
+	probe_local="$(probe_post "$PROBE_LOCAL_URL")"
+	if [[ "$probe_local" == "404" ]]; then
+		log "probe route: not enabled on the running daemon (404); skipping"
+	else
+		# Case 7 — the daemon serves it on loopback and rejects an unsigned delivery.
+		check "probe bad signature rejected on loopback" 401 "$probe_local"
 	fi
 fi
 
