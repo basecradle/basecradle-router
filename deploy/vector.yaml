@@ -22,8 +22,15 @@
 #     line lands here; the router escalates a wake via `sudo -> wake-runner`, so this matters) and
 #     from Vector itself (its own logs can echo the sink token via component ids/config — this is
 #     how the source token leaked ~40x on the NOC box);
+#   * DELETES `_CMDLINE` from EVERY event — journald attaches the emitting process's full argv as
+#     a metadata FIELD, which no message-level redaction reaches (basecradle-noc#443);
 #   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`,
 #     and provider API keys — `sk-…`, `xai-…`, `AIza…` and kin) from the message as defense in depth.
+#
+# The `_CMDLINE` deletion is UNCONDITIONAL — the guard is on the field, never on an allow-list of
+# identifiers known to be dangerous. The `sudo` drop above was written as if `sudo` were *the* argv
+# carrier on this box; it is not, and `runuser` is what got past it (basecradle-noc#443). The
+# reasoning is at the rule itself, in the transform below.
 #
 # PRESENTATION (basecradle-router#170) — the `ai_scrub` transform also PREFIXES each shipped message
 # with its journald `SYSLOG_IDENTIFIER`, so a Better Stack Live Tail line reads `[basecradle-router] …`
@@ -86,6 +93,19 @@ transforms:
       if .SYSLOG_IDENTIFIER == "sudo" || ."_COMM" == "sudo" || .SYSLOG_IDENTIFIER == "vector" || ."_SYSTEMD_UNIT" == "vector.service" {
           abort
       }
+      # Drop the emitting process's full command line, from EVERY event (basecradle-noc#443).
+      # journald attaches argv as the `_CMDLINE` METADATA FIELD, and Vector ships the whole journal
+      # record, not just MESSAGE — so every `msg` redaction below is blind to it. The rule above
+      # drops `sudo` because PAM logs argv, but that is an identifier allow-list, and `runuser` is
+      # not `sudo`: the NOC's fleet-deploy-runner passing `env -i KEY=VALUE …` on argv put all seven
+      # harness agents' credentials into the log store through exactly that gap.
+      #
+      # Unconditional on purpose. Guarding the FIELD holds for every program on this box, including
+      # ones this repo has never heard of; guarding a list of identifiers holds only until the next
+      # program puts a secret on its own command line, and nothing would announce that. Nothing
+      # observable is lost: `_COMM`/`_EXE` still name the binary, and the `[identifier]` prefix added
+      # below names the emitting program on every line.
+      del(."_CMDLINE")
       # Redact secret-shaped patterns from the message (defense in depth for anything else that
       # logs a secret to stdout — e.g. a heartbeat ping logging its own secret URL on failure).
       msg = to_string(.message) ?? ""

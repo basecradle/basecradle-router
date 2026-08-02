@@ -905,7 +905,8 @@ truth**, not Better Stack's generated kitchen-sink. It is tailored to this box (
 Caddy, no database) and has three load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
-   (the argv leak path) and from Vector itself (the self-logged-token path), and **redacts**
+   (the argv leak path) and from Vector itself (the self-logged-token path), **deletes the
+   `_CMDLINE` field from every event** (below), and **redacts**
    secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`, and **provider API
    keys** — `sk-…` covering the whole `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`,
    `hf_…`, `r8_…`) as defense in depth. The provider-key rules are the belt for the braces
@@ -949,6 +950,30 @@ Caddy, no database) and has three load-bearing properties:
 **Never pass a secret as a command-line argument** (to `sudo`, `bash -s`, anything) — sudo/PAM logs
 the whole command line to the journal, and on a telemetry box that ships it. Pass secrets via
 **stdin (a piped heredoc), an env var, or a chmod-600 file**.
+
+> **`_CMDLINE` is deleted from every shipped event, and the rule is on the FIELD (basecradle-noc#443).**
+> The paragraph above was in this README before the leak that proves it is not self-enforcing.
+> journald stamps **every** event with the emitting process's full argv as the `_CMDLINE` *metadata
+> field*, and Vector ships the whole journal record — so the `msg` redactions never see it, and the
+> `sudo` whole-event drop only covers one identifier. `runuser` is not `sudo`: the NOC's
+> `fleet-deploy-runner` handing each agent's entire `agent.env` to `runuser -u <agent> -- env -i
+> KEY=VALUE …` put all seven harness agents' credentials in the log store, unredacted, continuously.
+> `ai_scrub` now `del(."_CMDLINE")` **unconditionally** — guarding the field holds for every program
+> on this box, including ones this repo has never heard of, whereas an allow-list of risky
+> identifiers holds only until the next program puts a secret on its own argv and nothing announces
+> it. Nothing readable is lost: `_COMM`/`_EXE` still name the binary and every line carries the
+> `[identifier]` prefix. `tests/test_log_surface.py` pins both the deletion and its unconditionality.
+>
+> **The router's own launch paths were audited against this class and are clean**
+> (basecradle-router#213): `wake-runner` passes **no** environment across the `sudo` boundary — the
+> agent's `agent.env` is read *by the agent*, after the privilege drop, from a `0600` file it alone
+> can read — and `python -m basecradle_router probe wake` takes its BCNOC1 marker on **stdin, never
+> argv**. This scrub is the box-wide belt for every *other* program's braces.
+>
+> **The drift alarm cannot see this file, so merging it is not the end.** `drift-check.sh` compares
+> the *deploy stamp* against `origin/main`, and `deploy-router` writes that stamp without touching
+> Vector (the install below is the capital's, per the next note) — so a daemon deploy turns drift
+> **green** while `/etc/vector/vector.yaml` is still the old bytes. Re-run the `install` line.
 
 > **Division of labor (issue #116).** The router seat authors the version-controlled config here
 > (this repo, merged to `main`); the **capital** does the on-box install, creates the token file, and

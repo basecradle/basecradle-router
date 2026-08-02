@@ -108,6 +108,17 @@ def _scrub_source() -> str:
     return _component("ai_scrub")
 
 
+def _statement_indent(source: str, statement: str) -> int:
+    """The leading-whitespace width of the line `statement` starts, asserting it is there.
+
+    Used to tell a top-level VRL statement from one nested inside a conditional, without
+    hard-coding the block's own indentation (which is a YAML detail, not a security one).
+    """
+    match = re.search(rf"^(?P<indent> *){re.escape(statement)}", source, re.MULTILINE)
+    assert match, f"ai_scrub has no statement {statement!r}"
+    return len(match.group("indent"))
+
+
 def test_every_shipped_line_is_prefixed_with_the_emitting_programs_identifier() -> None:
     # The presentation half: a Live Tail line reads `[basecradle-router] …` or
     # `[basecradle-wake-jt] …`, so a human can see which program on the box emitted it.
@@ -135,6 +146,41 @@ def test_provider_api_keys_are_redacted() -> None:
     assert r"sk-[A-Za-z0-9_-]{16,}" in source  # openai / anthropic / openrouter / …
     assert r"xai-[A-Za-z0-9]{16,}" in source
     assert r"AIza[A-Za-z0-9_-]{20,}" in source
+
+
+def test_the_process_command_line_is_never_shipped() -> None:
+    # journald attaches the emitting process's full argv as the `_CMDLINE` metadata FIELD,
+    # and Vector ships the whole journal record — so every redaction above, which operates
+    # on `msg`, is blind to it. That gap put all seven harness agents' credentials into the
+    # Better Stack store: the NOC's fleet-deploy-runner hands each agent's whole agent.env
+    # to `runuser -u <agent> -- env -i KEY=VALUE …` on argv (basecradle-noc#443).
+    #
+    # The router's own launch paths are clean — wake-runner passes NO environment across the
+    # sudo boundary — but this box's scrub guards every program on it, not only ours.
+    source = _scrub_source()
+    assert 'del(."_CMDLINE")' in source, (
+        "ai_scrub must delete the `_CMDLINE` journald field before the logs sink — "
+        "any secret on any program's argv ships in it, unredacted (basecradle-noc#443)"
+    )
+
+
+def test_the_command_line_drop_is_unconditional_not_an_identifier_allow_list() -> None:
+    # The pre-existing `sudo` rule is an identifier allow-list, and `runuser` is not `sudo` —
+    # which is precisely how the leak above got past it. Guarding the field holds for programs
+    # this repo has never heard of; guarding a list of names holds only until the next one.
+    # Pinned because the tempting "fix" is to narrow this to the identifier we caught, which
+    # would restore the exact hole. The router-AI never deploys, so a regression here is only
+    # visible on the box, in the log store, after the secrets are already in it.
+    #
+    # Read structurally, off indentation: a VRL statement nested in a conditional is indented
+    # deeper than the block's own statements. Compare against the `sudo` drop, which is known
+    # to sit at the top level, so this keeps holding if the whole block is ever reindented.
+    source = _scrub_source()
+    top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
+    assert _statement_indent(source, 'del(."_CMDLINE")') == top_level, (
+        "the `_CMDLINE` deletion must not sit inside a conditional — it applies to every "
+        "event, whatever program emitted it (an identifier allow-list is what leaked)"
+    )
 
 
 def test_the_pre_existing_scrub_rules_survive() -> None:
