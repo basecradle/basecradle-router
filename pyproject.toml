@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "uvicorn>=0.52.0",
+    "uvicorn>=0.52.1",
 ]
 
 [dependency-groups]
