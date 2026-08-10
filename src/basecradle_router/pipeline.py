@@ -60,7 +60,7 @@ from basecradle_router.concurrency import (
     with_retry,
 )
 from basecradle_router.config import Config, ConfigError
-from basecradle_router.dedup import DeliveryDeduper
+from basecradle_router.dedup import DUPLICATE_DELIVERY, DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
@@ -312,9 +312,9 @@ class Pipeline:
         try:
             with self.locks.guard(agent.harness_key):
                 self._record(result, Stage.LOCK, Outcome.OK, **who)
-                # Every refusal below is tagged with the event's own source and
-                # provenance, so a probe refused by a gate is never mistaken for a
-                # production wake refused by it (and vice versa) — see
+                # Every non-wake outcome below is tagged with the event's own source
+                # and provenance, so a probe stopped by a gate is never mistaken for a
+                # production wake stopped by it (and vice versa) — see
                 # :meth:`~basecradle_router.evidence.EvidenceStore.record_wake_refused`.
                 # Deliberately not named `origin`: an Event already has one, and it means
                 # something else entirely (the issue the agent reports back on).
@@ -324,11 +324,15 @@ class Pipeline:
                     # deliberate, visible collapse, never a silent drop. Checked
                     # ahead of the wake-lock and breaker so a duplicate consumes
                     # neither's budget.
-                    self.evidence.record_wake_refused(
-                        agent.harness_key, "duplicate_delivery", **provenance
-                    )
+                    #
+                    # Recorded as a *dedup*, never a refusal (basecradle-router#218).
+                    # The cache is marked only after a successful wake, so reaching
+                    # here means the edge demonstrably worked moments ago — the exact
+                    # opposite of what the gates below record, which is a wake that
+                    # should have run and did not.
+                    self.evidence.record_wake_deduped(agent.harness_key, **provenance)
                     self._record(
-                        result, Stage.DEDUP, Outcome.IGNORED, **who, reason="duplicate_delivery"
+                        result, Stage.DEDUP, Outcome.IGNORED, **who, reason=DUPLICATE_DELIVERY
                     )
                     return
                 decision = self.wake_lock.check(agent.harness_key)

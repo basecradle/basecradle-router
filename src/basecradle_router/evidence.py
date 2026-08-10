@@ -26,6 +26,21 @@ Both fall out of the same primitive: **last demonstrable success + counters**,
 per subject, readable by a different process (the NOC's converge runs the claims
 emitter; the daemon writes this file).
 
+**And an idempotency dedup is not a refusal** (basecradle-router#218). A duplicate
+delivery the router collapses is the *only* outcome here that can be reached exclusively
+**through a success**: the dedup cache is marked only after a wake has already fired and
+succeeded, so a ``duplicate_delivery`` outcome is a downstream consequence of a recorded
+``stage=wake outcome=ok`` within the cache's TTL. Every other refusal means the opposite
+— a wake that should have run did not (a live converge freeze, a tripped breaker). Lumped
+into one counter, the newest recorded attempt on a perfectly healthy route reads as a
+rejection, which is what it did read live: ``ok=4 failed=0 refused=2``, the last refusal
+2.6 ms after the last success, both of them dedups. So the dedup gets its own counter and
+its own ``last_deduped_*`` fields, and ``refused`` narrows to mean exactly *a gate declined
+a wake that would otherwise have run*. **The counter is the classification**, deliberately:
+a consumer must never have to parse this store's reason strings to tell a benign collapse
+from a real refusal — that would be a second spelling of our contract living in someone
+else's repo (basecradle-noc#344/#366).
+
 **And every outcome records whether it was real.** Since basecradle-router#208 the
 router can wake an agent with its own signed synthetic probe, which is what gives the
 wake edge a lever it otherwise lacks — an ``evidence``-kind claim cannot exercise
@@ -84,6 +99,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+from basecradle_router.dedup import DUPLICATE_DELIVERY
+
 logger = logging.getLogger("basecradle_router.evidence")
 
 #: The on-box evidence document. ``/var/lib`` (not ``/run``) because age-of-proof
@@ -123,6 +140,15 @@ class DeliverySinkEvidence:
     verified delivery the route then ignores (a non-handoff event) still proves the
     sink works, which is exactly the distinction instance 5 lacked. ``woke`` and
     ``ignored`` split that accepted total by what the route decided.
+
+    ``woke`` is **the route's decision, not a count of wakes that ran** — it is recorded
+    at ``normalize``, before an agent is even resolved, so a delivery the dedup cache
+    later collapses or a gate later refuses is counted here all the same. That is the
+    right meaning for a *sink* claim, which asks whether the integration is armed and
+    actionable; how many wakes actually fired is :class:`AgentWakeEvidence`'s question,
+    and its four outcome counters are the only honest answer to it. Named explicitly
+    because the two readings differ by exactly the collapses and refusals that
+    basecradle-router#218 exists to keep legible.
     """
 
     accepted: int = 0
@@ -152,24 +178,32 @@ class RouteWakeEvidence:
     means — kept as an absence rather than a zero row so "never tried" and "tried
     and it worked" can never be confused.
 
-    All three outcomes are kept here, not just the successes (basecradle-router#208).
+    All four outcomes are kept here, not just the successes (basecradle-router#208).
     Once one route is **synthetic** — the probe firing at the fleet's own wake path —
     a route-less failure or refusal counter would let a probe's outcome read as a
     production one and vice versa, which is precisely the masquerade the synthetic is
     forbidden to commit. Each row therefore stands alone: it says what *this* route
     did to *this* agent, with the reason, so a reader never has to borrow a scalar
     that might describe a different route's event.
+
+    ``deduped`` is the fourth, and it is kept out of ``refused`` for the reason the class
+    above spells out: it is the one outcome only a *successful* wake can produce
+    (basecradle-router#218). This is also the granularity the misreading was measured at
+    — the per-route row is what the NOC's per-recipient claim points into, so a dedup
+    counted as a refusal here is a healthy route reading as a rejected one.
     """
 
     ok: int = 0
     failed: int = 0
     refused: int = 0
+    deduped: int = 0
     last_ok_at: str | None = None
     last_ok_delivery: str | None = None
     last_failed_at: str | None = None
     last_failed_reason: str | None = None
     last_refused_at: str | None = None
     last_refused_reason: str | None = None
+    last_deduped_at: str | None = None
 
 
 @dataclass
@@ -182,12 +216,23 @@ class AgentWakeEvidence:
     ``None`` means the router has **never** successfully woken this agent —
     never-proven, the state that makes a parked builder visible.
 
-    ``refused`` counts wakes the router deliberately declined (dedup, a held NOC
-    wake-lock, a tripped breaker). It is kept apart from ``failed`` because the two
+    ``refused`` counts wakes a gate deliberately declined — **a held NOC wake-lock or a
+    tripped breaker**, and nothing else. It is kept apart from ``failed`` because the two
     mean opposite things: a refusal is the router working correctly, a failure is
     the wake path broken. An agent whose only recent activity is refusals is
     *gated*, not dead — and a ledger that conflated them would cry wolf on every
     converge.
+
+    ``deduped`` counts duplicate deliveries collapsed by the dedup cache, and it is a
+    third thing again (basecradle-router#218). A refusal says *a wake that should have
+    run did not*; a dedup says *a wake that must not run did not* — and, because the
+    cache is marked only after a successful wake, a dedup is reachable **only** through
+    an ``ok``. Both halves of the old lumped counter are still visible, so nothing is
+    lost: what changes is that ``last_refused_at`` no longer moves for an event that
+    proves the edge is working. Note the two live *outside* ``refused`` and outside
+    ``failed`` both — a genuine rejection of a *delivery* (a bad signature, a malformed
+    payload, an untrusted sender) never reaches this class at all; it is counted at the
+    sink, in :class:`DeliverySinkEvidence`.
 
     ``by_route`` is the same proof at **(agent, route)** granularity — see
     :class:`RouteWakeEvidence` for why the scalars above it are not enough on their
@@ -212,6 +257,7 @@ class AgentWakeEvidence:
     ok: int = 0
     failed: int = 0
     refused: int = 0
+    deduped: int = 0
     last_ok_at: str | None = None
     last_ok_delivery: str | None = None
     last_ok_route: str | None = None
@@ -224,6 +270,9 @@ class AgentWakeEvidence:
     last_refused_reason: str | None = None
     last_refused_route: str | None = None
     last_refused_synthetic: bool | None = None
+    last_deduped_at: str | None = None
+    last_deduped_route: str | None = None
+    last_deduped_synthetic: bool | None = None
     queued: int = 0
     by_route: dict[str, RouteWakeEvidence] = field(default_factory=dict)
 
@@ -306,7 +355,73 @@ def _rebuild_agent_wake(fields: dict) -> AgentWakeEvidence:
     wake.by_route = {
         route: _rebuild(RouteWakeEvidence, entry) for route, entry in _items(fields.get("by_route"))
     }
+    _reclassify_legacy_dedup(wake, provenance=_LEGACY_DEDUP_PROVENANCE)
+    for per_route in wake.by_route.values():
+        _reclassify_legacy_dedup(per_route)
     return wake
+
+
+#: The provenance fields the agent-wide record carries beside each ``last_*`` timestamp,
+#: as ``(refusal field, dedup field)`` pairs to move together. The per-route record has
+#: none — its row already *is* one route's, and a route cannot be synthetic on one line
+#: and real on the next.
+_LEGACY_DEDUP_PROVENANCE = (
+    ("last_refused_route", "last_deduped_route"),
+    ("last_refused_synthetic", "last_deduped_synthetic"),
+)
+
+
+def _reclassify_legacy_dedup(
+    record: AgentWakeEvidence | RouteWakeEvidence,
+    *,
+    provenance: tuple[tuple[str, str], ...] = (),
+) -> None:
+    """Move a pre-#218 trailing ``duplicate_delivery`` out of the refusal fields.
+
+    **Why migrate at all.** This document is durable on purpose — it lives in ``/var/lib``
+    precisely so an age-of-proof survives a deploy — which makes the misreading durable
+    too. The two live per-route rows that surfaced this carry a
+    ``last_refused_reason: duplicate_delivery`` stamped 2.6 ms after their last success,
+    and code that merely stops *writing* that would never overwrite it: the field only
+    moves when a genuine refusal happens, and the whole point is that one has not. So the
+    fix has to reach the rows already on disk, or the page it is meant to prevent still
+    fires.
+
+    **Why not bump** :data:`EVIDENCE_VERSION`. That would clear it, and the cure is far
+    worse than the disease: :meth:`EvidenceDocument.from_json` discards a document whose
+    version it does not recognise, so every capability this box has ever proven would read
+    *never-proven* on the next boot — the exact reset ``/var/lib`` was chosen to prevent.
+    The shape is additive anyway (new fields, old ones unchanged in meaning), so a version
+    that means *incompatible reshape* would be lying about what changed.
+
+    **Why this is a reclassification and not a guess.** The reason string is an exact
+    classifier for the single event it describes, and ``duplicate_delivery`` had exactly
+    one writer. So the ``last_*`` group moves faithfully: what was recorded as the last
+    refusal provably was not one.
+
+    **What it cannot recover.** Nothing ever stored the *mix* of a cumulative counter, so
+    history cannot be split. Exactly one count moves — the event we can positively
+    identify — which conserves ``refused + deduped``; any earlier dedup stays miscounted
+    in ``refused`` and decays as real events accumulate. On a row that had several
+    refusals this can leave ``refused >= 1`` beside a null ``last_refused_at``: read that
+    as *there were refusals, and the most recent thing we filed as one turned out not to
+    be*. It understates refusals, which is this store's standing fail-direction — never
+    overstate what we have proven, and never invent a rejection that did not happen.
+
+    Idempotent by construction: after one pass the condition is false, and no write since
+    #218 ever puts :data:`~basecradle_router.dedup.DUPLICATE_DELIVERY` in a refusal reason
+    again.
+    """
+    if record.last_refused_reason != DUPLICATE_DELIVERY:
+        return
+    record.deduped += 1
+    record.refused = max(0, record.refused - 1)
+    record.last_deduped_at = record.last_refused_at
+    record.last_refused_at = None
+    record.last_refused_reason = None
+    for refusal_field, dedup_field in provenance:
+        setattr(record, dedup_field, getattr(record, refusal_field))
+        setattr(record, refusal_field, None)
 
 
 def _items(raw: object):
@@ -447,7 +562,13 @@ class EvidenceStore:
             self._flush_locked()
 
     def record_wake_refused(self, agent: str, reason: str, *, route: str, synthetic: bool) -> None:
-        """A wake the router deliberately declined — gated, not broken (see the class)."""
+        """A wake a gate deliberately declined — gated, not broken (see the class).
+
+        A held NOC wake-lock or a tripped breaker, and nothing else: a collapsed duplicate
+        delivery goes to :meth:`record_wake_deduped` instead. Both are the router working
+        correctly, but only this one means a wake that *should* have run did not, and only
+        this one should move the newest-attempt reading of a route's health.
+        """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
             at = _iso(self._now())
@@ -460,6 +581,33 @@ class EvidenceStore:
             per_route.refused += 1
             per_route.last_refused_at = at
             per_route.last_refused_reason = _reason(reason)
+            self._flush_locked()
+
+    def record_wake_deduped(self, agent: str, *, route: str, synthetic: bool) -> None:
+        """A duplicate delivery collapsed into the wake that already ran for it.
+
+        Its own outcome rather than a refusal, because it is the only one here that a
+        *success* produces: the dedup cache is marked only after a wake has fired and
+        succeeded, so this record can exist only downstream of an ``ok`` recorded within
+        the cache's TTL (basecradle-router#218). Counting it as a refusal made the newest
+        recorded attempt on a healthy route read as a rejection.
+
+        Takes no ``reason``: there is exactly one, and **the counter is the
+        classification**. Handing a consumer a reason string to parse is what would
+        oblige the NOC to keep a second spelling of this contract, which its own rulings
+        forbid (basecradle-noc#344/#366). ``route`` and ``synthetic`` stay required and
+        keyword-only for the reasons :meth:`record_wake_ok` gives.
+        """
+        with self._lock:
+            wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
+            at = _iso(self._now())
+            wake.deduped += 1
+            wake.last_deduped_at = at
+            wake.last_deduped_route = route
+            wake.last_deduped_synthetic = synthetic
+            per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
+            per_route.deduped += 1
+            per_route.last_deduped_at = at
             self._flush_locked()
 
     def record_queue_depth(self, agent: str, pending: int) -> None:

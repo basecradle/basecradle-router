@@ -458,8 +458,13 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
     """``agent_wakes.<harness_key>`` projected flat — the object the pointer walks into.
 
     ``refused`` stays apart from ``failed`` for the reason the evidence store keeps them
-    apart: a refusal is the dedup cache, the converge lock or the breaker working, and an
-    agent whose whole history is refusals is *gated*, not unreachable.
+    apart: a refusal is the converge lock or the breaker working, and an agent whose whole
+    history is refusals is *gated*, not unreachable. ``deduped`` stays apart from
+    ``refused`` for a sharper reason still (basecradle-router#218): a collapsed duplicate
+    is only reachable *through* a successful wake, so publishing it as a refusal made the
+    newest recorded attempt on a demonstrably healthy route read as a rejection. Both
+    counters ship, so a consumer classifies by the field it reads and never by parsing our
+    reason strings.
 
     ``by_route`` is the complete per-``(agent, route)`` record, including routes that are
     no longer armed — ``edges`` and the per-route claims carry only the armed ones, and a
@@ -477,6 +482,7 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
         "ok": wake.ok,
         "failed": wake.failed,
         "refused": wake.refused,
+        "deduped": wake.deduped,
         "queued": wake.queued,
         "last_ok_at": wake.last_ok_at,
         "last_ok_delivery": wake.last_ok_delivery,
@@ -490,6 +496,9 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
         "last_refused_reason": wake.last_refused_reason,
         "last_refused_route": wake.last_refused_route,
         "last_refused_synthetic": wake.last_refused_synthetic,
+        "last_deduped_at": wake.last_deduped_at,
+        "last_deduped_route": wake.last_deduped_route,
+        "last_deduped_synthetic": wake.last_deduped_synthetic,
         "by_route": {route: _route_scalars(p) for route, p in sorted(wake.by_route.items())},
     }
 
@@ -507,22 +516,31 @@ def _route_scalars(proof: RouteWakeEvidence | None) -> dict:
     the agent-wide claim's ``edges``/``by_route`` views, so the several places this row
     surfaces cannot disagree about the same wake.
 
-    It carries all three outcomes, not only the successes: once one route is the fleet's
+    It carries all four outcomes, not only the successes: once one route is the fleet's
     own probe, a row that reported only ``ok`` would leave "this edge has never been
     exercised" and "every exercise of it was refused because the agent has no probe
     secret armed" looking identical — the same *never tried* vs. *tried and it did not
     work* confusion the per-route granularity was introduced to end.
+
+    **This is the row the dedup misclassification was measured on** (basecradle-router#218).
+    It is where a per-recipient claim points, so a consumer asking *what did this route
+    last do for this agent?* reads it and nothing else — and with a collapsed duplicate
+    filed under ``refused``, ``ok=4 failed=0 refused=2`` with the refusal 2.6 ms after the
+    success was a route that had rejected nothing at all. ``deduped``/``last_deduped_at``
+    carry it now, so ``last_refused_at`` moves only for a wake a gate actually stopped.
     """
     return {
         "ok": proof.ok if proof else 0,
         "failed": proof.failed if proof else 0,
         "refused": proof.refused if proof else 0,
+        "deduped": proof.deduped if proof else 0,
         "last_ok_at": proof.last_ok_at if proof else None,
         "last_ok_delivery": proof.last_ok_delivery if proof else None,
         "last_failed_at": proof.last_failed_at if proof else None,
         "last_failed_reason": proof.last_failed_reason if proof else None,
         "last_refused_at": proof.last_refused_at if proof else None,
         "last_refused_reason": proof.last_refused_reason if proof else None,
+        "last_deduped_at": proof.last_deduped_at if proof else None,
     }
 
 

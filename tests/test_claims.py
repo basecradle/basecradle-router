@@ -177,18 +177,21 @@ def test_enabling_the_route_arms_the_edge_that_was_missing(tmp_path) -> None:
             "kind": "webhook-route",
             "source": "basecradle",
             "resolves_by": "recipient_uuid",
-            # Armed, and honest that being armed proves nothing yet — in all three
+            # Armed, and honest that being armed proves nothing yet — in all four
             # outcomes, so "never exercised" and "exercised and refused every time"
-            # can never read alike (basecradle-router#208).
+            # can never read alike (basecradle-router#208), and a collapsed duplicate
+            # never reads as a rejection (basecradle-router#218).
             "ok": 0,
             "failed": 0,
             "refused": 0,
+            "deduped": 0,
             "last_ok_at": None,
             "last_ok_delivery": None,
             "last_failed_at": None,
             "last_failed_reason": None,
             "last_refused_at": None,
             "last_refused_reason": None,
+            "last_deduped_at": None,
         }
     ]
 
@@ -238,6 +241,43 @@ def test_a_successful_wake_becomes_the_claims_evidence(tmp_path) -> None:
     # which is the only reason the NOC can arm the row at all.
     assert _resolve(claim) == claim["detail"]["last_ok_at"]
     assert _resolve(claim) is not None
+
+
+def test_a_collapsed_duplicate_is_published_apart_from_a_refusal(tmp_path) -> None:
+    """A healthy route must never publish as a rejected one (basecradle-router#218).
+
+    Measured live on both builders' ``wake-edge:webhook-route:github`` rows:
+    ``ok=4 failed=0 refused=2``, the newest refusal 2.6 ms after the newest success and
+    both of them idempotent dedups. A consumer reading *the newest recorded attempt was
+    refused* saw a route in trouble that had rejected nothing.
+
+    **The counter is the classification.** The NOC cannot tell a benign collapse from a
+    real refusal by reading our ``reason`` strings — that would be a second spelling of
+    this repo's contract living in its repo, which its own rulings forbid
+    (basecradle-noc#344/#366). So the split has to be visible in the published fields,
+    at both granularities, and ``last_refused_at`` must not move for a dedup.
+    """
+    evidence = EvidenceStore(None)
+    evidence.record_wake_ok("nova", DELIVERY, route="github", synthetic=False)
+    evidence.record_wake_deduped("nova", route="github", synthetic=False)
+
+    subject = _subject(_build(tmp_path, evidence=evidence), "agent:nova")
+    agent_row = _claim(subject, "wake-edge:webhook-route")["detail"]
+    route_row = _claim(subject, "wake-edge:webhook-route:github")["detail"]
+
+    for row in (agent_row, route_row):
+        assert (row["ok"], row["failed"], row["refused"], row["deduped"]) == (1, 0, 0, 1)
+        assert row["last_refused_at"] is None
+        assert row["last_deduped_at"] is not None
+    # Provenance rides the agent-wide dedup trio like every other outcome's, so a reader
+    # never has to know which route names are the fleet's own probes.
+    assert (agent_row["last_deduped_route"], agent_row["last_deduped_synthetic"]) == (
+        "github",
+        False,
+    )
+    # And the row the ledger actually arms still resolves to the success, which is the
+    # whole outcome being bought: nothing about a dedup disturbs the proof.
+    assert _resolve(_claim(subject, "wake-edge:webhook-route:github")) is not None
 
 
 def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_path) -> None:

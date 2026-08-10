@@ -213,16 +213,33 @@ def test_a_tripped_breaker_records_a_refusal() -> None:
     assert (wake.ok, wake.refused) == (1, 1)
 
 
-def test_a_duplicate_delivery_records_a_refusal_not_a_second_wake() -> None:
-    evidence = EvidenceStore(None)
+def test_a_duplicate_delivery_records_a_dedup_never_a_refusal(tmp_path) -> None:
+    """The collapse is counted, and counted as its own thing (basecradle-router#218).
+
+    A duplicate is reachable only *through* a successful wake — the cache is marked
+    after the wake, never before — so filing it under ``refused`` made the newest
+    recorded attempt on a demonstrably healthy route read as a rejection. Asserted at
+    both granularities, because the per-route row is the one a per-recipient claim
+    points into and where the misreading was measured live.
+    """
+    evidence = EvidenceStore(str(tmp_path / "evidence.json"))
     pipeline = _pipeline(evidence, deduper=DeliveryDeduper(600.0))
 
     pipeline.execute(NOVA, _event(), PipelineResult())
     pipeline.execute(NOVA, _event(), PipelineResult())  # same delivery id
 
     wake = evidence.snapshot().agent_wakes["nova"]
-    assert (wake.ok, wake.refused) == (1, 1)
-    assert wake.last_refused_reason == "duplicate_delivery"
+    assert (wake.ok, wake.failed, wake.refused, wake.deduped) == (1, 0, 0, 1)
+    assert wake.last_refused_at is None and wake.last_refused_reason is None
+    assert wake.last_deduped_at is not None
+    # Provenance rides the dedup trio too, so a synthetic collapse can never read as a
+    # production one — the rule every other outcome here already follows.
+    assert (wake.last_deduped_route, wake.last_deduped_synthetic) == ("github", False)
+
+    per_route = wake.by_route["github"]
+    assert (per_route.ok, per_route.refused, per_route.deduped) == (1, 0, 1)
+    assert per_route.last_refused_at is None
+    assert per_route.last_deduped_at == wake.last_deduped_at
 
 
 # --- the scheduler's queue depth -------------------------------------------
