@@ -39,13 +39,18 @@ read from the same file (`basecradle-noc#421`, requirement 5).
   the minted marker lands here, and that is the right reading — the NOC only fires at
   agents it has armed, so a refusal at the far end means the two copies have drifted.
 - ``unprovable`` / exit ``75`` — we never got an answer: the probe route is not enabled,
-  a gate *refused* the wake (a live converge freeze, the breaker, a duplicate), or
-  nothing was recorded before the deadline. Still red, still immediate — never quieter.
+  a gate *refused* the wake (a live converge freeze, the breaker), the injection was
+  collapsed as a duplicate, or nothing was recorded before the deadline. Still red, still
+  immediate — never quieter.
 
 The refused-vs-failed split the evidence store already draws maps exactly onto
 ``unprovable``-vs-``broken``, which is not a coincidence: a refusal is the router
 working correctly and declining to answer, and that is precisely *we never got an
-answer*.
+answer*. A collapsed duplicate reads the same way here for the same reason, and it is
+watched on its own counter since basecradle-router#218 moved it out of ``refused`` — the
+distinction that matters to the ledger (a dedup implies a wake that *worked*, a refusal a
+wake that was stopped) makes no difference to a probe, whose question is only whether
+*this* injection was answered.
 
 **The marker is supplied, never minted here.** The router holds no agent's
 ``NOC_PROBE_SECRET`` and must not — the wake-runner's whole boundary is that an agent's
@@ -193,6 +198,7 @@ class WakeProof:
     route_refused: int = 0
     route_last_refused_at: str | None = None
     route_last_refused_reason: str | None = None
+    route_deduped: int = 0
     queued: int = 0
 
     @classmethod
@@ -212,6 +218,7 @@ class WakeProof:
             route_refused=per_route.refused,
             route_last_refused_at=per_route.last_refused_at,
             route_last_refused_reason=per_route.last_refused_reason,
+            route_deduped=per_route.deduped,
             queued=wake.queued,
         )
 
@@ -229,6 +236,7 @@ class WakeProof:
             "route_refused": self.route_refused,
             "route_last_refused_at": self.route_last_refused_at,
             "route_last_refused_reason": self.route_last_refused_reason,
+            "route_deduped": self.route_deduped,
             "queued": self.queued,
         }
 
@@ -419,18 +427,18 @@ class WakeProbe:
         A non-``202`` injection is decided at once: the accept half already refused, so
         there is no wake to wait for and waiting would only delay a known answer.
 
-        Otherwise the loop watches for exactly three things, in the order that keeps them
+        Otherwise the loop watches for exactly four things, in the order that keeps them
         unambiguous. **Success is matched on the delivery id, never on the timestamp**,
         because a real wake for the same agent can land in the same window and a probe
         that accepted somebody else's proof would be worse than no probe at all.
 
-        Failure and refusal record no delivery id, so they are matched on the **counter**
-        moving rather than the timestamp — a counter is monotonic and cannot repeat a
-        value, whereas two outcomes recorded in the same instant would produce the same
-        ISO timestamp and read as "nothing happened". That the counter belongs to this
-        probe rather than to some other traffic is guaranteed one level up: the per-agent
-        lock serialises this agent's wakes, and the counter is scoped to the *probe*
-        route, so nothing else can be moving it.
+        The three non-success outcomes record no delivery id, so they are matched on the
+        **counter** moving rather than the timestamp — a counter is monotonic and cannot
+        repeat a value, whereas two outcomes recorded in the same instant would produce
+        the same ISO timestamp and read as "nothing happened". That the counter belongs to
+        this probe rather than to some other traffic is guaranteed one level up: the
+        per-agent lock serialises this agent's wakes, and the counters are scoped to the
+        *probe* route, so nothing else can be moving them.
         """
         if not injection.accepted:
             return (*_injection_verdict(injection), before)
@@ -457,6 +465,19 @@ class WakeProbe:
                     UNPROVABLE,
                     f"the router refused the wake, so nothing was proven either way: "
                     f"{after.route_last_refused_reason}",
+                    after,
+                )
+            if after.route_deduped != before.route_deduped:
+                # Watched on its own counter since basecradle-router#218 split it out of
+                # `refused`. Unreachable in practice — every run mints a fresh delivery
+                # id, so the dedup cache cannot hold it — but the verdict is the same
+                # class as any other gate that stops the wake: no wake ran, so nothing
+                # was proven. Dropping the check would silently downgrade that to a
+                # timeout, which reports the same colour with a far worse reason.
+                return (
+                    UNPROVABLE,
+                    "the router collapsed the injection as a duplicate delivery, so no "
+                    "wake ran and nothing was proven either way",
                     after,
                 )
             if self.clock() >= deadline:

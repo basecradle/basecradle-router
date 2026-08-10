@@ -472,6 +472,45 @@ operator's one-row view, and `detail.by_route` carries the full record — inclu
 armed, which both of the others by definition drop. An armed edge with `last_ok_at: null` beside a
 sink counting hundreds of rejections is instance 5, for that one agent, in one row.
 
+**The four wake outcomes, and why they are four counters and not two** (`#218`). Every wake this
+router dispatches ends in exactly one of these, published on both the agent-wide row and each
+`(agent, route)` row, with a matching `last_*` group:
+
+| Counter | What it means | What a consumer should do with it |
+|---|---|---|
+| `ok` | the wake fired and succeeded | the only thing that proves the edge; `last_ok_at` is what every wake-edge claim points at |
+| `failed` | the wake was dispatched and the wake path broke | **loud** — the edge is broken for this agent, with the reason |
+| `refused` | a **gate** declined a wake that would otherwise have run: a live NOC converge freeze, or a tripped wake-rate breaker | the router working correctly and *suppressing* a wake — an agent whose history is all refusals is **gated, not unreachable** |
+| `deduped` | a duplicate delivery was collapsed into the wake that already ran for it | the router working correctly *because a wake already succeeded* — never a finding |
+
+A **genuine rejection of a delivery** — a bad signature, a malformed payload, an untrusted sender —
+never reaches any of these. It is counted at the sink, as `delivery_sinks.<route>.rejected`, because
+it is refused at `verify`/`normalize` before an agent is ever resolved.
+
+`deduped` was split out of `refused` in `#218`, and the reason is sharper than tidiness: **a collapse
+is the one outcome only a success can produce.** The dedup cache is marked *after* a wake has fired
+and succeeded, so a `duplicate_delivery` is a downstream consequence of an `ok` recorded within the
+cache's TTL — whereas every other refusal means a wake that should have run did not. Sharing one
+counter published `ok=4 failed=0 refused=2` on both builders' `github` rows, the newest refusal 2.6 ms
+after the newest success and both of them dedups: a consumer reading *the newest recorded attempt was
+refused* saw a route in trouble that had rejected nothing (`basecradle-noc#462`). **The counter is the
+classification** — deliberately, because telling a benign collapse from a real refusal by parsing this
+repo's `reason` strings would put a second spelling of our contract in the NOC's repo, which its own
+rulings forbid (`basecradle-noc#344`/`#366`).
+
+Rows written before `#218` are **reclassified on load — by the daemon and by every reader**, so the
+emitted claim is correct on the first converge after the deploy rather than after the daemon's next
+flush (the CLI and the claims emitter stay strictly read-only; only the daemon rewrites the file). A
+trailing
+`last_refused_reason: duplicate_delivery` moves to `last_deduped_*` and one count moves with it
+(`refused + deduped` is conserved). The document is durable on purpose, so the misreading is durable
+too — `last_refused_at` moves only on a genuine refusal, and the whole point is that one has not
+happened. Bumping `EVIDENCE_VERSION` would have cleared it and reset **every** age-of-proof on the box
+to never-proven, which is precisely what `/var/lib` was chosen to prevent. History cannot be split
+further (nothing recorded the mix), so a row that had several refusals can read `refused >= 1` beside
+a null `last_refused_at`: *there were refusals, and the most recent thing we filed as one turned out
+not to be.* That understates refusals, which is this store's standing fail-direction.
+
 **The evidence document** (`/var/lib/basecradle-router/evidence.json`, `0644`, no secrets) is what the
 daemon writes and the emitter reads — they are different processes, so a file is the only channel.
 The unit's `StateDirectory=basecradle-router` creates the parent owned by `router` before the daemon
@@ -538,9 +577,9 @@ instrument defeating itself. A parked builder correctly reads `edge_count: 0` **
 `last_ok_synthetic: true`: the terminus answers, and nothing in the world will ever address it.
 
 **A synthetic never masquerades as real traffic.** It lands in its own `delivery_sinks.probe` and its
-own `agent_wakes.<slug>.by_route.probe`, and every `last_ok_*`/`last_failed_*`/`last_refused_*` trio
-records its `route` and a `synthetic` flag *at write time* — not derived at read time, where a route
-since disabled would silently answer "real".
+own `agent_wakes.<slug>.by_route.probe`, and every `last_ok_*`/`last_failed_*`/`last_refused_*`/
+`last_deduped_*` group records its `route` and a `synthetic` flag *at write time* — not derived at
+read time, where a route since disabled would silently answer "real".
 
 **Enabling it** (NOC-side config; the daemon will not boot on a route with no secret):
 
@@ -562,8 +601,10 @@ install -o root -g root -m 0755 deploy/bin/probe-ack /opt/basecradle-router/bin/
 successful wake for *this* delivery id), `1` proven broken (the injection was structurally refused, or
 the wake was dispatched and failed — including a probe secret that has drifted between the NOC's copy
 and the agent's), `75` could not prove (the route is not enabled, a gate *refused* the wake — a live
-converge freeze is the common one — or nothing was recorded before the deadline). The refused-vs-failed
-split the evidence store already draws maps exactly onto `unprovable`-vs-`broken`.
+converge freeze is the common one — the injection was collapsed as a duplicate, or nothing was recorded
+before the deadline). The refused-vs-failed split the evidence store already draws maps exactly onto
+`unprovable`-vs-`broken`, and a collapsed duplicate reads the same way: no wake ran, so nothing was
+proven either way.
 
 **The injection point is not reachable from the internet.** The CLI posts over loopback, and the
 Caddyfile answers `/webhooks/probe` with a `404` — the same answer an unknown route gives, so it

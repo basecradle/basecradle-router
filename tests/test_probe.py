@@ -804,6 +804,44 @@ def test_a_frozen_agent_refuses_the_probe_which_reads_unprovable_not_broken(box,
     assert box.attempts == []  # nothing was launched
 
 
+def test_a_collapsed_injection_reads_unprovable_naming_the_dedup(tmp_path) -> None:
+    """A dedup stops the wake like any other gate, so the probe still gets no answer.
+
+    Driven at the recording seam rather than through the real cache, because the real
+    path cannot produce this: every run mints a fresh delivery id, so a probe's key is
+    never in the cache — and forcing a repeat id instead would make the probe match the
+    *previous* run's success, testing nothing.
+
+    Pinned all the same, because basecradle-router#218 moved this outcome onto its own
+    counter, and a watch left behind on ``refused`` would silently downgrade the verdict
+    to a deadline timeout — the same colour, reported after a five-minute wait, with a
+    reason that names the wrong thing.
+    """
+    box = FakeBox(tmp_path, {"nova": NOVA_AGENT_SECRET})
+
+    def collapsed(*_args) -> Injection:
+        # The daemon accepted the delivery, then the dedup cache swallowed it.
+        box.pipeline.evidence.record_wake_deduped("nova", route="probe", synthetic=True)
+        return Injection(status=202, stages=(("resolve", "ok"),))
+
+    result = WakeProbe(
+        secret=PROBE_SECRET,
+        evidence_path=box.evidence_path,
+        self_url="http://127.0.0.1:8000",
+        post=collapsed,
+        read=lambda: read_evidence(box.evidence_path),
+        sleep=lambda _d: None,
+    ).run("nova", a_marker(NOVA_AGENT_SECRET))
+
+    assert result.status == UNPROVABLE
+    assert result.exit_code == EXIT_UNPROVABLE
+    assert "duplicate delivery" in result.detail
+    assert "no outcome recorded" not in result.detail  # decided, not waited out
+    # And the collapse is legible in the reported reading, on its own counter.
+    assert result.after.route_deduped == 1
+    assert result.after.route_refused == 0
+
+
 def test_the_probe_reaches_a_harness_persona_by_exactly_the_same_route(box) -> None:
     # Requirement 4: @jt migrates to this mechanism, with no special case. The only
     # difference is which binary the wrapper would have exec'd.

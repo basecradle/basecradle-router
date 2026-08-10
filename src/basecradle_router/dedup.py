@@ -51,6 +51,14 @@ import threading
 import time
 from collections.abc import Callable
 
+#: What a collapsed duplicate is called wherever the router names it — the pipeline's
+#: ``stage=dedup outcome=ignored reason=…`` line, and the legacy-reason migration in
+#: :mod:`basecradle_router.evidence`. One spelling, defined by the module that owns the
+#: concept, because a string two files spell independently is a string they can drift on
+#: — and here the migration's correctness *is* an exact match against what the pipeline
+#: used to write (basecradle-router#218).
+DUPLICATE_DELIVERY = "duplicate_delivery"
+
 # The cache accumulates one entry per distinct delivery ever woken — unbounded
 # over a long-running daemon. So expired keys are swept periodically: every
 # this-many marks, any entry older than the TTL is dropped (it would read as

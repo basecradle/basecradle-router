@@ -3,9 +3,11 @@
 What the router has demonstrably done — deliveries verified, agents woken — kept
 where a *different* process (the NOC's claims emitter) can read it. The properties
 pinned here are the ones the claims-vs-evidence ledger relies on
-(basecradle/basecradle#460): counters survive a restart, a duplicate delivery and a
-broken wake are counted apart, and a store that cannot write degrades quietly
-instead of taking a wake down with it. No network, model, or live agent.
+(basecradle/basecradle#460): counters survive a restart, the four wake outcomes stay
+told apart — a success, a broken wake, a gate's refusal, and an idempotent collapse
+that only a success can produce (basecradle-router#218) — and a store that cannot
+write degrades quietly instead of taking a wake down with it. No network, model, or
+live agent.
 Test cast: Nova Digital (``nova``, AI) and John Doe (``john``, human).
 """
 
@@ -172,10 +174,10 @@ def test_a_hand_mangled_per_route_map_is_dropped_not_fatal(tmp_path) -> None:
 
 
 def test_a_refused_wake_is_never_confused_with_a_failed_one(tmp_path) -> None:
-    # Opposite meanings: a refusal is the dedup cache, the NOC's converge lock, or the
-    # breaker working as designed; a failure is the wake path broken. An agent whose
-    # history is all refusals is suppressed, not unreachable — and the ledger must not
-    # cry wolf over a converge.
+    # Opposite meanings: a refusal is the NOC's converge lock or the breaker working as
+    # designed; a failure is the wake path broken. An agent whose history is all
+    # refusals is suppressed, not unreachable — and the ledger must not cry wolf over a
+    # converge.
     store = _store(tmp_path)
     store.record_wake_refused(
         NOVA, "wake_lock_held until 2026-07-27T12:05:00+00:00", route="github", synthetic=False
@@ -186,6 +188,157 @@ def test_a_refused_wake_is_never_confused_with_a_failed_one(tmp_path) -> None:
     assert (wake.ok, wake.refused, wake.failed) == (0, 1, 1)
     assert wake.last_refused_reason.startswith("wake_lock_held")
     assert wake.last_failed_reason == "claude exited 1"
+
+
+def test_a_dedup_is_never_confused_with_a_refusal(tmp_path) -> None:
+    """The third meaning, and the one only a *success* can produce (#218).
+
+    A refusal says a wake that should have run did not; a dedup says a wake that must
+    not run did not — and the cache is marked only after a wake has succeeded, so this
+    outcome is reachable exclusively downstream of an ``ok``. Sharing one counter made
+    the newest recorded attempt on a healthy route read as a rejection.
+    """
+    store = _store(tmp_path)
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+    store.record_wake_deduped(NOVA, route="github", synthetic=False)
+
+    wake = read_evidence(str(tmp_path / "evidence.json")).agent_wakes[NOVA]
+    assert (wake.ok, wake.failed, wake.refused, wake.deduped) == (1, 0, 0, 1)
+    # The fields a consumer reads to decide "what did this route last do": the dedup
+    # moved its own timestamp and left the refusal slot untouched.
+    assert wake.last_refused_at is None and wake.last_refused_reason is None
+    assert wake.last_deduped_at == wake.last_ok_at
+    assert (wake.last_deduped_route, wake.last_deduped_synthetic) == ("github", False)
+    assert wake.by_route["github"].deduped == 1
+    assert wake.by_route["github"].last_deduped_at == wake.last_deduped_at
+
+
+def test_a_synthetic_dedup_never_reads_as_a_production_one(tmp_path) -> None:
+    # Provenance is recorded at write time beside *every* outcome, the dedup included —
+    # deriving it later from the route name is what a since-disabled route answers
+    # wrongly (basecradle-router#208).
+    store = _store(tmp_path)
+    store.record_wake_deduped(NOVA, route="probe", synthetic=True)
+
+    wake = store.snapshot().agent_wakes[NOVA]
+    assert (wake.last_deduped_route, wake.last_deduped_synthetic) == ("probe", True)
+    assert set(wake.by_route) == {"probe"}
+
+
+def test_a_legacy_duplicate_delivery_refusal_is_reclassified_on_load(tmp_path) -> None:
+    """The rows already on disk carry the misreading, so the fix has to reach them.
+
+    This document is durable on purpose, and ``last_refused_*`` moves only when a
+    genuine refusal happens — so code that merely stops writing a dedup there would
+    leave the live rows saying "newest attempt: rejected" indefinitely. Shaped like the
+    rows measured live: ``ok=4 refused=2``, the last refusal a dedup.
+    """
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {
+                    NOVA: {
+                        "ok": 4,
+                        "failed": 0,
+                        "refused": 2,
+                        "last_ok_at": "2026-08-02T03:42:17+00:00",
+                        "last_refused_at": "2026-08-02T03:42:17.002600+00:00",
+                        "last_refused_reason": "duplicate_delivery",
+                        "last_refused_route": "github",
+                        "last_refused_synthetic": False,
+                        "by_route": {
+                            "github": {
+                                "ok": 4,
+                                "refused": 2,
+                                "last_ok_at": "2026-08-02T03:42:17+00:00",
+                                "last_refused_at": "2026-08-02T03:42:17.002600+00:00",
+                                "last_refused_reason": "duplicate_delivery",
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wake = read_evidence(str(path)).agent_wakes[NOVA]
+
+    # The one event we can positively identify moves; `refused + deduped` is conserved,
+    # because nothing ever recorded the mix of the rest.
+    assert (wake.ok, wake.refused, wake.deduped) == (4, 1, 1)
+    assert wake.last_deduped_at == "2026-08-02T03:42:17.002600+00:00"
+    assert (wake.last_deduped_route, wake.last_deduped_synthetic) == ("github", False)
+    # The point of the whole exercise: the newest recorded attempt is the success again.
+    assert wake.last_refused_at is None and wake.last_refused_reason is None
+    assert wake.last_refused_route is None and wake.last_refused_synthetic is None
+
+    per_route = wake.by_route["github"]
+    assert (per_route.ok, per_route.refused, per_route.deduped) == (4, 1, 1)
+    assert per_route.last_refused_at is None and per_route.last_refused_reason is None
+    assert per_route.last_deduped_at == "2026-08-02T03:42:17.002600+00:00"
+
+
+def test_reclassifying_a_legacy_dedup_is_idempotent(tmp_path) -> None:
+    # It must survive load → write → load: a migration that moved a count on every boot
+    # would inflate `deduped` forever. Safe by construction — nothing writes
+    # `duplicate_delivery` into a refusal reason any more — and pinned so it stays so.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {
+                    NOVA: {
+                        "refused": 1,
+                        "last_refused_at": "2026-08-02T03:42:17+00:00",
+                        "last_refused_reason": "duplicate_delivery",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # A round trip through the daemon's own writer, then a fresh read.
+    EvidenceStore(str(path)).record_queue_depth(JOHN, 1)
+    wake = read_evidence(str(path)).agent_wakes[NOVA]
+
+    assert (wake.refused, wake.deduped) == (0, 1)
+    assert wake.last_deduped_at == "2026-08-02T03:42:17+00:00"
+
+
+def test_a_genuine_refusal_on_disk_is_left_exactly_as_it_was(tmp_path) -> None:
+    # The migration is keyed on an exact reason the pipeline had exactly one writer for,
+    # so a converge freeze or a tripped breaker must pass through untouched — silently
+    # reclassifying a real refusal would be the mirror image of the bug being fixed.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {
+                    NOVA: {
+                        "refused": 1,
+                        "last_refused_at": "2026-08-02T03:42:17+00:00",
+                        "last_refused_reason": "wake_lock_held until 2026-08-02T04:00:00+00:00",
+                        "last_refused_route": "github",
+                        "last_refused_synthetic": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wake = read_evidence(str(path)).agent_wakes[NOVA]
+
+    assert (wake.refused, wake.deduped) == (1, 0)
+    assert wake.last_refused_at == "2026-08-02T03:42:17+00:00"
+    assert wake.last_refused_route == "github"
+    assert wake.last_deduped_at is None
 
 
 def test_an_agent_never_woken_has_no_evidence_at_all(tmp_path) -> None:
