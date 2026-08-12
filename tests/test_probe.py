@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import subprocess
 import sys
 import uuid
@@ -124,9 +125,7 @@ def registry(routes=("github", "basecradle", "probe")) -> RouteRegistry:
     return reg
 
 
-def probe_request(
-    harness_key: str, marker: str, *, delivery: str = "probe-abc", secret=PROBE_SECRET
-):
+def probe_request(harness_key: str, marker: str, *, delivery: str = "abc", secret=PROBE_SECRET):
     body = json.dumps(
         {"harness_key": harness_key, "marker": marker}, separators=(",", ":"), sort_keys=True
     ).encode()
@@ -206,14 +205,14 @@ def test_the_probe_route_verifies_like_every_other_source() -> None:
 
 def test_a_verified_probe_normalizes_to_a_synthetic_event_addressed_by_harness_key() -> None:
     marker = a_marker()
-    event = ProbeRoute().normalize(probe_request("nova", marker, delivery="probe-42"))
+    event = ProbeRoute().normalize(probe_request("nova", marker, delivery="d42"))
 
     assert event.source == "probe"
     assert event.kind is EventKind.SYNTHETIC_PROBE
     # Addressed by the OS-user slug — the identity every agent has, builder or persona.
     assert event.recipient == Recipient(by="harness_key", value="nova")
     assert event.wake_arg == marker  # the marker IS the wake argument
-    assert event.delivery_id == "probe-42"
+    assert event.delivery_id == "d42"
     assert event.synthetic is True
 
 
@@ -291,7 +290,7 @@ def test_the_bare_subprocess_waker_cannot_carry_a_probe_at_all() -> None:
 
 def test_the_home_server_waker_assembles_probe_mode_never_a_command() -> None:
     marker = a_marker()
-    event = ProbeRoute().normalize(probe_request("nova", marker, delivery="probe-7"))
+    event = ProbeRoute().normalize(probe_request("nova", marker, delivery="d7"))
 
     argv = HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event).argv
 
@@ -303,7 +302,7 @@ def test_the_home_server_waker_assembles_probe_mode_never_a_command() -> None:
         "--cwd",
         "/home/nova/basecradle-python",
         "--delivery",
-        "probe-7",
+        "d7",
         "--probe",
         marker,
     )
@@ -333,7 +332,7 @@ def test_the_waker_refuses_a_probe_whose_marker_is_malformed() -> None:
         kind=EventKind.SYNTHETIC_PROBE,
         recipient=Recipient(by="harness_key", value="nova"),
         wake_arg="not-a-marker",
-        delivery_id="probe-9",
+        delivery_id="d9",
     )
     with pytest.raises(WakeError, match="malformed BCNOC1 marker"):
         HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event)
@@ -613,7 +612,7 @@ def test_the_probe_proves_the_edge_end_to_end_and_last_ok_at_moves(box) -> None:
 def test_the_probe_traverses_every_stage_a_genuine_delivery_traverses(box) -> None:
     # Requirement 1: "A synthetic that bypasses verification proves nothing about the
     # edge that matters." The stage record is the router's own account of the trip.
-    request = probe_request("nova", a_marker(NOVA_AGENT_SECRET), delivery="probe-real-path")
+    request = probe_request("nova", a_marker(NOVA_AGENT_SECRET), delivery="real-path")
     result = box.pipeline.handle("probe", request)
 
     assert result.stages == [
@@ -951,12 +950,30 @@ def test_the_body_the_probe_signs_is_the_body_the_route_verifies() -> None:
     probe = WakeProbe(secret=PROBE_SECRET, evidence_path=None, self_url="http://x")
     marker = a_marker()
     body = probe.body_for("nova", marker)
-    headers = probe.headers_for(body, "probe-round-trip")
+    headers = probe.headers_for(body, "round-trip")
 
     request = InboundRequest(headers=headers, body=body)
     ProbeRoute().verify(request, PROBE_SECRET)
     event = ProbeRoute().normalize(request)
     assert (event.recipient.value, event.wake_arg) == ("nova", marker)
+
+
+def test_a_minted_delivery_id_identifies_the_delivery_and_types_it_with_nothing() -> None:
+    # basecradle-router#222, a founder order: a ticket number identifies, it never types.
+    # The id used to be minted `probe-<hex>` so a human reading journald could see the
+    # delivery was manufactured — which buried a low-cardinality fact inside the one
+    # high-cardinality key label extraction cannot lift, so every wake chart mixed the
+    # fleet's probe traffic with its real work while the raw line looked informative.
+    # That question is `source=probe`'s now, and the id goes back to identifying.
+    probe = WakeProbe(secret=PROBE_SECRET, evidence_path=None, self_url="http://x")
+    minted = {probe.mint_delivery_id() for _ in range(8)}
+
+    assert len(minted) == 8  # still unique per run: the join key still joins
+    for delivery in minted:
+        # Bare hex — which structurally excludes a prefix of ANY route's name, not just
+        # the one that was there, and stays inside the inert charset the wake boundary
+        # and the wake-runner both pin.
+        assert re.fullmatch(r"[0-9a-f]{32}", delivery), delivery
 
 
 # --- 8. the claims: a probe is a lever, never an edge ------------------------

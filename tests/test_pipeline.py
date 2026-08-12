@@ -18,7 +18,7 @@ from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
-from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
+from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
@@ -714,15 +714,16 @@ def test_log_fields_renders_key_value_dropping_empties_and_quoting_spaces() -> N
 
 
 def test_log_fields_renders_a_bool_lowercase_and_never_drops_false() -> None:
-    # A bool is a LABEL a log-metric extractor lifts and a dashboard filters on
-    # literally, so it must render the way every other structured surface in the fleet
-    # writes it — not the way `str()` happens to render a Python object (#220).
-    assert log_fields(synthetic=True) == "synthetic=true"
-    assert log_fields(synthetic=False) == "synthetic=false"
-    # And `False` is a value like `0`, never an absence: a real wake that stopped
-    # saying `synthetic=false` would leave the production filter matching nothing —
-    # the silent-absence shape this field exists to close.
-    assert log_fields(agent="nova", synthetic=False) == "agent=nova synthetic=false"
+    # No field passes a bool today — #222 retired `synthetic=`, the one that did — but
+    # this is the RENDERER's contract, not that field's, and it is pinned so the next
+    # bool field is correct on arrival. A bool is a LABEL a log-metric extractor lifts
+    # and a dashboard filters on literally, so it must render the way every other
+    # structured surface in the fleet writes it — not the way `str()` renders a Python
+    # object — and `False` is a value like `0`, never an absence: a key whose `false`
+    # were dropped as empty would leave a filter matching nothing, silently.
+    assert log_fields(armed=True) == "armed=true"
+    assert log_fields(armed=False) == "armed=false"
+    assert log_fields(agent="nova", armed=False) == "agent=nova armed=false"
 
 
 def test_the_wake_line_identifies_the_agent_the_delivery_the_exit_and_the_duration(caplog) -> None:
@@ -837,33 +838,34 @@ def test_the_breaker_ignore_line_names_the_agent_and_the_delivery(caplog) -> Non
     assert f"delivery={DELIVERY_B}" in line
 
 
-# --- the wake-origin label: `synthetic=true|false` on every wake line (#220) ---
+# --- the wake-origin label: `source=<route>` on every wake line (#222) -------
 #
 # The router's probe traverses the real path on purpose, so a probe wake lands on the
 # same `stage=wake` line a real handoff does — and that line is what a log-metric
 # extractor lifts a per-wake metric from. Extraction lifts only LOW-CARDINALITY keys,
-# so the probe's one previous marker (the `probe-` prefix inside the high-cardinality
+# so the probe's one previous marker (a `probe-` prefix typed into the high-cardinality
 # `delivery=` id) was dropped on the floor and every chart built on the metric silently
-# mixed the fleet's own test traffic with its real work. These pin the label that makes
-# the two separable, and pin that no line about a wake can lose it.
+# mixed the fleet's own test traffic with its real work. `source=` is the router's own
+# existing vocabulary — the fast half and the routes layer have always logged it —
+# carried through to the half that had dropped it. These pin that no pipeline line can
+# lose it, whatever the wake's outcome.
 
-# The accept half is deliberately exempt: its lines carry `source=`, which names the
-# route — `source=probe` is the same fact in the vocabulary that half speaks. Everything
-# else is a line ABOUT a wake and must carry the label, and the split is written this way
-# round on purpose: a Stage added later falls into the wake half by default and fails
-# this test until it is classified, rather than slipping through unlabelled.
+# The wake half is the half `_who` feeds, and is what the NOC's extraction guard names
+# as the surface that must newly carry `source=`. It is derived by SUBTRACTION on
+# purpose: a Stage added later falls into it by default and fails the coverage assertion
+# below until it is exercised, rather than slipping through untested.
 _ACCEPT_STAGES = (Stage.ROUTE, Stage.VERIFY, Stage.NORMALIZE, Stage.RESOLVE)
 _WAKE_STAGES = tuple(stage for stage in Stage if stage not in _ACCEPT_STAGES)
 
-PROBE_DELIVERY = "probe-dd5443c7af3a475abb31af8a1b07e4f7"
+PROBE_DELIVERY = "dd5443c7af3a475abb31af8a1b07e4f7"
 
 
 def _probe_event(delivery: str = PROBE_DELIVERY) -> Event:
     """A synthetic probe event, shaped as the probe route normalizes one.
 
-    Built here rather than driven through the probe route because the label is the
-    *core's*: it is derived from the event's own kind, so it must hold for any
-    synthetic source, not just the one that happens to exist today.
+    Built here rather than driven through the probe route because the key is the
+    *core's*: `_who` reads `Event.source`, so it must hold for any source at all, not
+    just the ones that happen to exist today.
     """
     return Event(
         source="probe",
@@ -874,28 +876,31 @@ def _probe_event(delivery: str = PROBE_DELIVERY) -> Event:
     )
 
 
+def _pipeline_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "basecradle_router.pipeline"]
+
+
 def _wake_lines(caplog) -> list[str]:
     """Every pipeline line that is *about a wake* — the slow half, plus the retry line."""
-    messages = [r.getMessage() for r in caplog.records if r.name == "basecradle_router.pipeline"]
     return [
         message
-        for message in messages
+        for message in _pipeline_lines(caplog)
         if "event=wake_retry" in message
         or any(f"stage={stage.value} " in message for stage in _WAKE_STAGES)
     ]
 
 
-def test_a_wake_line_says_whether_the_wake_was_real_or_the_routers_own_probe(caplog) -> None:
-    # The headline of #220, on the one line the per-wake duration metric is lifted from.
+def test_a_wake_line_names_the_source_the_delivery_arrived_on(caplog) -> None:
+    # The headline of #222, on the one line the per-wake duration metric is lifted from.
     pipeline, _ = _pipeline()
 
     with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
         pipeline.handle("github", _github_request(delivery=DELIVERY_A))
     real = _stage_line(caplog, Stage.WAKE)
     assert "outcome=ok" in real
-    assert "synthetic=false" in real
-    # `delivery=` is untouched — it stays the high-cardinality join key, and the label
-    # is a field of its own rather than a prefix hidden inside it.
+    assert "source=github" in real
+    # `delivery=` identifies, and only identifies: it stays the high-cardinality join
+    # key, and the kind marker is a field of its own — never a prefix hidden inside it.
     assert f"delivery={DELIVERY_A}" in real
 
     caplog.clear()
@@ -903,7 +908,35 @@ def test_a_wake_line_says_whether_the_wake_was_real_or_the_routers_own_probe(cap
         pipeline.execute(NOVA, _probe_event(), PipelineResult())
     probe = _stage_line(caplog, Stage.WAKE)
     assert "outcome=ok" in probe
-    assert "synthetic=true" in probe
+    assert "source=probe" in probe
+    assert f"delivery={PROBE_DELIVERY}" in probe
+
+
+def test_no_pipeline_line_says_synthetic_at_all(caplog) -> None:
+    # #222 retired the vocabulary outright ("in an AI fleet, everything is synthetic —
+    # it answers no question"), so the retirement is pinned rather than merely done: a
+    # line that carried BOTH keys would leave two answers to one question in the journal
+    # and let a consumer quietly keep reading the retired one.
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+        pipeline.execute(NOVA, _probe_event(), PipelineResult())
+
+    for line in _pipeline_lines(caplog):
+        assert "synthetic=" not in line, f"a retired key came back: {line}"
+
+
+def test_the_source_value_set_is_exactly_the_registered_route_names() -> None:
+    # `source=` invents no vocabulary: its value is `Event.source`, which a route sets
+    # to its own `name`. So the closed set a dashboard groups by is the registry's own
+    # names — and adding a route extends it without touching the core, which is the
+    # core/routes split holding at the log layer too.
+    registry = RouteRegistry()
+    for route in (GithubRoute(TRUSTED_ACTORS), BasecradleRoute(), ProbeRoute()):
+        registry.register(route)
+
+    assert registry.names() == frozenset({"basecradle", "github", "probe"})
+    assert {route.name for route in registry.routes() if route.synthetic} == {"probe"}
 
 
 def _send_real(pipeline, *, dup: bool) -> None:
@@ -915,21 +948,21 @@ _probe_seq = itertools.count(1)
 
 
 def _send_probe(pipeline, *, dup: bool) -> None:
-    """One synthetic probe delivery, straight into the slow half the label lives in."""
-    delivery = PROBE_DELIVERY if dup else f"probe-{next(_probe_seq):032x}"
+    """One synthetic probe delivery, straight into the slow half the key lives in."""
+    delivery = PROBE_DELIVERY if dup else f"{next(_probe_seq):032x}"
     pipeline.execute(NOVA, _probe_event(delivery), PipelineResult())
 
 
-def test_every_line_about_a_wake_carries_the_label_however_that_wake_ended(caplog) -> None:
+def test_every_line_about_a_wake_names_its_source_however_that_wake_ended(caplog) -> None:
     # A refused probe and a failed probe pollute a wake-failure count exactly as a
-    # successful one pollutes a duration chart, so the label rides on every outcome —
-    # not only the happy one. Each scenario is driven twice, real and synthetic, and
+    # successful one pollutes a duration chart, so the key rides on every outcome — not
+    # only the happy one. Each scenario is driven twice, over two different sources, and
     # between them they must cover every stage of the wake half.
     held = {"nova": WakeLockState.HELD}
     one_wake = BreakerConfig(max_wakes=1, window=60.0, cooldown=60.0)
     covered: set[str] = set()
 
-    for send, expected in ((_send_real, "synthetic=false"), (_send_probe, "synthetic=true")):
+    for send, expected in ((_send_real, "source=github"), (_send_probe, "source=probe")):
         # (name, pipeline, deliveries to send, whether they share one delivery id)
         scenarios = (
             ("a clean wake", _pipeline()[0], 1, False),
@@ -947,7 +980,7 @@ def test_every_line_about_a_wake_carries_the_label_however_that_wake_ended(caplo
             lines = _wake_lines(caplog)
             assert lines, f"{expected}/{name}: no line about the wake was emitted at all"
             for line in lines:
-                assert expected in line, f"{expected}/{name}: a wake line lost the label: {line}"
+                assert expected in line, f"{expected}/{name}: a wake line lost the source: {line}"
             covered.update(
                 stage.value
                 for stage in _WAKE_STAGES
@@ -961,7 +994,27 @@ def test_every_line_about_a_wake_carries_the_label_however_that_wake_ended(caplo
     assert covered == {stage.value for stage in _WAKE_STAGES}
 
 
-def test_a_retried_wake_says_on_every_attempt_whether_it_was_real(caplog) -> None:
+def test_both_halves_of_the_pipeline_name_the_source(caplog) -> None:
+    # The point of reusing the router's own word rather than minting a new one: ONE key
+    # now spans a delivery's whole trip, so `source=` groups the fast half's lines and
+    # the slow half's alike and the two halves cannot drift into two vocabularies.
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    lines = _pipeline_lines(caplog)
+    # The gates log only when they STOP a wake, so a clean trip is exactly these six —
+    # asserted by name so a stage that silently stopped logging is a failure here rather
+    # than a vacuously-passing loop over whatever happened to be emitted.
+    assert [line.split(" ", 1)[0] for line in lines] == [
+        f"stage={stage.value}"
+        for stage in (Stage.ROUTE, Stage.VERIFY, Stage.NORMALIZE, Stage.RESOLVE, Stage.LOCK)
+    ] + ["stage=wake"]
+    for line in lines:
+        assert "source=github" in line, f"a pipeline line lost the source: {line}"
+
+
+def test_a_retried_wake_names_its_source_on_every_attempt(caplog) -> None:
     # The retry WARNING is a per-wake line too: a flapping *probe* must not read as a
     # flapping agent on a wake-failure chart.
     pipeline, _ = _pipeline(waker=_StubWaker(fail_times=2))
@@ -970,25 +1023,25 @@ def test_a_retried_wake_says_on_every_attempt_whether_it_was_real(caplog) -> Non
 
     retries = [r.getMessage() for r in caplog.records if "event=wake_retry" in r.getMessage()]
     assert len(retries) == 2
-    assert all("synthetic=false" in message for message in retries)
+    assert all("source=github" in message for message in retries)
 
 
-def test_the_journal_label_and_the_evidence_ledger_record_the_same_fact(caplog) -> None:
-    # One definition, two surfaces. The label on the line and the flag the evidence
-    # store writes beside the very same outcome are both read from `Event.synthetic`,
-    # so the journal a dashboard charts and the ledger the NOC's claims rest on can
-    # never disagree about whether a wake was real. In-memory store: no test writes to
-    # the box's state dir.
+def test_the_journal_and_the_evidence_ledger_name_the_same_source(caplog) -> None:
+    # One definition, two surfaces. The `source=` on the line and the `route` the
+    # evidence store writes beside the very same outcome are the same string read from
+    # the same `Event.source`, so the journal a dashboard charts and the ledger the
+    # NOC's claims rest on can never disagree about where a wake came from. In-memory
+    # store: no test writes to the box's state dir.
     evidence = EvidenceStore(None)
     pipeline, _ = _pipeline(evidence=evidence)
 
     with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
         pipeline.handle("github", _github_request(delivery=DELIVERY_B))
-    assert "synthetic=false" in _stage_line(caplog, Stage.WAKE)
-    assert evidence.snapshot().agent_wakes[NOVA.harness_key].last_ok_synthetic is False
+    assert "source=github" in _stage_line(caplog, Stage.WAKE)
+    assert evidence.snapshot().agent_wakes[NOVA.harness_key].last_ok_route == "github"
 
     caplog.clear()
     with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
         pipeline.execute(NOVA, _probe_event(), PipelineResult())
-    assert "synthetic=true" in _stage_line(caplog, Stage.WAKE)
-    assert evidence.snapshot().agent_wakes[NOVA.harness_key].last_ok_synthetic is True
+    assert "source=probe" in _stage_line(caplog, Stage.WAKE)
+    assert evidence.snapshot().agent_wakes[NOVA.harness_key].last_ok_route == "probe"

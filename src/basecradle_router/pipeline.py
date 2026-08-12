@@ -30,34 +30,39 @@ trip through the router — and, because the wake child is handed the same id in
 environment (:data:`~basecradle_router.wake.DELIVERY_ID_ENV`), through the agent's
 own journal too.
 
-**And every line about a wake says whether that wake was real**
-(``synthetic=true|false``, basecradle-router#220). The router's own probe traverses
-this exact path, so its wakes land on the same ``stage=wake`` lines a real handoff
-does — and those lines are what a log-metric extractor lifts a per-wake metric from.
-Extraction lifts only *low-cardinality* keys, so the probe's one previous marker —
-the ``probe-`` prefix inside the high-cardinality ``delivery=`` id — was dropped on
-the floor, and every duration chart and wake-rate alert built on the resulting metric
-silently mixed the fleet's own test traffic with its real work. ``synthetic=`` is
-that fact as a label with a closed two-value set, so the mix is filterable rather
-than merely visible to a human reading the raw line. Three properties are deliberate:
+**And every line about a wake names the source that asked for it** (``source=``,
+basecradle-router#222, a founder order). The router's own probe traverses this exact
+path, so its wakes land on the same ``stage=wake`` lines a real handoff does — and
+those lines are what a log-metric extractor lifts a per-wake metric from. Extraction
+lifts only *low-cardinality* keys, so the probe's one previous marker — a ``probe-``
+prefix typed into the high-cardinality ``delivery=`` id — was dropped on the floor,
+and every duration chart and wake-rate alert built on the resulting metric silently
+mixed the fleet's own test traffic with its real work. ``source=`` is the route the
+delivery arrived on, said as a label: ``source=probe`` is the fleet probing itself,
+anything else is traffic something outside it actually sent. Three properties are
+deliberate:
 
-- **It is the same word, and the same fact, the rest of the router already uses.**
-  :attr:`~basecradle_router.models.Event.synthetic` is derived from the event's own
-  kind, the evidence store tags every outcome it writes with it, and
-  :attr:`~basecradle_router.routes.base.Route.synthetic` declares it per route. The
-  log line is one more reader of that single definition — never a second, driftable
-  one.
-- **It never names a source.** ``origin=probe`` would have put a route's name in the
-  core's vocabulary (which the core/routes split forbids) and would grow the value
-  set the day a second synthetic route lands; ``synthetic=`` is closed forever. The
-  key is also deliberately *not* ``origin``: an :class:`~basecradle_router.models.Event`
-  already has one, meaning something else entirely (the issue the agent reports back
-  on).
+- **It is the router's own existing vocabulary, carried through rather than invented.**
+  The value is :attr:`~basecradle_router.models.Event.source` — the same string the
+  fast half's stage lines already log, the same one the routes layer's
+  ``event=delivery_decision`` line already logs, and the same one the evidence store
+  records as ``route`` beside every outcome. The slow half was the only half that had
+  dropped it; this restores it, so one key spans a delivery's whole trip and no
+  surface can drift from another.
+- **The kind marker is a field, never a prefix inside another field.** A delivery id
+  identifies one delivery; typing a class into it makes a high-cardinality join key
+  carry a low-cardinality fact that extraction cannot see, which is how the mixing
+  went unnoticed. Whether a wake was manufactured is answered by ``source``, and by
+  the route's own :attr:`~basecradle_router.routes.base.Route.synthetic` declaration
+  behind it — never by reading characters off an id.
 - **It is on every line of the slow half, not only the happy one.** A refused probe
   and a failed probe pollute a wake-failure count exactly as a successful one pollutes
-  a duration chart, so the field rides in :func:`_who` alongside ``agent`` and
+  a duration chart, so the key rides in :func:`_who` alongside ``agent`` and
   ``delivery`` — which means a gate added later carries it by construction rather
   than by remembering to.
+
+The key is deliberately *not* ``origin``: an :class:`~basecradle_router.models.Event`
+already has one, meaning something else entirely (the issue the agent reports back on).
 
 **The pipeline ends at the wake — the router never merges.** Auto-merge of a
 captain's own green PR (constitution → Earned Autonomy) is performed by **GitHub
@@ -117,13 +122,16 @@ def log_fields(**pairs: object) -> str:
     ``""`` value is dropped rather than logged as ``key=`` (``0`` is a value, and is
     kept). Public because the server's startup banner renders through it too.
 
-    A ``bool`` renders lowercase — ``synthetic=true``, never Python's ``True``. These
-    are *labels* a log-metric extractor lifts and a dashboard filters on literally, so
-    the value must be the one every other structured surface in the fleet writes (JSON
-    evidence, logfmt, the NOC's queries) rather than the one ``str()`` happens to give
-    a Python object. ``False`` is a value like ``0`` and is never dropped as empty: a
-    real wake that stopped saying ``synthetic=false`` would leave the filter matching
-    nothing, which is the silent-absence shape this field exists to close.
+    A ``bool`` renders lowercase — ``key=true``, never Python's ``True`` — and ``False``
+    is a value like ``0``, never dropped as empty. No field passes a bool today
+    (basecradle-router#222 retired the one that did), but this is the *renderer's*
+    contract rather than that field's: a log value is a label a metric extractor lifts
+    and a dashboard filters on literally, so it must be spelled the way every other
+    structured surface in the fleet spells it (JSON evidence, logfmt, the NOC's queries)
+    rather than the way ``str()`` happens to render a Python object — and a key whose
+    ``false`` was dropped as empty would leave a filter matching nothing, silently. Both
+    are pinned by their own test, so the next bool field is correct on arrival instead
+    of re-deriving this.
     """
     parts = []
     for key, value in pairs.items():
@@ -142,27 +150,29 @@ def _seconds(elapsed: float) -> str:
 
 
 def _who(agent: Agent, event: Event) -> dict[str, object]:
-    """The keys every line of the slow half carries: which agent, real or not, which delivery.
+    """The keys every line of the slow half carries: which source, which agent, which delivery.
+
+    ``source`` is the route the delivery arrived on
+    (:attr:`~basecradle_router.models.Event.source`) — the low-cardinality label a
+    log-metric extractor can lift, and the one that says whether a wake was the fleet's
+    own probe (``source=probe``) or real traffic (basecradle-router#222). The fast half
+    has carried it all along; it rides *here* so the slow half carries it too, beside
+    the identity keys rather than spelled onto each wake line, which means every line
+    the slow half emits — the gates' refusals and the wake's failures as much as its
+    successes — carries it, and a gate added later cannot forget to. See the module
+    docstring for why the key is ``source`` and not ``origin``.
 
     ``agent`` is the OS-user slug (:attr:`~basecradle_router.models.Agent.harness_key`),
     deliberately not the registry key: it is the same slug the wake's *own* journal
     entries are tagged with (``basecradle-wake-<slug>``), so it is what makes the
     router's half of a wake and the agent's half joinable.
 
-    ``synthetic`` says whether this was the router's own probe rather than real traffic
-    (basecradle-router#220) — the low-cardinality label a log-metric extractor can lift,
-    where the ``probe-`` prefix inside ``delivery=`` cannot be. It rides *here*, beside
-    the identity keys, rather than being spelled onto the wake lines individually, so
-    every line the slow half emits — the gates' refusals and the wake's failures as much
-    as its successes — carries it, and a gate added later cannot forget to. See the
-    module docstring for why the key is ``synthetic`` and not ``origin``.
-
-    Ordered labels-first: ``agent`` and ``synthetic`` are the closed-set keys a query
+    Ordered labels-first: ``source`` and ``agent`` are the closed-set keys a query
     groups by, and ``delivery`` is the unbounded id it joins on.
     """
     return {
+        "source": event.source,
         "agent": agent.harness_key,
-        "synthetic": event.synthetic,
         "delivery": event.delivery_id,
     }
 
@@ -368,11 +378,12 @@ class Pipeline:
                 # and provenance, so a probe stopped by a gate is never mistaken for a
                 # production wake stopped by it (and vice versa) — see
                 # :meth:`~basecradle_router.evidence.EvidenceStore.record_wake_refused`.
-                # The same `synthetic` fact rides on the log lines (via `_who`), from the
-                # same source of truth: the ledger and the journal cannot disagree about
-                # whether a wake was real. Deliberately not named `origin`: an Event
-                # already has one, and it means something else entirely (the issue the
-                # agent reports back on).
+                # The ledger's `route` and the journal's `source=` (via `_who`) are the
+                # same string read from the same event, so the two surfaces cannot
+                # disagree about where a wake came from. The evidence document keeps its
+                # own `synthetic` flag beside it because it is read long after the fact,
+                # when the registry can no longer be asked which routes were manufactured
+                # — a log line is read in place and needs no such snapshot.
                 provenance = {"route": event.source, "synthetic": event.synthetic}
                 if self.deduper.seen(event.dedup_key):
                     # A duplicate delivery of an event we already woke for — a
