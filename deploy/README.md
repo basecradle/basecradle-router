@@ -142,8 +142,8 @@ journalctl -u basecradle-router -f                   # by unit — also fine; th
 |---|---|
 | `event=startup …` | one INFO at boot: `version=`, **`sha=`** (the deployed commit, read from `/etc/basecradle-router/deployed-sha`), `routes=`, `dedup_ttl=`, `wake_attempts=`, `breaker_*=`. The running daemon *states its own config* — so a Live Tail that looks wrong is first checked here: absent (it never started), stale `sha=` (the merged≠live gap, #54), or thresholds you did not expect. |
 | `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. |
-| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. |
-| `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. |
+| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. Every stage from `lock` onward — the slow half, the half that is *about a wake* — also carries **`synthetic=true\|false`** (below). |
+| `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `synthetic=` too. |
 
 **`delivery=<id>` is the join key.** Every line from `normalize` onward carries it (`route`/`verify` run
 before the route has read the source's delivery header — the deliberate exception), and the wake child is
@@ -159,12 +159,74 @@ journalctl -t basecradle-router -t basecradle-wake-basecradle-glm-ai --since -1h
 The wake completion line is the one that matters most, and it now identifies the wake fully:
 
 ```
-stage=wake outcome=ok agent=basecradle-glm-ai delivery=0192f3a4-… exit=0 duration=23.1s
+stage=wake outcome=ok agent=basecradle-glm-ai synthetic=false delivery=0192f3a4-… exit=0 duration=23.1s
 ```
 
 `agent=` is the OS-user slug — the same slug the wake's own entries are tagged with
 (`basecradle-wake-<slug>`), which is what makes the two joinable. `duration=` is the wake subprocess's
 wall-clock (the *last* attempt's, on every line that reports one — never the retry backoff's).
+
+#### `synthetic=true|false` — the wake-origin label (basecradle-router#220)
+
+**The contract, in one line:** every log line the router emits *about a wake* carries the key
+**`synthetic`**, whose value set is closed and exactly two: **`true`** — the router's own probe
+(`probe wake`, the wake-edge lever, fired on the NOC's own schedule — a cadence that repo owns) — and
+**`false`** — real traffic, a delivery a source outside the fleet actually sent. There is no third value
+and no absence: a line about a wake that carries no `synthetic=` is a defect, not a real wake.
+
+**Why it exists.** The router's probe traverses the real path on purpose, so a probe wake lands on the
+same `stage=wake` line a real handoff does — and that line is what a log-metric extractor lifts
+`wake_duration_s` (and every wake-rate counter) from. Extraction lifts only *low-cardinality* labels, so
+the probe's one previous marker — the `probe-` prefix inside the high-cardinality `delivery=` id — was
+dropped on the floor, and every chart and alert built on the metric silently mixed the fleet's own test
+traffic with its real work. The routes-layer line (`event=delivery_decision source=probe …`) knew, but it
+is a different line and not the one the metrics ride. `synthetic=` is that fact as a *label*.
+
+**Which lines carry it.** Every line of the pipeline's **slow half** — the half that is about a wake, from
+the moment the agent is known:
+
+| Line | What it records |
+|---|---|
+| `stage=lock outcome=ok` | the per-agent serialization guard was taken |
+| `stage=dedup outcome=ignored` | a duplicate delivery collapsed |
+| `stage=wake_lock outcome=ignored` | the NOC freeze interlock refused it |
+| `stage=breaker outcome=ignored` | the wake-rate breaker refused it |
+| `event=wake_retry attempt=N/M` | a transient failure a retry followed |
+| `stage=wake outcome=ok` | **the per-wake duration metric line** |
+| `stage=wake outcome=failed` | the wake-failure line |
+
+A refused probe and a failed probe pollute a wake-failure count exactly as a successful one pollutes a
+duration chart, so the label rides on all of them — not only the happy one. It sits beside `agent=`
+rather than being spelled onto each line, so a gate added later carries it by construction.
+
+The pipeline's **fast half** (`route`, `verify`, `normalize`, `resolve`) deliberately does *not* carry it:
+those lines already carry `source=`, which names the route — `source=probe` is the same fact, said in the
+vocabulary that half speaks. And the agent-side journal (`basecradle-wake-<slug>`) needs nothing: a probe
+wake is answered by `wake-runner --probe`, which returns its verdict to the caller and never routes
+through `systemd-cat`, so no probe traffic reaches that identifier at all.
+
+**Reading and filtering it:**
+
+```bash
+# Real wakes only — what an Agent Operations dashboard should ever show.
+journalctl -t basecradle-router --since -24h --no-pager | grep 'stage=wake ' | grep 'synthetic=false'
+
+# The fleet's own probe traffic, on its own.
+journalctl -t basecradle-router --since -24h --no-pager | grep 'synthetic=true'
+```
+
+**Why `synthetic` and not `origin=probe|real`.** Three reasons, all structural. (1) It is the *same word
+and the same fact* the rest of the router already uses — `Event.synthetic`, `Route.synthetic`, and the
+`synthetic` flag the evidence store writes beside every outcome in `evidence.json` — read from that one
+definition, so the journal and the claims ledger cannot disagree about whether a wake was real. (2)
+`origin=probe` would put a *route's name* in the core's vocabulary, which the core/routes split forbids,
+and would grow the value set the day a second synthetic route lands; a boolean is closed forever. (3)
+`origin` is already taken in the core: an `Event.origin` is the issue the woken agent reports back on.
+
+**For consumers (the NOC's extraction, `basecradle-noc#473`):** filter `synthetic=false` for the
+production view. Do not filter on the `probe-` prefix in `delivery=` — that prefix is the injector's
+convention, not a contract, and it is invisible to label extraction anyway. `delivery=` is unchanged and
+stays the high-cardinality join key.
 
 **`GET /up` is not logged.** Better Stack's uptime monitor probes it about once a minute, forever; those
 access lines were the largest single source of volume in the journal and in Live Tail, and pure noise. A
@@ -548,7 +610,9 @@ Operational Baselines). The NOC's timeline-based prober is retired for every age
    enter its clone — then execs the root-owned **`probe-ack`** verifier *as the agent*, which checks
    the marker against that agent's own `NOC_PROBE_SECRET` and prints `BCNOC1-ACK <nonce>`.
 5. The daemon records `stage=wake outcome=ok`, so **`last_ok_at` moves** — the one fact only the
-   router can honestly state, and the thing the ledger reads.
+   router can honestly state, and the thing the ledger reads. That line, like every line of the wake
+   half, says `synthetic=true` (see *`synthetic=true|false`* above), so the probe traffic this proof
+   depends on stays out of every production metric built on the same line.
 
 **Two secrets, two jobs, and neither is a trust edge.** The route secret authorises *injection into
 the router*; the agent's own secret proves the wake *arrived in that agent's context*. The router

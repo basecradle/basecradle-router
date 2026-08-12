@@ -30,6 +30,35 @@ trip through the router — and, because the wake child is handed the same id in
 environment (:data:`~basecradle_router.wake.DELIVERY_ID_ENV`), through the agent's
 own journal too.
 
+**And every line about a wake says whether that wake was real**
+(``synthetic=true|false``, basecradle-router#220). The router's own probe traverses
+this exact path, so its wakes land on the same ``stage=wake`` lines a real handoff
+does — and those lines are what a log-metric extractor lifts a per-wake metric from.
+Extraction lifts only *low-cardinality* keys, so the probe's one previous marker —
+the ``probe-`` prefix inside the high-cardinality ``delivery=`` id — was dropped on
+the floor, and every duration chart and wake-rate alert built on the resulting metric
+silently mixed the fleet's own test traffic with its real work. ``synthetic=`` is
+that fact as a label with a closed two-value set, so the mix is filterable rather
+than merely visible to a human reading the raw line. Three properties are deliberate:
+
+- **It is the same word, and the same fact, the rest of the router already uses.**
+  :attr:`~basecradle_router.models.Event.synthetic` is derived from the event's own
+  kind, the evidence store tags every outcome it writes with it, and
+  :attr:`~basecradle_router.routes.base.Route.synthetic` declares it per route. The
+  log line is one more reader of that single definition — never a second, driftable
+  one.
+- **It never names a source.** ``origin=probe`` would have put a route's name in the
+  core's vocabulary (which the core/routes split forbids) and would grow the value
+  set the day a second synthetic route lands; ``synthetic=`` is closed forever. The
+  key is also deliberately *not* ``origin``: an :class:`~basecradle_router.models.Event`
+  already has one, meaning something else entirely (the issue the agent reports back
+  on).
+- **It is on every line of the slow half, not only the happy one.** A refused probe
+  and a failed probe pollute a wake-failure count exactly as a successful one pollutes
+  a duration chart, so the field rides in :func:`_who` alongside ``agent`` and
+  ``delivery`` — which means a gate added later carries it by construction rather
+  than by remembering to.
+
 **The pipeline ends at the wake — the router never merges.** Auto-merge of a
 captain's own green PR (constitution → Earned Autonomy) is performed by **GitHub
 native auto-merge**: during its wake the agent opens its PR and runs
@@ -87,12 +116,20 @@ def log_fields(**pairs: object) -> str:
     a *single* field and a grep for the field after it still matches; a ``None`` or
     ``""`` value is dropped rather than logged as ``key=`` (``0`` is a value, and is
     kept). Public because the server's startup banner renders through it too.
+
+    A ``bool`` renders lowercase — ``synthetic=true``, never Python's ``True``. These
+    are *labels* a log-metric extractor lifts and a dashboard filters on literally, so
+    the value must be the one every other structured surface in the fleet writes (JSON
+    evidence, logfmt, the NOC's queries) rather than the one ``str()`` happens to give
+    a Python object. ``False`` is a value like ``0`` and is never dropped as empty: a
+    real wake that stopped saying ``synthetic=false`` would leave the filter matching
+    nothing, which is the silent-absence shape this field exists to close.
     """
     parts = []
     for key, value in pairs.items():
         if value is None or value == "":
             continue
-        text = str(value)
+        text = ("true" if value else "false") if isinstance(value, bool) else str(value)
         if any(char.isspace() for char in text) or '"' in text:
             text = json.dumps(text)
         parts.append(f"{key}={text}")
@@ -104,15 +141,30 @@ def _seconds(elapsed: float) -> str:
     return f"{elapsed:.1f}s"
 
 
-def _who(agent: Agent, event: Event) -> dict[str, str]:
-    """The identity keys every line of the slow half carries: which agent, which delivery.
+def _who(agent: Agent, event: Event) -> dict[str, object]:
+    """The keys every line of the slow half carries: which agent, real or not, which delivery.
 
     ``agent`` is the OS-user slug (:attr:`~basecradle_router.models.Agent.harness_key`),
     deliberately not the registry key: it is the same slug the wake's *own* journal
     entries are tagged with (``basecradle-wake-<slug>``), so it is what makes the
     router's half of a wake and the agent's half joinable.
+
+    ``synthetic`` says whether this was the router's own probe rather than real traffic
+    (basecradle-router#220) — the low-cardinality label a log-metric extractor can lift,
+    where the ``probe-`` prefix inside ``delivery=`` cannot be. It rides *here*, beside
+    the identity keys, rather than being spelled onto the wake lines individually, so
+    every line the slow half emits — the gates' refusals and the wake's failures as much
+    as its successes — carries it, and a gate added later cannot forget to. See the
+    module docstring for why the key is ``synthetic`` and not ``origin``.
+
+    Ordered labels-first: ``agent`` and ``synthetic`` are the closed-set keys a query
+    groups by, and ``delivery`` is the unbounded id it joins on.
     """
-    return {"agent": agent.harness_key, "delivery": event.delivery_id}
+    return {
+        "agent": agent.harness_key,
+        "synthetic": event.synthetic,
+        "delivery": event.delivery_id,
+    }
 
 
 class Stage(Enum):
@@ -316,8 +368,11 @@ class Pipeline:
                 # and provenance, so a probe stopped by a gate is never mistaken for a
                 # production wake stopped by it (and vice versa) — see
                 # :meth:`~basecradle_router.evidence.EvidenceStore.record_wake_refused`.
-                # Deliberately not named `origin`: an Event already has one, and it means
-                # something else entirely (the issue the agent reports back on).
+                # The same `synthetic` fact rides on the log lines (via `_who`), from the
+                # same source of truth: the ledger and the journal cannot disagree about
+                # whether a wake was real. Deliberately not named `origin`: an Event
+                # already has one, and it means something else entirely (the issue the
+                # agent reports back on).
                 provenance = {"route": event.source, "synthetic": event.synthetic}
                 if self.deduper.seen(event.dedup_key):
                     # A duplicate delivery of an event we already woke for — a
