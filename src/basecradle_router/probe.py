@@ -116,11 +116,6 @@ DEFAULT_TIMEOUT = 300.0
 #: costs nothing and keeps the measured fire-to-proof window meaningful.
 DEFAULT_POLL_INTERVAL = 0.5
 
-#: A minted delivery id is prefixed so a human reading journald, and the ``by_route``
-#: record it lands in, both say plainly that this delivery was manufactured. The whole id
-#: stays inside the inert charset the wake boundary and the wake-runner both pin.
-DELIVERY_PREFIX = "probe-"
-
 #: How the *far side* of the sudo boundary says "we never got an answer".
 #:
 #: A refused probe and a broken one both come back to the router as a non-zero exit and
@@ -325,9 +320,16 @@ class WakeProbe:
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     now: Callable[[], datetime] = _utc_now
-    mint_delivery_id: Callable[[], str] = field(
-        default=lambda: f"{DELIVERY_PREFIX}{uuid.uuid4().hex}"
-    )
+    #: A bare random id, carrying **no type prefix** (basecradle-router#222, a founder
+    #: order). It used to be minted ``probe-<hex>`` so a human reading journald could see
+    #: the delivery was manufactured — but a delivery id identifies one delivery and must
+    #: never also *type* it: the prefix put a low-cardinality fact inside a
+    #: high-cardinality join key, where label extraction cannot see it, and every wake
+    #: chart mixed the fleet's own probe traffic with its real work while the raw line
+    #: looked perfectly informative. That question is answered by ``source=probe`` on the
+    #: line and by ``route`` in the evidence, so the id goes back to identifying. The hex
+    #: stays inside the inert charset the wake boundary and the wake-runner both pin.
+    mint_delivery_id: Callable[[], str] = field(default=lambda: uuid.uuid4().hex)
 
     def run(self, harness_key: str, marker: str) -> ProbeResult:
         """Fire one probe at ``harness_key`` carrying ``marker``; never raises on a verdict.
