@@ -7,8 +7,11 @@ the alarm silently to zero (basecradle-router#232, basecradle-noc#509). The prob
 that by firing a real trip through the daemon's own render statement.
 
 What these tests pin is the pair of properties that make the proof honest: the probe has
-**no renderer of its own**, and the bytes it asserts are the bytes it writes. The journald
-seams are injected, so nothing here shells out or sleeps.
+**no renderer of its own**, and the bytes it asserts are the bytes it writes. They also pin
+the reach the capital ruled on 2026-08-18 (basecradle-router#234): the verdict is about the
+line being **rendered and accepted**, never about its **landing** — the daemon is a system
+user that structurally cannot read the journal back, and the NOC's witness owns that half.
+The journald write seam is injected, so nothing here shells out.
 Test cast: the synthetic key is the reserved literal ``probe`` — no agent is named for a
 route, which is why it cannot collide with a real slug.
 """
@@ -35,35 +38,33 @@ from basecradle_router.log_grammar import (
 
 
 class _Journal:
-    """A stand-in for journald: what was written, and what a read-back returns."""
+    """A stand-in for journald: the lines it accepted, and nothing to read them back.
 
-    def __init__(self, *, accepts: bool = True) -> None:
+    Deliberately write-only, because the real one is: a uid-999 system user may hand
+    journald an entry and may not read its own entry back (basecradle-router#234). A test
+    double with a reader would let a read-back grow back here without a single test
+    failing.
+    """
+
+    def __init__(self) -> None:
         self.lines: list[str] = []
-        self.since: list[float] = []
-        self._accepts = accepts
 
     def write(self, line: str) -> None:
-        if self._accepts:
-            self.lines.append(line)
-
-    def read(self, since: float):
-        self.since.append(since)
-        return list(self.lines)
+        self.lines.append(line)
 
 
-def _probe(journal: _Journal, **overrides) -> LogGrammarProbe:
-    return LogGrammarProbe(
-        writer=journal.write,
-        reader=journal.read,
-        sleep=lambda _: None,
-        **overrides,
-    )
+def _probe(journal: _Journal) -> LogGrammarProbe:
+    return LogGrammarProbe(writer=journal.write)
 
 
 # --- the happy path, and what it actually demonstrates ----------------------
 
 
-def test_a_rendered_line_read_back_from_the_journal_is_proven() -> None:
+def test_a_line_journald_accepts_is_proven_without_reading_anything_back() -> None:
+    # The whole verdict, from a write-only journal. On the box that is the only journal
+    # this principal has: `router` is uid 999, and journald's SplitMode=uid gives a
+    # readable per-user journal to uid >= 1000 only, so a read-back answered `unprovable`
+    # on a healthy box while the line itself landed, shipped and extracted.
     journal = _Journal()
     result = _probe(journal).run()
 
@@ -71,6 +72,17 @@ def test_a_rendered_line_read_back_from_the_journal_is_proven() -> None:
     assert result.exit_code == 0
     assert result.line_class == LINE_CLASS
     assert result.identifier == IDENTIFIER
+    assert journal.lines == [result.rendered]
+
+
+def test_the_verdict_says_out_loud_which_half_it_does_not_cover() -> None:
+    # A green row that reads as "the alarm's line is in the journal" would be the
+    # instrument overstating itself — the exact green-while-absent shape this arc exists
+    # to close. The detail an operator reads names the landing half as the NOC's.
+    result = _probe(_Journal()).run()
+
+    assert "cannot read the journal back" in result.detail
+    assert "NOC" in result.detail
 
 
 def test_the_bytes_asserted_are_the_bytes_written() -> None:
@@ -85,28 +97,7 @@ def test_the_bytes_asserted_are_the_bytes_written() -> None:
     assert result.rendered.endswith(f"source={SOURCE}")
 
 
-def test_the_read_back_is_bounded_to_this_run() -> None:
-    # An unbounded scan would let a PREVIOUS probe's identical line stand in for this
-    # one's — the probe grading a run that already happened.
-    journal = _Journal()
-    _probe(journal).run()
-
-    assert journal.since and journal.since[0] > 0
-
-
 # --- the failure arms, each a different true statement ----------------------
-
-
-def test_a_line_that_never_lands_is_broken_not_unprovable() -> None:
-    # We asked and the answer is no: the write was accepted and the journal does not have
-    # it, which is the alarm's own channel failing. Reporting that as `unprovable` would
-    # describe a blind spot in the probe rather than a fault in the fleet.
-    journal = _Journal(accepts=False)
-    result = _probe(journal, timeout=0.0).run()
-
-    assert result.status == BROKEN
-    assert result.exit_code == 1
-    assert "never appeared" in result.detail
 
 
 def test_a_grammar_the_manifest_no_longer_matches_is_broken(monkeypatch) -> None:
@@ -114,10 +105,15 @@ def test_a_grammar_the_manifest_no_longer_matches_is_broken(monkeypatch) -> None
     # `claims.py` following — the drift that lets a manifest keep describing a line the
     # daemon stopped writing, which is the whole reason this claim exists.
     monkeypatch.setattr(grammar_mod, "TRIP_EVENT", "event=breaker_detonated")
-    result = _probe(_Journal()).run()
+    journal = _Journal()
+    result = _probe(journal).run()
 
     assert result.status == BROKEN
+    assert result.exit_code == 1
     assert "does not carry the declared grammar" in result.detail
+    # And the bytes we already judged wrong never reached the fleet's journal: the write
+    # is downstream of the verdict, so a broken probe is silent rather than noisy.
+    assert journal.lines == []
 
 
 def test_a_stamp_that_stops_trailing_the_grammar_is_refused() -> None:
@@ -151,7 +147,7 @@ def test_journald_tooling_that_does_not_answer_is_unprovable() -> None:
     def refuse(_line: str) -> None:
         raise LogGrammarError("could not run systemd-cat: no such file")
 
-    probe = LogGrammarProbe(writer=refuse, reader=lambda _s: [], sleep=lambda _: None)
+    probe = LogGrammarProbe(writer=refuse)
     with pytest.raises(LogGrammarError):
         probe.run()
 
@@ -164,8 +160,9 @@ def test_the_synthetic_is_the_genuine_line_plus_one_trailing_token() -> None:
 
 
 def test_one_trip_emits_exactly_one_line() -> None:
-    # The read-back matches a whole line, and a trip that emitted two would make the
-    # probe's assertion about only one of them.
+    # The probe asserts a whole line and writes a whole line; a trip that emitted two
+    # would make its verdict about only one of them, and split the alarm's needle in the
+    # journal besides.
     assert "\n" not in render_trip(synthetic=True)
 
 
@@ -216,6 +213,13 @@ def test_the_manifest_publishes_the_bytes_this_build_actually_renders() -> None:
     assert detail["discriminator"] == f"source={SOURCE}"
     assert detail["genuine_level"] == "ERROR"
     assert detail["synthetic_level"] == "INFO"
+
+
+def test_the_manifest_states_the_claims_reach_rather_than_leaving_it_to_lore() -> None:
+    # The ledger row is read by people who were not here for the ruling. `proves` is how
+    # a reader learns that green means the line was RENDERED, and that its landing is the
+    # NOC's witness on the same identifier — not a second, weaker spelling of it.
+    assert manifest_detail()["proves"] == "rendered"
 
 
 def test_the_published_line_omits_the_timestamped_envelope() -> None:

@@ -186,10 +186,11 @@ def _parser() -> argparse.ArgumentParser:
         help="prove the alarm's needle line is still the line this daemon writes",
         description=(
             "Drive a real wake-rate breaker past its threshold so the daemon's own trip "
-            "statement renders the line, write it to the daemon's journald identifier "
-            "stamped source=probe at INFO, and read it back out of the journal. Proves "
-            "EMISSION, never extraction — the NOC's guard owns that half, off the live "
-            "stream. Exit 0 proven, 1 proven broken, 75 could not be proven."
+            "statement renders the line, and write it to the daemon's journald identifier "
+            "stamped source=probe at INFO. Proves RENDERED, never landed or extracted — "
+            "the daemon is a system user that cannot read the journal back, so the NOC's "
+            "witness on that identifier owns those halves, off the live stream. "
+            "Exit 0 proven, 1 proven broken, 75 could not be proven."
         ),
     )
     grammar.add_argument(
@@ -325,7 +326,7 @@ def _cmd_probe_wake(args: argparse.Namespace) -> int:
 
 
 def _cmd_probe_log_grammar(args: argparse.Namespace) -> int:
-    """Emit one synthetic breaker trip and report whether the journal carries it.
+    """Emit one synthetic breaker trip and report whether it carries the declared grammar.
 
     It needs **no configuration at all**, which is the point rather than an omission: the
     bytes under proof come from the breaker's own trip statement and the journal is
