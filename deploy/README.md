@@ -144,6 +144,10 @@ journalctl -u basecradle-router -f                   # by unit — also fine; th
 | `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. |
 | `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
+| `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
+| `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. |
+| `event=breaker_tripped …` / `event=breaker_reset …` | the runaway-loop backstop firing (**ERROR**) and self-healing. `scope=`, `key=`, `agent=`, `count=`, `threshold=`, `window=`, `cooldown=`. |
+| `event=wake_lock_unreadable …` / `event=wake_lock_stale …` | the freeze surface could not be read (**ERROR** — fail-open, the wake still runs) / a lock outlived its `expires_at`. |
 
 **`delivery=<id>` is the join key.** Every line from `normalize` onward carries it (`route`/`verify` run
 before the route has read the source's delivery header — the deliberate exception), and the wake child is
@@ -159,12 +163,67 @@ journalctl -t basecradle-router -t basecradle-wake-basecradle-glm-ai --since -1h
 The wake completion line is the one that matters most, and it now identifies the wake fully:
 
 ```
-stage=wake outcome=ok source=github agent=basecradle-glm-ai delivery=0192f3a4-… exit=0 duration=23.1s
+stage=wake outcome=ok delivery=0192f3a4-… agent=basecradle-glm-ai source=github exit=0 duration=23.1s
 ```
 
 `agent=` is the OS-user slug — the same slug the wake's own entries are tagged with
 (`basecradle-wake-<slug>`), which is what makes the two joinable. `duration=` is the wake subprocess's
 wall-clock (the *last* attempt's, on every line that reports one — never the retry backoff's).
+
+#### The wake lifecycle bookends and the fleet colours (basecradle-router#228, @origin 2026-08-17)
+
+**The router used to be silent at launch.** Its first word about a wake was the `stage=wake` line
+*minutes later*, at completion — so a Live Tail could not tell an agent hard at work from an agent that
+was never woken at all. A wake is now bracketed:
+
+```
+event=wake_start delivery=0192f3a4-… agent=basecradle-glm-ai source=github
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=ok exit=0 duration=93.4s
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=failed attempts=3 duration=4.1s error="…"
+```
+
+- **The pair is the human surface; `stage=…` is the machinery.** Both stay — the same two-surface split
+  Rails draws between its `Started …`/`Completed …` request lines and its instrumentation events. The
+  `stage=` records are what `StageRecord` and the HTTP status summary are built from.
+- **A bracket always closes.** `wake_end` is emitted from a `finally`, so a clean exit, a retry
+  exhaustion, and an unexpected fault all close it. An unclosed `wake_start` would read, forever, as a
+  wake still running.
+- **Real wakes only.** A probe never launches the agent, so it is never bracketed — bracketing one would
+  put a start and an end around nothing and blur the very signal the pair exists to show.
+- **Field order: `delivery` → `agent` → `source`**, uniformly across every line the slow half emits
+  (`wake_start`, `wake_end`, `wake_retry`, and each `stage=` line from `lock` on, gates included — the
+  guards' own `event=wake_refused` lines are handed a slug, never an event, so they carry neither key).
+  It is ordered for
+  the person reading the line, not the query reading the key: a query addresses a key by *name*, and the
+  delivery id is what a human copies to follow one wake through the router and on into the agent's own
+  journal.
+
+**The colours** (fleet-wide — the harness's and the NOC's journald surfaces carry the same table, so a
+colour means the same thing whichever daemon emitted the line):
+
+| Colour | Applied to |
+|---|---|
+| **green** `\x1b[32m` | `event=wake_start`, `outcome=ok`, `event=breaker_reset` |
+| **blue** `\x1b[34m` | `event=wake_end` (the bookend's identity — its trailing `outcome=` carries the verdict's colour) |
+| **yellow** `\x1b[33m` | `event=wake_retry`, `event=wake_refused`, `event=wake_lock_stale` — the warning tier, neither success nor failure |
+| **red** `\x1b[31m` | `outcome=failed`, `outcome=rejected`, `event=breaker_tripped`, `event=wake_lock_unreadable` |
+
+Two rules govern them, and both are pinned by tests:
+
+- **Token integrity.** The escape wraps the **whole `key=value` token** — `\x1b[32mevent=wake_start\x1b[0m
+  delivery=…`, never `event=\x1b[32mwake_start\x1b[0m` — so every substring search (Live Tail,
+  `journalctl | grep`, a ClickHouse `match()`) still matches. **The one thing colour does move** is a
+  consumer matching *across the space between two tokens*: a regex for `stage=wake outcome=` no longer
+  matches, because the escape sits between them. The NOC's `wake_duration_s`, `wake_failed`, and
+  `breaker_tripped` extractions are re-pointed in lockstep with the deploy that lands this.
+- **Containment.** Colour is presentation added as a line is handed to the logger. It never enters a
+  `StageRecord`, the HTTP status summary, or any other machine surface — those carry the data, the
+  journal line carries the data *and* its colour, and the two can never disagree about a value.
+
+**The render path is verified, not assumed** (capital probe, 2026-08-17 — the `[basecradle-color-probe]`
+line in the Better Stack `AI` source): Live Tail renders all four colours, this box's Vector `ai_scrub`
+transform passes the escapes through untouched (it never parses the message), and a search matched the
+coloured line in both the UI and ClickHouse.
 
 #### `source=<route>` — the wake-origin label (basecradle-router#222, a founder order)
 
@@ -331,7 +390,7 @@ is the single chokepoint for every wake, so it alone can catch a runaway loop th
 can't (a harness that crashes before it can self-track, a multi-agent ping-pong, a novel loop from a
 drop-in `tools/` or MCP server). It tracks wakes per **agent** (and per **(agent, timeline/issue)**) in a
 rolling window; over a generous sanity cap it **trips** — stops dispatching that scope's wakes, logs a
-visible refusal, and escalates with a loud `CIRCUIT BREAKER TRIPPED` `ERROR` the NOC can detect — then
+visible refusal, and escalates with a loud `event=breaker_tripped` `ERROR` the NOC can detect — then
 **auto-resets** once the cooldown elapses and the window clears (a transient burst self-heals). The four
 `router.env` knobs above tune it; defaults (20/60 s per agent, 15/60 s per stream, 60 s cooldown) are set
 so legitimate multi-peer activity never trips it. Refusing a wake never loses data — the platform's

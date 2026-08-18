@@ -294,3 +294,21 @@ def test_the_health_counters_never_enter_the_log_scrub() -> None:
     assert "ai_internal_metrics" not in _scrub_source(), (
         "`ai_internal_metrics` is metric events — the log scrub would corrupt them"
     )
+
+
+# --- 4. the fleet colours survive the shipping path (#228) ------------------
+
+
+def test_the_scrub_never_strips_the_ansi_colour_the_journal_lines_carry() -> None:
+    # The router paints its verdict tokens (@origin's fleet palette, 2026-08-17) and
+    # Better Stack Live Tail renders them — but only because every hop between the two
+    # passes the escape bytes through. `ai_scrub` is the one hop this repo owns, and VRL
+    # ships a `strip_ansi_escape_codes` function that a future sanitising edit could
+    # reach for in good faith. That edit would delete a decided fleet convention with
+    # nothing failing: the daemon's own unit tests cannot see this file, and the loss
+    # would surface only as colourless lines nobody happens to look at. Redaction is
+    # unaffected — every rule here rewrites secret-SHAPED text, and an escape is not one.
+    assert "strip_ansi_escape_codes" not in _scrub_source(), (
+        "ai_scrub must pass ANSI through untouched — the palette is presentation the "
+        "journal carries end to end (basecradle-router#228)"
+    )

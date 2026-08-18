@@ -194,8 +194,50 @@ def test_trip_escalates_with_a_loud_error_log(caplog) -> None:
             breaker.admit(NOVA)  # third trips
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
-    assert "CIRCUIT BREAKER TRIPPED" in errors[0].getMessage()
-    assert NOVA in errors[0].getMessage()
+    assert "event=breaker_tripped" in errors[0].getMessage()
+    assert f"agent={NOVA}" in errors[0].getMessage()
+
+
+def test_the_trip_line_keeps_every_field_the_prose_sentence_carried(caplog) -> None:
+    # #228 normalised the breaker's prose into the router's kv grammar. The SHAPE moved;
+    # the DATA did not — a trip must still say which scope, which key, which agent, how
+    # many wakes over what threshold, and how long the halt lasts, because that is the
+    # whole content of the runaway-loop escalation an operator reads at 3am.
+    clock = _Clock()
+    breaker = _breaker(clock, max_wakes=2, window=60.0, cooldown=90.0)
+    with caplog.at_level(logging.INFO, logger="basecradle_router.breaker"):
+        for _ in range(3):
+            breaker.admit(NOVA, "issue-7")
+    line = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    for field in (
+        "event=breaker_tripped",
+        f"agent={NOVA}",
+        f"scope={AGENT_SCOPE}",
+        f"key={NOVA}",
+        "count=3",
+        "threshold=2",
+        "window=60s",
+        "cooldown=90s",
+    ):
+        assert field in line, f"the trip line dropped {field!r}: {line}"
+
+
+def test_a_refusal_mid_cooldown_is_spelled_as_a_refused_wake(caplog) -> None:
+    # One vocabulary for one fact: the wake-lock guard already refuses wakes with
+    # `event=wake_refused reason=<why>`, so the breaker's cooling-down refusal says the
+    # same thing the same way — one query finds every wake a gate stopped, and `reason=`
+    # says which gate. The old line led with a prose "wake refused: circuit breaker OPEN"
+    # that no such query could reach.
+    clock = _Clock()
+    breaker = _breaker(clock, max_wakes=1, cooldown=60.0)
+    for _ in range(2):
+        breaker.admit(NOVA)  # second trips
+    with caplog.at_level(logging.INFO, logger="basecradle_router.breaker"):
+        assert breaker.admit(NOVA).state is BreakerState.OPEN
+    line = next(r.getMessage() for r in caplog.records if "event=wake_refused" in r.getMessage())
+    assert f"reason={breaker_mod.BREAKER_OPEN}" in line
+    assert f"agent={NOVA}" in line
+    assert f"scope={AGENT_SCOPE}" in line
 
 
 # --- the per-stream window dict stays bounded ------------------------------
@@ -247,5 +289,7 @@ def test_reset_is_logged(caplog) -> None:
     clock.advance(11.0)
     with caplog.at_level(logging.INFO, logger="basecradle_router.breaker"):
         assert breaker.admit(NOVA).admitted
-    resets = [r for r in caplog.records if "circuit breaker reset" in r.getMessage()]
+    resets = [r for r in caplog.records if "event=breaker_reset" in r.getMessage()]
     assert len(resets) == 1
+    assert f"agent={NOVA}" in resets[0].getMessage()
+    assert f"scope={AGENT_SCOPE}" in resets[0].getMessage()

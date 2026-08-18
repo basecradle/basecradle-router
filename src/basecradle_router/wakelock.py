@@ -61,6 +61,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+from basecradle_router.logfmt import paint
+
 logger = logging.getLogger("basecradle_router.wakelock")
 
 #: The pinned lock directory on the home server (root-owned, ``/run`` tmpfs).
@@ -185,22 +187,37 @@ class WakeLockGuard:
         """
         decision = self.inspect(slug)
         state = decision.state
+        # The leading `event=` token is painted with the fleet palette
+        # (basecradle-router#228) — red for the one that says the guard itself is
+        # broken, yellow for a wake that did not run. It wraps the WHOLE token, so
+        # every existing search for `event=wake_refused` still matches; see
+        # :mod:`basecradle_router.logfmt`.
         if state is WakeLockState.UNREADABLE:
-            logger.error("event=wake_lock_unreadable agent=%s detail=%s", slug, decision.reason)
+            logger.error(
+                "%s agent=%s detail=%s",
+                paint("event=wake_lock_unreadable"),
+                slug,
+                decision.reason,
+            )
         elif state is WakeLockState.HELD:
             logger.warning(
-                "event=wake_refused reason=wake_lock_held agent=%s lock_reason=%s expires_at=%s",
+                "%s reason=wake_lock_held agent=%s lock_reason=%s expires_at=%s",
+                paint("event=wake_refused"),
                 slug,
                 decision.lock_reason,
                 decision.expires_at,
             )
         elif state is WakeLockState.STALE:
             logger.warning(
-                "event=wake_lock_stale agent=%s expires_at=%s", slug, decision.expires_at
+                "%s agent=%s expires_at=%s",
+                paint("event=wake_lock_stale"),
+                slug,
+                decision.expires_at,
             )
         elif state is WakeLockState.UNPARSEABLE:
             logger.warning(
-                "event=wake_refused reason=wake_lock_unparseable agent=%s detail=%s",
+                "%s reason=wake_lock_unparseable agent=%s detail=%s",
+                paint("event=wake_refused"),
                 slug,
                 decision.reason,
             )

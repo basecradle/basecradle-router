@@ -42,8 +42,9 @@ import sys
 
 from basecradle_router import __version__
 from basecradle_router.config import DEFAULT_WAKE_LANES
+from basecradle_router.logfmt import log_fields
 from basecradle_router.models import Agent, Event
-from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
+from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
 from basecradle_router.scheduler import WakeScheduler
 from basecradle_router.selftest import log_freeze_selftest, run_freeze_selftest

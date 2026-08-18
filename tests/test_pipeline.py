@@ -9,6 +9,7 @@ Test cast: John Doe (human) hands off; Nova Digital (``nova``, AI) is woken.
 
 import itertools
 import json
+import re
 import shlex
 from types import MappingProxyType
 
@@ -16,8 +17,9 @@ from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
+from basecradle_router.logfmt import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKind
-from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, log_fields
+from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
@@ -693,6 +695,11 @@ def test_same_agent_is_locked_during_a_wake() -> None:
 # read as healthy. These pin the fix.
 
 
+#: Any ANSI SGR sequence — the palette's escapes, stripped when a test wants to read a
+#: line the way a colour-blind consumer (a grep, a ClickHouse `extract`) reads it.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _stage_line(caplog, stage: Stage) -> str:
     """The pipeline's log line for ``stage`` — the message as it reaches journald."""
     return next(
@@ -700,30 +707,6 @@ def _stage_line(caplog, stage: Stage) -> str:
         for r in caplog.records
         if r.name == "basecradle_router.pipeline" and f"stage={stage.value} " in r.getMessage()
     )
-
-
-def test_log_fields_renders_key_value_dropping_empties_and_quoting_spaces() -> None:
-    # The one renderer behind every line the pipeline logs. `exit=0` must survive
-    # (0 is a value, not an absence) and an error message must stay ONE field, or a
-    # grep for the key after it would silently miss.
-    assert log_fields(agent="nova", exit=0) == "agent=nova exit=0"
-    assert log_fields(agent="nova", error=None, reason="") == "agent=nova"
-    assert log_fields(error="wake of x exited 1: boom") == 'error="wake of x exited 1: boom"'
-    # A newline in a value cannot break the line into two.
-    assert "\n" not in log_fields(error="line one\nline two")
-
-
-def test_log_fields_renders_a_bool_lowercase_and_never_drops_false() -> None:
-    # No field passes a bool today — #222 retired `synthetic=`, the one that did — but
-    # this is the RENDERER's contract, not that field's, and it is pinned so the next
-    # bool field is correct on arrival. A bool is a LABEL a log-metric extractor lifts
-    # and a dashboard filters on literally, so it must render the way every other
-    # structured surface in the fleet writes it — not the way `str()` renders a Python
-    # object — and `False` is a value like `0`, never an absence: a key whose `false`
-    # were dropped as empty would leave a filter matching nothing, silently.
-    assert log_fields(armed=True) == "armed=true"
-    assert log_fields(armed=False) == "armed=false"
-    assert log_fields(agent="nova", armed=False) == "agent=nova armed=false"
 
 
 def test_the_wake_line_identifies_the_agent_the_delivery_the_exit_and_the_duration(caplog) -> None:
@@ -880,6 +863,16 @@ def _pipeline_lines(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "basecradle_router.pipeline"]
 
 
+def _uncoloured(line: str) -> str:
+    """``line`` with every ANSI escape stripped — what a colour-blind consumer reads."""
+    return _ANSI.sub("", line)
+
+
+def _leading_token(line: str) -> str:
+    """The line's first ``key=value`` token, whether or not the palette painted it."""
+    return _uncoloured(line).split(" ", 1)[0]
+
+
 def _wake_lines(caplog) -> list[str]:
     """Every pipeline line that is *about a wake* — the slow half, plus the retry line."""
     return [
@@ -1003,13 +996,15 @@ def test_both_halves_of_the_pipeline_name_the_source(caplog) -> None:
         pipeline.handle("github", _github_request(delivery=DELIVERY_A))
 
     lines = _pipeline_lines(caplog)
-    # The gates log only when they STOP a wake, so a clean trip is exactly these six —
+    # The gates log only when they STOP a wake, so a clean trip is exactly these eight —
     # asserted by name so a stage that silently stopped logging is a failure here rather
-    # than a vacuously-passing loop over whatever happened to be emitted.
-    assert [line.split(" ", 1)[0] for line in lines] == [
+    # than a vacuously-passing loop over whatever happened to be emitted. The two
+    # bookends (#228) bracket the wake: `wake_start` before the attempt, `wake_end`
+    # after the `stage=wake` record it closes over.
+    assert [_leading_token(line) for line in lines] == [
         f"stage={stage.value}"
         for stage in (Stage.ROUTE, Stage.VERIFY, Stage.NORMALIZE, Stage.RESOLVE, Stage.LOCK)
-    ] + ["stage=wake"]
+    ] + ["event=wake_start", "stage=wake", "event=wake_end"]
     for line in lines:
         assert "source=github" in line, f"a pipeline line lost the source: {line}"
 
@@ -1045,3 +1040,212 @@ def test_the_journal_and_the_evidence_ledger_name_the_same_source(caplog) -> Non
         pipeline.execute(NOVA, _probe_event(), PipelineResult())
     assert "source=probe" in _stage_line(caplog, Stage.WAKE)
     assert evidence.snapshot().agent_wakes[NOVA.harness_key].last_ok_route == "probe"
+
+
+# --- the wake lifecycle bookends, and the colour that reads them (#228) -----
+#
+# The router used to be SILENT at launch: its first word about a wake was the
+# `stage=wake` line minutes later, at completion, so a Live Tail could not tell an
+# agent hard at work from an agent that was never woken — the green-while-absent shape
+# again. `event=wake_start` / `event=wake_end` bracket the wake for the human watching
+# it; the `stage=wake` record stays as the pipeline machinery behind it (the same
+# two-surface split Rails draws between `Started`/`Completed` and its instrumentation
+# events). @origin decided the pair, the field order, and the palette on 2026-08-17.
+
+
+def _bookends(caplog, phase: str) -> list[str]:
+    """Every `event=wake_start` / `event=wake_end` line, painted as it will ship."""
+    return [line for line in _pipeline_lines(caplog) if f"event={phase}" in _uncoloured(line)]
+
+
+class _WatchingWaker(_StubWaker):
+    """A waker that snapshots the journal at the moment it is called.
+
+    The only way to prove `wake_start` lands *before the first attempt* rather than
+    merely before the completion line: the start line must already be in the journal
+    when the subprocess boundary is reached.
+    """
+
+    def __init__(self, caplog, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._caplog = caplog
+        self.journal_at_call: list[list[str]] = []
+
+    def wake(self, agent: Agent, event: Event) -> WakeResult:
+        self.journal_at_call.append([r.getMessage() for r in self._caplog.records])
+        return super().wake(agent, event)
+
+
+def test_the_wake_start_line_is_emitted_before_the_first_attempt(caplog) -> None:
+    waker = _WatchingWaker(caplog)
+    pipeline, _ = _pipeline(waker=waker)
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    assert len(waker.journal_at_call) == 1
+    already_logged = [_uncoloured(line) for line in waker.journal_at_call[0]]
+    assert any(line.startswith("event=wake_start ") for line in already_logged), (
+        f"the launch was still silent when the wake ran: {already_logged}"
+    )
+    # And it says WHICH wake is starting — a bare "starting" would be no better than
+    # the silence it replaces once two agents are woken at once.
+    start = _uncoloured(_bookends(caplog, "wake_start")[0])
+    assert start == (
+        f"event=wake_start delivery={DELIVERY_A} agent={NOVA.harness_key} source=github"
+    )
+
+
+def test_the_wake_end_line_closes_a_clean_wake_with_its_verdict(caplog) -> None:
+    pipeline, _ = _pipeline(clock=_FakeClock(step=93.4))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    end = _uncoloured(_bookends(caplog, "wake_end")[0])
+    assert end == (
+        f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} source=github "
+        "outcome=ok exit=0 duration=93.4s"
+    )
+
+
+def test_the_wake_end_line_closes_an_exhausted_wake_too(caplog) -> None:
+    # A bracket must always close. Retry exhaustion is the other path that produces a
+    # `stage=wake` record today, so it produces a `wake_end` too — and at WARNING, so a
+    # bracket whose close was the one line filtered out of a warnings-only view cannot
+    # happen.
+    pipeline, _ = _pipeline(waker=_StubWaker(fail_times=99), clock=_FakeClock(step=4.1))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_B))
+
+    record = next(r for r in caplog.records if "event=wake_end" in _uncoloured(r.getMessage()))
+    assert record.levelname == "WARNING"
+    end = _uncoloured(record.getMessage())
+    assert end.startswith(
+        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github "
+        "outcome=failed attempts=3 duration=4.1s error="
+    )
+    assert "transient blip" in end
+
+
+def test_the_bracket_closes_even_when_the_wake_path_raises_unexpectedly(caplog) -> None:
+    # The one path that reaches the close with no verdict of its own: a bug (not a
+    # WakeError) escaping to the caller's last-resort handler. An unclosed `wake_start`
+    # would read, forever, as a wake still running — the worst possible lie for a line
+    # whose whole job is saying whether an agent is awake.
+    class _ExplodingWaker(_StubWaker):
+        def wake(self, agent: Agent, event: Event) -> WakeResult:
+            raise RuntimeError("the wake path is broken")
+
+    pipeline, _ = _pipeline(waker=_ExplodingWaker())
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    assert (Stage.WAKE, Outcome.FAILED) in result.stages  # the daemon survived it
+    assert len(_bookends(caplog, "wake_start")) == 1
+    end = _uncoloured(_bookends(caplog, "wake_end")[0])
+    assert end.startswith(f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} ")
+    assert "outcome=failed" in end
+
+
+def test_both_halves_of_the_bracket_carry_the_same_field_prefix(caplog) -> None:
+    # The close mirrors the open, so the eye reading a Live Tail matches them on sight
+    # and a query joins them on the same keys. Guaranteed by construction — one emitter
+    # renders one `_who` mapping for both halves — and pinned here so a second, drifting
+    # order cannot be introduced.
+    for waker in (_StubWaker(), _StubWaker(fail_times=99)):
+        caplog.clear()
+        pipeline, _ = _pipeline(waker=waker)
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+        start = _uncoloured(_bookends(caplog, "wake_start")[0]).split(" ", 1)[1]
+        end = _uncoloured(_bookends(caplog, "wake_end")[0]).split(" ", 1)[1]
+        assert end.startswith(start), f"the close does not mirror the open:\n{start}\n{end}"
+
+
+def test_a_probe_is_never_bracketed(caplog) -> None:
+    # A probe never launches the agent — the wake-runner acks after the privilege drop
+    # without ever exec'ing the model — so bracketing one would put a start and an end
+    # around nothing and blur the exact signal the pair exists to show. The gate is
+    # `Event.synthetic`, the same property that already decides the attempt count.
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.execute(NOVA, _probe_event(), PipelineResult())
+
+    assert _bookends(caplog, "wake_start") == []
+    assert _bookends(caplog, "wake_end") == []
+    # ...but the machinery line is unchanged: a probe still proves the edge.
+    assert "outcome=ok" in _uncoloured(_stage_line(caplog, Stage.WAKE))
+
+
+def test_the_slow_half_leads_with_the_delivery_then_the_agent_then_the_source(caplog) -> None:
+    # @origin's field-order decision: the line is ordered for the human reading it, not
+    # the query reading it. The delivery id is what a person copies to follow one wake
+    # through the router and on into the agent's own journal, so it leads — uniformly,
+    # across every line the slow half emits.
+    pipeline, _ = _pipeline(waker=_StubWaker(fail_times=2))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    slow = [
+        _uncoloured(line)
+        for line in _pipeline_lines(caplog)
+        if "event=wake_" in _uncoloured(line)
+        or any(f"stage={stage.value} " in _uncoloured(line) for stage in _WAKE_STAGES)
+    ]
+    assert slow, "no line of the slow half was emitted at all"
+    prefix = rf"delivery={DELIVERY_A} agent={NOVA.harness_key} source=github"
+    for line in slow:
+        assert re.search(prefix, line), f"a slow-half line is out of order: {line}"
+
+
+def test_the_verdict_tokens_are_painted_with_the_fleet_palette(caplog) -> None:
+    # Green for a wake that started and a stage that succeeded, blue for the bookend's
+    # own identity, red for a failure — the colours @origin decided, applied at the
+    # journal-emission boundary. Both a clean wake and a failing one are driven, since
+    # they are the two verdict colours.
+    for waker in (_StubWaker(), _StubWaker(fail_times=99)):
+        pipeline, _ = _pipeline(waker=waker)
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            pipeline.handle("github", _github_request())
+    lines = _pipeline_lines(caplog)
+
+    assert any(line.startswith(f"{GREEN}event=wake_start{RESET} ") for line in lines)
+    assert any(line.startswith(f"{BLUE}event=wake_end{RESET} ") for line in lines)
+    assert any(f"{GREEN}outcome=ok{RESET}" in line for line in lines)
+    assert any(f"{RED}outcome=failed{RESET}" in line for line in lines)
+    assert any(f"{YELLOW}event=wake_retry{RESET} " in line for line in lines)
+
+
+def test_a_painted_line_is_still_searchable_token_by_token(caplog) -> None:
+    # The token-integrity rule, asserted on the SHIPPED bytes rather than on `paint` in
+    # isolation: every token an operator or an extraction regex looks for must survive
+    # colour intact. (A consumer matching ACROSS the space between two tokens —
+    # `stage=wake outcome=` — is the one thing colour does move, which is why the NOC's
+    # extraction is re-pointed in lockstep with the deploy; see #228.)
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    lines = _pipeline_lines(caplog)
+
+    for token in ("event=wake_start", "event=wake_end", "outcome=ok", f"delivery={DELIVERY_A}"):
+        assert any(token in line for line in lines), f"colour broke the search for {token!r}"
+
+
+def test_colour_never_reaches_the_records_the_status_surface_is_built_from(caplog) -> None:
+    # The containment constraint. `StageRecord.detail` is data the admin/status API
+    # serves; the journal line is that same data plus presentation. They agree on every
+    # VALUE — an escape byte in a JSON payload would be a rendering artefact leaking
+    # into a machine surface, and would make the two disagree about what a stage said.
+    for waker in (_StubWaker(), _StubWaker(fail_times=99)):
+        pipeline, _ = _pipeline(waker=waker)
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            result = pipeline.handle("github", _github_request())
+        # a rejection too — `outcome=rejected` is a painted token on the journal side
+        rejected = pipeline.handle("github", _github_request(sign=False))
+
+        for record in (*result.records, *rejected.records):
+            assert "\x1b" not in record.detail, f"colour leaked into {record.stage}: {record!r}"
+            assert "\x1b" not in record.stage.value
+            assert "\x1b" not in record.outcome.value
+    # ...while the journal line for that same rejection IS painted.
+    assert any(f"{RED}outcome=rejected{RESET}" in line for line in _pipeline_lines(caplog))
