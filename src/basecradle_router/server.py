@@ -42,7 +42,7 @@ import sys
 
 from basecradle_router import __version__
 from basecradle_router.config import DEFAULT_WAKE_LANES
-from basecradle_router.logfmt import log_fields
+from basecradle_router.logfmt import LOG_FORMAT, log_fields
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
@@ -54,7 +54,6 @@ WEBHOOK_PREFIX = "/webhooks/"
 # The package logger every router log line descends from — the pipeline's per-stage
 # records and the routes' ignore-vs-act decision lines (#91) all log under it.
 _ROOT_LOGGER = "basecradle_router"
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 #: uvicorn's HTTP access logger — the one we filter ``/up`` out of (see
 #: :class:`_SuppressLivenessAccessLog`). Not our package, so it is configured by
@@ -135,7 +134,7 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
             return
     handler = logging.StreamHandler(sys.stdout if stream is None else stream)
     handler.setLevel(level)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
     handler._basecradle_router = True  # tag our own handler so re-config is idempotent
     pkg.addHandler(handler)
 

@@ -43,6 +43,16 @@ import json
 from collections.abc import Mapping
 from types import MappingProxyType
 
+#: The record envelope every router line is formatted with — ``asctime level name
+#: message``. It lives here beside the renderer and the palette because it is the third
+#: half of the same concern: the NOC lifts its ``level`` column out of the **message
+#: text** with ``extract(…, ' (CRITICAL|ERROR|WARNING|INFO|DEBUG) ')``, so this envelope
+#: is part of the log grammar rather than a detail of how the daemon happens to boot. It
+#: is shared by the daemon's stdout handler and by the log-grammar probe, which must
+#: format the bytes it puts in the journal exactly as the daemon formats its own
+#: (basecradle-router#232).
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
 #: ANSI SGR colours, and the reset that must follow each painted token.
 GREEN = "\x1b[32m"
 BLUE = "\x1b[34m"

@@ -13,6 +13,7 @@ from basecradle_router import breaker as breaker_mod
 from basecradle_router.breaker import (
     AGENT_SCOPE,
     STREAM_SCOPE,
+    TRIP_EVENT,
     BreakerConfig,
     BreakerState,
     WakeRateBreaker,
@@ -293,3 +294,108 @@ def test_reset_is_logged(caplog) -> None:
     assert len(resets) == 1
     assert f"agent={NOVA}" in resets[0].getMessage()
     assert f"scope={AGENT_SCOPE}" in resets[0].getMessage()
+
+
+# --- the synthetic-source switch (the log-grammar probe's lever) ------------
+#
+# basecradle-router#232 / basecradle-noc#509. `breaker_tripped` is a NEEDLE column: every
+# clause in the fleet alarm's pattern is a whole line that exists only on the failure
+# path, so nothing arrives on a healthy fleet for the NOC's extraction guard to watch and
+# a rename would take the alarm silently to zero. The remedy is to fire a real trip and
+# stamp it — which is only safe if the stamp cannot alter what a REAL trip writes, and
+# cannot be applied by halves.
+
+
+def test_a_genuine_trip_is_byte_identical_without_the_switch(caplog) -> None:
+    # The daemon's own construction. `log_fields` drops an empty value, so the stamp is
+    # ABSENT rather than `source=false` — an absent field is the only one that cannot
+    # change a production line, and every consumer of this line is downstream of bytes.
+    clock = _Clock()
+    breaker = _breaker(clock, max_wakes=2)
+    with caplog.at_level(logging.INFO, logger="basecradle_router.breaker"):
+        for _ in range(3):
+            breaker.admit(NOVA)
+    trip = next(r for r in caplog.records if TRIP_EVENT in r.getMessage())
+    assert "source=" not in trip.getMessage()
+    assert trip.levelno == logging.ERROR
+
+
+def _trip(source: str) -> logging.LogRecord:
+    """The trip record one breaker constructed with ``synthetic_source=source`` emits.
+
+    Records rather than formatted strings: the message and the level are two independent
+    channels here, and re-parsing them back out of a formatted line would be a second,
+    guessing parser of the daemon's own envelope.
+    """
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("basecradle_router.breaker")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        breaker = WakeRateBreaker(
+            BreakerConfig(max_wakes=2, window=60.0, cooldown=60.0),
+            clock=_Clock(),
+            synthetic_source=source,
+        )
+        for _ in range(3):
+            breaker.admit("probe")
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    return next(r for r in records if TRIP_EVENT in r.getMessage())
+
+
+def test_the_switch_moves_the_stamp_and_the_level_together() -> None:
+    # TWO channels, ONE switch, and that is the design rather than a convenience: the
+    # message stamp is what the extraction-fed alarm block-lists, and the level is what
+    # keeps the SEVERITY-fed alarms clean with no filter at all. Setting half would
+    # either page on a manufactured line or filter a real trip out of its own alarm, so
+    # there is no way to set half.
+    trip = _trip("probe")
+    assert trip.getMessage().endswith("source=probe")
+    assert trip.levelno == logging.INFO
+
+
+def test_the_stamp_trails_the_grammar_so_a_synthetic_extends_a_genuine_line() -> None:
+    # THE load-bearing invariant. The synthetic's message is the genuine message plus one
+    # trailing token, so no re-point of the NOC's expression can match the synthetic while
+    # failing on a real trip. An interleaved stamp would let the probe prove a pattern
+    # production traffic never satisfies — the gap re-opened one level down.
+    assert _trip("probe").getMessage() == f"{_trip('').getMessage()} source=probe"
+
+
+def test_severity_lives_in_the_envelope_and_never_in_the_message() -> None:
+    # Demoting the synthetic to INFO is only safe because no extraction gates on
+    # severity: the NOC's `breaker_tripped` column matches the MESSAGE, and its `level`
+    # column lifts the token out of the formatter's envelope as data. So the message
+    # bytes must be level-independent — identical but for the stamp. The day a level
+    # token leaks into the message body, this fails and the demotion is revisited.
+    synthetic, genuine = _trip("probe"), _trip("")
+    assert synthetic.levelno != genuine.levelno
+    for token in ("INFO", "ERROR", "WARNING"):
+        assert token not in synthetic.getMessage()
+        assert token not in genuine.getMessage()
+
+
+def test_the_refusal_and_reset_lines_carry_the_stamp_too(caplog) -> None:
+    # The stamp is a property of the INSTANCE, not of one statement: an unstamped refusal
+    # from a synthetic breaker would land on the same `event=wake_refused` query an
+    # operator uses to find real refused wakes.
+    clock = _Clock()
+    breaker = WakeRateBreaker(
+        BreakerConfig(max_wakes=2, window=60.0, cooldown=60.0),
+        clock=clock,
+        synthetic_source="probe",
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_router.breaker"):
+        for _ in range(3):
+            breaker.admit("probe")  # third trips
+        breaker.admit("probe")  # refused mid-cooldown
+        clock.advance(61.0)
+        breaker.admit("probe")  # cooldown elapsed -> reset
+    for event in ("event=wake_refused", "event=breaker_reset"):
+        line = next(r.getMessage() for r in caplog.records if event in r.getMessage())
+        assert line.endswith("source=probe"), line

@@ -14,8 +14,10 @@ import json
 
 import pytest
 
+from basecradle_router import log_grammar as grammar_mod
 from basecradle_router.__main__ import EXIT_CONFIG_ERROR, main
 from basecradle_router.probe import Injection
+from basecradle_router.selftest import EXIT_UNPROVABLE
 
 NOVA_ENTRY = {
     "os_user": "nova",
@@ -163,14 +165,92 @@ def test_selftest_freeze_json_is_the_shape_the_noc_parses(box, capsys) -> None:
     assert payload["ran_as"]
 
 
-def test_the_cli_never_writes_the_daemons_evidence_file(box) -> None:
+def test_the_cli_never_writes_the_daemons_evidence_file(box, monkeypatch) -> None:
     # The trap this forecloses: a probe run as root would replace the state file and
     # leave it root-owned, locking the *daemon* out of writing its own evidence — an
     # instrument that breaks the thing it instruments. The daemon is the sole writer.
+    #
+    # `probe log-grammar` is included deliberately: it is the one subcommand that has a
+    # side effect at all (one journal line), so the read-only rule is worth re-asserting
+    # where it is closest to being bent.
+    journal = _fake_journal(monkeypatch)
+
     assert main(["selftest", "freeze"]) == 0
     assert main(["claims"]) == 0
+    assert main(["probe", "log-grammar"]) == 0
 
     assert not box.evidence.exists()
+    assert len(journal) == 1
+
+
+# --- probe log-grammar ------------------------------------------------------
+
+
+def _fake_journal(monkeypatch, *, accepts: bool = True) -> list[str]:
+    """Stand in for journald so the CLI is drivable on a machine without systemd."""
+    lines: list[str] = []
+
+    def write(line: str) -> None:
+        if accepts:
+            lines.append(line)
+
+    monkeypatch.setattr(grammar_mod, "_write_to_journal", write)
+    monkeypatch.setattr(grammar_mod, "_read_from_journal", lambda _since: list(lines))
+    monkeypatch.setattr(grammar_mod, "READBACK_INTERVAL", 0.0)
+    return lines
+
+
+def test_probe_log_grammar_needs_no_configuration_at_all(box, monkeypatch, capsys) -> None:
+    # The bytes under proof come from the breaker's own trip statement and the journal is
+    # addressed by the daemon's identifier, so there is nothing here a stale router.env
+    # could make this probe answer about the wrong thing. Pinned by running it with the
+    # registry deleted: every other probe reports a config error on this box.
+    journal = _fake_journal(monkeypatch)
+    box.registry.unlink()
+
+    assert main(["probe", "log-grammar", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["probe"] == "log-grammar"
+    assert payload["status"] == "proven"
+    assert payload["grammar"] in payload["rendered"]
+    assert journal == [payload["rendered"]]
+
+
+def test_probe_log_grammar_refuses_a_line_class_this_component_does_not_state(box, capsys) -> None:
+    # Named, never silently substituted. A probe that quietly proved a different line
+    # than the one asked for would report a healthy grammar about the wrong column — and
+    # the NOC schedules by claim id, so the id and the answer must be the same subject.
+    assert main(["probe", "log-grammar", "billing_blocked"]) == EXIT_UNPROVABLE
+
+    assert "states no grammar for 'billing_blocked'" in capsys.readouterr().err
+
+
+def test_probe_log_grammar_reports_a_silent_journal_as_broken(box, monkeypatch, capsys) -> None:
+    # We asked and the answer is no: the write was accepted and the journal does not
+    # carry it. Still a verdict about the fleet, never about the probe.
+    _fake_journal(monkeypatch, accepts=False)
+    monkeypatch.setattr(grammar_mod, "READBACK_TIMEOUT", 0.0)
+
+    assert main(["probe", "log-grammar"]) == 1
+
+    assert "log-grammar: broken" in capsys.readouterr().err
+
+
+def test_probe_log_grammar_reports_missing_journal_tooling_as_unprovable(
+    box, monkeypatch, capsys
+) -> None:
+    # "We could not ask" is never quieted — journald tooling that does not answer is the
+    # contract's one inconclusive sentinel, not a verdict about the grammar.
+    def refuse(_line: str) -> None:
+        raise grammar_mod.LogGrammarError("could not run systemd-cat: no such file")
+
+    _fake_journal(monkeypatch)
+    monkeypatch.setattr(grammar_mod, "_write_to_journal", refuse)
+
+    assert main(["probe", "log-grammar"]) == EXIT_UNPROVABLE
+
+    assert "log-grammar: unprovable: could not run systemd-cat" in capsys.readouterr().err
 
 
 # --- evidence ---------------------------------------------------------------

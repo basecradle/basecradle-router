@@ -503,6 +503,9 @@ the privilege drop and sources `router.env` itself, so the NOC schedules one sta
 
 # the synthetic wake — marker on STDIN, minted by the NOC with that agent's own secret
 <mint> | /opt/basecradle-router/app/deploy/bin/router-admin probe wake --agent <slug> --json
+
+# the log-grammar probe — fire a real breaker trip so the fleet's needle alarm can be watched
+/opt/basecradle-router/app/deploy/bin/router-admin probe log-grammar breaker_tripped --json
 ```
 
 **Both claims surfaces are ratified, and they are not two spellings of one thing** (`basecradle-noc#408`,
@@ -554,7 +557,7 @@ tmpfs, so between a reboot and the first converge the directory can still be abs
 guarantee is a root-owned `tmpfiles.d` fragment riding `basecradle-noc#409` — NOC-side, nothing for
 this repo to do.
 
-**The five claims and what each closes:**
+**The six claims and what each closes:**
 
 | Claim | Subject | Class / TTL | Closes |
 |---|---|---|---|
@@ -562,7 +565,62 @@ this repo to do.
 | `wake-edge:webhook-route:<route>` | `agent:<slug>` | `rare` / 168 h | **An integration armed on paper, read per *recipient*.** One row per **armed** `(agent, route)` pair — the granularity instance 5 is actually asked at, and the rows the NOC's eight hand-written `basecradle-platform@*` rows retire in favour of (`basecradle-noc#417`). A route that is registered but not enabled gets no row: a claim states a capability the router has *now*. |
 | `wake-edge:synthetic:<route>` | `agent:<slug>` | `rare` / 168 h | **An evidence claim with no lever.** The two rows above go green only when something *happens*, and for a deliberately quiet agent nothing ever does. This row is the lever — the router's own synthetic wake — and it is proven by the *same* `last_ok_at` a real wake writes, never by the probe's own exit code. Emitted per **armed synthetic** route; deliberately **not** counted as a wake edge (see below). |
 | `freeze-surface:readable` | `box:<host>` | `rare` / 24 h | **The control that existed but could not be read.** A `probe` claim, not a pointer: readability is not a fact you look up, it is one you demonstrate with the daemon's own credentials. |
+| `log-grammar:breaker_tripped` | `box:<host>` | `rare` / 1 h | **An alarm whose grammar nobody can watch.** `breaker_tripped` is a **needle** column — every clause in its pattern is a whole line that exists only when a breaker trips — so nothing arrives on a healthy fleet for the NOC's extraction guard to read, and a rename takes the *Circuit Breaker Tripped* alarm silently to zero (`basecradle-noc#509`). This row fires one, through the daemon's own trip statement. |
 | `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. `detail.synthetic` marks the probe's own sink, so the fleet probing itself never reads as an external integration being armed. |
+
+#### `probe log-grammar` — proving the alarm's needle line is still written (#232)
+
+`basecradle-noc#504`'s extraction guard evaluates every git-tracked `sql_expression` against the
+fleet's own log lines and reddens the drift heartbeat when a column that should be extracting is
+extracting nothing. It works by watching traffic — which is exactly why it cannot watch this one.
+`#228` renamed the breaker's trip line from prose to the kv grammar, and it was caught only because
+it was done deliberately with the NOC's re-point handed over in lockstep. **A needle alarm's grammar
+is a claim about the emitter's source, so the proof belongs to the emitter.**
+
+The probe drives a **real** `WakeRateBreaker` past its threshold, so the daemon's own trip statement
+renders the bytes — **there is no second renderer, and that is the whole design.** A rename in
+`breaker.py` moves the probe's bytes in the same commit. The line goes to the daemon's **own**
+journald identifier (`basecradle-router`) via `systemd-cat`, is read back out of the journal, ships
+through Vector like every other line, and the guard reads it off the live stream.
+
+Two discriminators keep it out of production alerting, and they are two because their consumers are
+(the joint shape ratified with the harness on `basecradle-noc#509`):
+
+| Channel | Carries | Keeps clean |
+|---|---|---|
+| a trailing `source=probe` in the message | *manufactured, not real traffic* — the fleet's founder-ratified wake-origin stamp (`basecradle-noc#473`), **reused rather than re-minted** | extraction-fed alarms: *Circuit Breaker Tripped* block-lists it, byte-identically to four production charts |
+| the level drops `ERROR` → `INFO` | *not an incident* | severity-fed alarms: `error_lines` is identifier-scoped, so *Server Errors* never sees it **with no filter at all** |
+
+Both ride **one** switch (`WakeRateBreaker(synthetic_source=…)`) precisely so neither can be set
+without the other. The stamp is appended **last**, which makes a synthetic line a strict
+**prefix-extension** of a genuine trip: no re-point of the NOC's expression can match the synthetic
+while failing on the real thing. And with the switch left empty — the daemon's only construction —
+`log_fields` drops the field, so a genuine trip is **byte-identical** to what it wrote before the
+probe existed.
+
+```
+genuine   … ERROR … event=breaker_tripped agent=nova scope=agent key=nova count=21 threshold=20 window=60s cooldown=60s
+synthetic … INFO  … event=breaker_tripped agent=probe scope=agent key=probe count=21 threshold=20 window=60s cooldown=60s source=probe
+```
+
+**It proves emission, never extraction** — it cannot see ClickHouse and must not gain a way to, or it
+would be the second spelling of the grammar the whole arc exists to prevent. The guard owns that
+half. The composition localizes a fault: claim green + guard deaf is a stale expression; claim red is
+an emitter defect.
+
+Exit codes are the same three: `0` the trip statement ran, the bytes carry the grammar the manifest
+declares, and the journal has the line · `1` the bytes do **not** carry it (a `breaker.py` change
+`claims.py` did not follow), or the line was written and never landed · `75` `systemd-cat`/`journalctl`
+did not answer. It needs **no configuration at all** — the bytes come from the breaker and the journal
+is addressed by identifier — so no stale `router.env` can make it answer about the wrong thing. Its
+only side effect is one journal line; the CLI's read-only rule is otherwise untouched.
+
+**On-box check:**
+
+```bash
+sudo -u router /opt/basecradle-router/app/deploy/bin/router-admin probe log-grammar --json
+journalctl -t basecradle-router --since -5min --no-pager | grep breaker_tripped   # the line it wrote
+```
 
 **Every pointer the emitter declares resolves from the claim's own `detail`.** An `evidence`-kind
 claim's `prove.source` is a `<path>#<dotted.field>` pointer, and the NOC resolves it from the

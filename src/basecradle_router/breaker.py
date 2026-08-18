@@ -84,6 +84,14 @@ STREAM_SCOPE = "stream"
 #: never two vocabularies for one fact (see :mod:`basecradle_router.wakelock`).
 BREAKER_OPEN = "breaker_open"
 
+#: The trip line's leading token — **the grammar the fleet's Circuit Breaker Tripped
+#: alarm matches on**, spelled once in this repository and imported everywhere else it
+#: is named (the claims emitter's ``log-grammar:breaker_tripped`` row, the probe that
+#: proves it). A second literal is how the manifest comes to describe a line the daemon
+#: no longer writes, which is the whole failure this claim exists to catch
+#: (basecradle-noc#509, basecradle-router#232).
+TRIP_EVENT = "event=breaker_tripped"
+
 # The per-(agent, stream) window dict accumulates one entry per distinct timeline
 # or issue ever seen — unbounded over a long-running daemon, unlike the per-agent
 # entries (bounded by the agent registry, like AgentLocks). So stale windows are
@@ -180,6 +188,29 @@ class WakeRateBreaker:
     :meth:`admit` for each wake the pipeline is about to dispatch; act on the
     returned :class:`BreakerOutcome`. The breaker logs its own trip/refuse/reset
     lines — the loud ops/security signal — so the pipeline only records the stage.
+
+    **``synthetic_source`` — the log-grammar probe's one switch, and why it is one.**
+    A manufactured trip must be readable by the NOC's extraction guard and invisible to
+    the alarms that extraction feeds, and those are two different consumers reading two
+    different channels. So the switch moves both at once, and cannot move half:
+
+    - **the message** gains a trailing ``source=<value>`` token (``probe``, the fleet's
+      founder-ratified wake-origin stamp — reused rather than re-minted, capital ruling
+      on basecradle-noc#509 §1), which is what the *Circuit Breaker Tripped* alarm
+      block-lists. It is appended **last**, so the synthetic is a strict
+      prefix-extension of the genuine line;
+    - **the level** drops from ``ERROR`` to ``INFO``, which is what keeps the
+      *severity*-fed alarms clean **with no filter at all** — *Server Errors* counts
+      ERROR/CRITICAL on this identifier, and a blanket synthetic filter there would be a
+      regression (a probe wake that drives the router to ERROR is a genuine fault the
+      fleet must see). Severity is safe to move because no extraction gates on it: the
+      NOC's ``breaker_tripped`` column matches the message and the ``level`` column
+      lifts the token as data. ``tests/test_breaker.py`` pins that.
+
+    Left empty — the daemon's only construction — :func:`~basecradle_router.logfmt.log_fields`
+    drops the field, so a genuine trip is **byte-identical** to what it emitted before
+    the switch existed. Not ``source=false``: an absent field is the one that cannot
+    change a production line.
     """
 
     def __init__(
@@ -187,9 +218,15 @@ class WakeRateBreaker:
         config: BreakerConfig | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        synthetic_source: str = "",
     ) -> None:
         self._config = config or BreakerConfig()
         self._clock = clock
+        # ONE switch, both channels — see the class docstring. Setting only half of it
+        # is the failure mode (a manufactured line that pages, or a real trip filtered
+        # out of its own alarm), so there is deliberately no way to set half.
+        self._synthetic_source = synthetic_source
+        self._trip_level = logging.INFO if synthetic_source else logging.ERROR
         self._lock = threading.Lock()
         self._windows: dict[tuple, _Window] = {}
         self._admits_since_gc = 0
@@ -246,7 +283,13 @@ class WakeRateBreaker:
                     logger.warning(
                         "%s %s",
                         paint("event=wake_refused"),
-                        log_fields(reason=BREAKER_OPEN, agent=agent_key, scope=scope, key=display),
+                        log_fields(
+                            reason=BREAKER_OPEN,
+                            agent=agent_key,
+                            scope=scope,
+                            key=display,
+                            source=self._synthetic_source,
+                        ),
                     )
                     return BreakerOutcome(BreakerState.OPEN, scope=scope, key=display)
                 window.timestamps.clear()
@@ -254,7 +297,12 @@ class WakeRateBreaker:
                 logger.info(
                     "%s %s",
                     paint("event=breaker_reset"),
-                    log_fields(agent=agent_key, scope=scope, key=display),
+                    log_fields(
+                        agent=agent_key,
+                        scope=scope,
+                        key=display,
+                        source=self._synthetic_source,
+                    ),
                 )
 
             # 2) Record this wake on each scope; trip the first that goes over.
@@ -267,9 +315,10 @@ class WakeRateBreaker:
                 count = len(window.timestamps)
                 if count > threshold:
                     window.tripped_until = now + cfg.cooldown
-                    logger.error(
+                    logger.log(
+                        self._trip_level,
                         "%s %s",
-                        paint("event=breaker_tripped"),
+                        paint(TRIP_EVENT),
                         log_fields(
                             agent=agent_key,
                             scope=scope,
@@ -278,6 +327,11 @@ class WakeRateBreaker:
                             threshold=threshold,
                             window=f"{cfg.window:.0f}s",
                             cooldown=f"{cfg.cooldown:.0f}s",
+                            # LAST, always. The stamp trails the grammar under proof so a
+                            # synthetic line is a strict prefix-extension of the genuine
+                            # one: no re-point of the NOC's expression can match the
+                            # synthetic while failing on a real trip.
+                            source=self._synthetic_source,
                         ),
                     )
                     return BreakerOutcome(
