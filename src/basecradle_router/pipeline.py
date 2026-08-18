@@ -662,11 +662,29 @@ class Pipeline:
         The level follows the verdict, so a failed ``wake_end`` is as visible as the
         ``stage=wake outcome=failed`` record beside it: a bracket whose close was the
         one line filtered out of a WARNING view would be worse than no bracket.
+
+        **And the colour follows it too** (basecradle-router#230). Blue names the
+        bookend's *identity*; the verdict's colour is carried by the token that states
+        the verdict, so ``outcome=`` is lifted out of the rendered run and painted whole
+        — the same token :meth:`_record` already paints on the machinery line beside it.
+        Lifting it here rather than teaching :func:`log_fields` about colour is what
+        keeps the renderer emitting values only, so no field can smuggle an escape into
+        the middle of a token; ``wake_start`` carries no verdict and so stays unpainted
+        past its own identity.
         """
         if event.synthetic:
             return
-        level = logging.WARNING if verdict.get("outcome") == Outcome.FAILED.value else logging.INFO
-        logger.log(level, "%s %s", paint(f"event={phase}"), log_fields(**who, **verdict))
+        outcome = verdict.pop("outcome", None)
+        level = logging.WARNING if outcome == Outcome.FAILED.value else logging.INFO
+        parts = [paint(f"event={phase}"), log_fields(**who)]
+        if outcome:
+            parts.append(paint(f"outcome={outcome}"))
+        parts.append(log_fields(**verdict))
+        # One empty-drop rule for the whole line, applied once: `log_fields` already
+        # drops an empty *field*, and this drops an empty *run* of them, so an open
+        # (no verdict at all) ends at its own field prefix rather than at a separator
+        # left behind by a token that was not there.
+        logger.log(level, "%s", " ".join(part for part in parts if part))
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, **detail: object

@@ -1216,6 +1216,48 @@ def test_the_verdict_tokens_are_painted_with_the_fleet_palette(caplog) -> None:
     assert any(f"{YELLOW}event=wake_retry{RESET} " in line for line in lines)
 
 
+def test_the_wake_end_bookend_paints_its_own_verdict_token(caplog) -> None:
+    # Blue names the bookend's IDENTITY; the verdict's colour rides the token that
+    # *states* the verdict. As first shipped, the close was the one plain verdict token
+    # left in the journal (basecradle-router#230) — a blue line whose `outcome=failed`
+    # scanned exactly like `outcome=ok`, which inverts the point of a bookend: the eye
+    # picking the close out of a Live Tail learned nothing from having found it.
+    for waker, outcome, colour in (
+        (_StubWaker(), "ok", GREEN),
+        (_StubWaker(fail_times=99), "failed", RED),
+    ):
+        caplog.clear()
+        pipeline, _ = _pipeline(waker=waker)
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+        end = _bookends(caplog, "wake_end")[0]
+        assert end.startswith(f"{BLUE}event=wake_end{RESET} ")
+        assert f"{colour}outcome={outcome}{RESET}" in end, f"the verdict is plain: {end!r}"
+        # ...and the paint moved nothing else: a colour-blind consumer reads the same
+        # run of tokens, in the same order, that it read before the token was painted.
+        assert _uncoloured(end).startswith(
+            f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} "
+            f"source=github outcome={outcome} "
+        )
+
+
+def test_the_wake_start_bookend_has_no_verdict_token_to_paint(caplog) -> None:
+    # The other half of lifting `outcome=` out of the rendered run: an open has no
+    # verdict, so it must end at its own field prefix — not at a stray separator left
+    # behind by the token that was not there. A trailing space is invisible in a
+    # terminal and breaks an equality match in a consumer.
+    pipeline, _ = _pipeline()
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    start = _bookends(caplog, "wake_start")[0]
+    assert start == (
+        f"{GREEN}event=wake_start{RESET} "
+        f"delivery={DELIVERY_A} agent={NOVA.harness_key} source=github"
+    )
+
+
 def test_a_painted_line_is_still_searchable_token_by_token(caplog) -> None:
     # The token-integrity rule, asserted on the SHIPPED bytes rather than on `paint` in
     # isolation: every token an operator or an extraction regex looks for must survive
