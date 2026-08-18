@@ -64,6 +64,26 @@ deliberate:
 The key is deliberately *not* ``origin``: an :class:`~basecradle_router.models.Event`
 already has one, meaning something else entirely (the issue the agent reports back on).
 
+**A wake is bracketed for the human watching it** — ``event=wake_start`` before the
+first attempt, ``event=wake_end`` when it resolves (basecradle-router#228, a founder
+decision). The router used to be *silent at launch*: its first word about a wake was
+the ``stage=wake`` line minutes later, at completion, so a Live Tail could not
+distinguish an agent hard at work from an agent that was never woken at all — the
+exact green-while-absent shape this repo exists to instrument against. The pair is
+the human lifecycle surface and the ``stage=`` records are the pipeline machinery
+serving :class:`StageRecord` and the status API; both stay, the same two-surface split
+Rails draws between its ``Started``/``Completed`` request lines and its instrumentation
+events. See :meth:`Pipeline._wake` for the two properties that make the bracket
+trustworthy — it always closes, and both halves carry one field prefix.
+
+**Colour is presentation the journal adds, and stops there.** The fleet ANSI palette
+(:mod:`basecradle_router.logfmt`, @origin 2026-08-17) paints the verdict tokens as the
+line is handed to the logger — green for ``outcome=ok``, red for ``outcome=failed`` —
+around the *whole* ``key=value`` token, so every substring search still matches. It
+never enters a :class:`StageRecord` or a status payload: those carry the data, the
+journal line carries the data *and* its colour, and the two can never disagree about a
+value.
+
 **The pipeline ends at the wake — the router never merges.** Auto-merge of a
 captain's own green PR (constitution → Earned Autonomy) is performed by **GitHub
 native auto-merge**: during its wake the agent opens its PR and runs
@@ -79,7 +99,6 @@ and rationale.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -96,6 +115,7 @@ from basecradle_router.concurrency import (
 from basecradle_router.config import Config, ConfigError
 from basecradle_router.dedup import DUPLICATE_DELIVERY, DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
+from basecradle_router.logfmt import log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -112,45 +132,13 @@ from basecradle_router.wakelock import WakeLockGuard
 logger = logging.getLogger("basecradle_router.pipeline")
 
 
-def log_fields(**pairs: object) -> str:
-    """Render ``pairs`` as a ``key=value`` run, dropping the empty ones.
-
-    The one renderer behind every line this module logs, so a stage line, a retry
-    warning, and the startup banner cannot drift apart in shape. A value carrying
-    whitespace or a quote — an error message, always — is JSON-quoted, so it stays
-    a *single* field and a grep for the field after it still matches; a ``None`` or
-    ``""`` value is dropped rather than logged as ``key=`` (``0`` is a value, and is
-    kept). Public because the server's startup banner renders through it too.
-
-    A ``bool`` renders lowercase — ``key=true``, never Python's ``True`` — and ``False``
-    is a value like ``0``, never dropped as empty. No field passes a bool today
-    (basecradle-router#222 retired the one that did), but this is the *renderer's*
-    contract rather than that field's: a log value is a label a metric extractor lifts
-    and a dashboard filters on literally, so it must be spelled the way every other
-    structured surface in the fleet spells it (JSON evidence, logfmt, the NOC's queries)
-    rather than the way ``str()`` happens to render a Python object — and a key whose
-    ``false`` was dropped as empty would leave a filter matching nothing, silently. Both
-    are pinned by their own test, so the next bool field is correct on arrival instead
-    of re-deriving this.
-    """
-    parts = []
-    for key, value in pairs.items():
-        if value is None or value == "":
-            continue
-        text = ("true" if value else "false") if isinstance(value, bool) else str(value)
-        if any(char.isspace() for char in text) or '"' in text:
-            text = json.dumps(text)
-        parts.append(f"{key}={text}")
-    return " ".join(parts)
-
-
 def _seconds(elapsed: float) -> str:
     """A wall-clock duration as a log value: ``23.1s``."""
     return f"{elapsed:.1f}s"
 
 
 def _who(agent: Agent, event: Event) -> dict[str, object]:
-    """The keys every line of the slow half carries: which source, which agent, which delivery.
+    """The keys every line of the slow half carries: which delivery, which agent, which source.
 
     ``source`` is the route the delivery arrived on
     (:attr:`~basecradle_router.models.Event.source`) — the low-cardinality label a
@@ -167,13 +155,24 @@ def _who(agent: Agent, event: Event) -> dict[str, object]:
     entries are tagged with (``basecradle-wake-<slug>``), so it is what makes the
     router's half of a wake and the agent's half joinable.
 
-    Ordered labels-first: ``source`` and ``agent`` are the closed-set keys a query
-    groups by, and ``delivery`` is the unbounded id it joins on.
+    **Ordered for the human reading the line, not the query reading the key**
+    (basecradle-router#228, a founder decision): ``delivery`` first, then ``agent``,
+    then ``source``. The order was labels-first before, on the reasoning that a query
+    groups by the closed-set keys and joins on the unbounded id — but a query addresses
+    a key *by name*, and no consumer of these lines has ever cared where in the line a
+    key sits. A person tailing the journal does: the delivery id is the thing they copy
+    to follow one wake through the router and on into the agent's own journal, so it
+    leads, and the identity narrows from there. One order across every line this half
+    emits — the wake bookends, ``wake_retry``, and each ``stage=`` line from ``lock``
+    on, gates included — because a prefix that reads the same on every line is what
+    makes an interleaved Live Tail scannable at all. (The wake-lock guard's and the
+    breaker's own ``event=wake_refused`` lines are a different surface: they are handed
+    a slug, never an event, so they carry no ``delivery``/``source`` to order.)
     """
     return {
-        "source": event.source,
-        "agent": agent.harness_key,
         "delivery": event.delivery_id,
+        "agent": agent.harness_key,
+        "source": event.source,
     }
 
 
@@ -204,10 +203,18 @@ class Outcome(Enum):
 class StageRecord:
     """One stage's outcome — the unit of the router's structured status log.
 
-    ``detail`` is the rendered ``key=value`` run for this stage (``agent=nova
-    delivery=… exit=0 duration=23.1s``) — the same string the log line carries, so
+    ``detail`` is the rendered ``key=value`` run for this stage (``delivery=…
+    agent=nova exit=0 duration=23.1s``) — the same string the log line carries, so
     the in-memory record and the journal can never disagree about what a stage
     said.
+
+    They agree on the *data*; the journal line adds *presentation* the record does
+    not carry (basecradle-router#228). ``stage``/``outcome`` ride on the line as their
+    own tokens rather than inside ``detail``, and the outcome token is painted with
+    the fleet ANSI colour for its verdict at the moment it is handed to the logger —
+    so no escape byte can reach this record, the admin/status payload built from it,
+    or anything else that reads the router's state rather than watches its journal.
+    :mod:`basecradle_router.logfmt` holds the palette and the containment rule.
     """
 
     stage: Stage
@@ -543,6 +550,29 @@ class Pipeline:
         agent with no probe secret armed refuses identically every time, so retrying
         only triples the noise, and a genuinely transient fault is answered by the next
         scheduled cycle — which is the honest place to answer it.
+
+        **The wake is bracketed for a human** (basecradle-router#228, a founder
+        decision): ``event=wake_start`` immediately before the first attempt and
+        ``event=wake_end`` when it resolves, whichever way it resolved. Until now the
+        router said nothing at launch — its first word about a wake arrived minutes
+        later, at completion — so a Live Tail could not tell an agent working from an
+        agent never woken. The pair is the *human* lifecycle surface and the
+        ``stage=wake`` record is the pipeline machinery behind it; both stay, the same
+        two-surface split Rails draws between its ``Started``/``Completed`` request
+        lines and its instrumentation events.
+
+        Two properties are structural rather than remembered. **The bracket always
+        closes** — ``wake_end`` is emitted from a ``finally``, so an unexpected error
+        on its way out of this method closes the bracket before it propagates; an
+        unclosed ``wake_start`` would read, forever, as a wake still running. And
+        **both lines carry the same field prefix**, because both render the one
+        :func:`_who` mapping — the verdict is appended to it, never spelled into a
+        second, drifting order.
+
+        **Real wakes only.** A probe never launches the agent, so bracketing one would
+        put a start and an end around nothing and blur the very signal the pair exists
+        to show. The gate is :attr:`~basecradle_router.models.Event.synthetic` — the
+        same property that already decides the attempt count above.
         """
         who = _who(agent, event)
         attempts = 1 if event.synthetic else self.wake_attempts
@@ -562,7 +592,8 @@ class Pipeline:
 
         def on_retry(failed: int, of: int, exc: Exception) -> None:
             logger.warning(
-                "event=wake_retry %s",
+                "%s %s",
+                paint("event=wake_retry"),
                 log_fields(
                     attempt=f"{failed}/{of}",
                     **who,
@@ -571,43 +602,71 @@ class Pipeline:
                 ),
             )
 
+        self._bookend(event, who, "wake_start")
+        verdict: dict[str, object] | None = None
         try:
-            woke = with_retry(attempt, attempts=attempts, sleep=self.sleep, on_retry=on_retry)
-        except RetryExhausted as exc:
-            error = str(exc.__cause__ or exc)
-            self.evidence.record_wake_failed(
-                agent.harness_key, error, route=event.source, synthetic=event.synthetic
+            try:
+                woke = with_retry(attempt, attempts=attempts, sleep=self.sleep, on_retry=on_retry)
+            except RetryExhausted as exc:
+                error = str(exc.__cause__ or exc)
+                self.evidence.record_wake_failed(
+                    agent.harness_key, error, route=event.source, synthetic=event.synthetic
+                )
+                # One dict, two surfaces: the stage record's detail and the bookend's
+                # verdict are the same fields under the same names, so the machinery
+                # line and the human line cannot come to say different things.
+                how = {
+                    "attempts": attempts,
+                    "duration": _seconds(last_duration),
+                    "error": error,
+                }
+                self._record(result, Stage.WAKE, Outcome.FAILED, **who, **how)
+                verdict = {"outcome": Outcome.FAILED.value, **how}
+                return False
+            # The evidence the whole wake-edge claim rests on: this agent was demonstrably
+            # woken, at this time, by this delivery, **over this route**. Nothing else in
+            # the router proves an agent is reachable rather than merely registered — and
+            # without the route it proves only that *some* source reached the agent, which
+            # would green a sibling route rejecting every delivery to that same agent.
+            self.evidence.record_wake_ok(
+                agent.harness_key,
+                event.delivery_id,
+                route=event.source,
+                synthetic=event.synthetic,
             )
-            self._record(
-                result,
-                Stage.WAKE,
-                Outcome.FAILED,
-                **who,
-                attempts=attempts,
-                duration=_seconds(last_duration),
-                error=error,
-            )
-            return False
-        # The evidence the whole wake-edge claim rests on: this agent was demonstrably
-        # woken, at this time, by this delivery, **over this route**. Nothing else in
-        # the router proves an agent is reachable rather than merely registered — and
-        # without the route it proves only that *some* source reached the agent, which
-        # would green a sibling route rejecting every delivery to that same agent.
-        self.evidence.record_wake_ok(
-            agent.harness_key,
-            event.delivery_id,
-            route=event.source,
-            synthetic=event.synthetic,
-        )
-        self._record(
-            result,
-            Stage.WAKE,
-            Outcome.OK,
-            **who,
-            exit=woke.exit_code,
-            duration=_seconds(last_duration),
-        )
-        return True
+            how = {"exit": woke.exit_code, "duration": _seconds(last_duration)}
+            self._record(result, Stage.WAKE, Outcome.OK, **who, **how)
+            verdict = {"outcome": Outcome.OK.value, **how}
+            return True
+        finally:
+            # Closed from `finally` so no exit path can leave the bracket open — not a
+            # return added later, and not an unexpected exception on its way out to the
+            # caller's last-resort handler, which is the one path that reaches here with
+            # no verdict of its own.
+            if verdict is None:
+                verdict = {
+                    "outcome": Outcome.FAILED.value,
+                    "duration": _seconds(last_duration),
+                    "error": "unexpected: the wake path raised",
+                }
+            self._bookend(event, who, "wake_end", **verdict)
+
+    def _bookend(self, event: Event, who: dict[str, object], phase: str, **verdict: object) -> None:
+        """Emit one half of the wake lifecycle bracket — ``wake_start`` or ``wake_end``.
+
+        One emitter for both halves, so the end line mirrors the start line's field
+        prefix by construction: both render the same ``who`` mapping, and only the
+        verdict (``outcome``, ``exit``/``attempts``, ``duration``, ``error``) is
+        appended. Nothing is emitted for a synthetic event — see :meth:`_wake`.
+
+        The level follows the verdict, so a failed ``wake_end`` is as visible as the
+        ``stage=wake outcome=failed`` record beside it: a bracket whose close was the
+        one line filtered out of a WARNING view would be worse than no bracket.
+        """
+        if event.synthetic:
+            return
+        level = logging.WARNING if verdict.get("outcome") == Outcome.FAILED.value else logging.INFO
+        logger.log(level, "%s %s", paint(f"event={phase}"), log_fields(**who, **verdict))
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, **detail: object
@@ -618,8 +677,10 @@ class Pipeline:
         level = logging.WARNING if outcome in (Outcome.REJECTED, Outcome.FAILED) else logging.INFO
         logger.log(
             level,
-            "stage=%s outcome=%s%s",
+            "stage=%s %s%s",
             stage.value,
-            outcome.value,
+            # Painted here and nowhere else: `rendered` above is the record's own
+            # bytes, so colour reaches the journal without ever reaching the record.
+            paint(f"outcome={outcome.value}"),
             f" {rendered}" if rendered else "",
         )

@@ -621,3 +621,25 @@ def test_deployed_sha_reads_the_stamp_and_never_raises_when_it_is_absent(tmp_pat
 
     stamp.write_text("   \n")
     assert deployed_sha(str(stamp)) == "unknown"  # an empty stamp is not a sha
+
+
+def test_no_ansi_colour_ever_reaches_the_http_response_body() -> None:
+    # The containment constraint of #228. The fleet palette paints the journal's verdict
+    # tokens — `outcome=ok` green, `outcome=rejected` red — at the moment a line is handed
+    # to the logger, and stops there. This surface is the other half of the same data: a
+    # machine-readable JSON summary, whose `outcome` values are the very same enum values
+    # the painted tokens are built from. An escape byte reaching here would be a rendering
+    # artefact in a machine payload, and would make the journal and the API disagree about
+    # what a stage said. Both verdicts are driven, since red and green are separate paths.
+    server, _ = _build()
+    body, headers = _signed_body()
+    ok_status, ok_summary = _post(server, "/webhooks/github", body, headers)
+
+    bad_headers = dict(headers, **{"X-Hub-Signature-256": "sha256=" + "0" * 64})
+    rejected_status, rejected_summary = _post(server, "/webhooks/github", body, bad_headers)
+
+    assert (ok_status, rejected_status) == (202, 401)
+    for summary in (ok_summary, rejected_summary):
+        blob = json.dumps(summary)
+        # Both spellings: a raw escape, and the `\u001b` json.dumps would encode it as.
+        assert "\x1b" not in blob and "\\u001b" not in blob, f"colour leaked into {summary}"

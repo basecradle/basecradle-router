@@ -13,6 +13,7 @@ import logging
 
 import pytest
 
+from basecradle_router.logfmt import RED, RESET, YELLOW
 from basecradle_router.wakelock import (
     DEFAULT_LOCK_DIR,
     WakeLockGuard,
@@ -159,6 +160,55 @@ def test_non_object_lock_refuses(tmp_path) -> None:
 def test_unparseable_expires_at_refuses(tmp_path) -> None:
     _write_lock(tmp_path, NOVA, expires_at="not-a-timestamp")
     assert _guard(tmp_path).check(NOVA).state is WakeLockState.UNPARSEABLE
+
+
+# --- the fleet palette on the guard's own lines (#228) ---------------------
+
+
+def _messages(caplog) -> str:
+    """The guard's log lines with their escapes intact.
+
+    Deliberately NOT `caplog.text`: pytest strips ANSI from that property, so a colour
+    assertion against it passes whatever the daemon emits — vacuously green, which is
+    the one failure mode a test about visibility must not have.
+    """
+    return "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_the_guard_paints_its_event_tokens_without_breaking_a_search(tmp_path, caplog) -> None:
+    # The guard's three lines are in the fleet palette (@origin, 2026-08-17): red for
+    # the one that says the guard ITSELF is broken and the freeze surface is unreadable,
+    # yellow for a wake that did not run — a refusal and a stale lock are neither a
+    # success nor a failure. The colour wraps the WHOLE token, which is why every
+    # assertion above (`"event=wake_refused" in line`) still holds; that is the property
+    # under test here, on the shipped bytes rather than on `paint` in isolation.
+    clock = _Clock("2026-06-26T12:00:00+00:00")
+
+    _write_lock(tmp_path, NOVA)  # live -> refused
+    with caplog.at_level(logging.WARNING, logger="basecradle_router.wakelock"):
+        _guard(tmp_path, clock).check(NOVA)
+    assert f"{YELLOW}event=wake_refused{RESET} reason=wake_lock_held" in _messages(caplog)
+
+    caplog.clear()
+    _write_lock(tmp_path, NOVA, expires_at="2026-06-26T11:00:00+00:00")  # expired -> stale
+    with caplog.at_level(logging.WARNING, logger="basecradle_router.wakelock"):
+        _guard(tmp_path, clock).check(NOVA)
+    assert f"{YELLOW}event=wake_lock_stale{RESET} agent={NOVA}" in _messages(caplog)
+
+
+def test_the_unreadable_line_is_painted_red(tmp_path, caplog, monkeypatch) -> None:
+    # The failure family: an unreadable lock means the NOC's freeze control cannot be
+    # honoured, which is the "capability armed on paper" shape this repo instruments
+    # against — it must read as red at a glance, not as one more warning.
+    _write_lock(tmp_path, NOVA)
+
+    def _boom(*_a, **_k):
+        raise PermissionError("EACCES")
+
+    monkeypatch.setattr("builtins.open", _boom)
+    with caplog.at_level(logging.ERROR, logger="basecradle_router.wakelock"):
+        _guard(tmp_path).check(NOVA)
+    assert f"{RED}event=wake_lock_unreadable{RESET} agent={NOVA}" in _messages(caplog)
 
 
 # --- unreadable: a deployment fault -> fail open (wake) + loud error --------

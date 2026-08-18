@@ -40,6 +40,20 @@ lock and immediately before the wake, so it counts the rate at which wakes are
 A real runaway fires wakes back-to-back as fast as each completes and trips the cap;
 a legitimate burst of queued deliveries drains one slow wake at a time and never does.
 
+**Its three lines speak the router's grammar** (basecradle-router#228): a leading
+``event=`` token and ``key=value`` fields, painted with the fleet palette
+(:mod:`basecradle_router.logfmt`) — ``event=breaker_tripped`` (red), ``event=wake_refused
+reason=breaker_open`` (yellow, the same spelling the wake-lock guard's refusals use, so
+one query finds every refused wake whatever gate refused it), and ``event=breaker_reset``
+(green). They were the last prose lines in the daemon: ``CIRCUIT BREAKER TRIPPED: wake
+rate exceeded scope=… key=…`` mixed a shouty sentence with kv fields, so the loudest line
+the router can emit was the one line a consumer had to special-case. The data is
+unchanged — scope, key, agent, count, threshold, window, cooldown — and the level stays
+``ERROR``; only the shape moved. **The literal moved with it**, and the NOC's
+``breaker_tripped`` log-metric matches the old sentence, so its detection is re-pointed at
+``event=breaker_tripped`` in lockstep with the deploy that lands this (handed to the
+capital on basecradle-router#228 — it is a NOC-repo change, not ours to make).
+
 Thread-safe: :meth:`WakeRateBreaker.admit` is called from the pipeline's worker
 threads, so all window state is guarded by one short-held lock (the check is
 microseconds). The clock is injectable so tests are deterministic and never sleep;
@@ -57,10 +71,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
+from basecradle_router.logfmt import log_fields, paint
+
 logger = logging.getLogger("basecradle_router.breaker")
 
 AGENT_SCOPE = "agent"
 STREAM_SCOPE = "stream"
+
+#: The ``reason=`` a wake refused mid-cooldown carries. A refusal is spelled
+#: ``event=wake_refused reason=<why>`` wherever it happens, so the wake-lock guard's
+#: refusals and the breaker's are one queryable class with a distinguishing reason —
+#: never two vocabularies for one fact (see :mod:`basecradle_router.wakelock`).
+BREAKER_OPEN = "breaker_open"
 
 # The per-(agent, stream) window dict accumulates one entry per distinct timeline
 # or issue ever seen — unbounded over a long-running daemon, unlike the per-agent
@@ -222,20 +244,17 @@ class WakeRateBreaker:
                     continue
                 if now < window.tripped_until:
                     logger.warning(
-                        "wake refused: circuit breaker OPEN scope=%s key=%s agent=%s "
-                        "(cooling down)",
-                        scope,
-                        display,
-                        agent_key,
+                        "%s %s",
+                        paint("event=wake_refused"),
+                        log_fields(reason=BREAKER_OPEN, agent=agent_key, scope=scope, key=display),
                     )
                     return BreakerOutcome(BreakerState.OPEN, scope=scope, key=display)
                 window.timestamps.clear()
                 window.tripped_until = None
                 logger.info(
-                    "circuit breaker reset: scope=%s key=%s cooldown elapsed, "
-                    "window clear; resuming wakes",
-                    scope,
-                    display,
+                    "%s %s",
+                    paint("event=breaker_reset"),
+                    log_fields(agent=agent_key, scope=scope, key=display),
                 )
 
             # 2) Record this wake on each scope; trip the first that goes over.
@@ -249,17 +268,17 @@ class WakeRateBreaker:
                 if count > threshold:
                     window.tripped_until = now + cfg.cooldown
                     logger.error(
-                        "CIRCUIT BREAKER TRIPPED: wake rate exceeded scope=%s key=%s "
-                        "agent=%s count=%d>%d window=%.0fs; halting wakes for "
-                        "cooldown=%.0fs. Runaway-loop backstop fired — investigate "
-                        "(harness#138 is the sibling self-breaker layer).",
-                        scope,
-                        display,
-                        agent_key,
-                        count,
-                        threshold,
-                        cfg.window,
-                        cfg.cooldown,
+                        "%s %s",
+                        paint("event=breaker_tripped"),
+                        log_fields(
+                            agent=agent_key,
+                            scope=scope,
+                            key=display,
+                            count=count,
+                            threshold=threshold,
+                            window=f"{cfg.window:.0f}s",
+                            cooldown=f"{cfg.cooldown:.0f}s",
+                        ),
                     )
                     return BreakerOutcome(
                         BreakerState.TRIPPED, scope=scope, key=display, count=count
