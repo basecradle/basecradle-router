@@ -16,9 +16,9 @@ in lockstep. The next one will not be.
 **A needle alarm's grammar is a claim about the emitter's source, so the proof belongs to
 the emitter** (basecradle-noc#509, basecradle-router#232). This module is the router's
 half: it drives a *real* :class:`~basecradle_router.breaker.WakeRateBreaker` past its own
-threshold so the daemon's **own** trip statement renders the bytes, writes that line to
-the daemon's **own** journald identifier, and reads it back out of the journal. The line
-then ships through Vector like any other and the guard reads it off the live stream.
+threshold so the daemon's **own** trip statement renders the bytes, and writes that line to
+the daemon's **own** journald identifier. The line then ships through Vector like any other
+and the guard reads it off the live stream.
 
 **It contains no renderer, and that is the whole design.** A probe with its own format
 string would be a second spelling of the grammar — the very thing that lets a manifest go
@@ -42,23 +42,46 @@ probe), and they are two because their consumers are two:
 Both are one switch on the breaker (``synthetic_source``) precisely so neither can be set
 without the other.
 
-**What this proves, and what it does not.** The probe proves **emission**: these bytes,
-this grammar, in this journal. It does not — and must not — assert **extraction**: it
-cannot see ClickHouse, must not gain a way to, and a probe that graded the NOC's regex
-would be the second spelling again. The guard owns that half, off the live stream. The
-composition is what localizes a fault: claim green + guard deaf is a stale expression;
-claim red is an emitter defect.
+**Rendered is ours; landed is the guard's** (capital ruling on basecradle-noc#509,
+2026-08-18; basecradle-router#234). This probe used to read its own line back out of the
+journal, and **on the box it never could**: the daemon runs as ``router``, a *system* user
+(uid 999), and journald's ``SplitMode=uid`` hands a per-user journal only to uid ≥ 1000
+principals — a system user's entries land in the *system* journal, readable to root or to
+``systemd-journal`` alone. So the read-back answered ``unprovable`` on a perfectly healthy
+box, with the line itself landed, shipped, and extracting, coloured and stamped. The repair
+is **not** a group membership: handing the wake-dispatching daemon a standing read over the
+whole system journal — every agent's wake output, and the credential history of #443 — so
+that a health check can go green is the shape basecradle-noc#421 refuses. The repair is to
+stop claiming the half we cannot see. This probe proves **rendered**: these bytes, this
+grammar, accepted by journald under the daemon's own identifier. **Landing is the NOC's
+witness on that identifier**, which populates only if the line survived journald → Vector →
+Better Stack — a *stronger* statement than a read-back, made from the side that can
+actually make it.
+
+The read-back was **dropped rather than made conditional on the principal**, deliberately.
+A verdict whose strength depends on who happened to run it is a claim that lies about
+itself, and on this box the readable arm would never execute at all — a branch nobody
+observes, deciding what ``proven`` means. basecradle-noc#409's own lesson is that a probe
+proves what the principal that ran it can reach and only that; the honest response is to
+narrow the claim, never to fork it. (The harness keeps its read-back, where its principals
+are regular users and it costs nothing.)
+
+**What this proves, and what it does not.** The probe proves **rendering and emission**:
+these bytes, this grammar, handed to this journal. It does not — and must not — assert
+**extraction**: it cannot see ClickHouse, must not gain a way to, and a probe that graded
+the NOC's regex would be the second spelling again. The guard owns that half, off the live
+stream. The composition is what localizes a fault: claim green + guard deaf is a stale
+expression *or* a broken shipping path; claim red is an emitter defect.
 
 **Three verdicts, the contract's own three** (basecradle-noc#408, ruling 4):
 
 - ``proven`` / exit ``0`` — the trip statement ran, the bytes carry the declared grammar,
-  and the line was found in the journal.
+  and journald accepted the line.
 - ``broken`` / exit ``1`` — we asked and the answer is no: the rendered bytes do **not**
   carry the grammar this component's manifest declares (a ``breaker.py`` change that
-  :mod:`basecradle_router.claims` did not follow), or the line was written and never
-  landed in the journal.
-- ``unprovable`` / exit ``75`` — we never got an answer: ``systemd-cat`` or ``journalctl``
-  is missing or failed. Still red, still immediate.
+  :mod:`basecradle_router.claims` did not follow).
+- ``unprovable`` / exit ``75`` — we never got an answer: ``systemd-cat`` is missing or
+  failed. Still red, still immediate.
 
 **It writes nothing but a log line.** The admin CLI's read-only rule holds: no evidence
 document, no daemon state, no live breaker — the instance here is local to this process,
@@ -69,8 +92,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -86,7 +108,8 @@ logger = logging.getLogger("basecradle_router.log_grammar")
 #: ruled per-emitter identifier ownership on basecradle-noc#509 §6: the router's line
 #: lands where a genuine trip lands, for maximal fidelity, and the ``INFO`` level is what
 #: keeps the identifier-scoped ``error_lines`` column clean with no predicate. It is also
-#: what the NOC's witness declares as its ``parent``.
+#: what the NOC's witness declares as its ``parent`` — and, since basecradle-router#234,
+#: the only party that can testify the line *landed*.
 IDENTIFIER = "basecradle-router"
 
 #: The NOC column this proves, and — by the capital's ruling on basecradle-noc#509 §5 —
@@ -99,14 +122,8 @@ LINE_CLASS = "breaker_tripped"
 #: ``agent`` label, which the alarm's own filter drops along with the rest of the line.
 SYNTHETIC_AGENT = "probe"
 
-#: How long to wait for journald to make the line readable, and how often to re-ask. The
-#: write is asynchronous, so a single immediate read would report a healthy journal as a
-#: fault; the budget is generous because the cost of being wrong here is a page.
-READBACK_TIMEOUT = 10.0
-READBACK_INTERVAL = 0.25
-
-#: How long the two journal commands may run before we call it *no answer*. They are
-#: local IPC against journald; anything near this is a broken box, not a slow one.
+#: How long the journal write may run before we call it *no answer*. It is local IPC
+#: against journald; anything near this is a broken box, not a slow one.
 COMMAND_TIMEOUT = 20.0
 
 #: The emitted stamp, read off the probe route rather than spelled here. The value is the
@@ -130,7 +147,7 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class LogGrammarResult:
-    """One run: what was rendered, what was written, and whether the journal has it."""
+    """One run: what the daemon's own trip statement rendered, and where it was written."""
 
     status: str
     line_class: str
@@ -139,7 +156,6 @@ class LogGrammarResult:
     rendered: str
     detail: str
     checked_at: str
-    waited: float
 
     @property
     def exit_code(self) -> int:
@@ -163,7 +179,6 @@ class LogGrammarResult:
             "rendered": self.rendered,
             "detail": self.detail,
             "checked_at": self.checked_at,
-            "waited_seconds": round(self.waited, 3),
         }
 
 
@@ -171,12 +186,13 @@ class LogGrammarError(Exception):
     """The probe could not be *attempted* — the journal tooling did not answer."""
 
 
-#: The two injectable seams, so the whole probe is drivable offline without journald —
-#: the same discipline :mod:`basecradle_router.probe` applies to its HTTP boundary.
-#: ``Writer`` puts one already-formatted line in the journal under ``IDENTIFIER``;
-#: ``Reader`` returns the journal's lines for that identifier since a given epoch.
+#: The one injectable seam, so the whole probe is drivable offline without journald — the
+#: same discipline :mod:`basecradle_router.probe` applies to its HTTP boundary. ``Writer``
+#: puts one already-formatted line in the journal under :data:`IDENTIFIER`. There is
+#: deliberately no reader seam to go with it (basecradle-router#234): the emitting
+#: principal is a system user that cannot read the journal back, so a reader here could
+#: only ever be exercised by a test.
 Writer = Callable[[str], None]
-Reader = Callable[[float], Sequence[str]]
 
 
 def capture_trip(*, synthetic: bool) -> logging.LogRecord:
@@ -268,6 +284,11 @@ def _write_to_journal(line: str) -> None:
     dependency the deploy does not already carry. ``--priority=info`` matches the level
     the switch already put in the message text, so the journal's ``PRIORITY`` and the
     ``level`` token the NOC extracts agree.
+
+    **Writing is a capability a system user has and reading is not**, which is the whole
+    asymmetry basecradle-router#234 turns on: any principal may hand journald an entry,
+    while reading one back needs a per-user journal (uid ≥ 1000) or a privileged group.
+    So this call is the last thing the probe can honestly witness.
     """
     try:
         completed = subprocess.run(
@@ -285,97 +306,40 @@ def _write_to_journal(line: str) -> None:
         )
 
 
-def _read_from_journal(since: float) -> Sequence[str]:
-    """The journal's message lines for this identifier since ``since`` (epoch seconds).
-
-    Read as the daemon's own user, which is the only principal that needs to succeed:
-    the line this probe wrote is that user's own entry, so no privileged group membership
-    is involved (verified live on the box, basecradle-noc#509 §7).
-    """
-    try:
-        completed = subprocess.run(
-            [
-                "journalctl",
-                f"--identifier={IDENTIFIER}",
-                f"--since=@{since:.0f}",
-                "--output=cat",
-                "--no-pager",
-            ],
-            text=True,
-            capture_output=True,
-            timeout=COMMAND_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise LogGrammarError(f"could not run journalctl: {exc}") from exc
-    if completed.returncode != 0:
-        raise LogGrammarError(
-            f"journalctl exited {completed.returncode}: {completed.stderr.strip()[:200]}"
-        )
-    return completed.stdout.splitlines()
-
-
 class LogGrammarProbe:
-    """Render the real trip line, put it in the journal, and prove the journal has it."""
+    """Render the real trip line and hand it to the daemon's own journald identifier."""
 
-    def __init__(
-        self,
-        *,
-        writer: Writer | None = None,
-        reader: Reader | None = None,
-        timeout: float | None = None,
-        interval: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        # Resolved here rather than bound as default argument values: a default binds at
-        # *definition* time, which would freeze the module's own constants into the
-        # signature and make them un-overridable — including for the tests that must drive
+    def __init__(self, *, writer: Writer | None = None) -> None:
+        # Resolved here rather than bound as a default argument value: a default binds at
+        # *definition* time, which would freeze the module's own function into the
+        # signature and make it un-overridable — including for the tests that must drive
         # this without a journald on the machine.
         self._writer = writer if writer is not None else _write_to_journal
-        self._reader = reader if reader is not None else _read_from_journal
-        self._timeout = READBACK_TIMEOUT if timeout is None else timeout
-        self._interval = READBACK_INTERVAL if interval is None else interval
-        self._clock = clock
-        self._sleep = sleep
 
     def run(self) -> LogGrammarResult:
-        """Emit one synthetic trip and report whether the journal carries it.
+        """Emit one synthetic trip and report whether it carries the declared grammar.
 
         Raises :class:`LogGrammarError` when the probe could not be *attempted* — the
         journal tooling did not answer — which the CLI reports as the contract's
         inconclusive sentinel rather than as a verdict about the grammar.
+
+        The grammar is judged **before** the write, so a line already known not to match
+        this component's manifest is never put in the fleet's journal.
         """
-        started = self._clock()
         record = capture_trip(synthetic=True)
         rendered = logging.Formatter(LOG_FORMAT).format(record)
         broken = self._grammar_fault(record.getMessage())
         if broken is not None:
-            return self._result(BROKEN, rendered, broken, self._clock() - started)
+            return self._result(BROKEN, rendered, broken)
 
-        # Bound the read-back to this run. The formatted line carries its own millisecond
-        # timestamp, so a match is already this run's rather than a previous probe's, but
-        # the bound keeps the scan small and says so out loud.
-        since = time.time() - 1
         self._writer(rendered)
-        deadline = self._clock() + self._timeout
-        while True:
-            if rendered in self._reader(since):
-                return self._result(
-                    PROVEN,
-                    rendered,
-                    f"rendered by the breaker's own trip statement and read back from the "
-                    f"{IDENTIFIER} journal",
-                    self._clock() - started,
-                )
-            if self._clock() >= deadline:
-                return self._result(
-                    BROKEN,
-                    rendered,
-                    f"the line was written but never appeared in the {IDENTIFIER} journal "
-                    f"within {self._timeout:.0f}s",
-                    self._clock() - started,
-                )
-            self._sleep(self._interval)
+        return self._result(
+            PROVEN,
+            rendered,
+            "rendered by the breaker's own trip statement and accepted by journald under "
+            f"{IDENTIFIER}; whether it landed is the NOC's witness to say, since this "
+            "daemon is a system user that cannot read the journal back",
+        )
 
     def _grammar_fault(self, message: str) -> str | None:
         """Why these bytes do not satisfy the manifest's declaration — or ``None``.
@@ -403,7 +367,7 @@ class LogGrammarProbe:
             )
         return None
 
-    def _result(self, status: str, rendered: str, detail: str, waited: float) -> LogGrammarResult:
+    def _result(self, status: str, rendered: str, detail: str) -> LogGrammarResult:
         return LogGrammarResult(
             status=status,
             line_class=LINE_CLASS,
@@ -412,7 +376,6 @@ class LogGrammarProbe:
             rendered=rendered,
             detail=detail,
             checked_at=_utc_now().isoformat(),
-            waited=max(waited, 0.0),
         )
 
 
@@ -434,6 +397,10 @@ def manifest_detail() -> dict:
     configuration: its ``threshold``/``window``/``cooldown`` values are the breaker's
     defaults, because the probe reads no config. What the claim asserts is the grammar a
     consumer must match on; the live thresholds are the startup banner's job.
+
+    ``proves`` states the claim's *reach* in the manifest itself, so a reader of the
+    ledger sees the half this probe does not cover without having to know the story
+    (basecradle-router#234): landing is the NOC's witness on :data:`IDENTIFIER`.
     """
     return {
         "line_class": LINE_CLASS,
@@ -445,6 +412,7 @@ def manifest_detail() -> dict:
         "genuine_level": logging.getLevelName(logging.ERROR),
         "synthetic_level": logging.getLevelName(logging.INFO),
         "rendered": trip_message(synthetic=True),
+        "proves": "rendered",
         "exit_codes": {status: code for status, code in EXIT_CODES.items()},
     }
 
@@ -456,7 +424,6 @@ __all__ = [
     "EXIT_CODES",
     "IDENTIFIER",
     "LINE_CLASS",
-    "READBACK_TIMEOUT",
     "SOURCE",
     "SYNTHETIC_AGENT",
     "LogGrammarError",

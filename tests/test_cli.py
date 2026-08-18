@@ -186,17 +186,15 @@ def test_the_cli_never_writes_the_daemons_evidence_file(box, monkeypatch) -> Non
 # --- probe log-grammar ------------------------------------------------------
 
 
-def _fake_journal(monkeypatch, *, accepts: bool = True) -> list[str]:
-    """Stand in for journald so the CLI is drivable on a machine without systemd."""
+def _fake_journal(monkeypatch) -> list[str]:
+    """Stand in for journald so the CLI is drivable on a machine without systemd.
+
+    Write-only, like the real one is for this daemon: `router` is a uid-999 system user
+    and cannot read its own entries back, which is why the probe proves *rendered* and
+    the NOC's witness proves *landed* (basecradle-router#234).
+    """
     lines: list[str] = []
-
-    def write(line: str) -> None:
-        if accepts:
-            lines.append(line)
-
-    monkeypatch.setattr(grammar_mod, "_write_to_journal", write)
-    monkeypatch.setattr(grammar_mod, "_read_from_journal", lambda _since: list(lines))
-    monkeypatch.setattr(grammar_mod, "READBACK_INTERVAL", 0.0)
+    monkeypatch.setattr(grammar_mod, "_write_to_journal", lines.append)
     return lines
 
 
@@ -226,15 +224,19 @@ def test_probe_log_grammar_refuses_a_line_class_this_component_does_not_state(bo
     assert "states no grammar for 'billing_blocked'" in capsys.readouterr().err
 
 
-def test_probe_log_grammar_reports_a_silent_journal_as_broken(box, monkeypatch, capsys) -> None:
-    # We asked and the answer is no: the write was accepted and the journal does not
-    # carry it. Still a verdict about the fleet, never about the probe.
-    _fake_journal(monkeypatch, accepts=False)
-    monkeypatch.setattr(grammar_mod, "READBACK_TIMEOUT", 0.0)
+def test_probe_log_grammar_reports_a_grammar_the_manifest_lost_as_broken(
+    box, monkeypatch, capsys
+) -> None:
+    # We asked and the answer is no: `breaker.py` renamed the token and `claims.py` did
+    # not follow. Still a verdict about the fleet, never about the probe — and the line
+    # we already judged wrong is never handed to the journal.
+    journal = _fake_journal(monkeypatch)
+    monkeypatch.setattr(grammar_mod, "TRIP_EVENT", "event=breaker_detonated")
 
     assert main(["probe", "log-grammar"]) == 1
 
     assert "log-grammar: broken" in capsys.readouterr().err
+    assert journal == []
 
 
 def test_probe_log_grammar_reports_missing_journal_tooling_as_unprovable(
@@ -245,7 +247,6 @@ def test_probe_log_grammar_reports_missing_journal_tooling_as_unprovable(
     def refuse(_line: str) -> None:
         raise grammar_mod.LogGrammarError("could not run systemd-cat: no such file")
 
-    _fake_journal(monkeypatch)
     monkeypatch.setattr(grammar_mod, "_write_to_journal", refuse)
 
     assert main(["probe", "log-grammar"]) == EXIT_UNPROVABLE
