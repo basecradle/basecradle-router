@@ -120,6 +120,9 @@ from basecradle_router.evidence import (
     EvidenceDocument,
     RouteWakeEvidence,
 )
+from basecradle_router.log_grammar import IDENTIFIER as LOG_GRAMMAR_IDENTIFIER
+from basecradle_router.log_grammar import LINE_CLASS as LOG_GRAMMAR_LINE_CLASS
+from basecradle_router.log_grammar import manifest_detail as log_grammar_detail
 from basecradle_router.models import Agent, WakeKind
 from basecradle_router.routes import Route, RouteRegistry
 from basecradle_router.selftest import EXIT_CODES as FREEZE_EXIT_CODES
@@ -140,6 +143,17 @@ COMPONENT = "basecradle-router"
 WAKE_EDGE_TTL_HOURS = 168
 DELIVERY_SINK_TTL_HOURS = 168
 FREEZE_TTL_HOURS = 24
+
+#: The log-grammar claim's age-of-proof threshold, and **the one TTL here that is
+#: load-bearing for another instrument**. The NOC's extraction guard judges the router's
+#: line class on a one-hour window, so the guard reads *deaf* — on a perfectly healthy
+#: fleet — in any hour this probe did not fire. One hour is what keeps it due on
+#: essentially every 30-minute exerciser pass (a ``rare`` claim is due within the 45-minute
+#: refresh margin of expiry, so worst-case proof age is 60 − 45 + 30 = 45 min). Raising it
+#: would not merely age the row; it would page. **The number is the NOC's to set** from its
+#: own constants (capital ruling, basecradle-noc#509 §7) — this is the value it implies
+#: today, and the reasoning is written down here so a later change is made knowingly.
+LOG_GRAMMAR_TTL_HOURS = 1
 
 _UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -201,7 +215,7 @@ def _box_manifest(
     admin_cmd: str,
 ) -> dict:
     synthetic = _synthetic_route_names(registry)
-    claims = [_freeze_claim(evidence, guard, admin_cmd)]
+    claims = [_freeze_claim(evidence, guard, admin_cmd), _log_grammar_claim(admin_cmd)]
     claims += [
         _delivery_sink_claim(
             route,
@@ -258,6 +272,38 @@ def _freeze_claim(evidence: EvidenceDocument, guard: WakeLockGuard, admin_cmd: s
             # named here anyway because it is a different finding, told apart on stderr.
             "exit_codes": {**FREEZE_EXIT_CODES, "config_error": EXIT_UNPROVABLE},
         },
+    }
+
+
+def _log_grammar_claim(admin_cmd: str) -> dict:
+    """The breaker-trip line is still the line the fleet's alarm matches on.
+
+    A ``probe`` claim, and it has to be: the NOC's ``breaker_tripped`` column is a
+    **needle** — every clause in its pattern is a whole line that exists only when a
+    breaker trips — so nothing arrives on a healthy fleet for its extraction guard to
+    watch, and a rename would take the *Circuit Breaker Tripped* alarm silently to zero
+    (basecradle-noc#509, basecradle-router#232). Observation cannot close that; only an
+    exercise can, so the router fires one.
+
+    ``class: rare`` is the class by its own definition — silence is the normal state and
+    the proof is a forced exercise. ``evidence`` names the journal rather than a
+    resolvable pointer: this is where the last success is recorded, and it is deliberately
+    **not** a ``<path>#<field>`` pointer, because a ``probe`` claim is proven by running,
+    never by re-reading (re-reading a pointer is the one thing that cannot move a needle).
+
+    The ``detail`` is read from :mod:`basecradle_router.log_grammar` rather than restated
+    here — see :func:`~basecradle_router.log_grammar.manifest_detail`.
+    """
+    return {
+        "claim": f"log-grammar:{LOG_GRAMMAR_LINE_CLASS}",
+        "class": "rare",
+        "prove": {
+            "kind": "probe",
+            "cmd": f"{admin_cmd} probe log-grammar {LOG_GRAMMAR_LINE_CLASS} --json",
+        },
+        "evidence": f"journal:{LOG_GRAMMAR_IDENTIFIER}",
+        "ttl_hours": LOG_GRAMMAR_TTL_HOURS,
+        "detail": log_grammar_detail(),
     }
 
 

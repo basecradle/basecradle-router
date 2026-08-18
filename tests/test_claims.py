@@ -487,6 +487,7 @@ def test_one_sink_claim_per_enabled_route(tmp_path) -> None:
     box = _subject(manifests, "box:ai.basecradle.com")
     assert [c["claim"] for c in box["claims"]] == [
         "freeze-surface:readable",
+        "log-grammar:breaker_tripped",
         "delivery-sink:basecradle",
         "delivery-sink:github",
     ]

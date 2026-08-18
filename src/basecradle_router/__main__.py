@@ -3,6 +3,7 @@
     python -m basecradle_router claims            # the Contract v1 claims manifests
     python -m basecradle_router selftest freeze   # prove the freeze surface is readable
     python -m basecradle_router probe wake …      # prove one agent's wake edge, by using it
+    python -m basecradle_router probe log-grammar    # prove the alarm's needle line is written
     python -m basecradle_router evidence          # dump the raw evidence document
 
 Four subcommands, one purpose: everything the claims-vs-evidence ledger
@@ -68,6 +69,11 @@ from basecradle_router.config import (
     load_wake_lock_dir,
 )
 from basecradle_router.evidence import read_evidence
+from basecradle_router.log_grammar import (
+    LINE_CLASS,
+    LogGrammarError,
+    LogGrammarProbe,
+)
 from basecradle_router.probe import DEFAULT_TIMEOUT, ProbeError, WakeProbe
 from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.selftest import EXIT_UNPROVABLE, OK, run_freeze_selftest
@@ -174,6 +180,30 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     wake.set_defaults(handler=_cmd_probe_wake)
+
+    grammar = kinds.add_parser(
+        "log-grammar",
+        help="prove the alarm's needle line is still the line this daemon writes",
+        description=(
+            "Drive a real wake-rate breaker past its threshold so the daemon's own trip "
+            "statement renders the line, write it to the daemon's journald identifier "
+            "stamped source=probe at INFO, and read it back out of the journal. Proves "
+            "EMISSION, never extraction — the NOC's guard owns that half, off the live "
+            "stream. Exit 0 proven, 1 proven broken, 75 could not be proven."
+        ),
+    )
+    grammar.add_argument(
+        "line_class",
+        nargs="?",
+        default=LINE_CLASS,
+        metavar="LINE_CLASS",
+        help=(
+            f"the NOC column whose grammar to prove (default {LINE_CLASS}; it is also the "
+            "claim id's suffix, so a second line class is a new claim row rather than a flag)"
+        ),
+    )
+    grammar.add_argument("--json", action="store_true", help="print the full result as JSON")
+    grammar.set_defaults(handler=_cmd_probe_log_grammar)
 
     evidence = sub.add_parser(
         "evidence",
@@ -291,6 +321,49 @@ def _cmd_probe_wake(args: argparse.Namespace) -> int:
         # `broken` and `unprovable` are what the NOC forwards, and it must be able to
         # read the cause without having asked for --json.
         print(f"synthetic-wake: {result.status}: {result.summary()}", file=sys.stderr)
+    return result.exit_code
+
+
+def _cmd_probe_log_grammar(args: argparse.Namespace) -> int:
+    """Emit one synthetic breaker trip and report whether the journal carries it.
+
+    It needs **no configuration at all**, which is the point rather than an omission: the
+    bytes under proof come from the breaker's own trip statement and the journal is
+    addressed by the daemon's identifier, so there is nothing here for a stale
+    ``router.env`` to make this probe answer about the wrong thing.
+
+    A :class:`~basecradle_router.log_grammar.LogGrammarError` is not a verdict about the
+    grammar — the journal tooling did not answer — so it reports the contract's
+    inconclusive sentinel with the cause on stderr, exactly as a configuration error does.
+    """
+    if args.line_class != LINE_CLASS:
+        # Named, never silently substituted: a probe that quietly proved a different line
+        # than the one asked for would report a healthy grammar about the wrong column.
+        print(
+            f"log-grammar: unprovable: this component states no grammar for "
+            f"{args.line_class!r} (it declares {LINE_CLASS!r})",
+            file=sys.stderr,
+        )
+        return EXIT_UNPROVABLE
+
+    try:
+        result = LogGrammarProbe().run()
+    except LogGrammarError as exc:
+        print(f"log-grammar: unprovable: {exc}", file=sys.stderr)
+        return EXIT_UNPROVABLE
+
+    if args.json:
+        print(json.dumps(result.to_json(), indent=2))
+    else:
+        print(f"log-grammar: {result.status} ({result.line_class} -> {result.identifier})")
+        print(f"  grammar:  {result.grammar}")
+        print(f"  rendered: {result.rendered}")
+        print(f"  {result.detail}")
+    if not result.proven:
+        # The verdict on stderr too, for the reason its siblings do it: `broken` and
+        # `unprovable` are what the NOC forwards, and it must be able to read the cause
+        # without having asked for --json.
+        print(f"log-grammar: {result.status}: {result.summary()}", file=sys.stderr)
     return result.exit_code
 
 
