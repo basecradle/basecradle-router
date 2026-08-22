@@ -91,7 +91,10 @@ ROUTE_NAME = "basecradle"
 
 #: Env var prefix for a **per-recipient** signing key: the route-wide secret's own
 #: variable plus ``_<SLUG>``, where ``<SLUG>`` is the recipient agent's registry key
-#: upper-cased with ``-`` → ``_`` (``jt`` → ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT``).
+#: upper-cased with every character outside ``[A-Za-z0-9_]`` normalised to ``_``
+#: (``jt`` → ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT``; ``glm-5.2`` →
+#: ``…_SECRET_GLM_5_2``) — see :func:`_slug_suffix` for why the charset, not just the
+#: hyphen.
 #: Keyed by the *slug* and not the uuid on purpose: an operator provisioning @jt's
 #: rotated secret should be able to see, in ``router.env``, that it is @jt's — a
 #: 36-character uuid in the variable name is unreadable at exactly the moment it
@@ -249,7 +252,10 @@ def load_recipient_keyring(
 
     Two registry keys that normalise to the same variable name are also a
     :class:`ConfigError`: the mapping from slug to env var must be a bijection or one
-    persona's key silently verifies another's deliveries.
+    persona's key silently verifies another's deliveries. That normalisation is lossy
+    (:func:`_slug_suffix` scrubs every character a variable name may not carry, so
+    ``glm-5.2`` and ``glm-5-2`` collapse together), which is exactly why the collision
+    is checked rather than assumed away.
     """
     env = os.environ if env is None else env
     fallback = _bool_env(env, SHARED_FALLBACK_VAR, default=True)
@@ -296,15 +302,42 @@ def load_recipient_keyring(
     return RecipientKeyring(by_recipient=MappingProxyType(by_recipient), shared_fallback=fallback)
 
 
-def _slug_suffix(key: str) -> str:
-    """An agent's registry key as an env-var suffix — upper-cased, ``-`` → ``_``.
+#: Every character an environment variable name may **not** contain. systemd accepts
+#: ``[A-Za-z_][A-Za-z0-9_]*`` and passes nothing else from an ``EnvironmentFile`` to
+#: the service, so a suffix is scrubbed to this class before it becomes a variable
+#: name (see :func:`_slug_suffix`). ASCII-only by intent: ``str.upper()`` maps a
+#: non-ASCII letter to another non-ASCII letter, which is just as unusable.
+_ENV_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 
-    ``jt`` → ``JT``; ``basecradle-harness`` → ``BASECRADLE_HARNESS``. Only harness
-    personas are ever passed here, and their keys are bare universal-identity slugs
-    (``[a-z0-9-]``), so the normalisation is total; a key that somehow normalises onto
-    another's is caught as a collision by the caller rather than assumed away.
+
+def _slug_suffix(key: str) -> str:
+    """An agent's registry key as an env-var suffix — upper-cased, everything else ``_``.
+
+    ``jt`` → ``JT``; ``basecradle-harness`` → ``BASECRADLE_HARNESS``; ``glm-5.2`` →
+    ``GLM_5_2``.
+
+    The normalisation is over the *whole* character class and not just ``-`` because
+    the output has to be a **legal environment variable name**, and one registry key
+    already is not a bare ``[a-z0-9-]`` slug: ``glm-5.2`` carries a dot. A hyphens-only
+    rule left that dot in place and produced ``…_WEBHOOK_SECRET_GLM_5.2`` — a name
+    outside systemd's ``[A-Za-z_][A-Za-z0-9_]*``, which it does not pass through to the
+    service. The daemon would never see the value, so that persona would keep
+    verifying against the *shared* secret after the platform had rotated it — and no
+    guard in :func:`load_recipient_keyring` can fire on a variable that never arrives.
+    That is the same silently-absent capability those guards exist to foreclose,
+    reaching us through the variable's **name** rather than its value, so it is closed
+    the same way: by construction here, not by remembering to spell it right.
+
+    The prefix supplies the leading non-digit, so scrubbing the suffix's charset is the
+    whole of what legality requires; the test suite re-runs systemd's own rule over
+    every name this derives.
+
+    Lossy on purpose: ``glm-5.2``, ``glm-5-2`` and ``glm_5_2`` all collapse to one
+    name. That is a collision the caller raises on rather than resolves — a persona's
+    key must be addressable one at a time or one persona's secret verifies another's
+    deliveries.
     """
-    return key.upper().replace("-", "_")
+    return _ENV_NAME_UNSAFE.sub("_", key.upper())
 
 
 _TRUE = frozenset({"1", "true", "yes", "on"})

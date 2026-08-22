@@ -316,7 +316,9 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the shared fallback integration_secret>
 #
-# Per-recipient signing keys (issue #236) — ONE key per persona, named by its slug.
+# Per-recipient signing keys (issue #236) — ONE key per persona, named by its slug
+# upper-cased with every character outside [A-Za-z0-9_] replaced by _ (glm-5.2 -> GLM_5_2;
+# a name systemd will not pass through never reaches the daemon at all).
 # A delivery is verified with its own recipient's key; a persona with no key here
 # falls back to the shared value above, so personas rotate one at a time:
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT=<@jt's own bc_isk_… integration secret>
@@ -409,11 +411,17 @@ route uses.
 | `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` | the shared fallback, during the cutover |
 | `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK` | `1` (default) or `0` to retire the fallback |
 
-`<SLUG>` is the persona's **`agents.json` key**, upper-cased with `-` → `_` (`jt` →
-`…_WEBHOOK_SECRET_JT`). Keyed by the readable slug, never the uuid: the registry already maps one to
-the other, so nobody transcribes a 36-character uuid into `router.env`, where a typo is invisible.
+`<SLUG>` is the persona's **`agents.json` key**, upper-cased with **every character outside
+`[A-Za-z0-9_]` replaced by `_`** — `jt` → `…_WEBHOOK_SECRET_JT`, `glm-5.2` → `…_WEBHOOK_SECRET_GLM_5_2`.
+Not just the hyphen: an environment variable name systemd will pass through to the service is
+`[A-Za-z_][A-Za-z0-9_]*`, and a registry key like `glm-5.2` carries a dot, so a name that kept it would
+never reach the daemon at all — that persona would go on verifying against the *shared* secret after the
+platform had rotated it, invisible to every boot check below, because a variable systemd dropped is a
+variable that never arrives (issue #236). Keyed by the readable slug and never the uuid: the registry
+already maps one to the other, so nobody transcribes a 36-character uuid into `router.env`, where a typo
+is invisible.
 
-**Three things stop the daemon at boot** rather than surfacing later as one persona quietly failing to
+**Four things stop the daemon at boot** rather than surfacing later as one persona quietly failing to
 verify — the same posture as the github trust allow-list:
 
 - a key set for a **slug no registered agent has** (the error lists the slugs that do exist) — a typo
@@ -421,7 +429,10 @@ verify — the same posture as the github trust allow-list:
   consecutive verification failures auto-disable an integration on the platform**;
 - a key set to an **empty value** (`""` is a usable HMAC key — one anybody can compute with);
 - **the fallback retired while any registered persona still has no key of its own**, which would leave
-  that persona permanently unverifiable while the box looked perfectly healthy.
+  that persona permanently unverifiable while the box looked perfectly healthy;
+- **two registry keys normalising onto one variable name** (`glm-5.2` and `glm-5-2` both give
+  `…_GLM_5_2`) — the scrub is lossy, and a shared name means one persona's secret verifies another's
+  deliveries, which is the property per-recipient keys exist to remove.
 
 **Watching the cutover.** Every *verified* delivery logs one line naming the key that verified it:
 

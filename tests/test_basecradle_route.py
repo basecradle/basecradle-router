@@ -12,6 +12,7 @@ fabricated user uuid is a well-formed UUIDv7.
 import hashlib
 import hmac
 import json
+import re
 
 import pytest
 
@@ -35,6 +36,7 @@ from basecradle_router.routes.basecradle import (
     RECIPIENT_SECRET_PREFIX,
     SHARED_FALLBACK_VAR,
     SIGNATURE_HEADER,
+    _slug_suffix,
 )
 
 SECRET = "s3cret-fake-integration-secret"
@@ -455,6 +457,60 @@ def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
     assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
 
 
+def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
+    # The registry key `glm-5.2` is not a bare [a-z0-9-] slug, and a hyphens-only rule
+    # left the dot in place: `…_WEBHOOK_SECRET_GLM_5.2` is not a name systemd passes
+    # through, so the value never reached the daemon and that persona stayed on the
+    # shared secret after the platform had rotated it — silent, and unreachable by
+    # every guard below, because the variable simply never arrives.
+    personas = {JT_UUID: _persona("glm-5.2", JT_UUID)}
+    keyring = load_recipient_keyring(personas, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": JT_KEY})
+    assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
+
+
+#: systemd's own rule for an environment variable name (`env_name_is_valid`): ASCII
+#: letters, digits and underscore, never leading with a digit. An assignment whose
+#: name fails it is not passed from an EnvironmentFile to the service.
+_SYSTEMD_ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "jt",
+        "nova",
+        "glm-5.2",
+        "basecradle-harness",
+        "5-alive",
+        "a.b c",
+        "persona!",
+        "caf\u00e9",
+        "\u00df-one",
+        "x/y",
+    ],
+)
+def test_a_derived_variable_name_is_always_one_systemd_will_pass_through(key: str) -> None:
+    # The invariant the dot defect broke, pinned over the whole character space rather
+    # than over the one character that happened to bite: whatever a registry key
+    # contains, the name it derives is a name the daemon can actually be handed. A key
+    # this refuses is a key whose secret is silently never consulted.
+    var = RECIPIENT_SECRET_PREFIX + _slug_suffix(key)
+    assert _SYSTEMD_ENV_NAME.fullmatch(var), var
+    # And that legal name is the one the loader actually provisions the persona from.
+    personas = {JT_UUID: _persona(key, JT_UUID)}
+    assert dict(load_recipient_keyring(personas, {var: JT_KEY}).by_recipient) == {JT_UUID: JT_KEY}
+
+
+def test_the_unknown_slug_error_names_the_normalised_variable_not_the_raw_slug() -> None:
+    # An operator following the old hyphens-only rule writes `…_GLM_5.2`. On the box
+    # systemd drops that name before the daemon sees it; anywhere it does arrive it is
+    # loud, and the error names the spelling that works.
+    personas = {JT_UUID: _persona("glm-5.2", JT_UUID)}
+    with pytest.raises(ConfigError) as caught:
+        load_recipient_keyring(personas, {f"{RECIPIENT_SECRET_PREFIX}GLM_5.2": JT_KEY})
+    assert f"{RECIPIENT_SECRET_PREFIX}GLM_5_2" in str(caught.value)
+
+
 def test_the_per_recipient_prefix_is_the_route_wide_variable_plus_a_slug() -> None:
     # Pinned so a rename of the route-wide secret cannot orphan the per-recipient keys
     # while leaving the daemon booting perfectly.
@@ -483,10 +539,15 @@ def test_an_empty_key_is_a_loud_error_never_an_empty_hmac_key() -> None:
         load_recipient_keyring(PERSONAS, {JT_SECRET_VAR: "   "})
 
 
-def test_two_slugs_colliding_on_one_variable_are_a_loud_error() -> None:
+@pytest.mark.parametrize("other", ["jt_one", "jt.one", "jt one"])
+def test_two_slugs_colliding_on_one_variable_are_a_loud_error(other: str) -> None:
+    # Scrubbing the whole character class is lossy, so more keys collapse together than
+    # the hyphen rule collapsed. Each collision is boot-fatal rather than resolved: two
+    # personas sharing one variable means one persona's secret verifies the other's
+    # deliveries, which is the property per-recipient keys exist to remove.
     personas = {
         JT_UUID: _persona("jt-one", JT_UUID),
-        NOVA_UUID: _persona("jt_one", NOVA_UUID),
+        NOVA_UUID: _persona(other, NOVA_UUID),
     }
     with pytest.raises(ConfigError, match="both map to"):
         load_recipient_keyring(personas, {})
