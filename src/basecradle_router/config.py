@@ -163,7 +163,7 @@ class Config:
             return self.webhook_secrets[route]
         except KeyError:
             raise ConfigError(
-                f"no webhook secret for route {route!r}; set {_route_secret_var(route)}"
+                f"no webhook secret for route {route!r}; set {route_secret_var(route)}"
             ) from None
 
 
@@ -175,7 +175,16 @@ def _is_repo_key(key: str) -> bool:
     return True
 
 
-def _route_secret_var(route: str) -> str:
+def route_secret_var(route: str) -> str:
+    """The env var name holding ``route``'s route-wide signing secret.
+
+    Public because it is a *contract*, not an implementation detail: the basecradle
+    route derives its per-recipient variants by suffixing this exact name with the
+    recipient agent's slug (see
+    :data:`~basecradle_router.routes.basecradle.RECIPIENT_SECRET_PREFIX`), so a rename
+    here moves both halves of the surface in one commit instead of silently orphaning
+    the per-recipient keys.
+    """
     return f"{ENV_PREFIX}{route.upper()}_WEBHOOK_SECRET"
 
 
@@ -317,10 +326,10 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
 
     secrets: dict[str, str] = {}
     for route in enabled:
-        secret = env.get(_route_secret_var(route))
+        secret = env.get(route_secret_var(route))
         if not secret:
             raise ConfigError(
-                f"route {route!r} is enabled but {_route_secret_var(route)} is not set"
+                f"route {route!r} is enabled but {route_secret_var(route)} is not set"
             )
         secrets[route] = secret
 
