@@ -12,9 +12,10 @@ import json
 
 import pytest
 
-from basecradle_router.app import create_app
-from basecradle_router.config import ConfigError
-from basecradle_router.models import Agent, Event
+from basecradle_router.app import build_registry, create_app
+from basecradle_router.config import ConfigError, load_config
+from basecradle_router.models import Agent, Event, WakeKind
+from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX
 from basecradle_router.wake import HomeServerWaker, WakeResult
 
 SECRET = "whsec_" + "0" * 32
@@ -204,3 +205,72 @@ def test_create_app_wires_the_self_comment_guard(tmp_path) -> None:
 
     assert _post(server, "/webhooks/github", body, headers) == 200  # accepted, ignored
     assert waker.calls == []  # no wake — the self-comment guard held
+
+
+# --- the basecradle route's per-recipient keyring is wired here (#497) --------
+#
+# Fabricated cast: @jt, a harness persona registered alongside Nova's builder entry.
+
+JT = Agent(
+    key="jt",
+    os_user="jt",
+    clone_path="/home/jt/harness",
+    wake_kind=WakeKind.HARNESS,
+    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
+    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+)
+JT_KEY = "bc_isk_fakejtintegrationsigningkey0001"
+
+
+def _env_with_persona(tmp_path) -> dict[str, str]:
+    path = tmp_path / "agents-with-persona.json"
+    path.write_text(
+        json.dumps(
+            {
+                NOVA.key: {
+                    "os_user": NOVA.os_user,
+                    "clone_path": NOVA.clone_path,
+                    "bot_slug": NOVA.bot_slug,
+                },
+                JT.key: {
+                    "kind": "harness",
+                    "os_user": JT.os_user,
+                    "clone_path": JT.clone_path,
+                    "recipient_uuid": JT.recipient_uuid,
+                    "wake_bin": JT.wake_bin,
+                },
+            }
+        )
+    )
+    return {
+        "BASECRADLE_ROUTER_AGENTS": str(path),
+        "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET": SECRET,
+        "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": HANDOFF_SENDER,
+        "BASECRADLE_ROUTER_ENABLED_ROUTES": "github,basecradle",
+        "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET": SECRET,
+    }
+
+
+def test_create_app_wires_the_per_recipient_keyring(tmp_path) -> None:
+    # The wiring proof: a key provisioned in the environment must reach the route, or
+    # the whole feature is inert on the box while every unit test still passes.
+    env = _env_with_persona(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY}
+    route = build_registry(load_config(env), env).get("basecradle")
+
+    assert dict(route.keyring.by_recipient) == {JT.recipient_uuid: JT_KEY}
+    assert route.keyring.shared_fallback is True
+
+
+def test_a_misprovisioned_key_stops_the_daemon_at_boot(tmp_path) -> None:
+    # Loud at boot, not as one persona's deliveries quietly failing to verify. The
+    # daemon refusing to start is what the NOC's converge and the box's alarms see.
+    env = _env_with_persona(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
+    with pytest.raises(ConfigError, match="names no registered agent"):
+        create_app(env, waker=_RecordingWaker())
+
+
+def test_the_keyring_is_not_built_when_the_basecradle_route_is_disabled(tmp_path) -> None:
+    # Each route's own config is demanded only when that route is in use — so a box
+    # running github only is never asked for keys it has no route to verify with.
+    env = _env(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
+    create_app(env, waker=_RecordingWaker())

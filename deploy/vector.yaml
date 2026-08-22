@@ -24,8 +24,9 @@
 #     how the source token leaked ~40x on the NOC box);
 #   * DELETES `_CMDLINE` from EVERY event — journald attaches the emitting process's full argv as
 #     a metadata FIELD, which no message-level redaction reaches (basecradle-noc#443);
-#   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`,
-#     and provider API keys — `sk-…`, `xai-…`, `AIza…` and kin) from the message as defense in depth.
+#   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`
+#     user tokens, `bc_isk_` integration signing keys, and provider API keys — `sk-…`, `xai-…`,
+#     `AIza…` and kin) from the message as defense in depth.
 #
 # The `_CMDLINE` deletion is UNCONDITIONAL — the guard is on the field, never on an allow-list of
 # identifiers known to be dangerous. The `sudo` drop above was written as if `sudo` were *the* argv
@@ -113,6 +114,13 @@ transforms:
       msg = replace(msg, r'(?i)bearer\s+[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       msg = replace(msg, r'https?://\S*/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
       msg = replace(msg, r'bc_uat_[A-Za-z0-9]+', "[REDACTED_BC_TOKEN]")
+      # BaseCradle integration signing keys (`bc_isk_…`). THIS box is where they live:
+      # the router verifies each platform delivery's HMAC with the recipient persona's
+      # own key, so every one of them sits in /etc/basecradle-router/router.env and is
+      # read into the daemon's environment (basecradle/basecradle#497). `bc_uat_` above
+      # covers user access tokens and never matched these — a distinct prefix is a
+      # distinct rule, and the one carried on the box that actually holds the secrets.
+      msg = replace(msg, r'bc_isk_[A-Za-z0-9]+', "[REDACTED_BC_INTEGRATION_SECRET]")
       # Provider API keys. Harness agents and builder agents run with these in their env
       # (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, …) and a wake's stdout+stderr — a traceback,
       # a curl echo, a misconfigured debug print — now flows into journald under

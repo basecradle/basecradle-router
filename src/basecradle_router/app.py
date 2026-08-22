@@ -35,7 +35,7 @@ from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.pipeline import Pipeline
 from basecradle_router.routes import RouteRegistry
-from basecradle_router.routes.basecradle import BasecradleRoute
+from basecradle_router.routes.basecradle import BasecradleRoute, load_recipient_keyring
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.server import WebhookServer
@@ -77,7 +77,8 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
     that does not exist.
 
     A route is registered only when its source is enabled, so each route's own
-    required config (the github trust allow-list) is demanded only when in use.
+    required config — the github trust allow-list, the basecradle per-recipient
+    keyring — is demanded only when in use.
     """
     registry = RouteRegistry()
     if "github" in config.enabled_routes:
@@ -88,7 +89,12 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
             )
         )
     if "basecradle" in config.enabled_routes:
-        registry.register(BasecradleRoute())
+        # The keyring is built here, from the same registry the daemon resolves with, so
+        # a per-recipient key can only ever be provisioned for an agent that exists
+        # (basecradle/basecradle#497). It is loaded eagerly and loudly: a mistyped slug
+        # or a retired fallback with an unprovisioned persona stops the daemon at boot
+        # rather than surfacing as one persona's deliveries quietly failing to verify.
+        registry.register(BasecradleRoute(load_recipient_keyring(config.recipient_index, env)))
     if ProbeRoute.name in config.enabled_routes:
         # The router's own synthetic wake (basecradle-router#208). Registered exactly
         # like a real source and behind the same enable-plus-secret gate, because that

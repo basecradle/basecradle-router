@@ -46,6 +46,7 @@ from basecradle_router.logfmt import LOG_FORMAT, log_fields
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
+from basecradle_router.routes.base import route_boot_summary
 from basecradle_router.scheduler import WakeScheduler
 from basecradle_router.selftest import log_freeze_selftest, run_freeze_selftest
 
@@ -282,6 +283,22 @@ class WebhookServer:
                 evidence=self.pipeline.evidence.path or "(in-memory)",
             ),
         )
+        self._log_route_config()
+
+    def _log_route_config(self) -> None:
+        """One line per route that has source-specific config worth stating at boot.
+
+        The banner above is the core's own config and stays route-agnostic; a route's
+        settings are the route's to describe (:func:`route_boot_summary`). Same reason
+        the banner exists at all: a setting nobody can read off a running daemon is one
+        nobody can tell has drifted — and for a security control like the basecradle
+        route's shared signing fallback, "armed" and "retired" look identical in
+        ordinary traffic.
+        """
+        for route in self.pipeline.registry.routes():
+            summary = route_boot_summary(route)
+            if summary:
+                logger.info("event=route_config %s", log_fields(source=route.name) + f" {summary}")
 
     def run_boot_selftest(self) -> None:
         """Prove the freeze control surface is readable, at boot, and say so loudly.

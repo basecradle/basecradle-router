@@ -211,3 +211,32 @@ class Route(Protocol):
         :class:`PayloadError` only when the payload is malformed.
         """
         ...
+
+    # A route MAY also define ``boot_summary() -> str``: a ``key=value`` run naming
+    # the source-specific configuration it booted with, logged once beside the
+    # startup banner (see :func:`route_boot_summary`). Deliberately *not* a member of
+    # this protocol — it is optional, and a required member would make every route
+    # implement one to satisfy the registry's ``isinstance`` gate whether it has
+    # anything to say or not.
+
+
+def route_boot_summary(route: object) -> str | None:
+    """``route``'s own ``key=value`` boot statement, or ``None`` if it makes none.
+
+    The banner states the *core's* config (routes, dedup, breaker, sha), which by
+    construction cannot name a source-specific setting without the core learning a
+    source's vocabulary. But some of those settings are exactly the kind that must be
+    stated at boot rather than discovered mid-incident — the basecradle route's shared
+    signing fallback is a security control whose *absence* and whose *presence* produce
+    identical traffic once every persona is keyed, so nothing else in the log can
+    distinguish "retired" from "we forgot to retire it".
+
+    Read by duck-typing rather than through the :class:`Route` protocol so a route with
+    nothing to say implements nothing, and a route that returns a blank summary is
+    treated as having none.
+    """
+    summary = getattr(route, "boot_summary", None)
+    if not callable(summary):
+        return None
+    text = summary()
+    return text if isinstance(text, str) and text.strip() else None

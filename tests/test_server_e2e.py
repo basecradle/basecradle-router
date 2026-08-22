@@ -26,7 +26,7 @@ from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
-from basecradle_router.routes import RouteRegistry
+from basecradle_router.routes import BasecradleRoute, RecipientKeyring, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.server import WebhookServer, configure_logging, deployed_sha
 from basecradle_router.wake import WakeResult
@@ -643,3 +643,34 @@ def test_no_ansi_colour_ever_reaches_the_http_response_body() -> None:
         blob = json.dumps(summary)
         # Both spellings: a raw escape, and the `\u001b` json.dumps would encode it as.
         assert "\x1b" not in blob and "\\u001b" not in blob, f"colour leaked into {summary}"
+
+
+def test_the_banner_is_followed_by_each_routes_own_config_line(caplog) -> None:
+    # The banner states the CORE's config and stays route-agnostic; a route's own
+    # settings are its to describe (basecradle/basecradle#497). For the basecradle
+    # route that matters because "shared fallback armed" and "shared fallback retired"
+    # produce identical traffic once every persona is keyed — no per-delivery line can
+    # tell them apart, so the daemon says which it booted with.
+    registry = RouteRegistry()
+    registry.register(GithubRoute(TRUSTED_ACTORS))
+    registry.register(
+        BasecradleRoute(RecipientKeyring({"019e916c-7f45-700e-afc0-f45557b237b7": "bc_isk_fake"}))
+    )
+    pipeline = Pipeline(
+        registry=registry,
+        config=_config(),
+        waker=_RecordingWaker(),
+        sleep=lambda _d: None,
+    )
+    server = WebhookServer(pipeline)
+
+    with caplog.at_level("INFO", logger="basecradle_router.server"):
+        server.log_startup_banner()
+
+    lines = [r.getMessage() for r in caplog.records if "event=route_config" in r.getMessage()]
+    # Exactly one: the github route has no source-specific config to state, and a
+    # route with nothing to say implements nothing rather than logging a blank line.
+    assert len(lines) == 1
+    assert "source=basecradle" in lines[0]
+    assert "recipient_keys=1" in lines[0]
+    assert "shared_fallback=true" in lines[0]
