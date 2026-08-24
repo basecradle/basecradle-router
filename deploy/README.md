@@ -1086,26 +1086,55 @@ traffic right now behave. Synthetic, HMAC-signed webhooks at the live endpoint �
 | 2 | valid sig, **untrusted** sender | **400** | the #52 trusted-actor gate **rejects** strangers |
 | 3 | valid sig, **trusted** sender, **unregistered** repo | **200** | the gate **admits** the fleet — and no agent is woken (resolve finds none) |
 
-Cases 4–5 do the same for the `basecradle` route once the capital wires it (self-gated on the secret and
-on the running daemon actually serving the route). Cases 6–7 pin where the **synthetic wake's** injection
-point lives (#208):
+Cases 4–6 do the same for the `basecradle` route once the capital wires it (self-gated on the route-wide
+secret and on the running daemon actually serving the route):
 
 | Case | Request | Asserted | Proves |
 |---|---|---|---|
-| 6 | `POST` the **public** `/webhooks/probe` | **404** | the injection point is **not reachable from the internet** — Caddy denies it |
-| 7 | `POST` **loopback** `/webhooks/probe`, bad signature | **401** | the daemon serves it on-box, and the shared HMAC boundary rejects |
+| 4 | **registered** recipient, **forged** digest | **401** | the HMAC boundary rejects a forgery — against a key that *exists* |
+| 5 | the **same body**, valid digest, a deliberately **non-actionable** event | **200** | the delivery verifies on that persona's **own** key (`key_path=recipient`) and `normalize` then **ignores** it — nothing is woken |
+| 6 | **unregistered** recipient, signed with the **route-wide** secret | **401** retired / **200** armed | which state the **shared fallback** is really in on the box |
 
-**Case 6 is asserted unconditionally**, unlike every other route case, and that asymmetry is the point: the
+Cases 4 and 5 differ in the digest alone, so 401-vs-200 there is the HMAC boundary and nothing else; 5 and
+6 differ in the recipient alone, so their split is the **keyring's key selection**. That separation is the
+point of the shape: post-cutover a forged digest and an unknown recipient both answer 401, so a gate that
+merely self-gated on the fallback flag would have kept the deploy green while proving neither (#243). Case
+5 additionally asserts the `event=verify_key … key_path=…` line in journald — the live proof of *which* key
+verified, which the status code cannot carry, and the one thing that distinguishes a completed cutover from
+a half-landed one.
+
+The persona under test and its signing key are **discovered from the box** — the registry
+(`BASECRADLE_ROUTER_AGENTS`) paired with `router.env`, read exactly the way `load_recipient_keyring` reads
+them — so no persona is ever hardcoded here. What keeps case 5 safe against production is the
+**non-actionable event type**, not the recipient: verify really does admit it as that persona, and
+`normalize` is what stops it. `tests/test_smoke_test_assertions.py` reads that event type back out of the
+shipped script and fails if it ever enters the route's `_ACTIONABLE_EVENTS`, so the one edit that would turn
+this gate into a live wake cannot land quietly. The cost is deliberate: an *actionable* basecradle delivery
+reaching resolve is no longer proven live (it would require waking a real harness), so it stays offline in
+`tests/test_basecradle_route.py` and `tests/test_server_e2e.py`.
+
+Cases 7–8 pin where the **synthetic wake's** injection point lives (#208):
+
+| Case | Request | Asserted | Proves |
+|---|---|---|---|
+| 7 | `POST` the **public** `/webhooks/probe` | **404** | the injection point is **not reachable from the internet** — Caddy denies it |
+| 8 | `POST` **loopback** `/webhooks/probe`, bad signature | **401** | the daemon serves it on-box, and the shared HMAC boundary rejects |
+
+**Case 7 is asserted unconditionally**, unlike every other route case, and that asymmetry is the point: the
 probe route can fire a wake at *any* registered agent, so its reachability from the internet must never
 quietly become true — not when the route is disabled, not when a Caddyfile is re-templated. Neither case
 carries a valid signature, so nothing is normalized and no agent is ever woken.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
-**without waking any real agent** — safe to run against production at any time. It reads the signing secret
-and the trusted-actor list from `router.env` (root-readable only), so it runs on the box (the `deploy-router`
-op runs it as root post-restart; or `sudo deploy/smoke-test.sh` by hand). It defaults `SMOKE_URL` to the
-live endpoint, so it needs no argument. The same three status-code outcomes are pinned offline in
-`tests/test_server_e2e.py`, so the smoke test can't bit-rot against the route logic unnoticed.
+**without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
+the trusted-actor list, and the registry path from `router.env` (root-readable only), so it runs on the box
+(the `deploy-router` op runs it as root post-restart; or `sudo deploy/smoke-test.sh` by hand); the basecradle
+cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`. It defaults
+`SMOKE_URL` to the live endpoint, so it needs no argument. The same status-code outcomes are pinned offline in
+`tests/test_server_e2e.py`, and the gate's own shell mirrors of the daemon's rules — the `<SLUG>` scrub, the
+boolean env parse, the registry read, and both journal regexes — are run against the daemon's own functions
+and rendered bytes in `tests/test_smoke_test_assertions.py`, so the smoke test can't bit-rot against the route
+logic unnoticed.
 
 ### Drift can never be silent: `deploy/drift-check.sh` + the timer
 `drift-check.sh` compares the stamped deployed SHA against the live tip of `origin/main`, fetched
