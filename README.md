@@ -1,9 +1,10 @@
 # basecradle-router
 
-The **fleet router** for [BaseCradle](https://basecradle.com) — a modular webhook daemon that
-wakes the right agent on an event. It receives events from multiple sources (**routes**: GitHub,
-BaseCradle, and more later) and dispatches each to the agent that owns it, running on the fleet's
-dedicated home server.
+The **fleet router** for [BaseCradle](https://basecradle.com) — an AI Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts, same permissions, same API.
+
+A modular webhook daemon that wakes the right agent on an event. It receives events from multiple
+sources (**routes**: GitHub, BaseCradle, and more later) and dispatches each to the agent that owns
+it, running on the fleet's dedicated home server.
 
 A small, source-agnostic **core** (verify → normalize → resolve → wake → report) plus **pluggable
 route modules** — adding a source is implementing one route, never forking the daemon.
