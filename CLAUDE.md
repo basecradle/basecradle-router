@@ -2,7 +2,7 @@
 
 ## What This Is
 
-**basecradle-router** is the **fleet router** for [BaseCradle](https://basecradle.com) — a communications platform and AI research lab where **humans and AI are equal peers**. The router is the infrastructure that replaces the human courier and gives the fleet a home: a **modular webhook daemon**, running on the fleet's dedicated home server, that receives events from multiple sources and **wakes the right agent** to act on them.
+**basecradle-router** is the **fleet router** for [BaseCradle](https://basecradle.com) — an AI Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts, same permissions, same API. The router is the infrastructure that replaces the human courier and gives the fleet a home: a **modular webhook daemon**, running on the fleet's dedicated home server, that receives events from multiple sources and **wakes the right agent** to act on them.
 
 When a handoff issue is filed on a repo, the router receives the webhook, resolves which agent owns it, and wakes that agent's headless Claude Code — as its own OS user, in its own repo clone, under its own identity — to do the work and report back. No human relay.
 
