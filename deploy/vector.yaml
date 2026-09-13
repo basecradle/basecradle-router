@@ -3,7 +3,22 @@
 #
 # Canonical, version-controlled config for the router box. It mirrors basecradle-noc's proven,
 # security-hardened config (basecradle-noc#31 enabled telemetry; basecradle-noc#33 / basecradle#338
-# hardened the scrub after an unscrubbed-journald secret leak). Install: deploy/README "Part 5 — Telemetry".
+# hardened the scrub after an unscrubbed-journald secret leak). First install and the full contract:
+# deploy/README "Part 5 — Telemetry".
+#
+# HOW A MERGE REACHES THE BOX (basecradle-noc#677 / #680) — unattended, with no human, in one NOC
+# `auto-converge` tick. The tick's router deploy mirrors this file into the deployed tree, and the same
+# tick installs it to /etc/vector/vector.yaml with the NOC's `deploy-vector` op (validate, install,
+# restart, roll back on failure, read the landing back) — but ONLY while the installed copy is still
+# byte-identical to this file's copy in the previously deployed router tree, i.e. what the NOC last
+# shipped. Any other state holds the apply: a box-only edit to /etc/vector/vector.yaml is never
+# overwritten, and it stays a red `config_diverged` drift finding for a human. So a change made only
+# on the box is never durable — it holds every later apply until the same change lands here.
+#
+# NO DOLLAR SIGN IN ANY COMMENT. Vector interpolates environment variables across the whole file
+# before it parses the YAML, so comments are NOT exempt: a dollar sign in a comment can fail the NOC's
+# pre-install validation, and the apply is refused. Write "dollar sign" in words. The two sink
+# `token:` values at the bottom are the only dollar signs this file carries.
 #
 # Tailored to this box (a webhook daemon + Caddy, no database), so the generated kitchen-sink config
 # (apache/nginx/mysql/mongo/redis/postgres log + metric sources scraping absent localhost endpoints)
@@ -41,10 +56,11 @@
 # bake a presentation concern into application code. The identifier is journald's, so it is only as good
 # as the program's name — which is why basecradle-router.service now sets `SyslogIdentifier=` (before
 # that, the daemon's lines were stamped `uv`, the name of its *launcher*).
-# The source ingest token is NOT in this file — it is interpolated from
-# ${BETTERSTACK_AI_SOURCE_TOKEN}, supplied to vector.service via the chmod-640 EnvironmentFile
-# /etc/vector/betterstack.env (a systemd drop-in), so the secret never lives in the repo or the
-# YAML, and a rotation is a one-line swap of that env file.
+#
+# The source ingest token is NOT in this file — the sinks interpolate it from the
+# BETTERSTACK_AI_SOURCE_TOKEN environment variable, supplied to vector.service via the chmod-640
+# EnvironmentFile /etc/vector/betterstack.env (a systemd drop-in), so the secret never lives in the
+# repo or the YAML, and a rotation is a one-line swap of that env file.
 
 sources:
   ai_journald:
