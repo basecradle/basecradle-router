@@ -1,6 +1,6 @@
 ---
 name: router-deploy-contract
-description: The deploy/ contract this repo authors for the NOC's deploy op — file layout, the deploy-router op and the NOC's unattended auto-converge deploy of main, the retired deploy.sh, and the merged≠live / smoke-test / drift-alarm mechanics. Use when adding to or maintaining anything under deploy/ (smoke-test.sh, drift-check.sh, the systemd units, wake-runner, README.md), when changing the paths/names the deploy op consumes, or when reasoning about how a merge reaches the live box. The invariant — the router-AI never deploys — lives in CLAUDE.md → Building vs. Deploying; this skill carries the contract mechanics.
+description: The deploy/ contract this repo authors for the NOC's deploy op — file layout, the deploy-router op and the NOC's unattended auto-converge deploy of main, and the merged≠live / smoke-test / drift-alarm mechanics. Use when adding to or maintaining anything under deploy/ (smoke-test.sh, drift-check.sh, the systemd units, wake-runner, README.md), when changing the paths/names the deploy op consumes, or when reasoning about how a merge reaches the live box. The invariant — the router-AI never deploys — lives in CLAUDE.md → Building vs. Deploying; this skill carries the contract mechanics.
 ---
 
 # Router Deploy Contract
@@ -19,7 +19,7 @@ This agent **authors and maintains** these as *code*, because the box's deploy c
 
 ## The deploy op — the NOC's, never the router-AI's
 
-The deploy loop is the NOC's structured op **`basecradle-noc deploy-router <sha>`** (basecradle#395 / basecradle-noc#134): the box pulls the merged SHA anonymously from the public repo and runs the on-box DoD loop (*tested → deployed → smoke-tested LIVE → confirmed*) with rollback. The old laptop-side [`deploy/deploy.sh`](deploy/deploy.sh) rsync loop is **retired** (interim emergency fallback only): it refuses to run by default and points at the op, so a reflexive self-deploy cannot happen.
+The deploy loop is the NOC's structured op **`basecradle-noc deploy-router <sha>`** (basecradle#395 / basecradle-noc#134): the box pulls the merged SHA anonymously from the public repo and runs the on-box DoD loop (*tested → deployed → smoke-tested LIVE → confirmed*) with rollback.
 
 **The NOC runs that op unattended** (founder decision, @origin 2026-09-13, basecradle-noc#672 / #674). Every NOC `auto-converge` tick (every 15 min) checks whether the daemon on `ai.basecradle.com` is behind the tip of `main` and, when it is, runs the same flow `deploy-router` runs by hand — offline gate, DoD loop, rollback, out-of-band `/up`, the ordinary `router-deploy` ledger row — and pings nothing, so a failed unattended deploy still reddens the NOC's hourly *Fleet Drift Detection* pass. No human is in the loop for a routine merge. The hand-run op remains for what the tick deliberately holds (a box with no deploy stamp, a `rollback_failed`, a SHA whose unattended deploy already failed) and for a deliberate roll or rollback. Mechanics: basecradle-noc `docs/fleet-ops.md` §2 → *The router daemon, deployed unattended*.
 

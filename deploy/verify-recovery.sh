@@ -39,8 +39,8 @@ UP_URL="${UP_URL:-http://127.0.0.1:8000/up}"
 RETRIES="${RETRIES:-30}"
 RETRY_INTERVAL="${RETRY_INTERVAL:-5}"
 
-# The verbatim Rails health body the app serves at /up (see server.py LIVENESS_BODY
-# and deploy/deploy.sh). A 200 alone is not enough — we assert the exact contract.
+# The verbatim Rails health body the app serves at /up (see server.py LIVENESS_BODY).
+# A 200 alone is not enough — we assert the exact contract.
 LIVENESS_BODY='<!DOCTYPE html><html><body style="background-color: green"></body></html>'
 
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }

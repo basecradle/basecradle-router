@@ -1030,12 +1030,11 @@ The box **PULLS** the merged commit **anonymously from the public `basecradle-ro
 crown-jewels box carries **no GitHub credential** — a public repo needs no read token, strictly better than
 a scoped one) and runs the same Definition-of-Done loop **on-box**, plus a **rollback** to the prior good
 SHA on any failure. github.com TLS authenticates the source; the content-addressed SHA verifies the bytes;
-the driver's offline gate confirms that SHA is the tip of branch-protected, CI-gated `main`. This replaced
-the old capital-run `deploy/deploy.sh` rsync-from-laptop (basecradle#395). The op's steps mirror what
-deploy.sh did on-box — mirror into `/opt/basecradle-router/app` (protecting `.venv`) + `chown router`,
-`uv sync`, reinstall `wake-runner` + the systemd unit files, stamp the SHA, `daemon-reload` + restart +
-settle + `is-active`, then the live smoke test — and the NOC's driver adds the out-of-band `GET /up` check
-over the public TLS path (a broken `/up` after an on-box success is a FAIL).
+the driver's offline gate confirms that SHA is the tip of branch-protected, CI-gated `main`
+(basecradle#395). The op's on-box steps are: mirror into `/opt/basecradle-router/app` (protecting `.venv`)
++ `chown router`, `uv sync`, reinstall `wake-runner` + the systemd unit files, stamp the SHA,
+`daemon-reload` + restart + settle + `is-active`, then the live smoke test — and the NOC's driver adds the
+out-of-band `GET /up` check over the public TLS path (a broken `/up` after an on-box success is a FAIL).
 
 #### Unattended: Every NOC `auto-converge` Tick Deploys `main` (basecradle-noc#672)
 **Founder decision, @origin 2026-09-13.** Nobody runs the op for a routine merge. The NOC's
@@ -1081,10 +1080,9 @@ from the deployed tree / box, and they are this repo's to keep stable:
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
 | `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. |
 
-> **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The old deploy.sh
-> re-`enable`d `basecradle-router-recovery.service` on every run (belt-and-suspenders). The NOC op does not,
-> because it cannot distinguish a service that must be enabled from one that must stay timer-triggered — both
-> carry `[Install]`. This is harmless: an `enable` symlink **persists across a file reinstall**, so the
+> **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The NOC op never
+> re-`enable`s `basecradle-router-recovery.service`, because it cannot distinguish a service that must be
+> enabled from one that must stay timer-triggered — both carry `[Install]`. This is harmless: an `enable` symlink **persists across a file reinstall**, so the
 > recovery gate enabled once at provisioning stays enabled. Adding a **new** non-timer service that must be
 > enabled directly (or a new root-owned file outside `app/` beyond `wake-runner`) is therefore a
 > **provisioning change**, not a routine deploy — out of the op's routine band by design. New **timers** and
@@ -1102,17 +1100,6 @@ from the deployed tree / box, and they are this repo's to keep stable:
 > cross-repo NOC re-point PR and put a privileged install sequence in a repo whose agent has no on-box
 > presence. The contract-vs-mechanism split is the cleaner line: stable artifacts here, install logic in
 > the NOC's op.
-
-### `deploy/deploy.sh` is RETIRED (interim emergency fallback only)
-The old one-command rsync-from-laptop loop `deploy/deploy.sh` is **retired**, superseded by the op above. It
-refuses to run by default — for everyone, NOC and capital included — directing the deployer to
-`basecradle-noc deploy-router <sha>`. Its rsync body survives **only** as an emergency fallback for the
-transition window **before** the `deploy-router` wrapper is installed on the box; a deployer who genuinely
-needs it in that gap must opt in explicitly with `ROUTER_INTERIM_RSYNC_DEPLOY=1` (and still `DEPLOYER=noc`).
-The NOC path is live — and since basecradle-noc#672 it deploys every `main` move unattended — so that gap no
-longer exists on the live box, and this fallback can be deleted outright. Until it is: it takes neither the
-NOC deploy flow's lock nor its ledger, so an rsync run would race the `auto-converge` tick on the same
-`/opt/basecradle-router/app` tree and leave no `router-deploy` row behind.
 
 ### The live smoke test: `deploy/smoke-test.sh`
 Proves the **running** daemon enforces the boundary — not that code merged, but that the bytes serving

@@ -51,8 +51,9 @@
 # agent, so its reachability from the internet must never quietly become true.
 #
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
-# router.env, which is root-readable only). deploy.sh invokes it over SSH after a
-# restart; you can also run it by hand:  sudo deploy/smoke-test.sh
+# router.env, which is root-readable only). The NOC's deploy-router op runs it on-box
+# after a restart, rolling the deploy back on failure; you can also run it by hand:
+#   sudo deploy/smoke-test.sh
 #
 # Config (env overrides):
 #   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
