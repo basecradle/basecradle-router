@@ -18,14 +18,15 @@ The router daemon runs on **one dedicated box that *is* the fleet's home** — `
 dedicated Ubuntu server. It is not a published package; the daemon reaches the box by deploy, not by
 release.
 
-> **Who does what (capital PR basecradle#363, issue #122).** **basecradle-router AI builds and
-> maintains the router daemon's code and all the version-controlled server/deploy config in this repo
-> (`deploy/`) — it never deploys.** The **capital owns and operates `ai.basecradle.com`** (the **NOC**
-> once its fleet-ops ships): it provisions the box, installs the daemon, and runs every command in this
-> doc that touches the box. The router-AI is a **tenant** on the box, not its operator. Throughout this
-> doc, work marked *(router-AI)* is config the agent authors in this repo; anything that installs, runs,
-> or hardens on the box is the **capital/NOC's**, even where older wording below still reads as if one
-> actor did both.
+> **Who does what (capital PR basecradle#363, issue #122; basecradle-noc#134, basecradle-noc#672).** **basecradle-router
+> AI builds and maintains the router daemon's code and all the version-controlled server/deploy config in
+> this repo (`deploy/`) — it never deploys.** The **capital owns and operates `ai.basecradle.com`**; the
+> **NOC is the daemon's sole deployer**, and since basecradle-noc#672 it deploys **unattended**: every NOC
+> `auto-converge` tick (every 15 min) deploys `main` when the daemon is behind it, so a merge reaches the
+> box with no human (Part 3). Nobody hand-deploys a routine merge — the capital included. The router-AI is
+> a **tenant** on the box, not its operator. Throughout this doc, work marked *(router-AI)* is config the
+> agent authors in this repo; anything that installs, runs, or hardens on the box is the **capital/NOC's**,
+> even where older wording below still reads as if one actor did both.
 
 On that box the router runs as a `systemd` service, receives signed webhooks at a TLS endpoint, and —
 per inbound event — **wakes the target repo's agent by running its headless `claude -p` as that agent's
@@ -61,9 +62,11 @@ The daemon enforces least privilege around that wake:
   propagation are unchanged. **The wrapper is the privilege boundary** — deliberately not argv-matching
   in `sudoers` (which is brittle and bypassable). This keeps the long-running webhook daemon fully
   unprivileged.
-- **The box's operator** (the capital today; the NOC once its fleet-ops ships) acts on the box over its
-  own administrative SSH, not as a fleet wake-user — it installs and operates the daemon. basecradle-router
-  AI has **no** operator presence on the box: it authors this config in the repo and never logs in to deploy.
+- **The box's operator and its deployer** act on the box under their own identities, never as a fleet
+  wake-user: the **capital** owns and operates the box over its own administrative SSH, and the **NOC**
+  installs and upgrades the daemon through its structured `deploy-router` op — unattended on every `main`
+  move (Part 3), so nobody hand-deploys a routine merge. basecradle-router AI has **no** operator presence
+  on the box: it authors this config in the repo and never logs in to deploy.
 
 The agent OS users themselves — created, credentialed, and seeded by the NOC's onboarding (noc#91) — are
 the daemon's *wake targets*, resolved from the registry below. Provisioning them is not the daemon's job.
@@ -1009,8 +1012,10 @@ runs it on the box.
 **For the deployer, `merged` ≠ `done`.** The artifact is a running service; a merge to `main` changes
 nothing on the box until the code lands there and the daemon restarts. Issue #54 was the proof:
 #50/#52/#53 sat merged but unrun for a day while the live daemon served pre-#52 code, because "done"
-silently meant "merged" and nothing redeployed. The deployer's Definition of Done is therefore the full
-loop, mirrored in `CLAUDE.md` ("Building vs. Deploying"):
+silently meant "merged" and nothing redeployed. Since basecradle-noc#672 the NOC closes that gap
+unattended (*Unattended* below), so it lasts one `auto-converge` tick rather than until someone runs the
+op — but the loop is unchanged. The deployer's Definition of Done is the full loop, mirrored in
+`CLAUDE.md` ("Building vs. Deploying"):
 
 > **tested (offline) → deployed to the box → smoke-tested LIVE → confirmed.**
 
@@ -1031,6 +1036,36 @@ deploy.sh did on-box — mirror into `/opt/basecradle-router/app` (protecting `.
 `uv sync`, reinstall `wake-runner` + the systemd unit files, stamp the SHA, `daemon-reload` + restart +
 settle + `is-active`, then the live smoke test — and the NOC's driver adds the out-of-band `GET /up` check
 over the public TLS path (a broken `/up` after an on-box success is a FAIL).
+
+#### Unattended: Every NOC `auto-converge` Tick Deploys `main` (basecradle-noc#672)
+**Founder decision, @origin 2026-09-13.** Nobody runs the op for a routine merge. The NOC's
+`auto-converge` timer (every 15 min, on the NOC box) reads the router's deploy state through the same read
+its `router-drift` guard makes and, when the daemon is behind the tip of `main`, runs **the same flow**
+`deploy-router` runs by hand — offline gate, on-box DoD loop, rollback, out-of-band `/up`, and the ordinary
+`router-deploy` ledger row (attributed by an `auto_remediations` row and an `event=auto_remediation`
+start/finish pair on the NOC journal). A merge reaches the box within one tick — at most ~16 minutes.
+*Why:* two Sundays running, a Dependabot bump auto-merged at ~11:13 UTC and the daemon sat behind `main` —
+~39 h (#250), then 8+ h and a page (#251) — because deploying needed a human to run the op.
+
+- **Remediation never marks its own homework.** The tick pings nothing. A failed unattended deploy writes
+  the same `fail` ledger row a failed hand-run does, and the NOC's hourly *Fleet Drift Detection* pass
+  withholds its ping by construction.
+- **The drift window.** The NOC's `router-drift` guard grants a **45-minute** answer window, measured from
+  the tip's committer date, before a behind daemon counts as drift — so a merge that lands cleanly never
+  reddens the heartbeat. The window expires, and it never covers a failed newest deploy or a missing stamp.
+- **What the tick holds — the hand-run's remaining job.** A box with no deploy stamp (a first deploy is a
+  captain's bootstrap), a newest deploy that is `rollback_failed`, a daemon already on `main` whose newest
+  deploy did not land, a SHA whose unattended deploy already failed (the damper — a new `main` SHA gets a
+  fresh attempt), and a read that errored (GitHub, the box, the inventory); a wake-seam probe cycle in
+  flight defers the deploy one tick. The hand-run `basecradle-noc deploy-router` stays for those, and for a
+  deliberate roll or rollback.
+- **One flow, one lock.** The hand-run and the tick take the same non-blocking lock around the deploy, so
+  they can never deploy concurrently; the loser sends nothing.
+- **This is not push-CD.** What changed is who presses go, not the trust path: the box still pulls a
+  content-addressed SHA the offline gate confirmed is the tip of branch-protected, CI-gated `main`, with no
+  GitHub credential on the box (*Why the box pulls* below).
+
+Mechanics: basecradle-noc `docs/fleet-ops.md` §2 → *The router daemon, deployed unattended*, §3.1, §3.4.
 
 #### The on-box contract the op consumes — the router repo owns these (confirmed, basecradle#395)
 The router owns the **contract** (the *what* — stable paths, names, and artifacts); the NOC owns the deploy
@@ -1074,7 +1109,10 @@ refuses to run by default — for everyone, NOC and capital included — directi
 `basecradle-noc deploy-router <sha>`. Its rsync body survives **only** as an emergency fallback for the
 transition window **before** the `deploy-router` wrapper is installed on the box; a deployer who genuinely
 needs it in that gap must opt in explicitly with `ROUTER_INTERIM_RSYNC_DEPLOY=1` (and still `DEPLOYER=noc`).
-Once the NOC path is live on the box, it is never used again, and this fallback can be deleted outright.
+The NOC path is live — and since basecradle-noc#672 it deploys every `main` move unattended — so that gap no
+longer exists on the live box, and this fallback can be deleted outright. Until it is: it takes neither the
+NOC deploy flow's lock nor its ledger, so an rsync run would race the `auto-converge` tick on the same
+`/opt/basecradle-router/app` tree and leave no `router-deploy` row behind.
 
 ### The live smoke test: `deploy/smoke-test.sh`
 Proves the **running** daemon enforces the boundary — not that code merged, but that the bytes serving
@@ -1142,7 +1180,17 @@ tokenlessly with `git ls-remote` (the repo is public, so the box needs no creden
 now?"). It exits non-zero and prints loudly on drift (or a missing stamp). The `deploy-router` op runs it
 as its final confirm step, and `deploy/systemd/basecradle-router-drift.{service,timer}` run it **hourly** as
 the `router` user — so a merge that never reached the box surfaces in `systemctl --failed` and the journal,
-instead of going unnoticed for a day. It only reads; it never auto-deploys.
+instead of going unnoticed for a day. It only reads; it never deploys.
+
+**What closes the gap it reports is the NOC's `auto-converge` tick, not a person** (basecradle-noc#672). So
+a red here that persists past ~45 minutes from the merge means the unattended deploy **failed or was held** —
+read the NOC's `router-deploy` ledger for which — not that nobody ran it.
+
+**The two drift guards compare different things, and the tick bounds the difference.** This check classifies
+a docs-only gap as green (below, #189); the NOC's `router-drift` compares raw SHAs. Before
+basecradle-noc#672 the two could disagree for as long as a docs-only merge sat undeployed; now the tick
+deploys that merge like any other, so the disagreement lasts at most one tick (~16 minutes), inside
+`router-drift`'s window. This check's classification is unchanged.
 
 #### The gap is classified, not just measured (issue #189)
 **Differing SHAs are not by themselves drift.** This repo carries every one of the fleet's
@@ -1189,6 +1237,8 @@ DoD loop on-box with rollback, plus a **drift alarm** that makes the merge≠dep
 silent-drift root cause (#54) with no read token to leak anywhere. Only the box pulling by content-addressed
 SHA bounds a compromised deployer to code the offline gate already confirmed is on branch-protected `main`;
 rsync, a NOC-shipped tarball, or a git bundle would each let a leaked key ship arbitrary root code.
+**Unattended changes none of this** (basecradle-noc#672): the `auto-converge` tick is the NOC driver pressing
+go on the same pull, gate, and rollback — the trust path is identical; only the human is gone.
 
 ---
 

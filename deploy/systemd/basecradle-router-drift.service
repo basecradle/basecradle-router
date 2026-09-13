@@ -5,11 +5,14 @@
 # journal instead of going unnoticed. A gap confined to docs, skills, .github/, or
 # CLAUDE.md passes green and says so in the journal (issue #189) — those change
 # nothing the box runs, and an alarm that is routinely red for a harmless reason is
-# the one that gets waved through when it finally matters. It only reads — it never
-# auto-deploys; the NOC redeploys with `basecradle-noc deploy-router <sha>` after
-# seeing the failure. (Auto-pulling from the internet onto the crown-jewels box,
-# unattended, is a security trade we deliberately do NOT make — see
-# deploy/README.md Part 3.)
+# the one that gets waved through when it finally matters. It only reads — this unit
+# never deploys. What closes the gap is the NOC's auto-converge tick, which deploys
+# main unattended within one tick of a merge (basecradle-noc#672) through the same
+# `basecradle-noc deploy-router` flow a captain can hand-run: the box pulls a SHA the
+# NOC's offline gate confirmed is branch-protected main, so there is still no
+# credential on the box and no push-CD (deploy/README.md Part 3). A failure here that
+# outlives the NOC's 45-min drift window means that unattended deploy failed or was
+# held — read the NOC's router-deploy ledger.
 #
 # Install to /etc/systemd/system/, then:
 #   systemctl daemon-reload && systemctl enable --now basecradle-router-drift.timer
