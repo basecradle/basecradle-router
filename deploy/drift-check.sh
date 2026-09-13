@@ -38,6 +38,11 @@
 # final confirm step; a systemd timer (deploy/systemd/basecradle-router-drift.timer)
 # runs it on a schedule so drift surfaces even when no one is deploying.
 #
+# What CLOSES the gap this reports is the NOC's auto-converge tick, not a human
+# (basecradle-noc#672): every 15 min it deploys main when the daemon is behind it. So a
+# red here that persists past ~45 min from the merge means that unattended deploy failed
+# or was held — read the NOC's router-deploy ledger — not that nobody ran it.
+#
 set -euo pipefail
 
 STAMP="${STAMP:-/etc/basecradle-router/deployed-sha}"

@@ -1,7 +1,8 @@
 # Schedule for the deployed-vs-main drift check (basecradle-router-drift.service).
 #
-# Hourly is plenty: a deploy is the normal way main reaches the box, and this is
-# the backstop that catches a merge that never got deployed. Install alongside the
+# Hourly is plenty: the NOC's unattended auto-converge deploy (every 15 min,
+# basecradle-noc#672) is the normal way main reaches the box, and this is the
+# backstop that catches a merge that never got deployed. Install alongside the
 # .service, then: systemctl enable --now basecradle-router-drift.timer
 
 [Unit]
