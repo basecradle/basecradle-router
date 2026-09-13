@@ -1386,17 +1386,26 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 > can read — and `python -m basecradle_router probe wake` takes its BCNOC1 marker on **stdin, never
 > argv**. This scrub is the box-wide belt for every *other* program's braces.
 >
-> **The drift alarm cannot see this file, so merging it is not the end.** `drift-check.sh` compares
-> the *deploy stamp* against `origin/main`, and `deploy-router` writes that stamp without touching
-> Vector (the install below is the capital's, per the next note) — so a daemon deploy turns drift
-> **green** while `/etc/vector/vector.yaml` is still the old bytes. Re-run the `install` line.
+> **The router's drift alarm cannot see this file, so a merged change to it is not live.**
+> `drift-check.sh` compares the *deploy stamp* against `origin/main`, and `deploy-router` — run unattended
+> by the NOC's `auto-converge` tick on every `main` move (Part 3) — mirrors the new `deploy/vector.yaml`
+> into the deployed tree and writes that stamp **without touching Vector**. So within one tick of the merge
+> this box's drift reads green while `/etc/vector/vector.yaml` is still the old bytes. **Applying it is the
+> NOC's `deploy-vector` op** (basecradle-noc#202), and the tick does **not** run it. The op installs from
+> the *deployed* tree — never a fetch of its own, so it can apply only bytes `deploy-router`'s offline gate
+> already vetted — validates the VRL before install, rolls back on failure, and reads the landing back. The
+> gap is loud on the NOC side, not here: its `fleet-vector-config` census, folded into the hourly drift
+> pass, reports `config_diverged` and withholds the *Fleet Drift Detection* ping until the config is
+> applied. The hand `install` line below is the first install only.
 
-> **Division of labor (issue #116).** The router seat authors the version-controlled config here
-> (this repo, merged to `main`); the **capital** does the on-box install, creates the token file, and
-> live-verifies. The steps below are the capital's runbook — they are **not** part of the router-daemon
-> deploy (the NOC's `deploy-router` op, which deploys only the router daemon).
+> **Division of labor (issue #116, basecradle-noc#202).** The router seat authors the version-controlled
+> config here (this repo, merged to `main`). The **first install** below — the Vector package, the token
+> file, the drop-in, the initial config — is a one-time on-box bootstrap by the **capital**, which also
+> live-verifies it. Every later **update** of `vector.yaml` is the NOC's `deploy-vector` op, not a hand
+> install. Neither is part of the router-daemon deploy (`deploy-router`, which deploys only the router
+> daemon).
 
-### Install / update (capital, on-box)
+### First Install (Capital, On-Box, One-Time)
 
 ```bash
 # one-time: install Vector from the official .deb — NOT Better Stack's setup-script.
@@ -1426,7 +1435,9 @@ sudo install -D -o root -g root -m 644 \
   /etc/systemd/system/vector.service.d/10-ai-betterstack-env.conf
 sudo systemctl daemon-reload
 
-# install the canonical scrubbed config (from the repo checkout), validate, then enable + start
+# install the canonical scrubbed config (from the repo checkout), validate, then enable + start.
+# First install only — every later vector.yaml update is the NOC's `deploy-vector` op, which
+# installs from the deployed router tree, validates, rolls back on failure, and reads back.
 sudo install -o root -g vector -m 640 deploy/vector.yaml /etc/vector/vector.yaml
 sudo bash -c 'set -a; . /etc/vector/betterstack.env; vector validate /etc/vector/vector.yaml'
 sudo systemctl enable --now vector
