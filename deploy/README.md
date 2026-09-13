@@ -889,8 +889,10 @@ BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds th
 # BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000
 ```
 
-Install `deploy/bin/probe-ack` root-owned beside the wrapper — it runs *as* the agent but must not be
-*writable* by it, or the account under test could rewrite its own verifier to always ack:
+`deploy/bin/probe-ack` sits root-owned beside the wrapper — it runs *as* the agent but must not be
+*writable* by it, or the account under test could rewrite its own verifier to always ack. Every deploy
+reinstalls it (the op's `deploy/bin/*` glob, Part 3); the by-hand equivalent, the command `wake-runner`
+names when the verifier is missing, is:
 
 ```bash
 install -o root -g root -m 0755 deploy/bin/probe-ack /opt/basecradle-router/bin/
@@ -1031,8 +1033,8 @@ crown-jewels box carries **no GitHub credential** — a public repo needs no rea
 a scoped one) and runs the same Definition-of-Done loop **on-box**, plus a **rollback** to the prior good
 SHA on any failure. github.com TLS authenticates the source; the content-addressed SHA verifies the bytes;
 the driver's offline gate confirms that SHA is the tip of branch-protected, CI-gated `main`
-(basecradle#395). The op's on-box steps are: mirror into `/opt/basecradle-router/app` (protecting `.venv`)
-+ `chown router`, `uv sync`, reinstall `wake-runner` + the systemd unit files, stamp the SHA,
+(basecradle#395). The op's on-box steps are: mirror into `/opt/basecradle-router/app` (protecting `.venv`) +
+`chown router`, `uv sync`, reinstall every `deploy/bin/*` helper + the systemd unit files, stamp the SHA,
 `daemon-reload` + restart + settle + `is-active`, then the live smoke test — and the NOC's driver adds the
 out-of-band `GET /up` check over the public TLS path (a broken `/up` after an on-box success is a FAIL).
 
@@ -1074,25 +1076,27 @@ from the deployed tree / box, and they are this repo's to keep stable:
 | Contract | What the op does with it |
 |---|---|
 | `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. |
-| `deploy/bin/wake-runner` | reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/wake-runner` on every deploy. |
-| `deploy/bin/probe-ack` | **NOT yet in the op's routine band — a one-time provisioning step (#208).** Install root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/probe-ack`. Until it is there, `probe wake` reports `75` / *unprovable* naming the exact `install` command, and no other path is affected. Ideally the op's `wake-runner` line becomes a `deploy/bin/*` glob, so the next root-owned helper is not a provisioning change either. |
+| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), and `router-admin` (the NOC calls the `app/` copy). `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
 | `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. |
 
 > **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The NOC op never
 > re-`enable`s `basecradle-router-recovery.service`, because it cannot distinguish a service that must be
-> enabled from one that must stay timer-triggered — both carry `[Install]`. This is harmless: an `enable` symlink **persists across a file reinstall**, so the
-> recovery gate enabled once at provisioning stays enabled. Adding a **new** non-timer service that must be
-> enabled directly (or a new root-owned file outside `app/` beyond `wake-runner`) is therefore a
-> **provisioning change**, not a routine deploy — out of the op's routine band by design. New **timers** and
-> new **unit files** are handled automatically (the timer arm-loop and the unit glob).
+> enabled from one that must stay timer-triggered — both carry `[Install]`. This is harmless: an `enable`
+> symlink **persists across a file reinstall**, so the recovery gate enabled once at provisioning stays
+> enabled. Adding a **new** non-timer service that must be enabled directly (or a new root-owned file
+> outside `app/` that is not a `deploy/bin/*` helper) is therefore a **provisioning change**, not a routine
+> deploy — out of the op's routine band by design. New **timers**, new **unit files**, and new
+> **`deploy/bin/*` helpers** are handled automatically (the timer arm-loop, the unit glob, and the helper
+> glob).
 >
-> **`deploy/bin/probe-ack` is the first case of that second clause** (#208): a new root-owned file outside
-> `app/`, so it needs one provisioning install. Its absence fails *safe and loud* — the wrapper refuses with
-> `75` naming the exact `install` command, and nothing else on the box changes — but it is worth turning the
-> op's single `wake-runner` line into a `deploy/bin/*` glob so root-owned helpers join units in the
-> handled-automatically column.
+> **Helpers joined that column because of `deploy/bin/probe-ack`** (#208). The op once reinstalled only
+> `wake-runner`, which would have left `probe-ack` merged, deployed, and still absent from the box.
+> basecradle-noc#428 turned that line into the `deploy/bin/*` glob, and basecradle-noc#454 recorded
+> `probe-ack` installed. The glob widens no privilege: this repo already decides what runs as root there.
+> An absent verifier still fails *safe and loud* — `wake-runner` refuses the probe with `75` naming the exact
+> `install` command, and nothing else on the box changes.
 
 > **Why the op globs units rather than a router-owned `deploy/apply.sh`?** Considered and declined
 > (basecradle#395). The unit glob already drift-proofs the common evolution (adding a unit), so an
