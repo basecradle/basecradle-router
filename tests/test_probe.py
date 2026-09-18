@@ -2,7 +2,7 @@
 
 basecradle-router#208, from `basecradle-noc#421`. The NOC's retired probe posted a
 signed marker into each agent's own BaseCradle timeline, which required mutual trust
-with every persona — a consent surface a monitor is now forbidden to depend on
+with every agent — a consent surface a monitor is now forbidden to depend on
 (``constitution.md`` → Operational Baselines). The router owns the router→agent wake
 edge, so the router proves it: a signed test delivery fired at its own real
 verify→wake path, on-box, with no platform account and no relationship with anyone.
@@ -14,12 +14,12 @@ What these tests pin, in the order the requirements were handed down:
 2. **Token-free, or it does not fire.** No code path can build a model command for a
    synthetic event, and an agent with no probe secret armed is refused — never woken.
 3. **A synthetic is distinguishable from real traffic** in every counter it touches.
-4. **One rule, every agent** — builders and harness personas, no special case.
+4. **One rule, every agent** — builders and harness agents, no special case.
 5. **The probe's own PASS is not the proof**: only the *daemon's* record of a wake
    carrying this run's delivery id counts.
 
 Everything is fabricated and offline: the cast is John Doe (``john``) and Nova Digital
-(``nova``), plus the harness persona ``jt``. No network, no model, no live agent. The
+(``nova``), plus the harness agent ``jt``. No network, no model, no live agent. The
 one real subprocess is ``deploy/bin/probe-ack``, which by construction can reach
 neither — it imports ``hmac`` and prints a line.
 """
@@ -209,7 +209,7 @@ def test_a_verified_probe_normalizes_to_a_synthetic_event_addressed_by_harness_k
 
     assert event.source == "probe"
     assert event.kind is EventKind.SYNTHETIC_PROBE
-    # Addressed by the OS-user slug — the identity every agent has, builder or persona.
+    # Addressed by the OS-user slug — the identity every agent has, builder or harness agent.
     assert event.recipient == Recipient(by="harness_key", value="nova")
     assert event.wake_arg == marker  # the marker IS the wake argument
     assert event.delivery_id == "d42"
@@ -253,7 +253,7 @@ def test_a_probe_is_never_a_silent_ignore() -> None:
         ProbeRoute().normalize(missing_delivery)
 
 
-def test_every_registered_agent_is_reachable_by_the_probe_builder_and_persona_alike() -> None:
+def test_every_registered_agent_is_reachable_by_the_probe_builder_and_harness_agent_alike() -> None:
     # Requirement 4: one rule, every agent — including @jt, whose grandfathered trust
     # edge the founder's ruling explicitly declined to preserve.
     cfg = config()
@@ -841,7 +841,7 @@ def test_a_collapsed_injection_reads_unprovable_naming_the_dedup(tmp_path) -> No
     assert result.after.route_refused == 0
 
 
-def test_the_probe_reaches_a_harness_persona_by_exactly_the_same_route(box) -> None:
+def test_the_probe_reaches_a_harness_agent_by_exactly_the_same_route(box) -> None:
     # Requirement 4: @jt migrates to this mechanism, with no special case. The only
     # difference is which binary the wrapper would have exec'd.
     result = box.probe().run("jt", a_marker(JT_AGENT_SECRET))
@@ -1009,7 +1009,7 @@ def test_a_probe_is_not_a_wake_edge_and_never_inflates_the_edge_count(box) -> No
     box.probe().run("jt", a_marker(JT_AGENT_SECRET))
     edge = claim(subject(manifests(box), "agent:jt"), "wake-edge:webhook-route")
 
-    # jt is a persona: with only github+probe enabled, it has NO production edge at all.
+    # jt is a harness agent: with only github+probe enabled, it has NO production edge at all.
     assert edge["detail"]["edges"] == []
     assert edge["detail"]["edge_count"] == 0
     # ...and yet the terminus demonstrably answers. That pair IS the honest reading.
@@ -1034,7 +1034,7 @@ def test_the_synthetic_claim_is_emitted_per_armed_agent_and_points_at_its_own_ro
     assert "probe_secret_match" in synthetic["detail"]["proves"]
 
 
-def test_the_synthetic_claim_names_the_binary_a_persona_would_have_run(box) -> None:
+def test_the_synthetic_claim_names_the_binary_a_harness_agent_would_have_run(box) -> None:
     synthetic = claim(subject(manifests(box), "agent:jt"), "wake-edge:synthetic:probe")
     assert synthetic["detail"]["stops_before"] == f"exec {JT.wake_bin}"
 

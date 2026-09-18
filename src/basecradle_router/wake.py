@@ -52,7 +52,7 @@ _SAFE_DELIVERY_ID = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
     """The agent-kind-specific command (binary + args) the wake launches.
 
-    A builder runs ``claude -p "<trigger>"``; a harness persona runs its own
+    A builder runs ``claude -p "<trigger>"``; a harness agent runs its own
     ``<wake_bin> --timeline "<uuid>"``. Either way the single event value
     (:attr:`Event.wake_arg` — the trigger or the timeline uuid) rides as one inert
     argv element, never a shell string, so it is never re-interpreted. The home
@@ -295,7 +295,7 @@ class HomeServerWaker:
     Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> --delivery <id> --
     <wake command>`` and runs it, where the wake command is the agent-kind-specific
     :func:`wake_command` (``claude -p "<trigger>"`` for a builder, ``<wake_bin>
-    --timeline "<uuid>"`` for a harness persona). The root-owned wrapper validates
+    --timeline "<uuid>"`` for a harness agent). The root-owned wrapper validates
     the request, drops to the agent's own OS user, and (as the agent) sources that
     agent's ``agent.env`` — so the router itself passes **no** environment and never
     holds a secret. The event value rides as a single ``argv`` element, never a

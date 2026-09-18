@@ -215,7 +215,7 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
     assert result.agent is NOVA
 
 
-# --- the basecradle route: a platform event wakes a harness persona --------
+# --- the basecradle route: a platform event wakes a harness agent ----------
 
 
 def _basecradle_pipeline(waker: _StubWaker | None = None) -> tuple[Pipeline, _StubWaker]:
@@ -262,7 +262,7 @@ def _basecradle_request(
     return InboundRequest(headers=headers, body=body)
 
 
-def test_signed_platform_event_wakes_the_harness_persona() -> None:
+def test_signed_platform_event_wakes_the_harness_agent() -> None:
     pipeline, waker = _basecradle_pipeline()
     result = pipeline.handle("basecradle", _basecradle_request())
 

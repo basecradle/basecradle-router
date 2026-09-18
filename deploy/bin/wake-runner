@@ -63,7 +63,7 @@
 # Two agent kinds are wakeable, selected by the registry entry's `kind`:
 #   - a builder ("github", the default): only the trusted, system-installed
 #     `claude` may be launched, resolved off a root-owned PATH;
-#   - a harness persona ("harness", e.g. @jt): only the exact `wake_bin` the
+#   - a harness agent ("harness", e.g. @jt): only the exact `wake_bin` the
 #     registry pins for that agent may be launched (its own wake CLI in its venv).
 # Either way the binary is decided by the ROOT-OWNED registry, never by the
 # caller's argv, so a compromised router cannot substitute a different command.
@@ -73,7 +73,7 @@
 #   - the target must be a real agent login user (UID >= 1000, never root/system),
 #     registered in the agent registry with exactly the requested clone path;
 #   - only the registry-sanctioned binary for that agent may be launched —
-#     `claude` for a builder, the pinned `wake_bin` for a harness persona — and a
+#     `claude` for a builder, the pinned `wake_bin` for a harness agent — and a
 #     harness `wake_bin` must resolve inside the agent's own home;
 #   - the agent's secrets are read by the AGENT, after the privilege drop, and
 #     parsed literally (KEY=VALUE), never evaluated as shell.
@@ -244,7 +244,7 @@ github)
 	launch_bin="$(PATH="$TRUSTED_PATH" command -v claude)" || die "claude not found on the trusted PATH"
 	;;
 harness)
-	# A harness persona's wake CLI lives in its OWN venv (agent-writable), so it
+	# A harness agent's wake CLI lives in its OWN venv (agent-writable), so it
 	# cannot be resolved off a root PATH. The control instead is the registry: the
 	# launched path must equal the `wake_bin` the registry pins for this agent, and
 	# must resolve to a real executable inside the agent's own home. The router
@@ -302,7 +302,7 @@ fi
 # discipline, and exit-code propagation (runuser's exit, i.e. the wake's, flows
 # straight back to the caller) are all byte-for-byte unchanged. The tag is the
 # agent's OS-user slug (its universal identity; `journalctl -t basecradle-wake-<slug>`
-# reads one persona's wake ledger). systemd-cat is resolved off the trusted PATH —
+# reads one agent's wake ledger). systemd-cat is resolved off the trusted PATH —
 # the same discipline as `claude` above — never the caller's.
 #
 # Three deliberate consequences, not bugs:

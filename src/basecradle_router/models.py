@@ -11,7 +11,7 @@ carry; every input, whatever its source, resolves to an agent. So an event names
 its agent through a source-tagged :class:`Recipient` the core resolves without
 knowing any source's specifics, and an :class:`Agent` carries a stable ``key``
 (its slug) plus a :class:`WakeKind` that says how to wake it — a builder's
-``claude -p`` or a harness persona's own wake CLI.
+``claude -p`` or a harness agent's own wake CLI.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class WakeKind(Enum):
     """How an agent's one harness instance is woken.
 
     ``CLAUDE`` — a builder agent's headless Claude Code: ``claude -p "<arg>"``.
-    ``HARNESS`` — a non-builder harness persona's own wake CLI, invoked as
+    ``HARNESS`` — a non-builder harness agent's own wake CLI, invoked as
     ``<wake_bin> --timeline "<arg>"``. The single event value (the trigger, or
     the timeline uuid) rides as one inert argv element either way.
     """
@@ -113,15 +113,15 @@ class Agent:
 
     ``key`` is the agent's stable slug — its identity in the registry and the
     target of resolution. For a GitHub builder it is the ``owner/name`` repo it
-    captains; for a harness persona it is its bare slug (e.g. ``jt``). The
+    captains; for a harness agent it is its bare slug (e.g. ``jt``). The
     home-server fields (``os_user``, ``clone_path``) describe *where* to run the
     wake; ``wake_kind`` describes *how*. The router only ever delivers a trigger —
     it never becomes the agent.
 
     Source-specific fields are optional and carried only for the kind that needs
     them: ``bot_slug`` (a builder's GitHub App bot identity); ``recipient_uuid``
-    (a harness persona's BaseCradle user uuid, the key its events resolve by);
-    ``wake_bin`` (a harness persona's wake CLI, the only command the home-server
+    (a harness agent's BaseCradle user uuid, the key its events resolve by);
+    ``wake_bin`` (a harness agent's wake CLI, the only command the home-server
     wrapper will launch for it).
     """
 
@@ -177,7 +177,7 @@ class Event:
     GitHub handoff's trigger prompt, or a BaseCradle event's timeline uuid).
     ``origin`` records where the agent reports back when the source has such a
     place (a GitHub issue) — informational, and ``None`` for sources that don't
-    (a harness persona replies on its timeline itself).
+    (a harness agent replies on its timeline itself).
     """
 
     source: str

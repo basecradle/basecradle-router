@@ -1,7 +1,7 @@
 """Shape and validation invariants for the core vocabulary.
 
 Test cast: John Doe (``john``, human) and Nova Digital (``nova``, AI); plus the
-fleet harness persona @jt (``jt``, a non-builder agent) for the non-repo shape.
+harness agent @jt (``jt``, a non-builder agent) for the non-repo shape.
 """
 
 from dataclasses import FrozenInstanceError
@@ -90,8 +90,8 @@ def test_builder_agent_round_trips() -> None:
     assert agent.wake_kind is WakeKind.CLAUDE  # the default
 
 
-def test_harness_persona_agent_round_trips() -> None:
-    # A non-builder persona: no repo, no bot_slug — a slug key, a wake_bin, and a
+def test_harness_agent_round_trips() -> None:
+    # A non-builder harness agent: no repo, no bot_slug — a slug key, a wake_bin, and a
     # recipient_uuid its basecradle events resolve by.
     agent = Agent(
         key="jt",

@@ -289,12 +289,12 @@ assert_journal_has "delivery id threaded onto the decision line (#170)" \
 # skipped if the live daemon does not yet serve the route (a bad-sig probe returns 404,
 # not 401) — so a deploy made before the capital enables basecradle stays green.
 #
-# The delivery under test is signed for a REGISTERED persona under that persona's OWN
+# The delivery under test is signed for a REGISTERED harness agent under that agent's OWN
 # `…_WEBHOOK_SECRET_<SLUG>` key, and carries a deliberately NON-ACTIONABLE event type.
 # That pairing is what keeps it safe against production after the per-recipient keyring
 # cutover (basecradle/basecradle#497): verify runs the real `key_path=recipient` path,
 # and normalize then IGNORES the delivery, so nothing is resolved and no harness is ever
-# woken. The persona and its key are DISCOVERED from the box — the registry
+# woken. The agent and its key are DISCOVERED from the box — the registry
 # (`BASECRADLE_ROUTER_AGENTS`) paired with router.env, read exactly the way
 # `load_recipient_keyring` reads them — never hardcoded.
 #
@@ -317,11 +317,11 @@ assert_journal_has "delivery id threaded onto the decision line (#170)" \
 # 4 and 5 differ in the digest alone, so 401-vs-200 there is the HMAC boundary and nothing
 # else. 5 and 6 differ in the recipient alone, so their split is the keyring's key
 # selection. And 6 is the live proof of which configuration the box is actually in — the
-# one thing no per-delivery line can reveal, because once every persona holds its own key
+# one thing no per-delivery line can reveal, because once every agent holds its own key
 # an armed fallback and a retired one produce byte-identical traffic.
 #
 # What is deliberately NOT proven live any more: an actionable basecradle delivery
-# reaching resolve. Post-cutover that would mean signing as a registered persona with an
+# reaching resolve. Post-cutover that would mean signing as a registered agent with an
 # actionable event — which is precisely the delivery that wakes a real harness — so it
 # stays offline (tests/test_basecradle_route.py, tests/test_server_e2e.py). The github
 # route still covers accept -> normalize -> resolve-miss live, in case 3.
@@ -334,12 +334,12 @@ BC_RECIPIENT_SECRET_PREFIX="${BC_SECRET_VAR}_"
 BC_FALLBACK_VAR="BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK"
 BC_AGENTS_VAR="BASECRADLE_ROUTER_AGENTS"
 # A uuid no registry entry can hold, so no per-recipient key exists for it: case 6 reads
-# the shared fallback's state and can never reach a real persona.
+# the shared fallback's state and can never reach a real agent.
 UNREGISTERED_RECIPIENT="00000000-0000-7000-8000-000000000000"
 SMOKE_TIMELINE="00000000-0000-7000-8000-0000000000aa"
 # A platform event the router deliberately does NOT act on, so a delivery that verifies is
 # then a logged ignore and nothing is woken. This is the ONLY thing standing between case
-# 5 and a live wake at a real persona, so it is pinned rather than remembered:
+# 5 and a live wake at a real agent, so it is pinned rather than remembered:
 # tests/test_smoke_test_assertions.py reads this exact value out of this script and fails
 # if it ever enters the route's `_ACTIONABLE_EVENTS`.
 BC_IGNORED_EVENT="timeline.locked"
@@ -376,17 +376,17 @@ bc_post() {
 		--data-binary "@${body_file}"
 }
 
-# The registry's harness personas as `<key><TAB><recipient_uuid>` lines, in key order.
-# The registry is the daemon's own authority on which uuid is which persona — the same
+# The registry's harness agents as `<key><TAB><recipient_uuid>` lines, in key order.
+# The registry is the daemon's own authority on which uuid is which agent — the same
 # file `load_recipient_keyring` resolves a `…_WEBHOOK_SECRET_<SLUG>` variable through — so
-# reading it is what lets this gate name a real recipient without hardcoding a persona.
+# reading it is what lets this gate name a real recipient without hardcoding an agent.
 # `jq` is already a hard requirement of the box (deploy/bin/wake-runner validates every
 # wake against this same registry with it).
 #
 # The markers let tests/test_smoke_test_assertions.py run these EXACT shipped bodies
 # offline against a fabricated registry, so a regression fails in CI, not on the box.
 # >>> registry_parsers >>>
-registry_personas() {
+registry_harness_agents() {
 	jq -r '
 		to_entries
 		| sort_by(.key)
@@ -396,21 +396,21 @@ registry_personas() {
 	' "$1"
 }
 
-# The first registered persona holding a per-recipient signing key on THIS box, as
-# bc_slug / bc_uuid / bc_key. All three are left empty when no persona has a key of its
+# The first registered harness agent holding a per-recipient signing key on THIS box, as
+# bc_slug / bc_uuid / bc_key. All three are left empty when no agent has a key of its
 # own — a pre-cutover box, where the shared fallback is necessarily still armed, because
 # `load_recipient_keyring` refuses to boot a daemon whose fallback is retired while any
-# registered persona is unprovisioned.
+# registered agent is unprovisioned.
 #
 # The registry output is CAPTURED before it is iterated: `break`ing out of a loop reading
 # straight from a live producer SIGPIPEs it, which under `pipefail` is the #172 class of
 # bug this repo bans outright (tests/test_shell_pipeline_safety.py).
 discover_recipient() {
-	local personas slug uuid var value
+	local agents slug uuid var value
 	bc_slug=""
 	bc_uuid=""
 	bc_key=""
-	personas="$(registry_personas "$1")"
+	agents="$(registry_harness_agents "$1")"
 	while IFS=$'\t' read -r slug uuid; do
 		[[ -n "$slug" && -n "$uuid" ]] || continue
 		var="${BC_RECIPIENT_SECRET_PREFIX}$(slug_suffix "$slug")"
@@ -421,7 +421,7 @@ discover_recipient() {
 			bc_key="$value"
 			return 0
 		fi
-	done <<<"$personas"
+	done <<<"$agents"
 	return 0
 }
 # <<< registry_parsers <<<
@@ -456,7 +456,7 @@ else
 			bc_case_key_path="recipient"
 			log "basecradle recipient under test: ${bc_slug} (its own per-recipient key)"
 		elif [[ "$bc_fallback" == "true" ]]; then
-			# Pre-cutover: no persona holds a key of its own yet, so the route-wide secret
+			# Pre-cutover: no agent holds a key of its own yet, so the route-wide secret
 			# is the only key there is and the unregistered uuid is still safe to sign for.
 			bc_case_recipient="$UNREGISTERED_RECIPIENT"
 			bc_case_secret="$bc_secret"

@@ -103,7 +103,7 @@ part of that agent's own onboarding, not the daemon's.
 #### Reading a Wake's Ledger
 
 `wake-runner` routes each wake's stdout+stderr into journald under the identifier
-`basecradle-wake-<os_user>`, so one persona's wake output — including the harness's per-step ledger
+`basecradle-wake-<os_user>`, so one agent's wake output — including the harness's per-step ledger
 (`step N/M: tools=… (…s)`, `wake used X/N steps`) and its install/config warnings — is greppable on
 its own:
 
@@ -145,7 +145,7 @@ journalctl -u basecradle-router -f                   # by unit — also fine; th
 |---|---|
 | `event=startup …` | one INFO at boot: `version=`, **`sha=`** (the deployed commit, read from `/etc/basecradle-router/deployed-sha`), `routes=`, `dedup_ttl=`, `wake_attempts=`, `breaker_*=`. The running daemon *states its own config* — so a Live Tail that looks wrong is first checked here: absent (it never started), stale `sha=` (the merged≠live gap, #54), or thresholds you did not expect. |
 | `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. |
-| `event=route_config …` | one INFO per route that has source-specific config, logged right after the banner: `source=`, then that route's own fields. The basecradle route states `recipient_keys=` and `shared_fallback=` (#236) — once every persona is keyed, an armed fallback and a retired one produce identical traffic, so nothing but this line distinguishes them. |
+| `event=route_config …` | one INFO per route that has source-specific config, logged right after the banner: `source=`, then that route's own fields. The basecradle route states `recipient_keys=` and `shared_fallback=` (#236) — once every agent is keyed, an armed fallback and a retired one produce identical traffic, so nothing but this line distinguishes them. |
 | `event=verify_key …` | which signing key verified a basecradle delivery (#236): `source=`, `key_path=recipient\|fallback`, `recipient=`, `delivery=`. Emitted only *after* the signature checks out — before that the recipient is an unauthenticated claim. `key_path=` and not `key=`, which `event=breaker_tripped` already spends on its scope. |
 | `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
@@ -319,11 +319,11 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the shared fallback integration_secret>
 #
-# Per-recipient signing keys (issue #236) — ONE key per persona, named by its slug
+# Per-recipient signing keys (issue #236) — ONE key per harness agent, named by its slug
 # upper-cased with every character outside [A-Za-z0-9_] replaced by _ (glm-5.2 -> GLM_5_2;
 # a name systemd will not pass through never reaches the daemon at all).
-# A delivery is verified with its own recipient's key; a persona with no key here
-# falls back to the shared value above, so personas rotate one at a time:
+# A delivery is verified with its own recipient's key; an agent with no key here
+# falls back to the shared value above, so agents rotate one at a time:
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT=<@jt's own bc_isk_… integration secret>
 # BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK=1   # set 0 to retire the shared value
 #
@@ -399,10 +399,10 @@ actor allow-list here. A `message.created` delivery resolves to the agent by its
 
 ##### Per-recipient verification keys (issue #236)
 
-An `integration_secret` belongs to **one persona**, so the route selects the verification key by the
+An `integration_secret` belongs to **one agent**, so the route selects the verification key by the
 delivery's `recipient_uuid` rather than verifying everything with one route-wide value. A single shared
-value made all seven fleet personas interchangeable at the signature: any holder of it could forge a
-delivery addressed to any other persona, and one leak meant rotating the whole fleet
+value made all seven harness agents interchangeable at the signature: any holder of it could forge a
+delivery addressed to any other agent, and one leak meant rotating every one of them
 (basecradle/basecradle#497). The route reads `recipient_uuid` out of the still-unverified body, uses it
 for **nothing but key selection** (it is shape-checked to a uuid first, and every way the body can
 disappoint selects no key at all), and then verifies through the same audited HMAC boundary the github
@@ -410,31 +410,31 @@ route uses.
 
 | Variable | Holds |
 |---|---|
-| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_<SLUG>` | that persona's own `integration_secret` |
+| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_<SLUG>` | that agent's own `integration_secret` |
 | `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` | the shared fallback, during the cutover |
 | `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK` | `1` (default) or `0` to retire the fallback |
 
-`<SLUG>` is the persona's **`agents.json` key**, upper-cased with **every character outside
+`<SLUG>` is the agent's **`agents.json` key**, upper-cased with **every character outside
 `[A-Za-z0-9_]` replaced by `_`** — `jt` → `…_WEBHOOK_SECRET_JT`, `glm-5.2` → `…_WEBHOOK_SECRET_GLM_5_2`.
 Not just the hyphen: an environment variable name systemd will pass through to the service is
 `[A-Za-z_][A-Za-z0-9_]*`, and a registry key like `glm-5.2` carries a dot, so a name that kept it would
-never reach the daemon at all — that persona would go on verifying against the *shared* secret after the
+never reach the daemon at all — that agent would go on verifying against the *shared* secret after the
 platform had rotated it, invisible to every boot check below, because a variable systemd dropped is a
 variable that never arrives (issue #236). Keyed by the readable slug and never the uuid: the registry
 already maps one to the other, so nobody transcribes a 36-character uuid into `router.env`, where a typo
 is invisible.
 
-**Four things stop the daemon at boot** rather than surfacing later as one persona quietly failing to
+**Four things stop the daemon at boot** rather than surfacing later as one agent quietly failing to
 verify — the same posture as the github trust allow-list:
 
 - a key set for a **slug no registered agent has** (the error lists the slugs that do exist) — a typo
-  here would leave that persona on the shared secret *after* the platform had rotated it, and **five
+  here would leave that agent on the shared secret *after* the platform had rotated it, and **five
   consecutive verification failures auto-disable an integration on the platform**;
 - a key set to an **empty value** (`""` is a usable HMAC key — one anybody can compute with);
-- **the fallback retired while any registered persona still has no key of its own**, which would leave
-  that persona permanently unverifiable while the box looked perfectly healthy;
+- **the fallback retired while any registered harness agent still has no key of its own**, which would leave
+  that agent permanently unverifiable while the box looked perfectly healthy;
 - **two registry keys normalising onto one variable name** (`glm-5.2` and `glm-5-2` both give
-  `…_GLM_5_2`) — the scrub is lossy, and a shared name means one persona's secret verifies another's
+  `…_GLM_5_2`) — the scrub is lossy, and a shared name means one agent's secret verifies another's
   deliveries, which is the property per-recipient keys exist to remove.
 
 **Watching the cutover.** Every *verified* delivery logs one line naming the key that verified it:
@@ -446,7 +446,7 @@ event=verify_key source=basecradle key_path=recipient recipient=<uuid> delivery=
 `key_path=fallback` is the count that must reach zero before the shared value is retired; a rejection
 names the path it tried in its reason (`… does not match the request body (key_path=fallback)`), so a
 half-landed rotation — platform rotated, box not yet provisioned — reads as `key_path=fallback` failures
-on exactly one persona instead of a mute rise in 401s. The line is emitted only *after* the signature checks out:
+on exactly one agent instead of a mute rise in 401s. The line is emitted only *after* the signature checks out:
 before that the recipient is an unauthenticated claim.
 
 **Provisioning a key.** The value is the router's own verification key, not an agent credential, so it
@@ -454,17 +454,17 @@ belongs in `router.env` (chmod-640, root-owned, read by the daemon) — **never*
 `agent.env`, which the unprivileged daemon deliberately cannot read. It is placed by **@origin's hands
 through the NOC's deploy/converge path**, the same way every other value in `router.env` is; the
 capital coordinates the sequencing, the router-AI never touches the box. A secret **never transits a
-GitHub issue, a PR, a session transcript, or a log line** — the issue coordinates *which persona is
-next*, never the value. Per persona, in this order: the capital rotates the persona's
+GitHub issue, a PR, a session transcript, or a log line** — the issue coordinates *which agent is
+next*, never the value. Per agent, in this order: the capital rotates the agent's
 `integration_secret` on the platform → @origin adds `…_WEBHOOK_SECRET_<SLUG>=<new value>` to
 `router.env` and the daemon is restarted → the capital live-verifies one delivery reaching that agent
 (`key_path=recipient` in the journal, and the agent's `last_ok_at` moving in the evidence document). Keeping
-the gap between the first two steps short is what keeps that persona's deliveries from failing five
-times and auto-disabling its integration. Once every persona reads `key_path=recipient`, retire the shared value: set
+the gap between the first two steps short is what keeps that agent's deliveries from failing five
+times and auto-disabling its integration. Once every agent reads `key_path=recipient`, retire the shared value: set
 `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK=0` and decommission the shared secret on the
 platform side. `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` itself **stays set** — the core requires a
 secret for every enabled route, and with the flag off it is simply never consulted; the daemon refuses
-to start if the flip would strand a persona, and the `event=route_config` line at boot states
+to start if the flip would strand an agent, and the `event=route_config` line at boot states
 `shared_fallback=false` so the retirement is visible rather than assumed.
 
 Both prefixes are scrubbed from the box's telemetry (`deploy/vector.yaml` redacts `bc_isk_…`
@@ -531,7 +531,7 @@ each layer on its own view.
 
 A JSON object of **agent key → fields** — the daemon's wake-resolution table, maintained on the box by
 the operator (the daemon reads it; it never writes it). The key is the agent's stable slug: a GitHub
-builder's key is the `owner/name` repo it captains; a harness persona's key is its bare slug (e.g. `jt`).
+builder's key is the `owner/name` repo it captains; a harness agent's key is its bare slug (e.g. `jt`).
 An entry's `kind` selects how it is read (absent ⇒ `github`); existing github entries are unchanged.
 
 ```jsonc
@@ -543,7 +543,7 @@ An entry's `kind` selects how it is read (absent ⇒ `github`); existing github 
     "clone_path": "/home/basecradle-ruby-ai/repos/basecradle-ruby",
     "bot_slug": "basecradle-ruby-ai"
   },
-  // A harness persona: woken via its OWN wake CLI in its venv, resolved by its
+  // A harness agent: woken via its OWN wake CLI in its venv, resolved by its
   // BaseCradle user uuid. No bot_slug; carries kind/recipient_uuid/wake_bin.
   "jt": {
     "kind": "harness",
@@ -955,7 +955,7 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- <wake command>`,
   where the wake command is `claude -p "<trigger>"` for a builder or `<wake_bin> --timeline "<uuid>"`
-  for a harness persona (#87) — the binary decided by the registry, never the caller's argv. The
+  for a harness agent (#87) — the binary decided by the registry, never the caller's argv. The
   `sudoers` rule is command-generic (it grants only the wrapper), so adding the harness kind needs no
   sudoers change: the registry entry for the new agent is what authorizes its wake.
   It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
@@ -1121,7 +1121,7 @@ secret and on the running daemon actually serving the route):
 | Case | Request | Asserted | Proves |
 |---|---|---|---|
 | 4 | **registered** recipient, **forged** digest | **401** | the HMAC boundary rejects a forgery — against a key that *exists* |
-| 5 | the **same body**, valid digest, a deliberately **non-actionable** event | **200** | the delivery verifies on that persona's **own** key (`key_path=recipient`) and `normalize` then **ignores** it — nothing is woken |
+| 5 | the **same body**, valid digest, a deliberately **non-actionable** event | **200** | the delivery verifies on that agent's **own** key (`key_path=recipient`) and `normalize` then **ignores** it — nothing is woken |
 | 6 | **unregistered** recipient, signed with the **route-wide** secret | **401** retired / **200** armed | which state the **shared fallback** is really in on the box |
 
 Cases 4 and 5 differ in the digest alone, so 401-vs-200 there is the HMAC boundary and nothing else; 5 and
@@ -1132,10 +1132,10 @@ merely self-gated on the fallback flag would have kept the deploy green while pr
 verified, which the status code cannot carry, and the one thing that distinguishes a completed cutover from
 a half-landed one.
 
-The persona under test and its signing key are **discovered from the box** — the registry
+The agent under test and its signing key are **discovered from the box** — the registry
 (`BASECRADLE_ROUTER_AGENTS`) paired with `router.env`, read exactly the way `load_recipient_keyring` reads
-them — so no persona is ever hardcoded here. What keeps case 5 safe against production is the
-**non-actionable event type**, not the recipient: verify really does admit it as that persona, and
+them — so no agent is ever hardcoded here. What keeps case 5 safe against production is the
+**non-actionable event type**, not the recipient: verify really does admit it as that agent, and
 `normalize` is what stops it. `tests/test_smoke_test_assertions.py` reads that event type back out of the
 shipped script and fails if it ever enters the route's `_ACTIONABLE_EVENTS`, so the one edit that would turn
 this gate into a live wake cannot land quietly. The cost is deliberate: an *actionable* basecradle delivery

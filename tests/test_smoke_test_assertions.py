@@ -22,13 +22,13 @@ The second half pins the gate's **basecradle** cases to the daemon (#243). The o
 5 signed an unregistered recipient uuid with the route-wide secret and expected 200 —
 an assertion about the shared-secret fallback, which the per-recipient keyring cutover
 retired. It then failed on every deploy *and* every rollback, so `deploy-router` was
-hard-blocked at every SHA. The replacement signs a **registered** persona's delivery
-with that persona's own key and a deliberately **non-actionable** event, which means
+hard-blocked at every SHA. The replacement signs a **registered** harness agent's delivery
+with that agent's own key and a deliberately **non-actionable** event, which means
 the gate now depends on three daemon-side facts. Each is pinned here rather than
 remembered: the two shell mirrors (`slug_suffix`, `bool_env`) are run against the
 daemon's own functions over one table; the registry reader is run against a fabricated
 `agents.json`; the chosen event type is asserted to be outside `_ACTIONABLE_EVENTS`
-(the one edit that would turn a safe smoke run into a live wake at a real persona);
+(the one edit that would turn a safe smoke run into a live wake at a real agent);
 and the journal regexes are matched against the bytes the route really renders, so a
 field rename moves both halves in the same commit.
 
@@ -310,7 +310,7 @@ NOVA_UUID = "0192bbbb-cccc-7ddd-8eee-ffff00001111"  # Nova Digital's BaseCradle 
 AURORA_UUID = "0192cccc-dddd-7eee-8fff-000011112222"  # Aurora 5.2's, likewise fabricated
 
 # A registry in the shape the daemon reads (deploy/README.md → "The registry"): one
-# github builder (no `kind`) and two harness personas. `aurora-5.2` carries a dot on
+# github builder (no `kind`) and two harness agents. `aurora-5.2` carries a dot on
 # purpose — it is the key whose env-var suffix only survives the WHOLE-charset scrub
 # (#236), so the discovery below fails if the shell mirror ever narrows back to hyphens.
 REGISTRY = json.dumps(
@@ -380,11 +380,11 @@ def _run_registry(env_text: str, snippet: str, tmp_path: Path) -> str:
     "key", ["jt", "nova", "aurora-5.2", "aurora-5-2", "basecradle-harness", "glm_5_2"]
 )
 def test_shell_slug_suffix_agrees_with_the_daemons_own(key: str, tmp_path: Path) -> None:
-    """The gate derives a persona's key variable; the daemon reads it. One rule, two runners.
+    """The gate derives an agent's key variable; the daemon reads it. One rule, two runners.
 
     A divergence here is silent in both directions: the gate would either look up a
     variable that is not there (and quietly fall through to the shared-fallback branch,
-    surrendering the `key_path=recipient` proof) or sign with the wrong persona's key
+    surrendering the `key_path=recipient` proof) or sign with the wrong agent's key
     and fail a healthy daemon. So the shell body and `_slug_suffix` are run over the
     same table and asserted equal.
     """
@@ -417,15 +417,15 @@ def test_shell_bool_env_is_loud_on_a_value_the_daemon_would_refuse(tmp_path: Pat
 
 
 @requires_jq
-def test_registry_personas_lists_only_harness_entries_in_key_order(tmp_path: Path) -> None:
+def test_registry_harness_agents_lists_only_harness_entries_in_key_order(tmp_path: Path) -> None:
     """The github builder is not a basecradle recipient and must never be signed for."""
-    out = _run_registry(ENV_FILE, 'registry_personas "$2"', tmp_path)
+    out = _run_registry(ENV_FILE, 'registry_harness_agents "$2"', tmp_path)
     assert out.splitlines() == [f"aurora-5.2\t{AURORA_UUID}", f"nova\t{NOVA_UUID}"]
 
 
 @requires_jq
-def test_discovery_skips_a_persona_whose_key_is_not_provisioned(tmp_path: Path) -> None:
-    """Mid-cutover, only some personas hold their own key; the gate must find one that does.
+def test_discovery_skips_an_agent_whose_key_is_not_provisioned(tmp_path: Path) -> None:
+    """Mid-cutover, only some agents hold their own key; the gate must find one that does.
 
     `aurora-5.2` sorts first but has no key here, so picking it would sign with an empty
     secret and fail a perfectly healthy daemon.
@@ -451,7 +451,7 @@ def test_discovery_is_deterministic_and_applies_the_whole_charset_scrub(tmp_path
 
 
 @requires_jq
-def test_discovery_reports_nothing_when_no_persona_holds_its_own_key(tmp_path: Path) -> None:
+def test_discovery_reports_nothing_when_no_agent_holds_its_own_key(tmp_path: Path) -> None:
     """A pre-cutover box. The gate must fall to the shared fallback, not sign with "".
 
     Empty is the answer that routes the gate into its `elif` branch; an empty *secret*
@@ -464,9 +464,9 @@ def test_discovery_reports_nothing_when_no_persona_holds_its_own_key(tmp_path: P
 
 
 def test_the_smoke_tests_event_type_is_never_actionable() -> None:
-    """The single fact that keeps case 5 from waking a real persona on every deploy.
+    """The single fact that keeps case 5 from waking a real agent on every deploy.
 
-    Case 5 is signed for a REGISTERED persona with that persona's own key, so verify
+    Case 5 is signed for a REGISTERED harness agent with that agent's own key, so verify
     admits it for real. What stops it there is that `normalize` does not act on this
     event type. Adding it to `_ACTIONABLE_EVENTS` would silently convert the deploy gate
     into a live wake at a real harness with a fabricated timeline uuid — so the event is

@@ -92,8 +92,8 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
         # The keyring is built here, from the same registry the daemon resolves with, so
         # a per-recipient key can only ever be provisioned for an agent that exists
         # (basecradle/basecradle#497). It is loaded eagerly and loudly: a mistyped slug
-        # or a retired fallback with an unprovisioned persona stops the daemon at boot
-        # rather than surfacing as one persona's deliveries quietly failing to verify.
+        # or a retired fallback with an unprovisioned agent stops the daemon at boot
+        # rather than surfacing as one agent's deliveries quietly failing to verify.
         registry.register(BasecradleRoute(load_recipient_keyring(config.recipient_index, env)))
     if ProbeRoute.name in config.enabled_routes:
         # The router's own synthetic wake (basecradle-router#208). Registered exactly

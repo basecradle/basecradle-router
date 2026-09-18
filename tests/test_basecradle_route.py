@@ -4,8 +4,8 @@ Offline only: a fabricated secret and a hand-computed signature, no network. The
 verify boundary is the shared HMAC implementation (also exercised via github), so
 these tests focus on this route's header names and its normalize contract.
 
-Fabricated platform event: a new message lands on a timeline the fleet harness
-persona @jt (``jt``, an AI user) views; the platform signs and POSTs it. @jt's
+Fabricated platform event: a new message lands on a timeline the harness
+agent @jt (``jt``, an AI user) views; the platform signs and POSTs it. @jt's
 fabricated user uuid is a well-formed UUIDv7.
 """
 
@@ -253,10 +253,10 @@ def test_normalize_logs_ignored_event_type_none_when_header_absent(caplog) -> No
 
 # --- per-recipient verification keys (basecradle/basecradle#497) -------------
 #
-# One `integration_secret` per persona, not one per route. The route picks the key by
+# One `integration_secret` per agent, not one per route. The route picks the key by
 # the delivery's `recipient_uuid`, falls back to the route-wide secret while the
 # cutover runs, and — once that fallback is retired — rejects a recipient it holds no
-# key for. Fabricated cast: @jt and @nova, two harness personas with well-formed
+# key for. Fabricated cast: @jt and @nova, two harness agents with well-formed
 # UUIDv7 user uuids and correctly-shaped fake integration secrets.
 
 NOVA_UUID = "019e916c-7f45-700e-afc0-f45557b2aaaa"  # @nova's BaseCradle user uuid
@@ -267,7 +267,7 @@ JT_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}JT"
 NOVA_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}NOVA"
 
 
-def _persona(key: str, recipient_uuid: str) -> Agent:
+def _harness_agent(key: str, recipient_uuid: str) -> Agent:
     return Agent(
         key=key,
         os_user=key,
@@ -279,9 +279,9 @@ def _persona(key: str, recipient_uuid: str) -> Agent:
 
 
 #: The registry's by-``recipient_uuid`` index, as ``load_recipient_keyring`` reads it.
-PERSONAS = {
-    JT_UUID: _persona("jt", JT_UUID),
-    NOVA_UUID: _persona("nova", NOVA_UUID),
+RECIPIENTS = {
+    JT_UUID: _harness_agent("jt", JT_UUID),
+    NOVA_UUID: _harness_agent("nova", NOVA_UUID),
 }
 
 
@@ -307,14 +307,14 @@ def test_a_provisioned_recipient_is_verified_with_its_own_key() -> None:
 
 def test_a_provisioned_recipient_no_longer_accepts_the_shared_secret() -> None:
     # The whole point of the change: once @jt is rotated, the value the other six
-    # personas still share stops being able to speak for @jt. Without this assertion the
+    # agents still share stops being able to speak for @jt. Without this assertion the
     # feature could be entirely inert and every other test here would still pass.
     route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
     with pytest.raises(SignatureError, match="does not match"):
         route.verify(_keyed_request(SECRET), SECRET)
 
 
-def test_one_personas_key_cannot_sign_for_another() -> None:
+def test_one_agents_key_cannot_sign_for_another() -> None:
     # The forgery the shared secret allowed: @nova signing a delivery addressed to @jt.
     route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY, NOVA_UUID: NOVA_KEY}))
     with pytest.raises(SignatureError, match="does not match"):
@@ -324,7 +324,7 @@ def test_one_personas_key_cannot_sign_for_another() -> None:
 def test_an_unprovisioned_recipient_still_verifies_against_the_shared_secret() -> None:
     # The backward-compatible half: @nova has not been rotated yet, so its deliveries
     # keep verifying while @jt's already use @jt's own key. This is what lets the
-    # platform rotate one persona at a time.
+    # platform rotate one agent at a time.
     route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
     route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), SECRET)
 
@@ -437,22 +437,22 @@ def test_the_rejection_names_the_fallback_path_when_that_is_what_was_tried(caplo
 
 def test_the_keyring_defaults_to_empty_with_the_fallback_on() -> None:
     # No per-recipient vars set: today's deployment, unchanged.
-    keyring = load_recipient_keyring(PERSONAS, {})
+    keyring = load_recipient_keyring(RECIPIENTS, {})
     assert dict(keyring.by_recipient) == {}
     assert keyring.shared_fallback is True
 
 
-def test_a_key_is_loaded_under_the_personas_uuid_not_its_slug() -> None:
+def test_a_key_is_loaded_under_the_agents_uuid_not_its_slug() -> None:
     # The registry is what maps @jt's readable slug to the uuid the platform signs
     # for, so an operator never transcribes a uuid into router.env.
-    keyring = load_recipient_keyring(PERSONAS, {JT_SECRET_VAR: JT_KEY})
+    keyring = load_recipient_keyring(RECIPIENTS, {JT_SECRET_VAR: JT_KEY})
     assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
 
 
 def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
-    personas = {JT_UUID: _persona("basecradle-harness", JT_UUID)}
+    recipients = {JT_UUID: _harness_agent("basecradle-harness", JT_UUID)}
     keyring = load_recipient_keyring(
-        personas, {f"{RECIPIENT_SECRET_PREFIX}BASECRADLE_HARNESS": JT_KEY}
+        recipients, {f"{RECIPIENT_SECRET_PREFIX}BASECRADLE_HARNESS": JT_KEY}
     )
     assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
 
@@ -460,11 +460,11 @@ def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
 def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
     # The registry key `glm-5.2` is not a bare [a-z0-9-] slug, and a hyphens-only rule
     # left the dot in place: `…_WEBHOOK_SECRET_GLM_5.2` is not a name systemd passes
-    # through, so the value never reached the daemon and that persona stayed on the
+    # through, so the value never reached the daemon and that agent stayed on the
     # shared secret after the platform had rotated it — silent, and unreachable by
     # every guard below, because the variable simply never arrives.
-    personas = {JT_UUID: _persona("glm-5.2", JT_UUID)}
-    keyring = load_recipient_keyring(personas, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": JT_KEY})
+    recipients = {JT_UUID: _harness_agent("glm-5.2", JT_UUID)}
+    keyring = load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": JT_KEY})
     assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
 
 
@@ -483,7 +483,7 @@ _SYSTEMD_ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
         "basecradle-harness",
         "5-alive",
         "a.b c",
-        "persona!",
+        "agent!",
         "caf\u00e9",
         "\u00df-one",
         "x/y",
@@ -496,18 +496,18 @@ def test_a_derived_variable_name_is_always_one_systemd_will_pass_through(key: st
     # this refuses is a key whose secret is silently never consulted.
     var = RECIPIENT_SECRET_PREFIX + _slug_suffix(key)
     assert _SYSTEMD_ENV_NAME.fullmatch(var), var
-    # And that legal name is the one the loader actually provisions the persona from.
-    personas = {JT_UUID: _persona(key, JT_UUID)}
-    assert dict(load_recipient_keyring(personas, {var: JT_KEY}).by_recipient) == {JT_UUID: JT_KEY}
+    # And that legal name is the one the loader actually provisions the agent from.
+    recipients = {JT_UUID: _harness_agent(key, JT_UUID)}
+    assert dict(load_recipient_keyring(recipients, {var: JT_KEY}).by_recipient) == {JT_UUID: JT_KEY}
 
 
 def test_the_unknown_slug_error_names_the_normalised_variable_not_the_raw_slug() -> None:
     # An operator following the old hyphens-only rule writes `…_GLM_5.2`. On the box
     # systemd drops that name before the daemon sees it; anywhere it does arrive it is
     # loud, and the error names the spelling that works.
-    personas = {JT_UUID: _persona("glm-5.2", JT_UUID)}
+    recipients = {JT_UUID: _harness_agent("glm-5.2", JT_UUID)}
     with pytest.raises(ConfigError) as caught:
-        load_recipient_keyring(personas, {f"{RECIPIENT_SECRET_PREFIX}GLM_5.2": JT_KEY})
+        load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5.2": JT_KEY})
     assert f"{RECIPIENT_SECRET_PREFIX}GLM_5_2" in str(caught.value)
 
 
@@ -519,16 +519,16 @@ def test_the_per_recipient_prefix_is_the_route_wide_variable_plus_a_slug() -> No
 
 
 def test_a_key_for_an_unknown_slug_is_a_loud_error() -> None:
-    # The cutover's worst silent failure: a typo'd slug leaves that persona on the
+    # The cutover's worst silent failure: a typo'd slug leaves that agent on the
     # shared secret after the platform has already rotated it, and five failed
     # deliveries auto-disable its integration.
     with pytest.raises(ConfigError, match="names no registered agent"):
-        load_recipient_keyring(PERSONAS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
+        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
 
 
 def test_the_unknown_slug_error_lists_the_slugs_that_do_exist() -> None:
     with pytest.raises(ConfigError) as caught:
-        load_recipient_keyring(PERSONAS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
+        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
     assert JT_SECRET_VAR in str(caught.value)
     assert NOVA_SECRET_VAR in str(caught.value)
 
@@ -536,54 +536,54 @@ def test_the_unknown_slug_error_lists_the_slugs_that_do_exist() -> None:
 def test_an_empty_key_is_a_loud_error_never_an_empty_hmac_key() -> None:
     # "" is a perfectly usable HMAC key — one an attacker can also compute with.
     with pytest.raises(ConfigError, match="set but empty"):
-        load_recipient_keyring(PERSONAS, {JT_SECRET_VAR: "   "})
+        load_recipient_keyring(RECIPIENTS, {JT_SECRET_VAR: "   "})
 
 
 @pytest.mark.parametrize("other", ["jt_one", "jt.one", "jt one"])
 def test_two_slugs_colliding_on_one_variable_are_a_loud_error(other: str) -> None:
     # Scrubbing the whole character class is lossy, so more keys collapse together than
     # the hyphen rule collapsed. Each collision is boot-fatal rather than resolved: two
-    # personas sharing one variable means one persona's secret verifies the other's
+    # agents sharing one variable means one agent's secret verifies the other's
     # deliveries, which is the property per-recipient keys exist to remove.
-    personas = {
-        JT_UUID: _persona("jt-one", JT_UUID),
-        NOVA_UUID: _persona(other, NOVA_UUID),
+    recipients = {
+        JT_UUID: _harness_agent("jt-one", JT_UUID),
+        NOVA_UUID: _harness_agent(other, NOVA_UUID),
     }
     with pytest.raises(ConfigError, match="both map to"):
-        load_recipient_keyring(personas, {})
+        load_recipient_keyring(recipients, {})
 
 
 @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off"])
 def test_the_fallback_can_be_retired_by_flag(raw: str) -> None:
     keyring = load_recipient_keyring(
-        PERSONAS, {SHARED_FALLBACK_VAR: raw, JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
+        RECIPIENTS, {SHARED_FALLBACK_VAR: raw, JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
     )
     assert keyring.shared_fallback is False
 
 
 @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", "", "   "])
 def test_the_fallback_stays_on_for_every_truthy_or_absent_value(raw: str) -> None:
-    assert load_recipient_keyring(PERSONAS, {SHARED_FALLBACK_VAR: raw}).shared_fallback is True
+    assert load_recipient_keyring(RECIPIENTS, {SHARED_FALLBACK_VAR: raw}).shared_fallback is True
 
 
 def test_an_unparseable_fallback_flag_is_a_loud_error() -> None:
     # A security switch must never read "flase" as "leave the fallback on".
     with pytest.raises(ConfigError, match=SHARED_FALLBACK_VAR):
-        load_recipient_keyring(PERSONAS, {SHARED_FALLBACK_VAR: "flase"})
+        load_recipient_keyring(RECIPIENTS, {SHARED_FALLBACK_VAR: "flase"})
 
 
-def test_retiring_the_fallback_with_an_unprovisioned_persona_refuses_to_boot() -> None:
-    # The combination that would make a persona permanently unreachable while the box
+def test_retiring_the_fallback_with_an_unprovisioned_agent_refuses_to_boot() -> None:
+    # The combination that would make an agent permanently unreachable while the box
     # looked perfectly healthy — the green-while-absent shape this repo instruments
     # everywhere else. It is caught at boot, by name.
     with pytest.raises(ConfigError, match="nova") as caught:
-        load_recipient_keyring(PERSONAS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY})
+        load_recipient_keyring(RECIPIENTS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY})
     assert SHARED_FALLBACK_VAR in str(caught.value)
 
 
-def test_retiring_the_fallback_is_accepted_once_every_persona_is_provisioned() -> None:
+def test_retiring_the_fallback_is_accepted_once_every_agent_is_provisioned() -> None:
     keyring = load_recipient_keyring(
-        PERSONAS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
+        RECIPIENTS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
     )
     assert keyring.shared_fallback is False
     assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY, NOVA_UUID: NOVA_KEY}
@@ -591,7 +591,7 @@ def test_retiring_the_fallback_is_accepted_once_every_persona_is_provisioned() -
 
 def test_the_loader_ignores_environment_it_does_not_own() -> None:
     keyring = load_recipient_keyring(
-        PERSONAS, {"PATH": "/usr/bin", "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET": SECRET}
+        RECIPIENTS, {"PATH": "/usr/bin", "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET": SECRET}
     )
     assert dict(keyring.by_recipient) == {}
 
@@ -600,7 +600,7 @@ def test_the_loader_ignores_environment_it_does_not_own() -> None:
 
 
 def test_the_route_states_its_keyring_at_boot() -> None:
-    # Once every persona is keyed, an armed fallback and a retired one produce
+    # Once every agent is keyed, an armed fallback and a retired one produce
     # identical traffic — every delivery reads key=recipient either way. Nothing but
     # a boot statement can tell a finished cutover from a forgotten last step.
     route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}, shared_fallback=False))

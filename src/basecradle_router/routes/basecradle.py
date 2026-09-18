@@ -14,10 +14,10 @@ actor allow-list here as there is on github, where any org actor can fire a
 webhook.
 
 **The key is chosen per recipient, not per route** (basecradle/basecradle#497).
-An ``integration_secret`` belongs to *one persona*, so a single route-wide value
-made all seven fleet personas share one signing key: any one of them (or anyone
+An ``integration_secret`` belongs to *one agent*, so a single route-wide value
+made all seven harness agents share one signing key: any one of them (or anyone
 who ever saw that value) could forge a delivery addressed to any other, and one
-leak meant rotating the whole fleet. So the route carries a
+leak meant rotating every one of them. So the route carries a
 :class:`RecipientKeyring` and selects the verification key by the delivery's
 ``recipient_uuid`` — the standard multi-tenant webhook pattern: **parse to route,
 then verify before trusting anything else.** The parse ahead of verification reads
@@ -29,12 +29,12 @@ there exactly as it is today. Nothing skips verification, and no branch of the
 selection can widen what a valid signature means.
 
 During the cutover the route-wide secret the core passes in remains the
-**fallback**, so the platform rotates personas one at a time; the key path that
+**fallback**, so the platform rotates keys one agent at a time; the key path that
 verified each delivery is logged (``event=verify_key … key_path=recipient|fallback``)
 so the cutover is watchable in Better Stack rather than inferred. Retiring the
 fallback is one env flag (:data:`SHARED_FALLBACK_VAR`), and it is *safe* to flip
 because :func:`load_recipient_keyring` refuses to boot a daemon whose fallback is
-retired while any registered persona still has no key of its own — the exact
+retired while any registered harness agent still has no key of its own — the exact
 "capability silently absent" shape this repo instruments everywhere else.
 
 :meth:`BasecradleRoute.normalize` turns a verified delivery in the actionable set
@@ -105,7 +105,7 @@ RECIPIENT_SECRET_PREFIX = f"{route_secret_var(ROUTE_NAME)}_"
 #: Env flag retiring the shared route-wide fallback at the end of the cutover.
 #: Defaults to **enabled**, which is today's behaviour exactly; setting it false is
 #: the single act that ends the shared-secret era. See :func:`load_recipient_keyring`
-#: for why flipping it cannot silently strand a persona.
+#: for why flipping it cannot silently strand an agent.
 SHARED_FALLBACK_VAR = f"{ENV_PREFIX}{ROUTE_NAME.upper()}_SHARED_SECRET_FALLBACK"
 
 #: The two values of the ``key=`` field on a ``verify_key`` line — the whole point of
@@ -176,10 +176,10 @@ _ACTIONABLE_EVENTS = frozenset(
 class RecipientKeyring:
     """Which signing key verifies which recipient's deliveries.
 
-    ``by_recipient`` maps a persona's BaseCradle user uuid to *that persona's own*
+    ``by_recipient`` maps a harness agent's BaseCradle user uuid to *that agent's own*
     ``integration_secret``. ``shared_fallback`` says whether a recipient with no key
     of its own may still be verified with the route-wide secret the core passes into
-    :meth:`BasecradleRoute.verify` — true during the cutover, false once every persona
+    :meth:`BasecradleRoute.verify` — true during the cutover, false once every agent
     has been rotated.
 
     The keyring holds only the *selection* rule, never the comparison: the digest is
@@ -232,27 +232,27 @@ def load_recipient_keyring(
 
     ``recipients`` is the registry's by-``recipient_uuid`` index
     (:attr:`~basecradle_router.config.Config.recipient_index`) — the authority on which
-    uuid is which persona, so a key provisioned as ``…_SECRET_JT`` lands under @jt's
+    uuid is which agent, so a key provisioned as ``…_SECRET_JT`` lands under @jt's
     uuid without an operator ever transcribing one.
 
     Three things are loud here rather than silent, because each of them is a way the
     cutover fails while looking fine:
 
     * **A key set for an unknown slug** is a :class:`ConfigError` naming the variable
-      and listing the slugs that do exist. A typo'd persona name would otherwise leave
-      that persona verifying against the *shared* secret while the platform had already
+      and listing the slugs that do exist. A typo'd slug would otherwise leave
+      that agent verifying against the *shared* secret while the platform had already
       rotated it — five failed deliveries auto-disable the integration, and the box
       would have shown nothing wrong.
     * **A key set to an empty value** is a :class:`ConfigError`. An empty secret is a
       real HMAC key, so it would verify a signature an attacker can compute.
-    * **A retired fallback with an unprovisioned persona** is a :class:`ConfigError`
-      naming every such persona. That combination is a wake edge that can never fire
+    * **A retired fallback with an unprovisioned agent** is a :class:`ConfigError`
+      naming every such agent. That combination is a wake edge that can never fire
       again — permanently unreachable, perfectly green — which is precisely the class
       of failure this repo exists to make impossible to hold silently.
 
     Two registry keys that normalise to the same variable name are also a
     :class:`ConfigError`: the mapping from slug to env var must be a bijection or one
-    persona's key silently verifies another's deliveries. That normalisation is lossy
+    agent's key silently verifies another's deliveries. That normalisation is lossy
     (:func:`_slug_suffix` scrubs every character a variable name may not carry, so
     ``glm-5.2`` and ``glm-5-2`` collapse together), which is exactly why the collision
     is checked rather than assumed away.
@@ -262,30 +262,30 @@ def load_recipient_keyring(
 
     # var name -> the (uuid, agent) it provisions. The uuid is taken from the index's
     # own key rather than from ``agent.recipient_uuid``: it is the value resolution
-    # will actually look this persona up by, so the keyring and the resolver cannot
+    # will actually look this agent up by, so the keyring and the resolver cannot
     # disagree about who a key belongs to.
-    var_for_persona: dict[str, tuple[str, Agent]] = {}
+    var_for_agent: dict[str, tuple[str, Agent]] = {}
     for uuid, agent in recipients.items():
         var = RECIPIENT_SECRET_PREFIX + _slug_suffix(agent.key)
-        claimed = var_for_persona.get(var)
+        claimed = var_for_agent.get(var)
         if claimed is not None and claimed[0] != uuid:
             raise ConfigError(
                 f"agent keys {claimed[1].key!r} and {agent.key!r} both map to {var}; "
-                "per-recipient signing keys must be addressable one persona at a time"
+                "per-recipient signing keys must be addressable one agent at a time"
             )
-        var_for_persona[var] = (uuid, agent)
+        var_for_agent[var] = (uuid, agent)
 
     by_recipient: dict[str, str] = {}
     for var, value in env.items():
         if not var.startswith(RECIPIENT_SECRET_PREFIX):
             continue
-        persona = var_for_persona.get(var)
-        if persona is None:
-            known = ", ".join(sorted(var_for_persona)) or "(no harness personas registered)"
+        entry = var_for_agent.get(var)
+        if entry is None:
+            known = ", ".join(sorted(var_for_agent)) or "(no harness agents registered)"
             raise ConfigError(f"{var} names no registered agent; expected one of: {known}")
         if not value.strip():
             raise ConfigError(f"{var} is set but empty; unset it to fall back, or give it a key")
-        by_recipient[persona[0]] = value
+        by_recipient[entry[0]] = value
 
     if not fallback:
         unprovisioned = sorted(
@@ -294,7 +294,7 @@ def load_recipient_keyring(
         if unprovisioned:
             raise ConfigError(
                 f"{SHARED_FALLBACK_VAR} is off but no per-recipient signing key is set for "
-                f"{', '.join(unprovisioned)}; those personas could never be verified again "
+                f"{', '.join(unprovisioned)}; those agents could never be verified again "
                 f"(set {RECIPIENT_SECRET_PREFIX}<SLUG>, or leave the fallback on until they "
                 "are rotated)"
             )
@@ -321,7 +321,7 @@ def _slug_suffix(key: str) -> str:
     already is not a bare ``[a-z0-9-]`` slug: ``glm-5.2`` carries a dot. A hyphens-only
     rule left that dot in place and produced ``…_WEBHOOK_SECRET_GLM_5.2`` — a name
     outside systemd's ``[A-Za-z_][A-Za-z0-9_]*``, which it does not pass through to the
-    service. The daemon would never see the value, so that persona would keep
+    service. The daemon would never see the value, so that agent would keep
     verifying against the *shared* secret after the platform had rotated it — and no
     guard in :func:`load_recipient_keyring` can fire on a variable that never arrives.
     That is the same silently-absent capability those guards exist to foreclose,
@@ -333,8 +333,8 @@ def _slug_suffix(key: str) -> str:
     every name this derives.
 
     Lossy on purpose: ``glm-5.2``, ``glm-5-2`` and ``glm_5_2`` all collapse to one
-    name. That is a collision the caller raises on rather than resolves — a persona's
-    key must be addressable one at a time or one persona's secret verifies another's
+    name. That is a collision the caller raises on rather than resolves — an agent's
+    key must be addressable one at a time or one agent's secret verifies another's
     deliveries.
     """
     return _ENV_NAME_UNSAFE.sub("_", key.upper())
@@ -365,7 +365,7 @@ class BasecradleRoute:
     """The BaseCradle webhook route. ``name`` is the source key the registry uses."""
 
     name = ROUTE_NAME
-    #: A harness persona is addressed by its BaseCradle user uuid, so its events
+    #: A harness agent is addressed by its BaseCradle user uuid, so its events
     #: resolve by ``Recipient(by="recipient_uuid", …)`` — see
     #: :class:`~basecradle_router.routes.base.Route`.
     recipient_kind = "recipient_uuid"
@@ -388,7 +388,7 @@ class BasecradleRoute:
     def boot_summary(self) -> str:
         """What this route booted with, for the line beside the startup banner.
 
-        Two fields, and the second is the load-bearing one: once every persona holds
+        Two fields, and the second is the load-bearing one: once every agent holds
         its own key, an *armed* shared fallback and a *retired* one produce byte-
         identical traffic — every delivery reads ``key_path=recipient`` either way — so no
         per-delivery line can tell a completed cutover from one where the last step was
@@ -415,7 +415,7 @@ class BasecradleRoute:
         Which key path was used is stated in one ``event=verify_key`` line per
         *verified* delivery, and named in the rejection reason otherwise — so a
         cutover step that half-landed (the platform rotated, the box did not) reads as
-        ``key_path=fallback`` failures on exactly one persona, rather than as a mute
+        ``key_path=fallback`` failures on exactly one agent, rather than as a mute
         rise in 401s. The line is emitted only after the signature checks out: before
         that the recipient is a claim, not a fact, and a log line asserting an
         unverified one would be the forgeable field in an otherwise-trustworthy record.
@@ -497,7 +497,7 @@ def _recipient_hint(body: bytes) -> str | None:
     that is not uuid-shaped — answers ``None``, which selects no per-recipient key and
     leaves the delivery to the shared secret and, failing that, to rejection. So a body
     an attacker controls cannot steer key selection anywhere except *away* from a
-    persona's own key, and it can never reach the journal in a shape that would forge a
+    agent's own key, and it can never reach the journal in a shape that would forge a
     record there.
 
     ``normalize`` re-reads the field from the verified body through the strict

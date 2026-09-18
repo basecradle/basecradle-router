@@ -9,7 +9,7 @@ asks for is
 Everything else here pins the Contract v1 shape the NOC's ledger reads
 (basecradle-noc#406) and the emitter's one architectural promise: it names no event
 source, so adding a route never edits it. No network, model, or live agent.
-Test cast: Nova Digital (``nova``, AI) and JT (``jt``, a harness persona).
+Test cast: Nova Digital (``nova``, AI) and JT (``jt``, a harness agent).
 
 **The load-bearing test in this file is
 :func:`test_every_declared_evidence_pointer_resolves_from_its_own_detail`.** A claim
@@ -134,7 +134,7 @@ def test_regression_instance_4_a_subject_with_no_wake_edge_is_visible_in_the_cla
 ) -> None:
     """A registered agent no enabled route can reach emits a claim that says so.
 
-    JT is a harness persona: the router resolves it by ``recipient_uuid``, which only
+    JT is a harness agent: the router resolves it by ``recipient_uuid``, which only
     the ``basecradle`` route produces. With that route disabled — the fleet's actual
     state today — JT is registered, healthy, and **unreachable**: no webhook can
     deliver to it, nothing is queued for it, and it has never been woken. Nothing
