@@ -38,7 +38,7 @@ EVENT = Event(
     origin=IssueRef(repo=NOVA.key, number=42, url=ISSUE_URL, title="Mirror the wire-shape change"),
 )
 
-# A harness persona (@jt): woken via its own wake CLI, not claude.
+# A harness agent (@jt): woken via its own wake CLI, not claude.
 JT = Agent(
     key="jt",
     os_user="jt",
@@ -90,7 +90,7 @@ def test_wake_assembles_command_cwd_env_and_run_as_user() -> None:
     assert result.stdout == "done"
 
 
-def test_wake_assembles_the_harness_command_for_a_persona() -> None:
+def test_wake_assembles_the_harness_command_for_a_harness_agent() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
     waker = SubprocessWaker(runner=runner)
 
@@ -282,7 +282,7 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
 
 
 def test_home_server_waker_assembles_the_harness_wake_command() -> None:
-    # A harness persona is woken via its registry-pinned wake CLI, not claude:
+    # A harness agent is woken via its registry-pinned wake CLI, not claude:
     # sudo <wrapper> --user jt --cwd <home> --delivery ID -- <wake_bin> --timeline <uuid>.
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
     result = HomeServerWaker(runner=runner).wake(JT, JT_EVENT)

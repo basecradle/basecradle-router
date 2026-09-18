@@ -209,7 +209,7 @@ def test_create_app_wires_the_self_comment_guard(tmp_path) -> None:
 
 # --- the basecradle route's per-recipient keyring is wired here (#497) --------
 #
-# Fabricated cast: @jt, a harness persona registered alongside Nova's builder entry.
+# Fabricated cast: @jt, a harness agent registered alongside Nova's builder entry.
 
 JT = Agent(
     key="jt",
@@ -222,8 +222,8 @@ JT = Agent(
 JT_KEY = "bc_isk_fakejtintegrationsigningkey0001"
 
 
-def _env_with_persona(tmp_path) -> dict[str, str]:
-    path = tmp_path / "agents-with-persona.json"
+def _env_with_harness_agent(tmp_path) -> dict[str, str]:
+    path = tmp_path / "agents-with-harness-agent.json"
     path.write_text(
         json.dumps(
             {
@@ -254,7 +254,7 @@ def _env_with_persona(tmp_path) -> dict[str, str]:
 def test_create_app_wires_the_per_recipient_keyring(tmp_path) -> None:
     # The wiring proof: a key provisioned in the environment must reach the route, or
     # the whole feature is inert on the box while every unit test still passes.
-    env = _env_with_persona(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY}
+    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY}
     route = build_registry(load_config(env), env).get("basecradle")
 
     assert dict(route.keyring.by_recipient) == {JT.recipient_uuid: JT_KEY}
@@ -262,9 +262,9 @@ def test_create_app_wires_the_per_recipient_keyring(tmp_path) -> None:
 
 
 def test_a_misprovisioned_key_stops_the_daemon_at_boot(tmp_path) -> None:
-    # Loud at boot, not as one persona's deliveries quietly failing to verify. The
+    # Loud at boot, not as one agent's deliveries quietly failing to verify. The
     # daemon refusing to start is what the NOC's converge and the box's alarms see.
-    env = _env_with_persona(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
+    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
     with pytest.raises(ConfigError, match="names no registered agent"):
         create_app(env, waker=_RecordingWaker())
 

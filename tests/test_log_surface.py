@@ -185,7 +185,7 @@ def test_the_command_line_drop_is_unconditional_not_an_identifier_allow_list() -
 
 def test_basecradle_integration_signing_keys_are_redacted() -> None:
     # THIS box is where `bc_isk_…` values live: the router verifies each platform
-    # delivery's HMAC with the recipient persona's own integration secret, so all of
+    # delivery's HMAC with the recipient agent's own integration secret, so all of
     # them sit in router.env and are read into the daemon's environment
     # (basecradle/basecradle#497). The pre-existing `bc_uat_` rule covers *user access
     # tokens* and never matched these — a distinct prefix needs its own rule, and the

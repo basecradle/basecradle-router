@@ -3,7 +3,7 @@
 Before basecradle-router#168 the caller (the router) captured the wake's
 stdout+stderr and dropped it, so the harness's per-step ledger (`step N/M …`,
 `wake used X/N steps`) reached journald *nowhere*. The wrapper now `exec`s the wake
-through `systemd-cat --identifier=basecradle-wake-<os_user>`, so one persona's
+through `systemd-cat --identifier=basecradle-wake-<os_user>`, so one agent's
 wake output is greppable via `journalctl -t basecradle-wake-<slug>`.
 
 A full behavioural exec of wake-runner is not offline-testable — it gates on

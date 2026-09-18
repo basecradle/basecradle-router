@@ -649,7 +649,7 @@ def test_the_banner_is_followed_by_each_routes_own_config_line(caplog) -> None:
     # The banner states the CORE's config and stays route-agnostic; a route's own
     # settings are its to describe (basecradle/basecradle#497). For the basecradle
     # route that matters because "shared fallback armed" and "shared fallback retired"
-    # produce identical traffic once every persona is keyed — no per-delivery line can
+    # produce identical traffic once every agent is keyed — no per-delivery line can
     # tell them apart, so the daemon says which it booted with.
     registry = RouteRegistry()
     registry.register(GithubRoute(TRUSTED_ACTORS))

@@ -228,7 +228,7 @@ def route_boot_summary(route: object) -> str | None:
     source's vocabulary. But some of those settings are exactly the kind that must be
     stated at boot rather than discovered mid-incident — the basecradle route's shared
     signing fallback is a security control whose *absence* and whose *presence* produce
-    identical traffic once every persona is keyed, so nothing else in the log can
+    identical traffic once every agent is keyed, so nothing else in the log can
     distinguish "retired" from "we forgot to retire it".
 
     Read by duck-typing rather than through the :class:`Route` protocol so a route with

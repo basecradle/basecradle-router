@@ -72,8 +72,8 @@ class Config:
     """Everything the daemon needs that isn't code.
 
     ``agents`` maps an agent's stable ``key`` (a ``owner/name`` repo for a github
-    builder, a bare slug for a harness persona) to the agent to wake;
-    ``recipient_index`` maps a harness persona's BaseCradle user uuid to the same
+    builder, a bare slug for a harness agent) to the agent to wake;
+    ``recipient_index`` maps a harness agent's BaseCradle user uuid to the same
     agent, so a basecradle event resolves by ``recipient_uuid`` while github
     resolves by repo; ``harness_index`` maps every agent's ``harness_key`` (its OS
     user — the universal identity) to it, which is how a source that addresses an
@@ -101,7 +101,7 @@ class Config:
 
         Dispatches on the recipient's source-set tag without naming any source:
         ``"repo"`` is a direct key lookup (a github builder's key *is* its repo);
-        ``"recipient_uuid"`` consults the harness-persona index; ``"harness_key"``
+        ``"recipient_uuid"`` consults the harness-agent index; ``"harness_key"``
         consults the by-OS-user index. An unknown tag or an unregistered value is a
         loud :class:`ConfigError` (a registry gap), never a silent miss.
         """
@@ -138,11 +138,11 @@ class Config:
         looking perfectly healthy.
 
         A ``"repo"`` entry requires the key to be repo-shaped as well as present:
-        every agent is in ``agents``, but a harness persona is keyed by a bare slug
+        every agent is in ``agents``, but a harness agent is keyed by a bare slug
         that no ``Recipient(by="repo", …)`` can ever carry.
 
         ``"harness_key"`` is the tag every registered agent carries, builder and
-        persona alike — it is the OS user, the universal identity. It is still
+        harness agent alike — it is the OS user, the universal identity. It is still
         checked against the index rather than assumed, for the same reason as the
         other two: the answer must be *what resolution would actually do*, so that
         two registry entries collapsing onto one harness instance report the tag for
@@ -198,7 +198,7 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent], dict[st
 
     An entry's ``kind`` selects how it is read: absent or ``"github"`` is a
     builder (keyed by its ``owner/name`` repo, woken via ``claude``); ``"harness"``
-    is a non-builder persona (keyed by its bare slug, woken via its ``wake_bin``,
+    is a non-builder harness agent (keyed by its bare slug, woken via its ``wake_bin``,
     resolved for basecradle events by its ``recipient_uuid``). Existing github
     entries — which carry no ``kind`` — therefore load unchanged.
 
@@ -207,7 +207,7 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent], dict[st
     OS user are *one harness instance* by definition (constitution → unified
     identity, and the reason the lock is keyed on it), so the first in registry
     order wins rather than raising: unlike a duplicated ``recipient_uuid`` — which
-    would misroute one persona's events to another — a shared ``harness_key``
+    would misroute one agent's events to another — a shared ``harness_key``
     resolves to the same instance either way, which is the correct answer.
     """
     try:
@@ -231,7 +231,7 @@ def _load_agents(path: str) -> tuple[dict[str, Agent], dict[str, Agent], dict[st
         elif kind == "harness":
             agent = _build_harness_agent(key, fields)
             # The recipient_uuid index must be a bijection: two entries claiming the
-            # same uuid would silently misroute one persona's events to the other.
+            # same uuid would silently misroute one agent's events to the other.
             # Fail loudly, matching the rest of load_config's posture (no silent miss).
             if agent.recipient_uuid in by_recipient:
                 raise ConfigError(
@@ -273,7 +273,7 @@ def _build_github_agent(key: str, fields: dict) -> Agent:
 
 
 def _build_harness_agent(key: str, fields: dict) -> Agent:
-    # A harness persona is keyed by a bare slug, never an ``owner/name`` repo —
+    # A harness agent is keyed by a bare slug, never an ``owner/name`` repo —
     # which keeps it out of the github key-space, so a ``Recipient(by="repo")``
     # lookup can never resolve to a harness agent and feed it a builder's trigger.
     if "/" in key:

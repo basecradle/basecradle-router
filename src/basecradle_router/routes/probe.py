@@ -12,7 +12,7 @@ consent or trust surface (``constitution.md`` → Operational Baselines): a chec
 the layer that *owns* the property it proves, and the system is never widened to make a
 monitor go green. The retired design probed the wake seam by posting a signed marker
 into each agent's own BaseCradle timeline, which required mutual trust between the
-monitor and every persona — a prompt-injection channel into the fleet's most privileged
+monitor and every agent — a prompt-injection channel into the fleet's most privileged
 agent, manufactured N times over, to make a health check pass. **The router owns the
 router→agent wake edge, so the router proves it** — on-box, over loopback, with no
 platform account, no timeline, and no relationship with anyone
@@ -38,9 +38,9 @@ bypassed verification would prove nothing about the edge that matters.
 
 **Recipients are named by ``harness_key``** — the agent's OS user, its universal identity
 (``CLAUDE.md`` → Naming: one slug, everywhere). Deliberately not a repo and not a
-platform uuid: those are one source's naming, and a builder has no uuid while a persona
+platform uuid: those are one source's naming, and a builder has no uuid while a harness agent
 has no repo. Every registered agent has a harness key, so one probe mechanism reaches
-every agent — builder and persona alike, @jt included, with no special case
+every agent — builder and harness agent alike, @jt included, with no special case
 (`basecradle-noc#421`, the founder's "one rule, every agent").
 
 **What a probe must never be able to do is masquerade as real traffic.** It cannot,
