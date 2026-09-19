@@ -50,6 +50,14 @@
 # it is asserted unconditionally: the probe route can fire a wake at any registered
 # agent, so its reachability from the internet must never quietly become true.
 #
+# The last case sends no webhook. It looks inside the daemon's own mount namespace,
+# the one every wake inherits (#271):
+#
+#   9. as the unit's User=, inside that namespace -> PID 1 invisible (another account's
+#                                                     argv cannot be read from a wake)
+#
+# It is asserted unconditionally for the same reason as case 7.
+#
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
 # router.env, which is root-readable only). The NOC's deploy-router op runs it on-box
 # after a restart, rolling the deploy back on failure; you can also run it by hand:
@@ -555,6 +563,110 @@ else
 		check "probe bad signature rejected on loopback" 401 "$probe_local"
 	fi
 fi
+
+# --- the wake's /proc: other accounts' argv stays hidden (#271) ---------------
+#
+# The box mounts /proc with `hidepid=invisible` so no account can read another's argv
+# (basecradle-noc#694). That control did not reach a single agent session: the unit's
+# sandbox gives it a private mount namespace with a fresh procfs instance, a procfs
+# instance carries its own options, and every wake is a child of the unit. From inside
+# a session the ruby agent read root's and vector's full argv (basecradle#545). The
+# unit now mounts that instance with ProtectProc=invisible.
+#
+#   9. inside the unit's mount namespace, as its User=  -> PID 1 is invisible
+#
+# Asserted here, live, rather than trusted to the unit file, because systemd leaves
+# ProtectProc= silently without effect on a kernel that lacks per-instance hidepid, and
+# a unit file that is merged is not a unit file that is loaded. The check takes the
+# unit's own User= and MainPID from systemd, so it follows the unit instead of a copy
+# of it. PID 1 stands in for every other account: it always exists, it is always
+# root's, and its argv is world-readable wherever hidepid is absent.
+#
+# The probe runs as the unprivileged principal inside the namespace and prints exactly
+# one verdict:
+#   hidden   — /proc/1 does not exist from there: hidepid=invisible holds
+#   listed   — /proc/1 exists but its argv is unreadable: a weaker policy than declared
+#   readable — PID 1's argv is readable: the leak itself
+#   no-proc  — the principal cannot read its OWN /proc entry, so no answer above counts
+# The self-read is what keeps `hidden` from being a vacuous pass: the same reader must
+# first succeed on an entry hidepid never hides.
+#
+# The markers let tests/test_proc_isolation.py run these EXACT shipped bodies offline.
+# >>> foreign_argv_probe >>>
+FOREIGN_ARGV_PROBE='
+if ! cat /proc/self/cmdline >/dev/null 2>&1; then echo no-proc
+elif cat /proc/1/cmdline >/dev/null 2>&1; then echo readable
+elif test -e /proc/1; then echo listed
+else echo hidden
+fi'
+# <<< foreign_argv_probe <<<
+
+# >>> proc_isolation >>>
+# The super options of the procfs mounted at /proc, read from a mountinfo file, or
+# `unknown`. Only the diagnosis on a failure: the verdict is the behaviour, never this.
+proc_mount_options() {
+	local mountinfo=$1 line opts=""
+	local -a fields=()
+	if [[ ! -r "$mountinfo" ]]; then
+		printf 'unknown'
+		return 0
+	fi
+	while IFS= read -r line; do
+		# <id> <parent> <maj:min> <root> <mount point> <options> [<optional>…] - <fstype> <source> <super options>
+		read -ra fields <<<"$line"
+		[[ "${fields[4]:-}" == /proc && "$line" == *" - proc "* ]] || continue
+		opts="${fields[${#fields[@]} - 1]}" # the last one listed is the one on top
+	done <"$mountinfo"
+	printf '%s' "${opts:-unknown}"
+	return 0
+}
+
+assert_foreign_argv_hidden() {
+	local name=$1 unit=$2 pid principal verdict err="$workdir/proc-isolation.err"
+	pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)"
+	principal="$(systemctl show --property=User --value "$unit" 2>/dev/null || true)"
+	if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+		red "  FAIL  ${name}: ${unit} has no main process to look inside (MainPID=${pid:-unknown})"
+		rc=1
+		return 0
+	fi
+	if [[ -z "$principal" || "$principal" == root ]]; then
+		red "  FAIL  ${name}: ${unit} runs as root, which hidepid never restricts"
+		rc=1
+		return 0
+	fi
+	# runuser is the same drop wake-runner takes into this namespace for every real wake.
+	verdict="$(nsenter --target "$pid" --mount -- \
+		runuser -u "$principal" -- /bin/sh -c "$FOREIGN_ARGV_PROBE" 2>"$err" || true)"
+	case "$verdict" in
+	hidden)
+		green "  PASS  ${name}: PID 1 is invisible to ${principal} inside ${unit}'s namespace"
+		;;
+	readable | listed)
+		if [[ "$verdict" == readable ]]; then
+			red "  FAIL  ${name}: ${principal} can read PID 1's argv inside ${unit}'s namespace"
+		else
+			red "  FAIL  ${name}: ${principal} can see PID 1 inside ${unit}'s namespace (its argv is hidden)"
+		fi
+		red "        that namespace's /proc is mounted $(proc_mount_options "/proc/${pid}/mountinfo");"
+		red "        the unit declares ProtectProc=invisible, which mounts it hidepid=invisible"
+		rc=1
+		;;
+	*)
+		red "  FAIL  ${name}: could not look inside ${unit}'s namespace as ${principal}: ${verdict:-no verdict}"
+		if [[ -s "$err" ]]; then
+			red "        $(<"$err")"
+		fi
+		rc=1
+		;;
+	esac
+	return 0
+}
+# <<< proc_isolation <<<
+
+# Case 9 — ALWAYS asserted: the leak it guards is open to every agent session on the
+# box, whether or not any route is wired.
+assert_foreign_argv_hidden "other accounts' argv hidden inside the wake's namespace (#271)" basecradle-router
 
 echo
 if [[ $rc -eq 0 ]]; then

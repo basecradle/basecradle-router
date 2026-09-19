@@ -89,5 +89,32 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
 
+# HIDE OTHER USERS' PROCESSES INSIDE THIS NAMESPACE (#271, basecradle#545). The
+# directives above give this unit its own mount namespace with a FRESH procfs
+# instance (ProtectKernelTunables/ProtectControlGroups imply MountAPIVFS). A procfs
+# instance carries its own mount options, so the host's `hidepid=invisible,
+# gid=procview` (basecradle-noc#694) never reaches it: with ProtectProc left at
+# `default`, every wake — a child of this service, in this namespace — could read
+# every other account's argv from /proc/<pid>/cmdline. `invisible` mounts this
+# instance with the host's hidepid value, so an agent's session sees its own
+# processes and nobody else's.
+#   Nothing here needs the wider view. The daemon supervises its wake by wait()ing
+# on the child it spawned, never by reading /proc/<pid>, and its stop drain awaits
+# its own tasks while systemd signals the cgroup; wake-runner, sudo, runuser and
+# systemd-cat run as root, which hidepid never restricts; the NOC's idle gate reads
+# the evidence document; the reboot drain runs in the host namespace. So no
+# `procview` exception is granted in here. systemd has no gid= knob
+# for this instance, which leaves the kernel's default exempt group, gid 0 — held by
+# no unprivileged account on this path.
+#   ProcSubset=pid is deliberately NOT set. It hides /proc's non-process files,
+# never /proc/<pid>, so it does nothing against the argv class — and a wake is a
+# general dev session: it would take /proc/{stat,meminfo,cpuinfo,loadavg,uptime}
+# away from Node's os.cpus()/totalmem(), procps (ps, top, free), and the tools
+# that size worker pools from them.
+#   deploy/smoke-test.sh proves this live from inside the namespace on every deploy,
+# because systemd leaves the setting silently without effect on a kernel that
+# lacks per-instance hidepid.
+ProtectProc=invisible
+
 [Install]
 WantedBy=multi-user.target
