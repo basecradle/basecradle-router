@@ -959,6 +959,17 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   > separation + the wake-runner boundary, not namespace sandboxing of the router. The unit
   > applies only the wake-compatible directives (`ProtectSystem=full`, `PrivateTmp`, the kernel/cgroup
   > protections). Stronger per-wake isolation later: launch each wake in its own `systemd-run --scope`.
+  >
+  > **That sandbox is also why the unit sets `ProtectProc=invisible` (#271).** The kernel/cgroup
+  > protections give the unit a private mount namespace with a **fresh procfs instance**, and a procfs
+  > instance carries its own options, so the host's `hidepid=invisible,gid=procview`
+  > (basecradle-noc#694) never reached it: every wake could read every other account's argv
+  > (basecradle#545). `ProtectProc=invisible` mounts that instance with the host's `hidepid` value. Nothing on
+  > the path needs the wider view: the daemon `wait()`s on the wake it spawned rather than reading its
+  > `/proc/<pid>`, the root-owned launch chain is never restricted by `hidepid`, and the NOC's idle gate
+  > reads the evidence document. `ProcSubset=pid` is deliberately **not** set: it never hides
+  > `/proc/<pid>`, so it does nothing for argv, and it would take `/proc/{stat,meminfo,cpuinfo}` away
+  > from the dev tooling a wake runs. Smoke-test case 9 proves the setting live on every deploy.
 - **The root-owned `wake-runner` wrapper** (`deploy/bin/wake-runner`) + the `sudoers` rule
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- <wake command>`,
@@ -1173,6 +1184,21 @@ Cases 7–8 pin where the **synthetic wake's** injection point lives (#208):
 probe route can fire a wake at *any* registered agent, so its reachability from the internet must never
 quietly become true — not when the route is disabled, not when a Caddyfile is re-templated. Neither case
 carries a valid signature, so nothing is normalized and no agent is ever woken.
+
+Case 9 sends no webhook. It looks inside the running unit's mount namespace, the one every wake
+inherits (#271):
+
+| Case | Check | Asserted | Proves |
+|---|---|---|---|
+| 9 | `nsenter` into the unit's `MainPID` mount namespace, `runuser` to its `User=`, read `/proc/1` | **invisible** | a wake cannot read another account's argv: the namespace's procfs is `hidepid=invisible` |
+
+It is asserted unconditionally, like case 7, because the leak it guards is open to every agent session
+whether or not any route is wired. It is checked live rather than trusted to the unit file because
+systemd leaves `ProtectProc=` silently without effect on a kernel that lacks per-instance `hidepid`. The
+probe first reads its own `/proc/self` entry, so a probe that never reached `/proc` cannot pass as
+*hidden*. A failure prints that namespace's `/proc` mount options, read from `/proc/<MainPID>/mountinfo`.
+`tests/test_proc_isolation.py` runs the shipped bodies offline and pins `ProtectProc=invisible` on every
+unit that opts into a private mount namespace.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
