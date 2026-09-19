@@ -43,6 +43,19 @@ StateDirectoryMode=0755
 # Stack Live Tail line says which program on the box emitted it.
 SyslogIdentifier=basecradle-router
 
+# NO DURABLE uv CACHE (#280). `uv run` below starts the daemon from the venv the
+# deploy's `uv sync` leaves in sync, and a start with the venv in sync downloads
+# nothing, so a durable cache buys it nothing: it only accumulates under
+# /home/router/.cache/uv, where nothing ever removes it. UV_NO_CACHE=1 gives each
+# start a throwaway cache in this unit's private /tmp (PrivateTmp= below): uv removes
+# it when it exits, and systemd removes that /tmp with the unit even if uv is killed.
+# Proven offline (#280): with the venv in sync, a start opens no network connection,
+# so this daemon (the fleet's only wake path) never needs PyPI to come back up. A
+# start after the tree changed WITHOUT that sync rebuilds the project and does need
+# PyPI; the deploy always syncs before it restarts. Nothing past the sudo boundary
+# inherits this variable: sudoers env_resets wake-runner.
+Environment=UV_NO_CACHE=1
+
 # SINGLE WORKER — load-bearing, never add --workers. The per-repo threading.Lock
 # only serializes wakes within one process; multiple worker processes would each
 # hold their own locks and could double-wake a repo's clone. Bind to localhost

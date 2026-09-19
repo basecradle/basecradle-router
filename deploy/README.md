@@ -99,7 +99,12 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
 ```
 
 The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
-deploy (the NOC's `deploy-router` op) on each run. The daemon's only system dependency on the box is the privilege-drop
+deploy (the NOC's `deploy-router` op) on each run. The unit starts it with **`UV_NO_CACHE=1`** (#280). A start
+against a venv in sync opens no network connection at all, so a durable cache buys it nothing, and it keeps
+none under `/home/router/.cache/uv`, where nothing ever removed one. Each start's throwaway cache lives in the
+unit's private `/tmp` and is gone when uv exits, so a restart never needs PyPI and leaves nothing behind. A
+start after the tree changed *without* that sync rebuilds the project and does need PyPI, which is why the
+deploy syncs before it restarts. The daemon's only system dependency on the box is the privilege-drop
 chain (`sudo` → `wake-runner` → `systemd-cat` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
 part of that agent's own onboarding, not the daemon's.
 
@@ -1152,7 +1157,7 @@ from the deployed tree / box, and they are this repo's to keep stable:
 
 | Contract | What the op does with it |
 |---|---|
-| `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. |
+| `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. The sync must land **before** the restart: the unit starts cache-less, and a cache-less start is network-free only against a venv in sync (#280). |
 | `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), and `router-admin` (the NOC calls the `app/` copy). `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
