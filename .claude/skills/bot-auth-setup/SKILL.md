@@ -23,12 +23,16 @@ With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and
 **Never put the token in a URL** (`https://x-access-token:${GH_TOKEN}@github.com/…`): the shell expands it into `git`'s argv, and argv is readable by every account on the machine (`/proc/<pid>/cmdline`, `ps`) for as long as the push runs (`basecradle-noc#694`, `basecradle#539`) — and a URL handed to `git pull`/`fetch` is also written verbatim into the reflog under `.git/logs`, so the token lands on disk. Hand git the token through a credential helper that reads `GH_TOKEN` from the environment instead:
 
 ```bash
-git -c credential.helper= \
-    -c credential.helper='!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f' \
+git -c 'credential.https://github.com.helper=' \
+    -c 'credential.https://github.com.helper=!f() { if [ "$1" = get ]; then if [ -z "$GH_TOKEN" ]; then echo quit=1; else echo username=x-access-token; echo "password=$GH_TOKEN"; fi; fi; }; f' \
     push origin <branch>
 ```
 
-The single quotes keep `$GH_TOKEN` literal in argv — the helper's own shell expands it from the environment. **The empty `credential.helper=` first is load-bearing**: it resets the helper list, and without it the laptop's system `osxkeychain` helper is asked **first** (measured, git 2.55) — it can answer with the `drawkkwast` credential (the silent fallback again, one layer down) and, after a successful push, would **store** the bot token in the keychain.
+The single quotes keep `$GH_TOKEN` literal in argv — the helper's own shell expands it from the environment. Three more parts are load-bearing:
+
+- **The empty scoped `credential.https://github.com.helper=` first** resets the helper list for GitHub. Without it the laptop's system `osxkeychain` helper is asked **first** (measured, git 2.55) — it can answer with the `drawkkwast` credential (the silent fallback again, one layer down) and, after a successful push, would **store** the bot token in the keychain. Scoping the reset loses none of that: a URL-scoped entry still clears the inherited unscoped helper for any URL it matches (`GIT_TRACE` shows `osxkeychain` never invoked for `github.com`).
+- **Both entries are scoped to `https://github.com`**, so the token cannot reach another host. An unscoped `credential.helper` answers for *every* host git asks about — a submodule, a redirect, or a mistyped remote on any other origin touched in the same command would be handed a live installation token (verified with `git credential fill` against `gitlab.com`).
+- **The `quit=1` branch** stops git on the spot when `GH_TOKEN` is unset (`fatal: credential helper '…' told us to quit`). Without it the helper sends an empty password and exits 0, so the push fails with a generic GitHub auth error instead of the real reason.
 
 (The `http.extraheader="AUTHORIZATION: bearer $TOKEN"` form **fails** — "invalid credentials" — for App installation tokens, and is argv besides.)
 
