@@ -392,6 +392,25 @@ def test_the_per_route_wake_record_survives_a_route_being_disarmed(tmp_path) -> 
     ]
 
 
+def test_a_departed_agents_kept_record_reaches_no_claim(tmp_path) -> None:
+    # basecradle-router#281. The store keeps a deregistered agent's entry and a disabled
+    # route's sink as a record, never pruned, which is safe only because neither is ever
+    # emitted: a claim states what the router can do *now*, for whom it can do it now.
+    evidence = EvidenceStore(None)
+    evidence.record_wake_ok("nova", DELIVERY, route="github", synthetic=False)
+    evidence.record_delivery_accepted("basecradle")
+
+    manifests = _build(
+        tmp_path, config=_config(agents=(JT,)), evidence=evidence, routes=("github",)
+    )
+
+    subjects = [m["subject"] for m in manifests]
+    assert "agent:jt" in subjects  # the registered agent is still emitted
+    assert "agent:nova" not in subjects  # the departed one's record stays a record
+    box = _subject(manifests, "box:ai.basecradle.com")
+    assert "delivery-sink:basecradle" not in [c["claim"] for c in box["claims"]]
+
+
 def test_the_agents_current_freeze_state_rides_on_the_wake_edge_claim(tmp_path) -> None:
     # Reported as detail, not as a claim of its own: a held lock suspends the edge, it
     # does not remove it, and a row that flipped to never-proven on every converge

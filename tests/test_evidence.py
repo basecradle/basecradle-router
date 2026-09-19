@@ -6,7 +6,8 @@ pinned here are the ones the claims-vs-evidence ledger relies on
 (basecradle/basecradle#460): counters survive a restart, the four wake outcomes stay
 told apart — a success, a broken wake, a gate's refusal, and an idempotent collapse
 that only a success can produce (basecradle-router#218) — and a store that cannot
-write degrades quietly instead of taking a wake down with it. No network, model, or
+write degrades quietly instead of taking a wake down with it, and a temp a killed flush
+left behind does not outlive the next boot (basecradle-router#281). No network, model, or
 live agent.
 Test cast: Nova Digital (``nova``, AI) and John Doe (``john``, human).
 """
@@ -14,7 +15,10 @@ Test cast: Nova Digital (``nova``, AI) and John Doe (``john``, human).
 import json
 import os
 import stat
+import tempfile
 from datetime import datetime
+
+import pytest
 
 from basecradle_router import evidence as evidence_module
 from basecradle_router.evidence import (
@@ -489,6 +493,124 @@ def test_a_flush_leaves_no_temp_files_behind(tmp_path) -> None:
         store.record_wake_ok(NOVA, f"delivery-{index}", route="github", synthetic=False)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["evidence.json"]
+
+
+# --- residue: nothing a killed flush leaves behind outlives the next boot ----
+
+
+def _orphan(directory, text: str = '{"version": 1, "agent_wa') -> str:
+    """A temp exactly as a flush creates it, abandoned before its swap — a hard kill's residue.
+
+    Made with the writer's own ``mkstemp`` call rather than a hand-typed name, so the test
+    plants what a killed daemon really leaves, torn mid-document.
+    """
+    fd, temp = tempfile.mkstemp(
+        dir=directory, prefix=evidence_module._TEMP_PREFIX, suffix=evidence_module._TEMP_SUFFIX
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return os.path.basename(temp)
+
+
+def test_a_temp_orphaned_by_a_killed_flush_is_removed_at_construction(tmp_path, caplog) -> None:
+    # basecradle-router#281. A SIGKILL at TimeoutStopSec, an OOM kill, or a power cut
+    # between mkstemp and os.replace never reaches _atomic_write's cleanup, so without the
+    # sweep each one leaves a temp in the state dir forever.
+    path = str(tmp_path / "evidence.json")
+    EvidenceStore(path, now=_Clock()).record_wake_ok(
+        NOVA, "delivery-1", route="github", synthetic=False
+    )
+    orphans = sorted([_orphan(tmp_path), _orphan(tmp_path)])
+
+    with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+        revived = EvidenceStore(path, now=_Clock("2026-07-28T09:00:00+00:00"))
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["evidence.json"]
+    # Removed, never recovered: the committed document is what loads, not the torn temp.
+    assert revived.snapshot().agent_wakes[NOVA].last_ok_delivery == "delivery-1"
+    # One line for the whole sweep, naming every file it removed.
+    assert caplog.text.count("event=evidence_orphaned_temps_removed") == 1
+    assert f"removed={','.join(orphans)}" in caplog.text
+
+
+def test_the_sweep_leaves_every_foreign_file_alone(tmp_path, caplog) -> None:
+    # Only the writer's own temp name, only regular files, only the document's own
+    # directory. Everything else in or near the state dir is somebody else's.
+    state = tmp_path / "state"
+    state.mkdir()
+    path = str(state / "evidence.json")
+    EvidenceStore(path, now=_Clock()).record_wake_ok(
+        NOVA, "delivery-1", route="github", synthetic=False
+    )
+    foreign = [
+        ".evidence-backup.json",  # our prefix, not our suffix
+        "evidence-abc123.tmp",  # our suffix, no leading dot
+        ".harness-abc123.tmp",  # a sibling's temp
+        "notes.tmp",
+    ]
+    for name in foreign:
+        (state / name).write_text("{}", encoding="utf-8")
+    (state / ".evidence-dir.tmp").mkdir()  # the name, but a directory
+    (state / ".evidence-link.tmp").symlink_to(state / "notes.tmp")  # the name, but a symlink
+    beside = _orphan(tmp_path)  # the name, but outside the document's directory
+
+    with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+        EvidenceStore(path, now=_Clock())
+
+    assert sorted(p.name for p in state.iterdir()) == sorted(
+        [*foreign, ".evidence-dir.tmp", ".evidence-link.tmp", "evidence.json"]
+    )
+    assert (tmp_path / beside).exists()
+    assert "event=evidence_orphaned_temps_removed" not in caplog.text  # nothing removed, no line
+
+
+def test_the_sweep_never_removes_the_document_itself(tmp_path) -> None:
+    # The document's path is configurable, so its name could carry the temp's shape. The
+    # sweep removes by-products; removing the deliverable would reset every age-of-proof.
+    path = str(tmp_path / ".evidence-document.tmp")
+    EvidenceStore(path, now=_Clock()).record_wake_ok(
+        NOVA, "delivery-1", route="github", synthetic=False
+    )
+
+    revived = EvidenceStore(path, now=_Clock())
+
+    assert revived.snapshot().agent_wakes[NOVA].last_ok_delivery == "delivery-1"
+    assert read_evidence(path).agent_wakes[NOVA].ok == 1
+
+
+def test_the_read_side_never_sweeps(tmp_path) -> None:
+    # read_evidence is the CLI's and the NOC's path, and it must not write. It also runs
+    # while the daemon flushes, where a sweep could delete the daemon's temp mid-swap.
+    path = str(tmp_path / "evidence.json")
+    EvidenceStore(path, now=_Clock()).record_queue_depth(NOVA, 1)
+    orphan = _orphan(tmp_path)
+
+    read_evidence(path)
+
+    assert (tmp_path / orphan).exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses the permissions under test")
+def test_an_unwritable_state_dir_still_degrades_quietly(tmp_path, caplog) -> None:
+    # A state dir the daemon cannot write is already reported once, by the first flush.
+    # The sweep adds no line of its own and never raises: the instrument must never break
+    # the thing it instruments.
+    state = tmp_path / "state"
+    state.mkdir()
+    path = str(state / "evidence.json")
+    orphan = _orphan(state)
+    state.chmod(0o555)
+    try:
+        with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+            store = EvidenceStore(path, now=_Clock())
+            store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+
+        assert (state / orphan).exists()
+        assert "event=evidence_orphaned_temps_removed" not in caplog.text
+        assert caplog.text.count("event=evidence_write_failed") == 1
+        assert store.snapshot().agent_wakes[NOVA].ok == 1  # still recorded in memory
+    finally:
+        state.chmod(0o755)  # so tmp_path teardown can remove it
 
 
 # --- degradation: the instrument must never break the thing it instruments ---
