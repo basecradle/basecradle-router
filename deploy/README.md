@@ -983,6 +983,18 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 - **The Caddyfile** (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
   reverse-proxy to the local uvicorn (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then
   `caddy validate` + `systemctl reload caddy`.
+  - **It holds a delivery across a daemon restart (#264).** `lb_try_duration 5s` re-dials the daemon
+    every 250 ms for up to 5 s, instead of answering 502 while uvicorn's listener is down. GitHub never
+    redelivers a failed webhook, so each 502 in that gap was a lost wake. Only a failed *dial* is
+    retried for a POST, which means the request never reached the daemon, so no delivery can run twice.
+    5 s is under GitHub's 10 s delivery timeout. This needs Caddy ≥ 2.11.4, the first release whose
+    retry re-sends an unread POST body intact. The comment in the file carries the full reasoning, and
+    `tests/test_caddyfile.py` pins the directive.
+  - **The deploy tick does not carry it.** `deploy-router` installs only the paths in the contract
+    table below, and the Caddyfile is not among them. The NOC installs the deployed tree's copy with its
+    box-level Caddyfile step, which today is the idempotent `arm-probe-route` op. So a merged Caddyfile
+    change reaches the box only when that step runs, and the change has to be handed to the NOC through
+    the capital.
 - **The ASGI entrypoint** `basecradle_router.app:create_app` + the `uvicorn` dependency (#37) — the
   composition root the systemd unit's `ExecStart` runs.
 - **The admin CLI wrapper** (`deploy/bin/router-admin`, #198) — the one stable path the NOC's converge
