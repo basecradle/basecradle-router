@@ -24,7 +24,28 @@ ai.basecradle.com {
 	@probe path /webhooks/probe /webhooks/probe/*
 	respond @probe 404
 
-	reverse_proxy 127.0.0.1:8000
+	reverse_proxy 127.0.0.1:8000 {
+		# Hold a request across a daemon restart instead of answering it 502 (#264). Every
+		# merge to main restarts the daemon (the NOC's unattended deploy tick), and while
+		# uvicorn's listener is down the dial is refused. With no retry, Caddy answered 502
+		# at once, and GitHub does not redeliver a failed webhook, so a delivery that
+		# landed in that gap was a lost wake. Now Caddy re-dials every 250 ms (the
+		# lb_try_interval default) for up to 5 s.
+		#
+		# - Safe for a POST: Caddy retries only a failed DIAL for a non-GET request (the
+		#   lb_retry_match default), and a failed dial means the request never reached the
+		#   daemon. A delivery that reached it and then failed is not retried, so this can
+		#   never deliver one twice.
+		# - Why 5 s: that is many times the gap (a restart of an idle daemon took 0.18 s,
+		#   basecradle-noc#695) and half GitHub's 10 s delivery timeout, so a held
+		#   delivery is still answered in time. A daemon that is really down gets its 502
+		#   5 s later than before, which GitHub records exactly as it records an
+		#   immediate 502.
+		# - Needs Caddy >= 2.11.4. Older releases closed an unread request body on a dial
+		#   error, so the retried POST failed with a 502 anyway (caddy#7546, fixed by
+		#   caddy#7715 and caddy#7719). That is never worse than no retry.
+		lb_try_duration 5s
+	}
 
 	# Access log to the journal; Caddy logs TLS/ACME there too.
 	log {
