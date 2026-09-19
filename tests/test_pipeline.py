@@ -11,6 +11,7 @@ import itertools
 import json
 import re
 import shlex
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
@@ -94,6 +95,7 @@ def _pipeline(
     wake_lock: WakeLockGuard | None = None,
     evidence: EvidenceStore | None = None,
     clock=None,
+    now=None,
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     kwargs = dict(
@@ -114,6 +116,8 @@ def _pipeline(
         kwargs["evidence"] = evidence
     if clock is not None:
         kwargs["clock"] = clock
+    if now is not None:
+        kwargs["now"] = now
     return Pipeline(**kwargs), waker
 
 
@@ -166,20 +170,37 @@ def _github_request(
     sign: bool = True,
     delivery: str | None = None,
     sender: str = HANDOFF_SENDER,
+    state: str | None = None,
+    updated_at: str | None = None,
 ) -> InboundRequest:
+    """A signed github delivery. ``state``/``updated_at`` are added only when given.
+
+    Without them the issue carries no state and no time — so it opts into neither the
+    dispatch-time recheck nor the coalesce (#272), and every test written before those
+    existed drives exactly the payload it always did. With them it is shaped the way
+    GitHub sends it, and an ``opened``/``labeled`` event is stamped from them.
+    """
     if delivery is None:
         delivery = f"0192f3a4-5b6c-7d8e-9f01-{next(_delivery_seq):012x}"
+    issue: dict = {
+        "number": 42,
+        "title": "Mirror the wire-shape change",
+        "html_url": f"https://github.com/{repo}/issues/42",
+        "labels": [{"name": name} for name in labels],
+    }
+    if state is not None:
+        issue["state"] = state
+    if updated_at is not None:
+        issue["created_at"] = updated_at
+        issue["updated_at"] = updated_at
     payload = {
         "action": action,
-        "issue": {
-            "number": 42,
-            "title": "Mirror the wire-shape change",
-            "html_url": f"https://github.com/{repo}/issues/42",
-            "labels": [{"name": name} for name in labels],
-        },
+        "issue": issue,
         "repository": {"full_name": repo},
         "sender": {"login": sender, "type": "User"},
     }
+    if action == "labeled":
+        payload["label"] = {"name": "handoff"}
     body = json.dumps(payload).encode("utf-8")
     headers = {"X-GitHub-Event": event, "X-GitHub-Delivery": delivery}
     if sign:
@@ -946,6 +967,30 @@ def _send_probe(pipeline, *, dup: bool) -> None:
     pipeline.execute(NOVA, _probe_event(delivery), PipelineResult())
 
 
+# The two dispatch-time gates (#272) open only for a route that stamps when its event
+# happened and answers a recheck. github does; the probe deliberately does neither, so
+# these scenarios are driven over github alone.
+_EVENT_AT = "2026-09-19T03:14:07Z"
+_WAKE_AT = datetime(2026, 9, 19, 3, 14, 8, 415000, tzinfo=timezone.utc)
+
+
+def _drive_a_coalesce() -> None:
+    """Two deliveries of one event moment: the second is read by the first's wake."""
+    pipeline, _ = _pipeline(now=lambda: _WAKE_AT)
+    for _ in range(2):
+        pipeline.handle("github", _github_request(state="open", updated_at=_EVENT_AT))
+
+
+def _drive_a_recheck_drop() -> None:
+    """A queued handoff whose issue closes before it reaches the front."""
+    pipeline, _ = _pipeline(now=lambda: _WAKE_AT)
+    queued = pipeline.accept("github", _github_request(state="open", updated_at=_EVENT_AT))
+    closed = _github_request(action="closed", state="closed", updated_at="2026-09-19T03:20:00Z")
+    pipeline.accept("github", closed)
+    agent, event = queued.pending
+    pipeline.execute(agent, event, queued.result)
+
+
 def test_every_line_about_a_wake_names_its_source_however_that_wake_ended(caplog) -> None:
     # A refused probe and a failed probe pollute a wake-failure count exactly as a
     # successful one pollutes a duration chart, so the key rides on every outcome — not
@@ -980,6 +1025,24 @@ def test_every_line_about_a_wake_names_its_source_however_that_wake_ended(caplog
                 for line in lines
                 if f"stage={stage.value} " in line
             )
+
+    for name, drive in (
+        ("a delivery a finished wake already read", _drive_a_coalesce),
+        ("a delivery whose issue closed while it waited", _drive_a_recheck_drop),
+    ):
+        caplog.clear()
+        with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+            drive()
+        lines = _wake_lines(caplog)
+        assert lines, f"github/{name}: no line about the wake was emitted at all"
+        for line in lines:
+            assert "source=github" in line, f"github/{name}: a wake line lost the source: {line}"
+        covered.update(
+            stage.value
+            for stage in _WAKE_STAGES
+            for line in lines
+            if f"stage={stage.value} " in line
+        )
 
     # Every stage of the wake half was actually exercised above — so the assertion
     # covers the whole surface rather than whichever part these scenarios happened to

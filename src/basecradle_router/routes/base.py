@@ -17,6 +17,7 @@ from enum import Enum
 from hashlib import sha256
 from typing import Any, Protocol, runtime_checkable
 
+from basecradle_router.logfmt import log_fields
 from basecradle_router.models import Event
 
 HMAC_SHA256_PREFIX = "sha256="
@@ -111,22 +112,33 @@ def parse_json_object(body: bytes) -> dict[str, Any]:
 
 
 class DeliveryDecision(Enum):
-    """What a route decided to do with one *verified* inbound delivery.
+    """What the router decided to do with one *verified* inbound delivery.
 
-    The two **quiet** outcomes a route chooses between in ``normalize`` — the pair
-    that used to be indistinguishable in the logs (basecradle-router#91): a
-    deliberate ignore looked byte-identical to an event class silently falling on
-    the floor, so a dead ``task.activated`` capability read as healthy until a
-    human poked it. ``WOKE`` means the delivery was classified actionable and
-    dispatched to the wake path (the server answers ``202``); ``IGNORED`` means it
-    was well-formed but deliberately not actionable (the server answers ``200``).
-    Loud outcomes — a bad signature, a malformed payload, an untrusted sender —
-    are *rejections* the pipeline already logs at ``WARNING`` with their cause, so
-    they are deliberately not part of this quiet pair.
+    ``WOKE`` and ``IGNORED`` are the two **quiet** outcomes a route chooses between in
+    ``normalize`` — the pair that used to be indistinguishable in the logs
+    (basecradle-router#91): a deliberate ignore looked byte-identical to an event class
+    silently falling on the floor, so a dead ``task.activated`` capability read as
+    healthy until a human poked it. ``WOKE`` means the delivery was classified
+    actionable and dispatched to the wake path (the server answers ``202``);
+    ``IGNORED`` means it was well-formed but deliberately not actionable (the server
+    answers ``200``). Loud outcomes — a bad signature, a malformed payload, an
+    untrusted sender — are *rejections* the pipeline already logs at ``WARNING`` with
+    their cause, so they are deliberately not part of this quiet set.
+
+    ``COALESCED`` and ``DROPPED`` are the core's **later** word on a delivery the route
+    classified ``WOKE`` — decided when it reaches the front of its agent's queue, not
+    when it arrives (basecradle-router#272). ``COALESCED``: a successful wake on the
+    same stream already covered it (the line names that wake's delivery as ``into=``).
+    ``DROPPED``: its route says the work it asked for has ended — the issue was closed,
+    say — so no session is launched for it (the line carries ``reason=``). Each is its
+    own line, so a delivery's whole fate reads off ``delivery=<id>``: one ``woke``, then
+    at most one of these.
     """
 
     WOKE = "woke"
     IGNORED = "ignored"
+    COALESCED = "coalesced"
+    DROPPED = "dropped"
 
 
 def log_delivery_decision(
@@ -136,18 +148,21 @@ def log_delivery_decision(
     *,
     recipient: str | None = None,
     delivery: str | None = None,
+    **detail: object,
 ) -> None:
     """Emit the one uniform, structured line recording a delivery's ignore-vs-act fate.
 
     One format for every route, so an operator (or a metric scraper over the logs)
     can answer *"did this event type wake an agent or get ignored, and for whom?"*
     from observability alone — the signal the silent ``task.activated`` drop lacked
-    (basecradle-router#91). It is the **route** that emits it, because only the
-    route knows its source's ``event_type`` for a delivery it chose to ignore (the
-    core never learns the source's vocabulary); the format is centralized here so
-    the contract cannot drift route-to-route. ``recipient`` is logged when the
-    route already knows it — the actionable path, where the body is parsed — and
-    left ``<unknown>`` for an ignore that short-circuits before parsing, because
+    (basecradle-router#91). It is the **route** that emits the first one, because only
+    the route knows its source's ``event_type`` for a delivery it chose to ignore (the
+    core never learns the source's vocabulary); the core emits its later word on a
+    ``WOKE`` delivery (``COALESCED``/``DROPPED``) with the ``event_type`` the route
+    stamped on the :class:`~basecradle_router.models.Event`. The format is centralized
+    here so the contract cannot drift route-to-route, or route-to-core. ``recipient``
+    is logged when the route already knows it — the actionable path, where the body is
+    parsed — and left ``<unknown>`` for an ignore that short-circuits before parsing, because
     the load-bearing field for spotting a silently-dropped *class* is the
     ``event_type``, not the per-recipient firehose target (deliveries are already
     per-recipient). ``decision`` is the *router's* dispatch choice, not the wake's
@@ -160,14 +175,20 @@ def log_delivery_decision(
     same key the pipeline's stage lines carry, so ``delivery=<id>`` selects one
     delivery's whole trip — route decision, every stage, and the wake — out of a
     Live Tail of interleaved concurrent deliveries.
+
+    ``detail`` is appended after the fixed prefix, as ``key=value``: the core's later
+    decisions say *why* — ``into=`` for a coalesce, ``reason=`` for a drop — while the
+    five leading keys stay in the same place on every decision line, whoever emits it.
     """
+    extra = log_fields(**detail)
     logger.info(
-        "event=delivery_decision source=%s event_type=%s decision=%s recipient=%s delivery=%s",
+        "event=delivery_decision source=%s event_type=%s decision=%s recipient=%s delivery=%s%s",
         source,
         event_type or "<none>",
         decision.value,
         recipient or "<unknown>",
         delivery or "<unknown>",
+        f" {extra}" if extra else "",
     )
 
 
@@ -218,6 +239,11 @@ class Route(Protocol):
     # this protocol — it is optional, and a required member would make every route
     # implement one to satisfy the registry's ``isinstance`` gate whether it has
     # anything to say or not.
+    #
+    # A route MAY likewise define ``recheck(event) -> str | None``: asked at dispatch,
+    # when a queued delivery reaches the front of its agent's queue, whether the work
+    # it asked for still stands — ``None`` to wake, or a short reason to drop it (see
+    # :func:`route_recheck`). Optional for the same reason.
 
 
 def route_boot_summary(route: object) -> str | None:
@@ -240,3 +266,23 @@ def route_boot_summary(route: object) -> str | None:
         return None
     text = summary()
     return text if isinstance(text, str) and text.strip() else None
+
+
+def route_recheck(route: object, event: Event) -> str | None:
+    """Why ``route`` says ``event`` should no longer wake anyone, or ``None`` to wake.
+
+    The dispatch-time question only a source can answer (basecradle-router#272): a
+    delivery can wait minutes behind its agent's running wake, and the work it asked
+    for can end in that time — a github handoff issue closed, its ``handoff`` label
+    removed. The core owns *when* to ask (the moment the delivery reaches the front of
+    the queue) and never learns what an issue is; the route owns the answer.
+
+    Read by duck-typing, like :func:`route_boot_summary`, so a route with nothing to
+    re-check implements nothing — and its wakes run exactly as they always did. A
+    blank answer is no answer.
+    """
+    recheck = getattr(route, "recheck", None)
+    if not callable(recheck):
+        return None
+    reason = recheck(event)
+    return reason if isinstance(reason, str) and reason.strip() else None

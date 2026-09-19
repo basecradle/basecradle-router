@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
@@ -67,7 +68,7 @@ def _registry() -> RouteRegistry:
     return registry
 
 
-def _build(*, waker=None, locks=None):
+def _build(*, waker=None, locks=None, now=None):
     waker = waker or _RecordingWaker()
     kwargs = dict(
         registry=_registry(),
@@ -77,6 +78,8 @@ def _build(*, waker=None, locks=None):
     )
     if locks is not None:
         kwargs["locks"] = locks
+    if now is not None:
+        kwargs["now"] = now
     server = WebhookServer(Pipeline(**kwargs))
     return server, waker
 
@@ -110,28 +113,46 @@ def _signed_body(
     return body, headers
 
 
+async def _deliver(
+    server: WebhookServer, path: str, body: bytes, headers: dict[str, str]
+) -> list[dict]:
+    """POST one request through the ASGI app in-process; return what it sent back.
+
+    Returns as soon as the server has answered — the wake it may have queued is still
+    running in the background, exactly as it is when GitHub is the one posting.
+    """
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()],
+    }
+    incoming = [{"type": "http.request", "body": body, "more_body": False}]
+    sent: list[dict] = []
+
+    async def receive():
+        return incoming.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    await server(scope, receive, send)
+    return sent
+
+
+async def _post_async(
+    server: WebhookServer, path: str, body: bytes, headers: dict[str, str]
+) -> int:
+    """The status one delivery was acked with, without waiting for its wake."""
+    sent = await _deliver(server, path, body, headers)
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+
 def _post(server: WebhookServer, path: str, body: bytes, headers: dict[str, str]):
     """Drive the ASGI app in-process and return (status, parsed-json-body)."""
 
     async def _drive():
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": path,
-            "headers": [
-                (k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()
-            ],
-        }
-        incoming = [{"type": "http.request", "body": body, "more_body": False}]
-        sent: list[dict] = []
-
-        async def receive():
-            return incoming.pop(0)
-
-        async def send(message):
-            sent.append(message)
-
-        await server(scope, receive, send)
+        sent = await _deliver(server, path, body, headers)
         # The response is sent from the fast accept half; the wake runs in the
         # background. Drain it so post-wake state (the woken agent) is observable
         # — without changing that the status was acked before the wake.
@@ -334,6 +355,71 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
 
     assert asyncio.run(_drive()) == 202
     assert len(waker.calls) == 1
+
+
+# --- one labeled create, one wake — through the real scheduler (#272) ---------
+
+
+def test_a_labeled_create_wakes_once_through_the_real_scheduler() -> None:
+    # `gh issue create --label handoff` sends `opened` and `labeled`. Both are accepted
+    # (202) — then the second waits in the agent's queue behind the first's wake, and
+    # collapses into it at dispatch because that session started after the create.
+    release = threading.Event()
+
+    class _BlockingWaker:
+        def __init__(self) -> None:
+            self.calls: list[Event] = []
+
+        def wake(self, agent: Agent, event: Event) -> WakeResult:
+            self.calls.append(event)
+            release.wait(timeout=5)  # safety net so a broken test can never hang CI
+            return WakeResult(exit_code=0)
+
+    waker = _BlockingWaker()
+    launched = datetime(2026, 9, 19, 3, 14, 8, 415000, tzinfo=timezone.utc)
+    server, _ = _build(waker=waker, now=lambda: launched)
+    issue = {
+        "number": 42,
+        "title": "Mirror the wire-shape change",
+        "html_url": "https://github.com/basecradle/basecradle-python/issues/42",
+        "labels": [{"name": "handoff"}],
+        "state": "open",
+        "created_at": "2026-09-19T03:14:07Z",
+        "updated_at": "2026-09-19T03:14:07Z",
+    }
+    deliveries = []
+    for action, delivery in (
+        ("opened", "0192f3a4-5b6c-7d8e-9f01-0000000c0001"),
+        ("labeled", "0192f3a4-5b6c-7d8e-9f01-0000000c0002"),
+    ):
+        payload = {
+            "action": action,
+            "issue": issue,
+            "repository": {"full_name": "basecradle/basecradle-python"},
+            "sender": {"login": HANDOFF_SENDER, "type": "User"},
+        }
+        if action == "labeled":
+            payload["label"] = {"name": "handoff"}
+        body = json.dumps(payload).encode("utf-8")
+        digest = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        headers = {
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": delivery,
+            "X-Hub-Signature-256": f"sha256={digest}",
+        }
+        deliveries.append((body, headers))
+
+    async def _drive() -> list[int]:
+        statuses = [
+            (await _post_async(server, "/webhooks/github", body, headers))
+            for body, headers in deliveries
+        ]
+        release.set()
+        await server.drain()
+        return statuses
+
+    assert asyncio.run(_drive()) == [202, 202]
+    assert [event.delivery_id for event in waker.calls] == ["0192f3a4-5b6c-7d8e-9f01-0000000c0001"]
 
 
 # --- the per-agent lock prevents a concurrent double-wake ------------------

@@ -144,10 +144,10 @@ journalctl -u basecradle-router -f                   # by unit — also fine; th
 | Line | Carries |
 |---|---|
 | `event=startup …` | one INFO at boot: `version=`, **`sha=`** (the deployed commit, read from `/etc/basecradle-router/deployed-sha`), `routes=`, `dedup_ttl=`, `wake_attempts=`, `breaker_*=`. The running daemon *states its own config* — so a Live Tail that looks wrong is first checked here: absent (it never started), stale `sha=` (the merged≠live gap, #54), or thresholds you did not expect. |
-| `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. |
+| `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. A `woke` delivery gets **one more** decision line if it never launches a session of its own (#272), decided when it reaches the front of its agent's queue: `decision=coalesced into=<delivery>` (a successful wake that started after its event already read it) or `decision=dropped reason=issue_closed\|handoff_removed\|do_not_work` (its work ended while it waited). So `delivery=<id>` accounts for every delivery: `woke`, then at most one of these. |
 | `event=route_config …` | one INFO per route that has source-specific config, logged right after the banner: `source=`, then that route's own fields. The basecradle route states `recipient_keys=` and `shared_fallback=` (#236) — once every agent is keyed, an armed fallback and a retired one produce identical traffic, so nothing but this line distinguishes them. |
 | `event=verify_key …` | which signing key verified a basecradle delivery (#236): `source=`, `key_path=recipient\|fallback`, `recipient=`, `delivery=`. Emitted only *after* the signature checks out — before that the recipient is an unauthenticated claim. `key_path=` and not `key=`, which `event=breaker_tripped` already spends on its scope. |
-| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
+| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `coalesce`, `recheck`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
 | `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
 | `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. |
@@ -258,6 +258,8 @@ half that is about a wake, from the moment the agent is known:
 |---|---|
 | `stage=lock outcome=ok` | the per-agent serialization guard was taken |
 | `stage=dedup outcome=ignored` | a duplicate delivery collapsed |
+| `stage=coalesce outcome=ignored` | a delivery a successful wake already read — `into=`, `occurred=`, `wake_started=` (#272) |
+| `stage=recheck outcome=ignored` | a queued delivery whose work ended while it waited — `reason=` (#272) |
 | `stage=wake_lock outcome=ignored` | the NOC freeze interlock refused it |
 | `stage=breaker outcome=ignored` | the wake-rate breaker refused it |
 | `event=wake_retry attempt=N/M` | a transient failure a retry followed |
@@ -388,6 +390,27 @@ case-insensitively.
   never re-wakes it (the infinite-loop guard, run ahead of the trust gate — the router resolves the repo's
   captain bot from `agents.json` and suppresses it). A comment storm on one issue is capped by the
   breaker's per-`(agent, issue)` scope below.
+
+**One handoff, one wake — and never for a closed issue** (#272). One handoff once cost five sessions: every
+accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`
+*and* the `labeled` of a single labeled create, comments that arrived mid-session, a label re-applied to
+a closed issue. Two gates now run when a queued delivery reaches the front of its agent's queue, both in
+the core and both opt-in per route, so the platform route and the probe pass them untouched:
+
+- **Coalesce.** The route stamps each event with when it happened (the issue's creation for `opened`, its
+  last update for `labeled`, the comment's creation for `issue_comment`). A delivery whose event happened
+  *before* a **successful** wake on the same issue *started* was read by that session, so it collapses
+  into it. That is what makes a labeled create one wake in either arrival order, and it bounds a burst:
+  everything that queued behind a running session collapses into the **first** follow-up, never N. A
+  failed wake covers nothing, so the delivery behind it keeps its own chance. GitHub timestamps are whole
+  seconds and never later than the truth, so every clock error errs towards an extra wake, never a lost one.
+- **Recheck.** A session's life is its issue's life. The route keeps the newest state of each handoff
+  issue *as GitHub's own deliveries report it* — `closed`, `reopened` and `unlabeled` included, which
+  the App subscription always sent and the router used to ignore — ordered by the payload's `updated_at`
+  so a late, older report never rolls it back. A queued wake for an issue that has since **closed**, lost
+  its **`handoff`** label, or gained **`Do Not Work`** is dropped. Nothing is fetched: the router still
+  holds no GitHub credential. Reopening an issue wakes nothing by itself — re-engage it with a comment or
+  by re-applying `handoff` once it is open.
 
 The **basecradle route** (issue #87) accepts signed BaseCradle platform events at
 `POST /webhooks/basecradle`. Enable it by adding `basecradle` to
@@ -778,11 +801,14 @@ router dispatches ends in exactly one of these, published on both the agent-wide
 | `ok` | the wake fired and succeeded | the only thing that proves the edge; `last_ok_at` is what every wake-edge claim points at |
 | `failed` | the wake was dispatched and the wake path broke | **loud** — the edge is broken for this agent, with the reason |
 | `refused` | a **gate** declined a wake that would otherwise have run: a live NOC converge freeze, or a tripped wake-rate breaker | the router working correctly and *suppressing* a wake — an agent whose history is all refusals is **gated, not unreachable** |
-| `deduped` | a duplicate delivery was collapsed into the wake that already ran for it | the router working correctly *because a wake already succeeded* — never a finding |
+| `deduped` | a delivery was collapsed into the wake that already ran for it — a duplicate delivery (#133), or one coalesced into a wake that read it (#272) | the router working correctly *because a wake already succeeded* — never a finding |
 
 A **genuine rejection of a delivery** — a bad signature, a malformed payload, an untrusted sender —
 never reaches any of these. It is counted at the sink, as `delivery_sinks.<route>.rejected`, because
-it is refused at `verify`/`normalize` before an agent is ever resolved.
+it is refused at `verify`/`normalize` before an agent is ever resolved. Nor does a delivery **dropped at
+dispatch because its work ended** (`stage=recheck`, #272 — its issue closed while it waited): no wake was
+attempted and no gate held the agent, so it says nothing about the edge and moves no counter. Its
+`decision=dropped` line is its whole record.
 
 `deduped` was split out of `refused` in `#218`, and the reason is sharper than tidiness: **a collapse
 is the one outcome only a success can produce.** The dedup cache is marked *after* a wake has fired
@@ -847,7 +873,9 @@ Operational Baselines). The NOC's timeline-based prober is retired for every age
 2. The **CLI**, running as the daemon's user, signs a probe body with **this box's `probe` route
    secret** and POSTs it at the daemon's own **loopback** listener.
 3. The **daemon** treats it as the genuine delivery it is: HTTP front end → HMAC `verify` →
-   `normalize` → resolve → per-agent lock → dedup → **NOC wake-lock** → **wake-rate breaker** → wake.
+   `normalize` → resolve → per-agent lock → dedup → coalesce → recheck → **NOC wake-lock** →
+   **wake-rate breaker** → wake. (A probe stamps no event time and has no recheck, so it passes the two
+   #272 gates untouched.)
 4. The **wake-runner** does everything a real wake does — validate against the root-owned registry,
    resolve the exact binary this agent's kind sanctions, `runuser` to the agent, load its `agent.env`,
    enter its clone — then execs the root-owned **`probe-ack`** verifier *as the agent*, which checks
