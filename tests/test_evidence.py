@@ -397,6 +397,73 @@ def test_evidence_survives_the_daemon_restarting(tmp_path) -> None:
     assert revived.snapshot().delivery_sinks["github"].accepted == 1
 
 
+def test_an_ungraceful_stop_leaves_no_stale_pending_wake(tmp_path) -> None:
+    # basecradle-router#264. A daemon SIGKILLed at TimeoutStopSec, OOM-killed, or crashed
+    # with work pending never publishes its pending=0, so its last depths stay on disk. The
+    # store is simply abandoned mid-queue here, which is exactly the state such a stop
+    # leaves behind.
+    path = str(tmp_path / "evidence.json")
+    killed = EvidenceStore(path, now=_Clock())
+    killed.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+    killed.record_queue_depth(NOVA, 2)  # one in flight, one queued behind it
+    killed.record_queue_depth(JOHN, 1)
+
+    revived = EvidenceStore(path, now=_Clock("2026-07-28T09:00:00+00:00"))
+
+    # The file is the NOC's view (its deploy idle-gate and the queued-wake claim edge both
+    # read it), so the reset must be on disk at boot, not held in memory until some
+    # unrelated record happens to flush it.
+    on_disk = read_evidence(path).agent_wakes
+    assert (on_disk[NOVA].queued, on_disk[JOHN].queued) == (0, 0)
+    assert revived.snapshot().agent_wakes[NOVA].queued == 0
+    # Only the live reading is discarded. The history beside it survives the restart.
+    assert (on_disk[NOVA].ok, on_disk[NOVA].last_ok_delivery) == (1, "delivery-1")
+
+
+def test_a_discarded_stale_depth_is_logged_per_agent(tmp_path, caplog) -> None:
+    # A stale depth is the only trace that a wake pending under the previous process may
+    # never have completed, so the reset says so instead of erasing that silently.
+    path = str(tmp_path / "evidence.json")
+    killed = EvidenceStore(path, now=_Clock())
+    killed.record_queue_depth(NOVA, 2)
+    killed.record_queue_depth(JOHN, 1)
+
+    with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+        EvidenceStore(path, now=_Clock())
+
+    assert caplog.text.count("event=evidence_stale_queue_cleared") == 2
+    assert "agent=nova pending=2" in caplog.text
+    assert "agent=john pending=1" in caplog.text
+
+
+def test_a_clean_boot_rewrites_nothing(tmp_path, monkeypatch, caplog) -> None:
+    # A graceful stop drains to pending=0 before exiting, so the next boot finds nothing
+    # stale. It must then neither write nor warn: the reset exists for the ungraceful case.
+    path = str(tmp_path / "evidence.json")
+    drained = EvidenceStore(path, now=_Clock())
+    drained.record_queue_depth(NOVA, 1)
+    drained.record_queue_depth(NOVA, 0)
+
+    writes: list[str] = []
+    monkeypatch.setattr(evidence_module, "_atomic_write", lambda p, text: writes.append(p))
+    with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+        EvidenceStore(path, now=_Clock("2026-07-28T09:00:00+00:00"))
+
+    assert writes == []
+    assert "event=evidence_stale_queue_cleared" not in caplog.text
+
+
+def test_the_read_side_keeps_the_live_depth(tmp_path) -> None:
+    # The reset belongs to the daemon's load alone. read_evidence is how the NOC sees a
+    # wake that is pending right now; zeroing there would hide every live queued wake and
+    # let a deploy restart the daemon underneath one.
+    path = str(tmp_path / "evidence.json")
+    EvidenceStore(path, now=_Clock()).record_queue_depth(NOVA, 2)
+
+    assert read_evidence(path).agent_wakes[NOVA].queued == 2
+    assert read_evidence(path).agent_wakes[NOVA].queued == 2  # reading changes nothing
+
+
 def test_the_document_on_disk_is_the_documented_shape(tmp_path) -> None:
     store = _store(tmp_path)
     store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)

@@ -814,6 +814,14 @@ The unit's `StateDirectory=basecradle-router` creates the parent owned by `route
 starts. **Only the daemon writes it**: the CLI is strictly read-only, so a probe run under the wrong
 identity can never take ownership of the daemon's own state file away from it.
 
+Everything in it survives a restart **except `agent_wakes.<agent>.queued`**, the live pending-wake depth
+the NOC's deploy idle-gate reads. It describes the scheduler of the process that wrote it, so the daemon
+zeroes it when it loads the file at boot. A graceful stop has already drained it to `0`. A non-zero value
+at boot means the previous daemon stopped *without* draining (SIGKILLed at `TimeoutStopSec`, OOM-killed,
+or crashed), and the daemon logs one `WARNING event=evidence_stale_queue_cleared agent=<slug>
+pending=<n>` per agent before it writes the zero. Without the reset, that stale value held every deploy
+deferred until the agent was next woken (#264).
+
 The **boot check** runs the same probe at daemon startup and logs it loudly
 (`event=freeze_selftest status=…`) — but it never aborts startup. That is deliberate: the wake-lock
 guard's fail-direction is to keep waking when a lock cannot be read (wedging every wake on a
