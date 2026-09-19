@@ -91,6 +91,14 @@ same agent. So the wake proof is also kept at **(agent, route)** granularity
 - *It is written from the wake threads.* One :class:`threading.Lock` guards the
   in-memory document and the replace, held only for the microseconds of an update
   — never across a wake.
+- *Nothing it leaves behind lacks an end* (basecradle-router#281, under
+  ``constitution.md`` → How We Build, "Whatever creates, cleans up"). The document is
+  the deliverable: one fixed name, replaced in place, never a dated copy. A flush's
+  one by-product is the ``.evidence-*.tmp`` it swaps in, and a flush killed before
+  its swap leaves that temp where no handler ever reaches it, so the daemon sweeps
+  those when it starts (:meth:`EvidenceStore._remove_orphaned_temps`). The entries of
+  an agent since deregistered or a route since disabled are *not* a by-product: they
+  are a record, kept on purpose (:class:`EvidenceDocument`).
 
 The store holds **no secrets and no payloads** — slugs, route names, counters,
 timestamps, and a truncated reason string. It is deliberately world-readable so
@@ -128,6 +136,12 @@ EVIDENCE_VERSION = 1
 #: A recorded failure reason is a log detail, not a payload — cap it so a pathological
 #: exception string can never grow the document without bound.
 _MAX_REASON = 200
+
+#: The name every flush's temp file carries in the document's own directory. One
+#: spelling for the writer and for the startup sweep that removes what a killed writer
+#: left behind, so the two can never drift apart (basecradle-router#281).
+_TEMP_PREFIX = ".evidence-"
+_TEMP_SUFFIX = ".tmp"
 
 
 def _utc_now() -> datetime:
@@ -308,7 +322,33 @@ class SelfTestEvidence:
 
 @dataclass
 class EvidenceDocument:
-    """The whole on-disk document: sinks by route, wakes by agent, last self-test."""
+    """The whole on-disk document: sinks by route, wakes by agent, last self-test.
+
+    **No key is ever removed, and that is deliberate** (basecradle-router#281).
+    ``delivery_sinks``, ``agent_wakes``, and each agent's ``by_route`` are filled by
+    ``setdefault`` and never pruned, so an agent deregistered or a route disabled keeps
+    its entry for the life of the box. That entry is a record, not a leftover ("logs and
+    audit records are not temp files," as the ruling on #281 put it), and keeping it is
+    the decided answer, for three reasons:
+
+    - *It is worth most exactly when the removal was a mistake.* After an accidental
+      deregistration, the departed agent's last proven wake, its last failure reason, and
+      its counters are the history an operator reaches for. A prune at boot would discard
+      them at the one moment they matter.
+    - *Nothing is armed on it.* Claims are emitted only for registered agents and enabled
+      routes (:mod:`~basecradle_router.claims`), so a departed agent's entry and a
+      disabled route's sink reach no claim at all. A disabled route's ``by_route`` row
+      still shows in its agent's ``detail``, as history and never as an edge, because an
+      agent whose only proof came from a route nobody enables any more is the
+      parked-builder shape this store exists to expose. If a slug is registered again,
+      its old proof is still true of that account, and the NOC's 7-day age-of-proof TTL
+      decides whether it still counts, exactly as it does for every other proof.
+    - *It is bounded.* The document grows with the agents ever registered and the routes
+      ever enabled on this box, never with traffic.
+
+    The TTL already retires stale proof as evidence without destroying it as a record,
+    and a prune would do the opposite on a guess about what an operator no longer needs.
+    """
 
     version: int = EVIDENCE_VERSION
     updated_at: str | None = None
@@ -476,12 +516,71 @@ class EvidenceStore:
         self.path = path
         self._now = now
         self._lock = threading.Lock()
+        if path:
+            self._remove_orphaned_temps(path)
         self._doc = _load(path) if path else EvidenceDocument()
         # One warning per process for an unwritable store, not one per delivery: a
         # broken state dir must be visible exactly once, never a firehose that buries
         # the wake lines an operator is actually reading.
         self._write_failed = False
         self._discard_stale_queue_depths()
+
+    @staticmethod
+    def _remove_orphaned_temps(path: str) -> None:
+        """Remove every ``.evidence-*.tmp`` a previous process left beside the document.
+
+        :func:`_atomic_write` unlinks its own temp on any failure it survives. It cannot
+        survive being killed: a SIGKILL at ``TimeoutStopSec`` on a stuck drain, an OOM
+        kill, or a power cut between ``mkstemp`` and ``os.replace`` never reaches that
+        handler, and the temp then sits in the state dir with nothing that will ever
+        remove it (basecradle-router#281). The window is microseconds, but it opens on
+        every flush, and a flush follows every wake outcome.
+
+        **Why here, and only here.** Construction is the one moment no temp in this
+        directory can be live: the daemon is the document's sole writer (a single worker,
+        by the unit's design), and no flush of this process has begun yet. Any later, the
+        sweep could race this process's own swap. Out-of-process readers go through
+        :func:`read_evidence`, which never writes and so never sweeps.
+
+        **Removed, never recovered.** An orphan may be complete or torn, and nothing
+        committed it, so the document on disk stays the last one that was. The update it
+        carried is lost, which understates what we have proven and never overstates it.
+
+        **Narrow, and quiet when it cannot act.** Only regular files carrying the temp's
+        name in the document's own directory are touched: never the document itself, a
+        symlink, or anything else there. A directory that is missing or cannot be listed,
+        or a temp that cannot be unlinked, gets no line of its own: on the box's state dir
+        (``0755``, owned by the daemon's user) each in practice means a directory this
+        process cannot write, which the first flush already reports exactly once
+        (``event=evidence_write_failed``).
+        """
+        directory = os.path.dirname(path) or "."
+        document = os.path.basename(path)
+        try:
+            with os.scandir(directory) as entries:
+                orphans = sorted(
+                    entry.name
+                    for entry in entries
+                    if entry.name.startswith(_TEMP_PREFIX)
+                    and entry.name.endswith(_TEMP_SUFFIX)
+                    and entry.name != document
+                    and entry.is_file(follow_symlinks=False)
+                )
+        except OSError:
+            return
+        removed = []
+        for name in orphans:
+            with suppress(OSError):
+                os.unlink(os.path.join(directory, name))
+                removed.append(name)
+        if removed:
+            logger.warning(
+                "event=evidence_orphaned_temps_removed dir=%s removed=%s "
+                "(a flush was interrupted before its swap; the update it carried never "
+                "reached the document)",
+                directory,
+                ",".join(removed),
+            )
 
     def _discard_stale_queue_depths(self) -> None:
         """Zero every ``queued`` loaded from disk, because no scheduler in this process owns it.
@@ -730,7 +829,7 @@ def _atomic_write(path: str, text: str) -> None:
     new one.
     """
     directory = os.path.dirname(path) or "."
-    fd, temp = tempfile.mkstemp(dir=directory, prefix=".evidence-", suffix=".tmp")
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)

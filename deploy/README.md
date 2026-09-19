@@ -93,6 +93,9 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
   evidence.json                    # what the router has demonstrably done — the NOC ledger's
                                    #   evidence source (0644, NO secrets). The DAEMON is its only
                                    #   writer; the admin CLI only ever reads it.
+  .evidence-*.tmp                  # transient: a flush writes one and renames it over evidence.json.
+                                   #   One left by a daemon killed mid-flush is removed at the next
+                                   #   daemon start (#281).
 ```
 
 The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
@@ -850,6 +853,17 @@ at boot means the previous daemon stopped *without* draining (SIGKILLed at `Time
 or crashed), and the daemon logs one `WARNING event=evidence_stale_queue_cleared agent=<slug>
 pending=<n>` per agent before it writes the zero. Without the reset, that stale value held every deploy
 deferred until the agent was next woken (#264).
+
+**Nothing else in the state dir outlives its purpose (#281).** A flush writes `.evidence-*.tmp` beside the
+document and renames it over `evidence.json`. A failed write removes its own temp, but a daemon killed
+between the two (SIGKILL at `TimeoutStopSec`, an OOM kill, a power cut) leaves it behind. So the daemon
+removes every `.evidence-*.tmp` in that directory when it starts, before its first flush, and logs one
+`WARNING event=evidence_orphaned_temps_removed dir=<dir> removed=<names>`. The update such a temp carried
+is lost, which understates the ledger and never overstates it. Only regular files with that name are
+touched. **Entries for an agent since deregistered or a route since disabled are kept, on purpose.** They
+are a record, not a leftover: no claim is emitted for them, the document grows only with the agents and
+routes ever registered, the NOC's 7-day age-of-proof TTL already retires them as evidence, and after an accidental
+deregistration they are the history you want.
 
 The **boot check** runs the same probe at daemon startup and logs it loudly
 (`event=freeze_selftest status=…`) — but it never aborts startup. That is deliberate: the wake-lock
