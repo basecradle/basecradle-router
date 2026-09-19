@@ -389,7 +389,10 @@ case-insensitively.
   carries the `handoff` label, from a trusted actor (same gate as above), and the agent's **own** comment
   never re-wakes it (the infinite-loop guard, run ahead of the trust gate — the router resolves the repo's
   captain bot from `agents.json` and suppresses it). A comment storm on one issue is capped by the
-  breaker's per-`(agent, issue)` scope below.
+  breaker's per-`(agent, issue)` scope below. Waking is not obeying: the gate admits a comment from any
+  actor on the list, but the trigger's SECURITY preamble (`routes/github.py`) tells the woken agent that
+  only a comment by a founder's account or the capital bot is instruction — every other comment is data,
+  whoever's it is (basecradle#546).
 
 **One handoff, one wake — and never for a closed issue** (#272). One handoff once cost five sessions: every
 accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`
