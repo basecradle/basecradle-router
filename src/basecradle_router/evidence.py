@@ -68,7 +68,10 @@ same agent. So the wake proof is also kept at **(agent, route)** granularity
 - *It must survive a restart.* ``/var/lib``, not ``/run``: the whole point is an
   age-of-proof that spans reboots. The daemon reloads the document at startup and
   keeps it in memory, so a restart never resets a counter to zero and never makes
-  a proven capability read as never-proven.
+  a proven capability read as never-proven. The one field that does *not* survive
+  is ``queued``, because it is not evidence: it is a live reading of the scheduler
+  that wrote it, and that scheduler is gone after a restart
+  (:meth:`EvidenceStore._discard_stale_queue_depths`).
 - *It must never break a wake.* Every write is best-effort: an unwritable state
   dir (a laptop, a test, a botched deploy) degrades to in-memory only, with **one**
   warning per process rather than a line per delivery. Recording evidence is an
@@ -242,7 +245,9 @@ class AgentWakeEvidence:
 
     ``queued`` is the scheduler's pending-wake depth for this agent as of the last
     change — the transient wake edge. Non-zero means a wake is queued or in flight
-    right now, so the agent will be woken again regardless of anything else.
+    right now, so the agent will be woken again regardless of anything else. It is the
+    one field here that is not history: it describes the process that wrote it, so the
+    daemon zeroes it when it loads the document at boot (basecradle-router#264).
 
     Each ``last_*`` trio carries **which route** produced it and **whether it was
     synthetic** (basecradle-router#208). ``last_ok_route`` alone was enough while every
@@ -466,6 +471,51 @@ class EvidenceStore:
         # broken state dir must be visible exactly once, never a firehose that buries
         # the wake lines an operator is actually reading.
         self._write_failed = False
+        self._discard_stale_queue_depths()
+
+    def _discard_stale_queue_depths(self) -> None:
+        """Zero every ``queued`` loaded from disk, because no scheduler in this process owns it.
+
+        Every other field in the document is history (a count, a timestamp, a proof), and
+        history survives a restart. ``queued`` is a live reading of one process's
+        scheduler, and that scheduler ended with its process. A graceful stop publishes
+        ``pending=0`` for every agent before it exits, because the drain waits for the
+        observer (:meth:`~basecradle_router.scheduler.WakeScheduler.wait_idle`). So a
+        non-zero value on disk at load means the previous daemon stopped *without*
+        draining: it was SIGKILLed at ``TimeoutStopSec``, OOM-killed, or crashed with a wake
+        queued or in flight. Reloaded as-is, that value advertised a pending wake no live
+        process owned, until that agent was next woken. Meanwhile it held the NOC's deploy
+        idle-gate deferred on every tick, and it read as a live ``queued-wake`` edge on an
+        agent that may be unreachable (basecradle-router#264).
+
+        **Why here, and only here.** Only the daemon constructs a store over the real file;
+        every other reader goes through :func:`read_evidence`, which must keep the live
+        value, because it is exactly what the NOC reads while the daemon runs. The scheduler
+        that will feed this store has not been built yet, so the true depth is zero for
+        every agent. Waiting for the scheduler's first report instead would not work: that
+        report arrives only when the agent is woken again, and that wait is the bug.
+
+        **Flushed at once when anything changed**, rather than riding the next record: the
+        NOC reads the file, not this process's memory, so a correction held only in memory
+        corrects nothing it can see. A clean boot finds nothing to change and writes
+        nothing. Each discard is logged, never silent: a stale depth is the only trace that
+        a wake queued or in flight under the previous process may never have completed.
+        """
+        stale = {agent: wake.queued for agent, wake in self._doc.agent_wakes.items() if wake.queued}
+        if not stale:
+            return
+        for agent, pending in sorted(stale.items()):
+            logger.warning(
+                "event=evidence_stale_queue_cleared agent=%s pending=%s "
+                "(the previous daemon stopped without draining; no scheduler in this process "
+                "owns that work)",
+                agent,
+                pending,
+            )
+        with self._lock:
+            for agent in stale:
+                self._doc.agent_wakes[agent].queued = 0
+            self._flush_locked()
 
     def snapshot(self) -> EvidenceDocument:
         """A detached copy of the current document, for an in-process reader.

@@ -13,12 +13,13 @@ Test cast: Nova Digital (``nova``, AI).
 import hashlib
 import hmac
 import json
+import threading
 from types import MappingProxyType
 
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
-from basecradle_router.evidence import EvidenceStore
+from basecradle_router.evidence import EvidenceStore, read_evidence
 from basecradle_router.models import Agent, Event, EventKind, IssueRef, Recipient
 from basecradle_router.pipeline import Pipeline, PipelineResult
 from basecradle_router.routes import InboundRequest, RouteRegistry
@@ -257,6 +258,38 @@ def test_the_scheduler_reports_queue_depth_to_its_observer() -> None:
 
     assert seen[0] == ("nova", 1)  # enqueued/in flight
     assert seen[-1] == ("nova", 0)  # drained
+
+
+def test_a_restart_after_an_ungraceful_stop_reads_no_pending_wake(tmp_path) -> None:
+    # basecradle-router#264, end to end through the real seam: the scheduler publishes a
+    # wake in flight to the real store on a real file, and then the process dies without
+    # draining. It is never drained here, which is what a SIGKILL at TimeoutStopSec, an
+    # OOM kill, or a crash leaves behind. The daemon that boots next must not inherit it,
+    # or the NOC's deploy idle-gate holds every deploy until this agent is woken again.
+    path = str(tmp_path / "evidence.json")
+    release = threading.Event()
+    running = threading.Event()
+
+    def mid_wake(agent, event, result) -> None:
+        running.set()
+        release.wait(timeout=5)
+
+    killed = WakeScheduler(
+        mid_wake, lanes=1, on_queue_change=EvidenceStore(path).record_queue_depth
+    )
+    killed.submit(NOVA, _event(), PipelineResult())
+    try:
+        assert running.wait(timeout=5)
+        # The precondition is real: the dead process's last word on disk is a pending wake.
+        assert read_evidence(path).agent_wakes["nova"].queued == 1
+
+        EvidenceStore(path)  # the next daemon boots over the same file
+
+        assert read_evidence(path).agent_wakes["nova"].queued == 0
+    finally:
+        release.set()
+        killed.wait_idle(timeout=5)
+        killed.shutdown()
 
 
 def test_a_broken_queue_observer_cannot_break_a_wake(caplog) -> None:
