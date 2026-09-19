@@ -37,12 +37,34 @@ route deliberately stays actor-agnostic and leaves the equivalent self-filter to
 the harness (see its module docstring) because its events are timeline-scoped and
 it never reads ``actor_uuid``. Same problem class, two routes, two right answers
 for two different payload shapes.
+
+**A session's life is its issue's life** (basecradle-router#272). A delivery can wait
+minutes behind its agent's running wake, and the issue it names can close — or lose its
+``handoff`` label, or gain ``Do Not Work`` — in that time. So when the delivery reaches
+the front of the queue the core asks this route whether the work still stands
+(:meth:`GithubRoute.recheck`), and the route answers from an :class:`IssueLedger`: the
+newest state of each handoff issue as GitHub itself reported it, in the ``issues`` and
+``issue_comment`` deliveries the App subscription already sends — ``closed``,
+``reopened`` and ``unlabeled`` included, which reached the router all along and were
+ignored. It is not a fetch: the router holds no GitHub credential by design, and needs
+none for this, because every change of state that matters arrives as a delivery.
+
+Each handoff :class:`~basecradle_router.models.Event` is also stamped with **when its
+event happened** — the issue's creation for ``opened``, its last update for ``labeled``,
+the comment's creation for ``issue_comment`` — which opts this route's streams into the
+core's collapse of a delivery into a wake that already read it
+(:mod:`basecradle_router.coalesce`). That collapse is what turns the ``opened`` and
+``labeled`` of one labeled create into one wake, whichever arrives first.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from basecradle_router.models import Event, EventKind, IssueRef, Recipient
@@ -80,6 +102,24 @@ _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 # not (the re-wake re-reads the whole thread anyway, so an edit adds nothing).
 _ACTIONABLE_COMMENT_ACTION = "created"
 
+# Why a queued github wake is dropped at dispatch — the ``reason=`` the core logs on
+# the ``decision=dropped`` line (basecradle-router#272). Most decisive first: a closed
+# issue is over whatever its labels say.
+ISSUE_CLOSED = "issue_closed"
+DO_NOT_WORK = "do_not_work"
+HANDOFF_REMOVED = "handoff_removed"
+
+# The `issues` actions that *make* a change, and so report its result first-hand — a
+# `closed` payload IS the close. Every other delivery (a comment, an edit) only mentions
+# the issue's state in passing, possibly as it stood a moment before (#272).
+_STATE_ACTIONS = frozenset({"opened", "closed", "reopened"})
+_LABEL_ACTIONS = frozenset({"opened", "labeled", "unlabeled"})
+
+#: How many handoff issues the ledger remembers. It only has to outlive the queue
+#: behind a running wake, so this is generous by orders of magnitude; an evicted issue
+#: is answered "no information", which wakes exactly as the router always did.
+LEDGER_CAPACITY = 1024
+
 # The standing trust-boundary envelope wrapped around every handoff trigger
 # (basecradle-router#60, workstream 1).
 #
@@ -112,6 +152,151 @@ _HANDOFF_TRIGGER = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _IssueState:
+    """One handoff issue as deliveries reported it: when, whether open, which labels.
+
+    ``state_first_hand``/``labels_first_hand`` record whether that field came from the
+    delivery whose action made the change — see :meth:`IssueLedger.observe`.
+    """
+
+    updated_at: datetime
+    open: bool
+    labels: frozenset[str]
+    state_first_hand: bool
+    labels_first_hand: bool
+
+
+class IssueLedger:
+    """The newest state of each handoff issue, as GitHub's own deliveries reported it.
+
+    Fed by :meth:`observe` from every verified ``issues``/``issue_comment`` payload —
+    the ones the route ignores as much as the ones it wakes on, because the ``closed``,
+    ``reopened`` and ``unlabeled`` deliveries are exactly what say a queued wake is no
+    longer wanted. Read by :meth:`reason_to_drop` when a queued wake reaches the front.
+
+    **Ordered by the payload's own ``updated_at``, not by arrival.** GitHub does not
+    promise delivery order, so an observation older than the one held is discarded
+    rather than allowed to roll the issue's state back.
+
+    **Within one second, the delivery that made the change outranks one that mentions
+    it.** ``updated_at`` is whole seconds, and an agent posts its completion comment and
+    closes its issue inside one: basecradle-ruby#149 did exactly that at 03:31:03, and the
+    comment's delivery reached the router 0.27 s *after* the close's. A comment's payload
+    may show the issue as it stood a moment before, so on a tie it never overrides the
+    open/closed state a ``closed``/``reopened`` delivery reported, nor the labels a
+    ``labeled``/``unlabeled`` one did. Otherwise, the later arrival wins the tie.
+
+    **Bounded to handoff issues.** An issue is first recorded when a payload shows it
+    carrying ``handoff``, and followed from then on — including the payload that shows
+    the label gone. No other issue can have a queued wake to re-check, so no other issue
+    is kept; and the whole ledger is an LRU of :data:`LEDGER_CAPACITY` issues.
+
+    **It fails towards waking.** An issue it has no record of — never seen, evicted, or
+    lost to a restart (the ledger is memory, like the queue it serves) — is answered
+    ``None``, which is the router's behaviour before the ledger existed.
+
+    Thread-safe: observed on the event loop (``normalize`` runs on the accept half) and
+    read from the wake threads, under one lock held for a dictionary operation.
+    """
+
+    def __init__(self, capacity: int = LEDGER_CAPACITY) -> None:
+        if capacity < 1:
+            raise ValueError(f"capacity must be >= 1, got {capacity}")
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._issues: OrderedDict[str, _IssueState] = OrderedDict()
+
+    def observe(self, data: dict[str, Any], *, event_type: str) -> None:
+        """Record the issue state a verified payload reports. Never raises.
+
+        Best-effort by design: a payload whose ``issue`` object is missing or malformed
+        is simply not recorded, because an ignored delivery must stay an ignore — the
+        ledger may never turn a quiet event into a rejection. A pull request's
+        ``issue_comment`` is skipped: its state is a PR's, never a handoff's.
+        ``event_type`` says whether ``data["action"]`` is an ``issues`` action — the only
+        kind that reports a change first-hand.
+        """
+        issue = data.get("issue")
+        if not isinstance(issue, dict) or issue.get("pull_request") is not None:
+            return
+        url = issue.get("html_url")
+        state = issue.get("state")
+        labels = issue.get("labels")
+        updated_at = _timestamp(issue.get("updated_at"))
+        if (
+            not isinstance(url, str)
+            or not url
+            or state not in ("open", "closed")
+            or not isinstance(labels, list)
+            or updated_at is None
+        ):
+            return
+        names = frozenset(
+            label["name"]
+            for label in labels
+            if isinstance(label, dict) and isinstance(label.get("name"), str)
+        )
+        action = data.get("action") if event_type == ISSUES_EVENT else None
+        report = _IssueState(
+            updated_at,
+            state == "open",
+            names,
+            state_first_hand=action in _STATE_ACTIONS,
+            labels_first_hand=action in _LABEL_ACTIONS,
+        )
+        with self._lock:
+            known = self._issues.get(url)
+            if known is None and HANDOFF_LABEL not in names:
+                return  # not a handoff issue, and never was one we followed
+            if known is not None and updated_at < known.updated_at:
+                return  # an older report arriving late — never roll the state back
+            if known is not None and updated_at == known.updated_at:
+                report = _settle_tie(known, report)
+            self._issues[url] = report
+            self._issues.move_to_end(url)
+            while len(self._issues) > self._capacity:
+                self._issues.popitem(last=False)
+
+    def reason_to_drop(self, url: str) -> str | None:
+        """Why a queued wake for the issue at ``url`` should not run, or ``None`` to run it.
+
+        Closed first — a closed issue is over, whatever its labels say — then the
+        ``Do Not Work`` brake (#146: an issue carrying it never wakes an agent, and that
+        must hold for a wake queued before the brake went on), then a ``handoff`` label
+        that has since been removed.
+        """
+        with self._lock:
+            known = self._issues.get(url)
+        if known is None:
+            return None
+        if not known.open:
+            return ISSUE_CLOSED
+        if DO_NOT_WORK_LABEL in known.labels:
+            return DO_NOT_WORK
+        if HANDOFF_LABEL not in known.labels:
+            return HANDOFF_REMOVED
+        return None
+
+
+def _settle_tie(known: _IssueState, report: _IssueState) -> _IssueState:
+    """Merge two reports stamped with the same second, field by field.
+
+    The later arrival wins each field — unless the earlier one heard it first-hand and
+    the later one did not. See :class:`IssueLedger` for the incident that makes this more
+    than tidiness.
+    """
+    keep_state = known.state_first_hand and not report.state_first_hand
+    keep_labels = known.labels_first_hand and not report.labels_first_hand
+    return _IssueState(
+        report.updated_at,
+        known.open if keep_state else report.open,
+        known.labels if keep_labels else report.labels,
+        state_first_hand=known.state_first_hand or report.state_first_hand,
+        labels_first_hand=known.labels_first_hand or report.labels_first_hand,
+    )
+
+
 class GithubRoute:
     """The GitHub webhook route. ``name`` is the source key the registry uses.
 
@@ -142,6 +327,22 @@ class GithubRoute:
         # default never identifies a self-comment, so a route built without it
         # cannot suppress an own-comment loop; production always provides it.
         self._bot_login_for_repo = bot_login_for_repo or (lambda _repo: None)
+        # What each handoff issue looks like now, per GitHub's own deliveries — read at
+        # dispatch by `recheck` (#272). One per route instance, so each test is isolated.
+        self._ledger = IssueLedger()
+
+    def recheck(self, event: Event) -> str | None:
+        """Why a queued handoff wake should no longer run, or ``None`` to run it.
+
+        Asked by the core when the delivery reaches the front of its agent's queue
+        (:func:`~basecradle_router.routes.base.route_recheck`) — the moment the answer
+        is needed, rather than the moment the delivery arrived, because a session's life
+        is its issue's life and the issue can close while the delivery waits. See
+        :meth:`IssueLedger.reason_to_drop` for the answers.
+        """
+        if event.origin is None:
+            return None
+        return self._ledger.reason_to_drop(event.origin.url)
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
@@ -183,6 +384,10 @@ class GithubRoute:
     ) -> Event | None:
         """An ``issues`` webhook: a handoff issue opened or labeled — the initial wake."""
         data = parse_json_object(request.body)
+        # Every verified `issues` delivery is a report of the issue's state — the
+        # `closed`/`reopened`/`unlabeled` ones this path ignores most of all — so it is
+        # observed before the action gate decides whether it wakes anyone (#272).
+        self._ledger.observe(data, event_type=event_type)
         action = data.get("action")
         if action not in _ACTIONABLE_ACTIONS:
             return self._ignore(event_type, delivery)
@@ -202,7 +407,10 @@ class GithubRoute:
         # sender is GitHub-attested. An untrusted (or unidentifiable) sender is a
         # rejection, not a wake — fail closed.
         self._require_trusted_sender(data)
-        return self._wake_event(data, issue, event_type, delivery)
+        # When it happened: an `opened` is the issue's creation; a `labeled` carries no
+        # time of its own, so the issue's last update — never earlier than the label.
+        stamp = issue.get("created_at") if action == "opened" else issue.get("updated_at")
+        return self._wake_event(data, issue, event_type, delivery, _timestamp(stamp))
 
     def _normalize_comment(
         self, request: InboundRequest, event_type: str, delivery: str | None
@@ -218,6 +426,9 @@ class GithubRoute:
         scope caps a comment storm downstream (basecradle-router#129).
         """
         data = parse_json_object(request.body)
+        # A comment payload carries the issue's state as of the comment — the agent's
+        # own progress notes included — so it is observed ahead of every gate (#272).
+        self._ledger.observe(data, event_type=event_type)
         if data.get("action") != _ACTIONABLE_COMMENT_ACTION:
             return self._ignore(event_type, delivery)
 
@@ -252,7 +463,9 @@ class GithubRoute:
         # Sender scope: every other commenter must be a trusted fleet actor (the
         # same gate as the label-wake path).
         self._require_trusted_sender(data)
-        return self._wake_event(data, issue, event_type, delivery)
+        comment = data.get("comment")
+        stamp = comment.get("created_at") if isinstance(comment, dict) else None
+        return self._wake_event(data, issue, event_type, delivery, _timestamp(stamp))
 
     def _wake_event(
         self,
@@ -260,6 +473,7 @@ class GithubRoute:
         issue: dict[str, Any],
         event_type: str,
         delivery: str | None,
+        occurred_at: datetime | None,
     ) -> Event:
         """Build the handoff :class:`Event` shared by both wake paths.
 
@@ -268,6 +482,10 @@ class GithubRoute:
         including any new comment, and the trust-boundary preamble is the same
         verbatim envelope — the new comment is exactly the "untrusted thread
         content" it already quarantines.
+
+        ``occurred_at`` is when the event happened (``None`` if the payload did not say
+        parseably — the event is then never collapsed, the old behaviour); ``event_type``
+        rides along so the core's later decision about this delivery names it too.
         """
         repository = data.get("repository")
         if not isinstance(repository, dict):
@@ -290,6 +508,8 @@ class GithubRoute:
                 wake_arg=_HANDOFF_TRIGGER.format(url=origin.url),
                 delivery_id=delivery,
                 origin=origin,
+                occurred_at=occurred_at,
+                event_type=event_type,
             )
         except ValueError as exc:
             raise PayloadError(f"malformed {event_type} payload: {exc}") from exc
@@ -423,6 +643,25 @@ def _has_label(issue: dict[str, Any], name: str) -> bool:
     if not isinstance(labels, list):
         return False
     return any(isinstance(label, dict) and label.get("name") == name for label in labels)
+
+
+def _timestamp(value: object) -> datetime | None:
+    """A GitHub ISO-8601 timestamp (``2026-09-19T03:14:07Z``) as an aware datetime.
+
+    ``None`` for anything absent, unparseable, or without a zone — never a guess, and
+    never an exception: an unparseable time only means the event is not collapsed and
+    the observation not recorded, which is the router's behaviour before either existed.
+    The ``Z`` is spelled out as ``+00:00`` because :meth:`datetime.fromisoformat` only
+    reads it from Python 3.11, and this package supports 3.10.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _text(obj: dict[str, Any], key: str, label: str) -> str:

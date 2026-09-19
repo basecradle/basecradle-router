@@ -41,6 +41,15 @@ a consumer must never have to parse this store's reason strings to tell a benign
 from a real refusal — that would be a second spelling of our contract living in someone
 else's repo (basecradle-noc#344/#366).
 
+**A coalesce is counted as a dedup, because it is one** (basecradle-router#272). A delivery
+the pipeline collapses into a wake that already read it — its event happened before a
+successful wake on the same stream started — is the same benign collapse at stream
+granularity rather than delivery granularity, and it is reachable only through a success
+in exactly the same way: coverage is recorded only when a wake succeeds. So it moves
+``deduped``, never ``refused``. A wake *dropped* at dispatch because its work ended (a
+closed issue) records nothing here at all: no wake was attempted and no gate held the
+agent, so it says nothing about the edge either way.
+
 **And every outcome records whether it was real.** Since basecradle-router#208 the
 router can wake an agent with its own signed synthetic probe, which is what gives the
 wake edge a lever it otherwise lacks — an ``evidence``-kind claim cannot exercise
@@ -226,16 +235,17 @@ class AgentWakeEvidence:
     *gated*, not dead — and a ledger that conflated them would cry wolf on every
     converge.
 
-    ``deduped`` counts duplicate deliveries collapsed by the dedup cache, and it is a
-    third thing again (basecradle-router#218). A refusal says *a wake that should have
-    run did not*; a dedup says *a wake that must not run did not* — and, because the
-    cache is marked only after a successful wake, a dedup is reachable **only** through
-    an ``ok``. Both halves of the old lumped counter are still visible, so nothing is
-    lost: what changes is that ``last_refused_at`` no longer moves for an event that
-    proves the edge is working. Note the two live *outside* ``refused`` and outside
-    ``failed`` both — a genuine rejection of a *delivery* (a bad signature, a malformed
-    payload, an untrusted sender) never reaches this class at all; it is counted at the
-    sink, in :class:`DeliverySinkEvidence`.
+    ``deduped`` counts deliveries collapsed into a wake that already ran for them — a
+    duplicate caught by the dedup cache, or a delivery coalesced into a wake that read it
+    (basecradle-router#272) — and it is a third thing again (basecradle-router#218). A
+    refusal says *a wake that should have run did not*; a dedup says *a wake that must not
+    run did not* — and, because the cache is marked only after a successful wake, a dedup is
+    reachable **only** through an ``ok``. Both halves of the old lumped counter are still
+    visible, so nothing is lost: what changes is that ``last_refused_at`` no longer moves
+    for an event that proves the edge is working. Note the two live *outside* ``refused``
+    and outside ``failed`` both — a genuine rejection of a *delivery* (a bad signature, a
+    malformed payload, an untrusted sender) never reaches this class at all; it is counted
+    at the sink, in :class:`DeliverySinkEvidence`.
 
     ``by_route`` is the same proof at **(agent, route)** granularity — see
     :class:`RouteWakeEvidence` for why the scalars above it are not enough on their
@@ -634,13 +644,15 @@ class EvidenceStore:
             self._flush_locked()
 
     def record_wake_deduped(self, agent: str, *, route: str, synthetic: bool) -> None:
-        """A duplicate delivery collapsed into the wake that already ran for it.
+        """A delivery collapsed into the wake that already ran for it.
 
         Its own outcome rather than a refusal, because it is the only one here that a
         *success* produces: the dedup cache is marked only after a wake has fired and
         succeeded, so this record can exist only downstream of an ``ok`` recorded within
         the cache's TTL (basecradle-router#218). Counting it as a refusal made the newest
-        recorded attempt on a healthy route read as a rejection.
+        recorded attempt on a healthy route read as a rejection. A delivery *coalesced*
+        into a wake that read it lands here for the same reason (basecradle-router#272):
+        stream coverage, like the dedup mark, is recorded only on a success.
 
         Takes no ``reason``: there is exactly one, and **the counter is the
         classification**. Handing a consumer a reason string to parse is what would

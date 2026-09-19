@@ -7,10 +7,11 @@ Test cast: John Doe (``john``, human) / Nova Digital (``nova``, AI).
 import hashlib
 import hmac
 import json
+from datetime import datetime
 
 import pytest
 
-from basecradle_router.models import EventKind, Recipient
+from basecradle_router.models import Event, EventKind, Recipient
 from basecradle_router.routes import (
     DeliveryDecision,
     GithubRoute,
@@ -24,6 +25,7 @@ from basecradle_router.routes.github import (
     DELIVERY_HEADER,
     EVENT_HEADER,
     SIGNATURE_HEADER,
+    IssueLedger,
 )
 
 SECRET = "s3cret-fake-webhook-signing-key"
@@ -596,3 +598,271 @@ def test_normalize_logs_woke_for_a_comment_rewake_naming_the_event_type(caplog) 
     assert f"decision={DeliveryDecision.WOKE.value}" in line
     assert f"recipient={TARGET_REPO}" in line
     assert f"delivery={DELIVERY}" in line
+
+
+# --- when it happened, and whether it still stands (#272) ----------------------
+#
+# Each handoff Event is stamped with when its event happened, so the core can collapse
+# a delivery into a wake that already read it; and the route keeps an IssueLedger of
+# each handoff issue's newest reported state, so a queued wake can be dropped at
+# dispatch once its issue closes. Both read only the delivered payload — the router
+# holds no GitHub credential and makes no GitHub call.
+
+CREATED = "2026-09-19T03:14:07Z"
+UPDATED = "2026-09-19T03:14:09Z"
+COMMENTED = "2026-09-19T03:22:03Z"
+
+
+def _stamped(payload: dict, *, state: str = "open") -> dict:
+    payload["issue"].update({"state": state, "created_at": CREATED, "updated_at": UPDATED})
+    return payload
+
+
+def _instant(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def test_an_opened_handoff_happened_when_the_issue_was_created() -> None:
+    event = GithubRoute(TRUSTED).normalize(_issues_request(_stamped(_issues_payload())))
+    assert event is not None
+    assert event.occurred_at == _instant(CREATED)
+    assert event.event_type == "issues"
+
+
+def test_a_labeled_handoff_happened_no_earlier_than_the_issues_last_update() -> None:
+    # A `labeled` payload carries no time of its own; the issue's `updated_at` is never
+    # earlier than the label, which is the direction that can only cost an extra wake.
+    payload = _stamped(_issues_payload(action="labeled", labels=("handoff",)))
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+    assert event.occurred_at == _instant(UPDATED)
+
+
+def test_a_comment_rewake_happened_when_the_comment_was_created() -> None:
+    payload = _stamped(_comment_payload())
+    payload["comment"]["created_at"] = COMMENTED
+    event = _comment_route().normalize(_comment_request(payload))
+    assert event is not None
+    assert event.occurred_at == _instant(COMMENTED)
+    assert event.event_type == "issue_comment"
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [None, "", "yesterday", "2026-09-19T03:14:07", 1726715647],
+    ids=["absent", "empty", "prose", "no-zone", "epoch-int"],
+)
+def test_an_unparseable_time_wakes_normally_and_is_never_guessed(stamp) -> None:
+    payload = _issues_payload()
+    if stamp is not None:
+        payload["issue"]["created_at"] = stamp
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None  # still a handoff: the time is an opt-in, never a gate
+    assert event.occurred_at is None
+
+
+def test_a_non_utc_offset_is_read_as_the_instant_it_names() -> None:
+    payload = _issues_payload()
+    payload["issue"]["created_at"] = "2026-09-18T22:14:07-05:00"
+    event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
+    assert event is not None
+    assert event.occurred_at == _instant(CREATED)
+
+
+def _handoff_event(route: GithubRoute) -> Event:
+    event = route.normalize(_issues_request(_stamped(_issues_payload())))
+    assert event is not None
+    return event
+
+
+def _report(route: GithubRoute, action: str, *, state: str, labels, updated: str) -> None:
+    """Feed the route one ignored `issues` delivery reporting the issue's state."""
+    payload = _issues_payload(action=action, labels=labels, added_label="handoff")
+    payload["issue"].update({"state": state, "updated_at": updated})
+    assert route.normalize(_issues_request(payload)) is None
+
+
+def test_recheck_lets_a_wake_run_while_the_handoff_stands() -> None:
+    route = GithubRoute(TRUSTED)
+    assert route.recheck(_handoff_event(route)) is None
+
+
+def test_recheck_drops_a_wake_once_a_closed_delivery_is_seen() -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:24:36Z")
+    assert route.recheck(event) == "issue_closed"
+
+
+def test_recheck_drops_a_wake_once_handoff_is_removed() -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    _report(route, "unlabeled", state="open", labels=(), updated="2026-09-19T03:26:07Z")
+    assert route.recheck(event) == "handoff_removed"
+
+
+def test_recheck_drops_a_wake_once_do_not_work_goes_on() -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    payload = _issues_payload(
+        action="labeled", labels=("handoff", "Do Not Work"), added_label="Do Not Work"
+    )
+    payload["issue"].update({"state": "open", "updated_at": "2026-09-19T03:26:07Z"})
+    assert route.normalize(_issues_request(payload)) is None  # the brake's own skip
+    assert route.recheck(event) == "do_not_work"
+
+
+def test_recheck_says_closed_before_anything_a_label_says() -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    _report(route, "closed", state="closed", labels=(), updated="2026-09-19T03:24:36Z")
+    assert route.recheck(event) == "issue_closed"
+
+
+def test_the_ledger_never_rolls_an_issue_back_on_an_older_report() -> None:
+    # GitHub promises no delivery order: a `closed` older than the `reopened` already
+    # seen is a stale report, and is discarded.
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    _report(route, "reopened", state="open", labels=("handoff",), updated="2026-09-19T03:26:05Z")
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:24:36Z")
+    assert route.recheck(event) is None
+
+
+def test_the_ledger_takes_the_later_arrival_within_one_second() -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    _report(route, "reopened", state="open", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    assert route.recheck(event) == "issue_closed"
+
+
+def _own_comment(route: GithubRoute, *, state: str, labels, updated: str) -> None:
+    """The recipient agent's own comment: ignored by the guard, but still a report."""
+    payload = _comment_payload(sender=RECIPIENT_BOT, labels=labels)
+    payload["issue"].update({"state": state, "updated_at": updated})
+    assert route.normalize(_comment_request(payload)) is None
+
+
+def test_a_comment_in_the_same_second_never_reopens_a_close_it_arrived_after() -> None:
+    # basecradle-ruby#149 at 03:31:03: the agent commented and closed in one second, and
+    # the comment's delivery reached the router 0.27 s AFTER the close's. A comment that
+    # shows the issue as it stood a moment before must not undo the close it trails.
+    route = _comment_route()
+    event = _handoff_event(route)
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    _own_comment(route, state="open", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    assert route.recheck(event) == "issue_closed"
+
+
+def test_a_close_in_the_same_second_overrides_a_comment_that_came_first() -> None:
+    route = _comment_route()
+    event = _handoff_event(route)
+    _own_comment(route, state="open", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    assert route.recheck(event) == "issue_closed"
+
+
+def test_a_comment_in_the_same_second_never_restores_a_label_just_removed() -> None:
+    route = _comment_route()
+    event = _handoff_event(route)
+    _report(route, "unlabeled", state="open", labels=(), updated="2026-09-19T03:26:07Z")
+    _own_comment(route, state="open", labels=("handoff",), updated="2026-09-19T03:26:07Z")
+    assert route.recheck(event) == "handoff_removed"
+
+
+def test_a_later_second_always_wins_whoever_reported_it() -> None:
+    # First-hand only breaks a tie: a newer report of any kind is the newer truth.
+    route = _comment_route()
+    event = _handoff_event(route)
+    _report(route, "closed", state="closed", labels=("handoff",), updated="2026-09-19T03:31:03Z")
+    _own_comment(route, state="open", labels=("handoff",), updated="2026-09-19T03:31:04Z")
+    assert route.recheck(event) is None
+
+
+def test_the_ledger_learns_from_the_agents_own_comment_it_ignores() -> None:
+    # The self-comment guard ignores the agent's own completion note — but the issue
+    # state it reports (closed alongside it) is GitHub's, and the ledger keeps it.
+    route = _comment_route()
+    event = _handoff_event(route)
+    payload = _comment_payload(sender=RECIPIENT_BOT)
+    payload["issue"].update({"state": "closed", "updated_at": "2026-09-19T03:31:03Z"})
+    assert route.normalize(_comment_request(payload)) is None
+    assert route.recheck(event) == "issue_closed"
+
+
+def test_the_ledger_ignores_a_pull_request_comment() -> None:
+    route = _comment_route()
+    event = _handoff_event(route)
+    payload = _comment_payload()
+    payload["issue"].update(
+        {
+            "state": "closed",
+            "updated_at": "2026-09-19T03:31:03Z",
+            "pull_request": {"url": f"https://api.github.com/repos/{TARGET_REPO}/pulls/42"},
+        }
+    )
+    assert route.normalize(_comment_request(payload)) is None
+    assert route.recheck(event) is None
+
+
+def test_the_ledger_follows_only_handoff_issues() -> None:
+    ledger = IssueLedger()
+    ledger.observe(
+        {
+            "issue": {
+                "html_url": ISSUE_URL,
+                "state": "closed",
+                "labels": [{"name": "bug"}],
+                "updated_at": UPDATED,
+            }
+        },
+        event_type="issues",
+    )
+    assert ledger.reason_to_drop(ISSUE_URL) is None  # never a handoff: never recorded
+
+
+@pytest.mark.parametrize(
+    "issue",
+    [
+        None,
+        "not-an-object",
+        {"state": "open", "labels": [], "updated_at": UPDATED},
+        {"html_url": ISSUE_URL, "state": "merged", "labels": [], "updated_at": UPDATED},
+        {"html_url": ISSUE_URL, "state": "open", "labels": "handoff", "updated_at": UPDATED},
+        {"html_url": ISSUE_URL, "state": "open", "labels": [], "updated_at": "soon"},
+    ],
+    ids=["missing", "not-object", "no-url", "bad-state", "bad-labels", "bad-time"],
+)
+def test_a_malformed_report_is_skipped_and_an_ignore_stays_an_ignore(issue) -> None:
+    route = GithubRoute(TRUSTED)
+    event = _handoff_event(route)
+    payload = {"action": "closed", "repository": {"full_name": TARGET_REPO}}
+    if issue is not None:
+        payload["issue"] = issue
+    assert route.normalize(_issues_request(payload)) is None  # never a rejection
+    assert route.recheck(event) is None
+
+
+def test_the_ledger_is_bounded_and_forgets_the_least_recent_issue() -> None:
+    ledger = IssueLedger(capacity=2)
+    urls = [f"https://github.com/{TARGET_REPO}/issues/{number}" for number in (1, 2, 3)]
+    for url in urls:
+        ledger.observe(
+            {
+                "issue": {
+                    "html_url": url,
+                    "state": "closed",
+                    "labels": [{"name": "handoff"}],
+                    "updated_at": UPDATED,
+                }
+            },
+            event_type="issues",
+        )
+    assert ledger.reason_to_drop(urls[0]) is None  # evicted: answered as the old router
+    assert ledger.reason_to_drop(urls[2]) == "issue_closed"
+
+
+def test_the_ledger_rejects_a_non_positive_capacity() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        IssueLedger(capacity=0)

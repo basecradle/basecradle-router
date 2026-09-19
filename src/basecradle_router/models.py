@@ -17,6 +17,7 @@ knowing any source's specifics, and an :class:`Agent` carries a stable ``key``
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 
@@ -178,6 +179,20 @@ class Event:
     ``origin`` records where the agent reports back when the source has such a
     place (a GitHub issue) — informational, and ``None`` for sources that don't
     (a harness agent replies on its timeline itself).
+
+    ``occurred_at`` is when the source says the event happened — timezone-aware, and
+    no later than the truth. It is what lets the core collapse a delivery into a wake
+    that already covered it (:mod:`basecradle_router.coalesce`): an event that happened
+    before a successful wake on its stream *started* is one that session read. A route
+    **opts its streams into that collapse by stamping it**, so ``None`` — every source
+    that does not — keeps the one-delivery-one-wake behaviour exactly as it was
+    (basecradle-router#272).
+
+    ``event_type`` is the source's own name for what kind of delivery this was
+    (github's ``X-GitHub-Event``). The core never reasons over it; it is carried so a
+    decision the core makes about this delivery *later* — coalesced, or dropped at
+    dispatch — is logged in the same vocabulary as the route's own first decision line
+    about it, rather than as a line that names everything but what arrived.
     """
 
     source: str
@@ -186,6 +201,8 @@ class Event:
     wake_arg: str
     delivery_id: str
     origin: IssueRef | None = None
+    occurred_at: datetime | None = None
+    event_type: str | None = None
 
     def __post_init__(self) -> None:
         _require(self.source, "Event.source")
@@ -197,6 +214,17 @@ class Event:
         _require(self.delivery_id, "Event.delivery_id")
         if self.origin is not None and not isinstance(self.origin, IssueRef):
             raise ValueError(f"Event.origin must be an IssueRef or None, got {self.origin!r}")
+        # Aware, or not at all: it is compared against the router's own UTC clock, and
+        # comparing a naive datetime with an aware one raises mid-dispatch.
+        if self.occurred_at is not None and (
+            not isinstance(self.occurred_at, datetime) or self.occurred_at.tzinfo is None
+        ):
+            raise ValueError(
+                f"Event.occurred_at must be a timezone-aware datetime or None, "
+                f"got {self.occurred_at!r}"
+            )
+        if self.event_type is not None:
+            _require(self.event_type, "Event.event_type")
 
     @property
     def synthetic(self) -> bool:

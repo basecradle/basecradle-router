@@ -507,7 +507,8 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
     apart: a refusal is the converge lock or the breaker working, and an agent whose whole
     history is refusals is *gated*, not unreachable. ``deduped`` stays apart from
     ``refused`` for a sharper reason still (basecradle-router#218): a collapsed duplicate
-    is only reachable *through* a successful wake, so publishing it as a refusal made the
+    — or a delivery coalesced into a wake that already read it (#272) — is only
+    reachable *through* a successful wake, so publishing it as a refusal made the
     newest recorded attempt on a demonstrably healthy route read as a rejection. Both
     counters ship, so a consumer classifies by the field it reads and never by parsing our
     reason strings.

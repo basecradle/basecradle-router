@@ -103,9 +103,11 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 
 from basecradle_router.breaker import WakeRateBreaker
+from basecradle_router.coalesce import WakeCoverage
 from basecradle_router.concurrency import (
     AgentLocks,
     RetryExhausted,
@@ -119,12 +121,15 @@ from basecradle_router.logfmt import log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
+    DeliveryDecision,
     InboundRequest,
     PayloadError,
     RouteRegistry,
     SignatureError,
     UnknownRouteError,
     UntrustedSenderError,
+    log_delivery_decision,
+    route_recheck,
 )
 from basecradle_router.wake import WakeError, Waker, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
@@ -135,6 +140,18 @@ logger = logging.getLogger("basecradle_router.pipeline")
 def _seconds(elapsed: float) -> str:
     """A wall-clock duration as a log value: ``23.1s``."""
     return f"{elapsed:.1f}s"
+
+
+def _utcnow() -> datetime:
+    """The router's wall clock, UTC-aware — what a wake's start is compared on."""
+    return datetime.now(timezone.utc)
+
+
+def _instant(at: datetime | None) -> str | None:
+    """A moment as a log value: ISO-8601 UTC, ``Z``-suffixed like the sources spell it."""
+    if at is None:
+        return None
+    return at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _who(agent: Agent, event: Event) -> dict[str, object]:
@@ -185,6 +202,8 @@ class Stage(Enum):
     RESOLVE = "resolve"
     LOCK = "lock"
     DEDUP = "dedup"
+    COALESCE = "coalesce"
+    RECHECK = "recheck"
     WAKE_LOCK = "wake_lock"
     BREAKER = "breaker"
     WAKE = "wake"
@@ -262,8 +281,10 @@ class Pipeline:
     All collaborators are injected so the whole pipeline is drivable offline:
     ``registry``/``config`` from the route + config layers, a ``waker`` (mocked
     in tests), per-agent ``locks``, a ``sleep`` used by the wake retry (injected
-    as a no-op in tests so nothing really waits), and a ``clock`` used to time the
-    wake subprocess (injected in tests so a logged duration is deterministic).
+    as a no-op in tests so nothing really waits), a ``clock`` used to time the
+    wake subprocess (injected in tests so a logged duration is deterministic), and a
+    ``now`` wall clock stamping when a wake starts (injected so a test places a
+    delivery's event before or after it exactly).
     """
 
     registry: RouteRegistry
@@ -272,6 +293,9 @@ class Pipeline:
     locks: AgentLocks = field(default_factory=AgentLocks)
     breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
     deduper: DeliveryDeduper = field(default_factory=DeliveryDeduper)
+    # Which successful wake already covered each stream, and when it started — the
+    # collapse of N queued deliveries for one issue into at most one follow-up (#272).
+    coverage: WakeCoverage = field(default_factory=WakeCoverage)
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
     # Durable proof of what this router has actually done, for the NOC's
     # claims-vs-evidence ledger (basecradle/basecradle#460). Defaults to an
@@ -284,6 +308,9 @@ class Pipeline:
     # stepped mid-wake (a wake runs for minutes; ntp can and does correct in that
     # window), and it is a *duration*, never a timestamp.
     clock: Callable[[], float] = time.monotonic
+    # Wall clock, deliberately separate from `clock`: a wake's *start* is compared with
+    # the time a source says its event happened, which only a wall clock can do.
+    now: Callable[[], datetime] = _utcnow
 
     def handle(self, source: str, request: InboundRequest) -> PipelineResult:
         """Run ``request`` for ``source`` synchronously, end to end; never raises.
@@ -348,6 +375,25 @@ class Pipeline:
         original) guarantees the duplicate observes the mark, while a *failed*
         original leaves the duplicate free to retry. See :mod:`basecradle_router.dedup`.
 
+        Then two gates ask whether this delivery still needs a session of its own — both
+        here, at dispatch, because a delivery can wait minutes behind its agent's running
+        wake and the answer changes in that time (basecradle-router#272, one handoff that
+        cost five sessions). **Coalesce** first: a delivery whose event happened before a
+        *successful* wake on the same stream started was read by that session, so it is
+        collapsed into it — recorded ``COALESCE``/``IGNORED`` naming that wake, and counted
+        as a dedup, because like one it is reachable only through a success. Every
+        delivery that queued behind a running wake collapses into the first follow-up the
+        same way, so a burst costs at most one more session. See
+        :mod:`basecradle_router.coalesce`. Then **recheck**: the delivery's route is asked
+        whether the work still stands — a github issue closed, or its ``handoff`` label
+        gone, while the delivery waited — and a ``RECHECK``/``IGNORED`` drop launches
+        nothing. It records no wake evidence, because it says nothing about the edge: the
+        work ended, the agent was never gated. Each gate also logs the delivery's
+        ``decision=coalesced``/``decision=dropped`` line, so ``delivery=<id>`` accounts for
+        it the way ``decision=woke`` accounted for its arrival. A route that stamps no
+        event time and implements no ``recheck`` — the platform route, the probe — passes
+        both gates untouched.
+
         Then the **NOC wake-lock** is honoured (basecradle-router#120): while the
         NOC converges (upgrades) this agent's
         harness it holds a lock at ``/run/basecradle-noc/wake-locks/<slug>.lock``, and
@@ -407,6 +453,30 @@ class Pipeline:
                     self._record(
                         result, Stage.DEDUP, Outcome.IGNORED, **who, reason=DUPLICATE_DELIVERY
                     )
+                    return
+                covering = self.coverage.covering(event)
+                if covering is not None:
+                    # A session already read this event: it started after the event and
+                    # succeeded. Counted as a dedup for the reason the dedup is — only a
+                    # success can produce it — and never as a refusal (#218).
+                    self.evidence.record_wake_deduped(agent.harness_key, **provenance)
+                    self._record(
+                        result,
+                        Stage.COALESCE,
+                        Outcome.IGNORED,
+                        **who,
+                        into=covering.delivery,
+                        occurred=_instant(event.occurred_at),
+                        wake_started=_instant(covering.started_at),
+                    )
+                    self._decide(event, DeliveryDecision.COALESCED, into=covering.delivery)
+                    return
+                gone = self._recheck(event)
+                if gone is not None:
+                    # The work this delivery asked for ended while it waited. No wake
+                    # evidence: nothing about the edge was tried, and nothing gated it.
+                    self._record(result, Stage.RECHECK, Outcome.IGNORED, **who, reason=gone)
+                    self._decide(event, DeliveryDecision.DROPPED, reason=gone)
                     return
                 decision = self.wake_lock.check(agent.harness_key)
                 if not decision.should_wake:
@@ -577,11 +647,16 @@ class Pipeline:
         who = _who(agent, event)
         attempts = 1 if event.synthetic else self.wake_attempts
         last_duration = 0.0
+        # When the attempt that ends up succeeding launched — the instant its session
+        # began reading, and so the line coverage is drawn at (#272). The *last*
+        # attempt's, never the first's: an earlier attempt that failed read nothing.
+        last_started_at: datetime | None = None
 
         # A wake failure is retryable transient by policy here (the boundary
         # reports it as a plain WakeError); the bound stops a permanent fault.
         def attempt() -> WakeResult:
-            nonlocal last_duration
+            nonlocal last_duration, last_started_at
+            last_started_at = self.now()
             started = self.clock()
             try:
                 return self.waker.wake(agent, event)
@@ -634,6 +709,11 @@ class Pipeline:
                 route=event.source,
                 synthetic=event.synthetic,
             )
+            # Only a success covers anything: a delivery behind a failed wake keeps its
+            # own chance to wake the agent, exactly as a duplicate behind one does. (The
+            # start is always set here — a success means an attempt ran.)
+            if last_started_at is not None:
+                self.coverage.record(event, last_started_at)
             how = {"exit": woke.exit_code, "duration": _seconds(last_duration)}
             self._record(result, Stage.WAKE, Outcome.OK, **who, **how)
             verdict = {"outcome": Outcome.OK.value, **how}
@@ -685,6 +765,37 @@ class Pipeline:
         # (no verdict at all) ends at its own field prefix rather than at a separator
         # left behind by a token that was not there.
         logger.log(level, "%s", " ".join(part for part in parts if part))
+
+    def _recheck(self, event: Event) -> str | None:
+        """Ask ``event``'s route whether its work still stands; ``None`` means wake.
+
+        A route the registry does not hold has nothing to answer with, so the delivery
+        wakes as it always did. In the daemon that cannot happen — the delivery was
+        accepted through that very route — but :meth:`execute` is public, and a gate
+        that turned a missing route into a failed wake would be a new way to fail.
+        """
+        try:
+            route = self.registry.get(event.source)
+        except UnknownRouteError:
+            return None
+        return route_recheck(route, event)
+
+    def _decide(self, event: Event, decision: DeliveryDecision, **detail: object) -> None:
+        """Log the core's later word on a delivery the route already classified ``woke``.
+
+        The same ``event=delivery_decision`` line, in the same five leading keys, the
+        route emitted when the delivery arrived — so one grep for ``delivery=<id>``
+        reads its whole fate: ``woke``, then ``coalesced`` or ``dropped`` (#272). The
+        ``stage=`` record beside it is the pipeline machinery; this is the accounting.
+        """
+        log_delivery_decision(
+            event.source,
+            event.event_type,
+            decision,
+            recipient=event.recipient.value,
+            delivery=event.delivery_id,
+            **detail,
+        )
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, **detail: object
