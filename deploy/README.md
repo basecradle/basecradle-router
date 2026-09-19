@@ -1059,9 +1059,10 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 ### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
 clean-reboot mechanism in Part 4), retention for the pipeline's structured stage log, backup of
-`agents.json` with a documented rebuild, and liveness alerting on the systemd service. The router-AI
-authors and maintains this hardening config in the repo; the box's operator (capital/NOC) applies and
-runs it on the box.
+`agents.json` with a documented rebuild — one fixed-name slot with a stated end, never a dated copy
+per run (`constitution.md` → How We Build; the NOC's slot is basecradle-noc#715) — and liveness
+alerting on the systemd service. The router-AI authors and maintains this hardening config in the repo;
+the box's operator (capital/NOC) applies and runs it on the box.
 
 ---
 
