@@ -13,8 +13,10 @@ limit = collaborators_only   # only basecradle org members/collaborators may
 
 This is **defense-in-depth**, not the load-bearing control. The load-bearing
 control is the dispatcher's trust-boundary envelope (every woken agent treats all
-thread content as untrusted data — see `routes/github.py`); the limit just shrinks
-who can write into a thread in the first place. (basecradle-router#60.)
+thread content as untrusted data, save the allow-list-authored issue body and
+comments authored by a founder or the capital bot — see `routes/github.py`); the
+limit just shrinks who can write into a thread in the first place.
+(basecradle-router#60, basecradle#546.)
 
 ## Why it needs tending
 
