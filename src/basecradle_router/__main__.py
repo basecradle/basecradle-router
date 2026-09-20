@@ -53,6 +53,7 @@ silent-death shape this program exists to kill.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -90,6 +91,15 @@ from basecradle_router.wakelock import WakeLockGuard
 EXIT_CONFIG_ERROR = EXIT_UNPROVABLE
 
 
+class ManifestWriteError(Exception):
+    """``claims --out-dir`` would have written somewhere it will not follow.
+
+    Not an *unprovable* verdict: nothing was inconclusive. We were asked to write a
+    file, we declined to follow a link to do it, and nothing was written — so it takes
+    the contract's ordinary FAIL code and says on stderr exactly which path it refused.
+    """
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -98,6 +108,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+    except ManifestWriteError as exc:
+        print(f"claims: {exc}", file=sys.stderr)
+        return 1
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -244,11 +257,29 @@ def _write_manifests(out_dir: str, manifests: list[dict]) -> None:
     purpose: the NOC's converge owns the real discovery directory and its own write
     discipline — this is the convenience path for an operator or a converge step that
     just wants the files.
+
+    **It follows no link it does not own** (basecradle/basecradle#576). This is the one
+    write in the CLI whose directory comes from the command line, and the CLI runs as
+    the *daemon's* user — which can write the evidence ledger the whole instrument
+    rests on. Pointed (by accident or by a poisoned argument) at a directory some other
+    account writes, a plain ``open(path, "w")`` would follow a planted link and clobber
+    whatever that user can reach. So the directory itself is refused if it is a symlink,
+    and each file is opened ``O_NOFOLLOW`` — the same posture ``confined_path`` takes on
+    the privileged side of ``deploy/bin/wake-runner``: refuse the link, never resolve it,
+    and name what was refused without echoing where it pointed.
     """
+    if os.path.islink(out_dir):
+        raise ManifestWriteError(f"refusing to write manifests into {out_dir}: it is a symlink")
     os.makedirs(out_dir, exist_ok=True)
     for manifest in manifests:
         path = os.path.join(out_dir, manifest_filename(manifest))
-        with open(path, "w", encoding="utf-8") as handle:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK):
+                raise ManifestWriteError(f"refusing to write {path}: it is a symlink") from None
+            raise ManifestWriteError(f"could not write {path}: {exc}") from None
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
             handle.write("\n")
         print(path)

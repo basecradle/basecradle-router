@@ -590,8 +590,23 @@ An entry's `kind` selects how it is read (absent ⇒ `github`); existing github 
 ```
 
 The `wake-runner` reads the same registry: for a harness entry it launches **only** the pinned
-`wake_bin` (which must resolve inside that agent's `/home/<user>`), never a caller-supplied path — the
+`wake_bin` (which must lie inside that agent's `/home/<user>`), never a caller-supplied path — the
 same registry-is-the-only-authority rule that confines builders to the system `claude`.
+
+#### The clone and the `wake_bin` must be plain paths — no symlink component (basecradle/basecradle#576)
+
+Both live inside a directory **the agent writes**, and both are checked by root *before* the privilege
+drop. So `wake-runner` puts them through one gate, `confined_path`, which walks the path a component at
+a time from `/home/<user>` and **refuses the first component that is a symlink** — and refuses `..`, `.`,
+a relative path, and a non-canonical one (`//`, a trailing `/`) itself rather than handing them to a
+resolver. The old check was `realpath` plus a prefix test: `realpath` *follows* every link and returns
+the target, so the privileged side ended up judging — and acting on — a path the agent chose. A symlinked
+component is now a loud refusal naming that component (never the link's target), and the wake does not
+fire. **The consequence for the registry: a `clone_path` or `wake_bin` whose path contains a symlink
+stops waking.** Point the registry at the real path instead; a venv's wake script and a git clone are
+ordinary files and directories, so this is a constraint on how an entry is written, not on what can be
+registered. Nothing about the privilege boundary changed — the `cd` and the `exec` still happen after the
+drop, as the agent, which is what makes root's part of this a check and not an action.
 
 Each agent's own secrets live in a per-agent `agent.env` that the **wrapper** loads *as that user* after
 the privilege drop — the live implementation of `wake.py`'s `env_provider` seam, so the unprivileged
