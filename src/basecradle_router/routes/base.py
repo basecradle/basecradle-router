@@ -164,7 +164,7 @@ def log_delivery_decision(
     is logged when the route already knows it — the actionable path, where the body is
     parsed — and left ``<unknown>`` for an ignore that short-circuits before parsing, because
     the load-bearing field for spotting a silently-dropped *class* is the
-    ``event_type``, not the per-recipient firehose target (deliveries are already
+    ``event_type``, not the per-delivery recipient (deliveries are already
     per-recipient). ``decision`` is the *router's* dispatch choice, not the wake's
     eventual exit code: a ``WOKE`` whose later resolve/wake fails is recorded
     loudly and separately by the pipeline.

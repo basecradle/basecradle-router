@@ -430,9 +430,9 @@ def test_discovery_skips_an_agent_whose_key_is_not_provisioned(tmp_path: Path) -
     `aurora-5.2` sorts first but has no key here, so picking it would sign with an empty
     secret and fail a perfectly healthy daemon.
     """
-    env = f"{NOVA_KEY_VAR}=whsec_fake_nova_integration_secret\n"
+    env = f"{NOVA_KEY_VAR}=bc_isk_fakenovasmokeintegrationkey00001\n"
     out = _run_registry(env, 'discover_recipient "$2"; echo "$bc_slug|$bc_uuid|$bc_key"', tmp_path)
-    assert out.strip() == f"nova|{NOVA_UUID}|whsec_fake_nova_integration_secret"
+    assert out.strip() == f"nova|{NOVA_UUID}|bc_isk_fakenovasmokeintegrationkey00001"
 
 
 @requires_jq
@@ -443,11 +443,11 @@ def test_discovery_is_deterministic_and_applies_the_whole_charset_scrub(tmp_path
     would leave the dot in, miss the variable, and silently fall through to nova.
     """
     env = (
-        f"{AURORA_KEY_VAR}=whsec_fake_aurora_integration_secret\n"
-        f"{NOVA_KEY_VAR}=whsec_fake_nova_integration_secret\n"
+        f"{AURORA_KEY_VAR}=bc_isk_fakeaurorasmokeintegrationkey001\n"
+        f"{NOVA_KEY_VAR}=bc_isk_fakenovasmokeintegrationkey00001\n"
     )
     out = _run_registry(env, 'discover_recipient "$2"; echo "$bc_slug|$bc_uuid|$bc_key"', tmp_path)
-    assert out.strip() == f"aurora-5.2|{AURORA_UUID}|whsec_fake_aurora_integration_secret"
+    assert out.strip() == f"aurora-5.2|{AURORA_UUID}|bc_isk_fakeaurorasmokeintegrationkey001"
 
 
 @requires_jq
@@ -504,7 +504,10 @@ def _basecradle_journal_patterns(key_path: str) -> list[str]:
 @pytest.mark.parametrize(
     ("key_path", "keyring"),
     [
-        (KEY_PATH_RECIPIENT, RecipientKeyring(by_recipient={NOVA_UUID: "whsec_fake_nova"})),
+        (
+            KEY_PATH_RECIPIENT,
+            RecipientKeyring(by_recipient={NOVA_UUID: "bc_isk_fakenovarecipientkey000000000001"}),
+        ),
         (KEY_PATH_FALLBACK, RecipientKeyring()),
     ],
 )
@@ -522,7 +525,7 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
     """
     delivery = _smoke_literal("BC_DELIVERY")
     event_type = _smoke_literal("BC_IGNORED_EVENT")
-    secret = keyring.by_recipient.get(NOVA_UUID, "whsec_fake_route_wide")
+    secret = keyring.by_recipient.get(NOVA_UUID, "bc_isk_fakeroutewidefallbackkey00000001")
     body = json.dumps(
         {
             "event": event_type,
@@ -545,7 +548,7 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
 
     route = BasecradleRoute(keyring)
     with caplog.at_level(logging.INFO, logger="basecradle_router"):
-        route.verify(request, "whsec_fake_route_wide")
+        route.verify(request, "bc_isk_fakeroutewidefallbackkey00000001")
         assert route.normalize(request) is None  # non-actionable => no wake, ever
 
     rendered = [record.getMessage() for record in caplog.records]
