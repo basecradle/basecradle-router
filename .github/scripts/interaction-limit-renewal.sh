@@ -59,6 +59,22 @@ if [[ "$REPO" != */* ]]; then
 fi
 : "${ORG:=${REPO%%/*}}"
 
+# Fail closed on the credential, and say so in the documented code. Without this a
+# credential-less run reports the WRONG failure: the renew path dies on gh's own
+# exit 4, and the --dry-run path skips renew entirely and reaches the audit, whose
+# every call then fails — which used to read as "audit clean" (see the audit loop
+# below). Neither says "no credential", which is the one thing the operator needs.
+#
+# Anything gh itself would accept counts, so a maintainer with a `gh auth login`
+# is not refused. Inside a Claude Code session in this repo there is deliberately
+# no such login to find (basecradle-router#303) — the probe just comes back empty.
+if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] && ! "$GH" auth status >/dev/null 2>&1; then
+  echo "interaction-limit-renewal: no GitHub credential. This needs a token with repo" \
+       "Administration:write — export it as GH_TOKEN (the scheduled workflow reads it" \
+       "from the FLEET_ADMIN_TOKEN secret), or log in with \`gh auth login\`." >&2
+  exit 2
+fi
+
 log() { printf '==> %s\n' "$*"; }
 
 # --- 1. RENEW the target repo -------------------------------------------------
@@ -72,6 +88,21 @@ fi
 
 # --- 2. AUDIT the whole fleet (read-only) ------------------------------------
 log "auditing every public repo in '$ORG' for an active limit + open reminder"
+
+# Read the repo list into a variable FIRST. As `done < <("$GH" repo list ...)` the
+# listing ran in a process substitution, whose exit status `set -e` cannot see: a
+# 403, a rate limit, a revoked or under-scoped token all yielded zero lines, the
+# loop body never ran, `gaps` stayed 0, and the script announced "audit clean" and
+# exited 0 — a false green on the one script whose job is to make a lapse loud.
+# A command substitution in an assignment IS seen, and an empty list is its own
+# alarm: this org always has public repos, so zero means the listing failed.
+repos="$("$GH" repo list "$ORG" --visibility public --no-archived --json name --jq '.[].name')"
+if [[ -z "${repos//[[:space:]]/}" ]]; then
+  echo "interaction-limit-renewal: '$ORG' returned NO public repos. The audit cannot" \
+       "be clean if it never ran — treating this as a failure, not a pass." >&2
+  exit 1
+fi
+
 gaps=0
 while IFS= read -r name; do
   [[ -z "$name" ]] && continue
@@ -96,7 +127,7 @@ while IFS= read -r name; do
   fi
 
   printf '  %-32s %s · %s\n' "$slug" "$limit_state" "$reminder_state"
-done < <("$GH" repo list "$ORG" --visibility public --no-archived --json name --jq '.[].name')
+done <<< "$repos"
 
 if (( gaps > 0 )); then
   echo "interaction-limit-renewal: AUDIT FOUND $gaps gap(s) — a public repo is" \

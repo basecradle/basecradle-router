@@ -30,7 +30,7 @@ This section is shared law — it is carried verbatim in every BaseCradle repo (
 
 ## The Constitution
 
-This repository is built under the **BaseCradle Constitution** — the principles shared by every repository in the BaseCradle ecosystem. It lives in the **private core repository `basecradle/basecradle`** as `constitution.md` (default branch); it is repo-internal and never served publicly. Read it from GitHub with your fleet credentials — this works from any machine (laptop or fleet server), unlike a local checkout path:
+This repository is built under the **BaseCradle Constitution** — the principles shared by every repository in the BaseCradle ecosystem. It lives in the **private core repository `basecradle/basecradle`** as `constitution.md` (default branch); it is repo-internal and never served publicly. Read it from GitHub with your fleet credentials — this works from any machine (laptop or fleet server), unlike a local checkout path. Every session in this repo is fail-closed, so **mint a `GH_TOKEN` in the same Bash call** (`bot-auth-setup` §0–§1); a tokenless `gh` reaches nothing, reads included:
 
 ```bash
 gh api repos/basecradle/basecradle/contents/constitution.md -H "Accept: application/vnd.github.raw"
@@ -128,7 +128,7 @@ To author or maintain the `deploy/` contract (the version-controlled config the 
 
 ## Where to Start
 
-The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency order; the authoritative requirements are in `basecradle/basecradle#277`. Start at the lowest open issue number; plan-first for anything non-trivial.
+The build is mapped in this repo's **GitHub Issues**, PR-sized and in dependency order; the authoritative requirements are in `basecradle/basecradle#277`. Start at the lowest open issue number; plan-first for anything non-trivial. This read needs a minted `GH_TOKEN` in the same Bash call like every other (`bot-auth-setup` §0–§1):
 
 ```bash
 gh issue list --repo basecradle/basecradle-router --state open
@@ -157,7 +157,7 @@ This repo's builder agent — **basecradle-router AI** — acts on GitHub under 
 - **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-router-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong.
 - **CI on bot PRs skips `claude-review`.** A `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so the automated `claude-review` is skipped — which is *why* self-review is mandatory (see "Self-review before opening a PR" under Conventions).
 
-To act on GitHub as the bot (mint the token, route `gh`/`git push` through it, set the git author) invoke the `bot-auth-setup` skill before your first `gh`/git write — and **mint the token in the same Bash call as every write**, never once per session: each Bash call is a fresh shell that inherits nothing, so a token exported in an earlier call is gone and `gh` silently falls back to @origin's stored login (`basecradle/basecradle#579`).
+To act on GitHub as the bot (mint the token, route `gh`/`git push` through it, set the git author) invoke the `bot-auth-setup` skill before your first `gh`/git call — and **mint the token in the same Bash call as every one of them**, never once per session: each Bash call is a fresh shell that inherits nothing, so a token exported in an earlier call is gone. That silent fallback to @origin's stored login (`basecradle/basecradle#579`) is now closed structurally as well as by instruction: `.claude/settings.json` makes every session in this repo **fail-closed** — `gh` cannot see a stored login, and a bare `git push` to an `https://github.com` remote (which `origin` is, pinned by a test) cannot authenticate without a minted `GH_TOKEN` — so a forgotten mint is a loud error rather than a post under @origin's name (#303). **Reads mint too** — that is the accepted cost, not a bug. The mechanics and the exact error text: `bot-auth-setup` §0.
 
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
