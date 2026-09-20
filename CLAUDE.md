@@ -157,7 +157,7 @@ This repo's builder agent — **basecradle-router AI** — acts on GitHub under 
 - **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-router-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong.
 - **CI on bot PRs skips `claude-review`.** A `[bot]`-authored PR runs CI in a restricted context where the review credential resolves empty, so the automated `claude-review` is skipped — which is *why* self-review is mandatory (see "Self-review before opening a PR" under Conventions).
 
-To act on GitHub as the bot (mint the token, route `gh`/`git push` through it, set the git author) — do this first, before any `gh`/git write — invoke the `bot-auth-setup` skill.
+To act on GitHub as the bot (mint the token, route `gh`/`git push` through it, set the git author) invoke the `bot-auth-setup` skill before your first `gh`/git write — and **mint the token in the same Bash call as every write**, never once per session: each Bash call is a fresh shell that inherits nothing, so a token exported in an earlier call is gone and `gh` silently falls back to @origin's stored login (`basecradle/basecradle#579`).
 
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
