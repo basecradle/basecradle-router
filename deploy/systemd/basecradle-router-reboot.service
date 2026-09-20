@@ -1,6 +1,6 @@
 # BaseCradle router — clean reboot when an OS update has staged one (oneshot).
 #
-# Runs deploy/reboot-if-required.sh: a no-op unless /var/run/reboot-required exists,
+# Runs deploy/bin/reboot-if-required.sh: a no-op unless /var/run/reboot-required exists,
 # otherwise it drains the router and performs a controlled reboot. This is the
 # "perform the reboot cleanly" half of issue #66; the post-boot health gate is
 # basecradle-router-recovery.service.
@@ -25,4 +25,17 @@ Type=oneshot
 # systemd never kills the orchestrator mid-drain (which would skip the reboot and
 # mark the unit failed). Once it reaches `exec systemctl reboot`, the box goes down.
 TimeoutStartSec=35min
-ExecStart=/opt/basecradle-router/app/deploy/reboot-if-required.sh
+# ROOT, DELIBERATELY — and therefore NOT out of the app tree (#297).
+# Root is genuine here: the orchestrator runs `systemctl stop basecradle-router` and
+# `systemctl reboot`, neither of which an unprivileged account can do. (Contrast
+# basecradle-router-drift.service and basecradle-router-recovery.service, which only
+# read and so run User=router.)
+# Because it IS root, its ExecStart points at /opt/basecradle-router/bin/ — the
+# root-owned install path THIS repo's deploy contract declares (deploy/bin/* is
+# installed root:root 0755 on every deploy, the same path and the same reason as
+# wake-runner and probe-ack) — never at /opt/basecradle-router/app/, whose ownership
+# another repo's deploy op decides. The app tree is root-owned today
+# (basecradle-noc#777), which is what makes the old path safe *now*; a root ExecStart
+# whose safety rests on an ownership decision made outside this repo is the pattern,
+# and the pattern is ours to close. No unit of ours runs root out of the app tree.
+ExecStart=/opt/basecradle-router/bin/reboot-if-required.sh

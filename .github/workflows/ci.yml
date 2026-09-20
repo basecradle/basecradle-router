@@ -17,14 +17,29 @@ jobs:
       - name: Injection-marker guard
         run: .github/scripts/injection-guard.sh
 
+      # PINNED TO THE BOX'S uv (#297). ai.basecradle.com runs uv 0.11.19, and the
+      # deploy's lock gate (`uv sync --locked` as `router`) runs under THAT resolver.
+      # Unpinned, this step installs whatever uv is newest, so CI could green a lock
+      # the box's uv disagrees with — and the disagreement would surface as a failed
+      # deploy on the fleet's only wake path instead of a red check here. Read the
+      # box's version from the NOC's `introspect-router` and move this pin with it;
+      # a pin gone stale is the safe direction (an older resolver cannot write a lock
+      # a newer one refuses).
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.19"
 
       - name: Set up Python
         run: uv python install 3.10
 
-      - name: Install dependencies
-        run: uv sync --frozen
+      # `--locked`, NOT `--frozen` (#297). `--frozen` installs from `uv.lock` and never
+      # compares it to `pyproject.toml`, so a commit whose lock is stale used to reach
+      # `main` green and then fail the deploy at the box's own `uv sync --locked`.
+      # This is the SAME command the deploy runs, so CI cannot pass what the box will
+      # reject.
+      - name: Install dependencies (asserts uv.lock is current)
+        run: uv sync --locked
 
       - name: Lint
         run: uv run ruff check .

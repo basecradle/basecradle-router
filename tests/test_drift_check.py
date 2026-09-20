@@ -104,14 +104,17 @@ def _deploy_contract_paths() -> list[str]:
         for p in sorted((ROOT / d).rglob("*"))
         if p.is_file() and p.suffix != ".md"
     ]
+    # Globbed too, not hand-listed: `deploy/reboot-if-required.sh` sat in this list by
+    # name and would have gone stale the day it moved into `deploy/bin/` (#297), while
+    # `deploy/verify-recovery.sh` — a script the box executes at every boot — was never
+    # in it at all. A glob cannot develop either hole.
+    paths += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "deploy").glob("*.sh"))]
     paths += [
-        "deploy/smoke-test.sh",
-        "deploy/drift-check.sh",
-        "deploy/reboot-if-required.sh",
         "deploy/vector.yaml",
         "pyproject.toml",
         "uv.lock",
     ]
+    assert "deploy/smoke-test.sh" in paths and "deploy/verify-recovery.sh" in paths
     assert len(paths) > 10, "the deploy contract glob found suspiciously little"
     return paths
 

@@ -1,6 +1,6 @@
 """The OS-update reboot orchestration (issue #66), tested at the boundary.
 
-``deploy/reboot-if-required.sh`` and ``deploy/verify-recovery.sh`` are ops bash,
+``deploy/bin/reboot-if-required.sh`` and ``deploy/verify-recovery.sh`` are ops bash,
 so they are exercised the way the rest of the suite mocks at the edge: the real
 ``systemctl``/``curl``/reboot are replaced with recording stubs on ``PATH``, and
 the scripts run under that fake environment. No service is touched, nothing
@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-REBOOT_SCRIPT = REPO_ROOT / "deploy" / "reboot-if-required.sh"
+REBOOT_SCRIPT = REPO_ROOT / "deploy" / "bin" / "reboot-if-required.sh"
 RECOVERY_SCRIPT = REPO_ROOT / "deploy" / "verify-recovery.sh"
 
 # The exact green liveness body the app serves and the recovery script asserts.
@@ -80,7 +80,7 @@ def _run(script: Path, tmp_path, extra_env: dict[str, str]):
     return proc, log.read_text()
 
 
-# --- reboot-if-required.sh -------------------------------------------------
+# --- bin/reboot-if-required.sh -------------------------------------------------
 
 
 def test_no_reboot_required_is_a_noop(tmp_path) -> None:

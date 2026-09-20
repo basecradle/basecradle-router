@@ -22,7 +22,7 @@ guards the shape rather than a live bug — the two pre-drop resolutions now go 
 component-wise gate, and the scanner below fails the build when new privileged code
 reaches an agent-writable path any other way.
 
-Four guards, each with a positive control so none can pass vacuously:
+Five guards, each with a positive control so none can pass vacuously:
 
 1. **the helper itself** — the shipped ``confined_path`` body, run in bash against a real
    sandbox, must refuse every link, ``..``, and non-canonical shape, and change nothing;
@@ -32,7 +32,11 @@ Four guards, each with a positive control so none can pass vacuously:
 3. **the literals** — ``/home/`` may appear in a shipped file only as an operand of the
    helper, or under ``/home/router`` (the daemon's own home, which is not an agent's);
 4. **the CLI's one caller-supplied write** — ``claims --out-dir`` runs as the daemon's
-   user, so it refuses a symlinked directory and opens every file ``O_NOFOLLOW``.
+   user, so it refuses a symlinked directory and opens every file ``O_NOFOLLOW``;
+5. **the units** — the same class one layer up (#297): a unit may run as root, or it may
+   execute out of the mirrored ``app`` tree whose ownership another repo's deploy op
+   decides. Never both. And the daemon's own start carries ``--no-sync``, so it never
+   depends on writing ``uv.lock`` into that tree.
 
 Offline by construction: the scanners read shipped text, and the behavioural tests run one
 extracted bash function against ``tmp_path``. No model, agent, box, or network.
@@ -932,3 +936,116 @@ def test_o_nofollow_is_the_errno_this_platform_raises(tmp_path: Path) -> None:
     with pytest.raises(OSError) as caught:
         os.open(str(link), os.O_WRONLY | os.O_NOFOLLOW)
     assert caught.value.errno in (errno.ELOOP, errno.EMLINK)
+
+
+# --------------------------------------------------------------------------------------
+# Guard 5 — no privileged unit of ours executes out of a tree another repo owns.
+#
+# The same class, one layer up (#297, basecradle-noc#777). Until the NOC narrowed
+# ownership, `/opt/basecradle-router/app` was chowned to `router` after every mirror, and
+# two of our units carried a root `ExecStart=` pointing into it — so an account that could
+# write the tree could choose what root executed, on a schedule, with no deploy involved.
+# Ownership of that tree is decided by the NOC's op, not by this repo; the shape that is
+# ours to hold is the one below, and it holds whatever that op does next.
+#
+# The rule: a unit may run as root, or it may run out of the mirrored app tree. Not both.
+# `deploy/bin/*` is installed root-owned by THIS repo's contract, so that is where
+# anything of ours that runs as root lives.
+# --------------------------------------------------------------------------------------
+
+#: The deployed tree the NOC's op mirrors into — not this repo's to own.
+MIRRORED_TREE = "/opt/basecradle-router/app"
+
+#: The root-owned install path this repo's own deploy contract declares (`deploy/bin/*`
+#: is installed `root:root 0755` on every deploy).
+ROOT_OWNED_BIN = "/opt/basecradle-router/bin"
+
+
+def shipped_units() -> list[Path]:
+    """Every systemd unit this repo ships — discovered, never hand-listed."""
+    return [p for p in shipped_files() if p.suffix in (".service", ".timer")]
+
+
+def unit_directives(text: str) -> list[tuple[str, str]]:
+    """``Key=value`` pairs from a unit file, comments and continuations resolved."""
+    joined, pairs = "", []
+    for raw in _strip_line_comments(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.endswith("\\"):
+            joined += line[:-1] + " "
+            continue
+        line, joined = joined + line, ""
+        if "=" in line:
+            key, _, value = line.partition("=")
+            pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def test_shipped_units_are_discovered() -> None:
+    names = {p.name for p in shipped_units()}
+    assert "basecradle-router.service" in names
+    assert "basecradle-router-reboot.service" in names
+    assert "basecradle-router-recovery.service" in names
+    assert len(names) >= 6
+
+
+@pytest.mark.parametrize("unit", shipped_units(), ids=lambda p: p.name)
+def test_no_unit_runs_as_root_out_of_the_mirrored_tree(unit: Path) -> None:
+    """Root ``Exec*=`` lives at the root-owned install path, never in the app tree.
+
+    A unit with no ``User=`` runs as root. Such a unit must execute a program this
+    repo's contract installs root-owned (``/opt/basecradle-router/bin/``), so its safety
+    never rests on how the mirrored tree happens to be owned on the day it fires.
+    """
+    directives = unit_directives(unit.read_text())
+    if any(key == "User" for key, _ in directives):
+        return  # unprivileged: nothing to escalate, so the tree's ownership is not load-bearing
+    offenders = [
+        f"{key}={value}"
+        for key, value in directives
+        if key.startswith("Exec") and MIRRORED_TREE in value
+    ]
+    assert not offenders, (
+        f"{unit.name}: runs as root (no User=) but executes out of {MIRRORED_TREE}; "
+        f"install it via deploy/bin/ and point at {ROOT_OWNED_BIN}/ instead:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_root_exec_guard_is_not_vacuous(tmp_path: Path) -> None:
+    """A positive control: the exact shape #297 removed must still be caught."""
+    unit = tmp_path / "bad.service"
+    unit.write_text(
+        f"[Service]\nType=oneshot\nExecStart={MIRRORED_TREE}/deploy/reboot-if-required.sh\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="runs as root"):
+        test_no_unit_runs_as_root_out_of_the_mirrored_tree(unit)
+    # ...and adding the one thing that makes it safe clears it.
+    unit.write_text(unit.read_text(encoding="utf-8") + "User=router\n", encoding="utf-8")
+    test_no_unit_runs_as_root_out_of_the_mirrored_tree(unit)
+
+
+def test_the_reboot_orchestrator_is_installed_root_owned_and_run_from_there() -> None:
+    """The one genuinely-root unit: its script ships in deploy/bin/ and runs from bin/."""
+    assert (REPO / "deploy" / "bin" / "reboot-if-required.sh").is_file()
+    unit = REPO / "deploy" / "systemd" / "basecradle-router-reboot.service"
+    execs = [v for k, v in unit_directives(unit.read_text()) if k.startswith("Exec")]
+    assert execs == [f"{ROOT_OWNED_BIN}/reboot-if-required.sh"]
+
+
+def test_the_daemon_start_never_writes_into_its_own_tree() -> None:
+    """``uv run`` syncs by default, which writes ``uv.lock`` — into a tree root owns.
+
+    ``--no-sync`` makes the start structurally independent of that write (#297). The
+    environment is established once, by the deploy's ``uv sync --locked`` as ``router``.
+    """
+    unit = REPO / "deploy" / "systemd" / "basecradle-router.service"
+    (start,) = [v for k, v in unit_directives(unit.read_text()) if k == "ExecStart"]
+    assert start.split()[0].endswith("/uv"), start
+    assert "--no-sync" in start.split(), (
+        "a bare `uv run` re-locks and writes uv.lock into the root-owned app tree; "
+        f"keep --no-sync on the daemon's ExecStart:\n  {start}"
+    )
