@@ -73,8 +73,11 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
 
 ### Daemon filesystem & config layout
 ```
-/opt/basecradle-router/            # ROOT-owned tree (router cannot write it)
-  app/                             # the daemon: checked-out repo + uv venv, owned by `router`
+/opt/basecradle-router/            # ROOT-owned tree, top to bottom (`router` writes NOTHING here
+                                   #   but its own venv) — see "Who owns the daemon tree" below.
+  app/                             # the daemon: checked-out repo, mirrored by the deploy. root:root.
+  app/.venv/                       # the ONE exception: router:router, so the deploy's
+                                   #   `uv sync --locked` (run AS router) can build it.
   app/deploy/bin/router-admin      # the admin CLI wrapper the NOC's converge + probes call
   bin/wake-runner                  # root-owned (root:root, 0755) privilege-drop wrapper
   bin/probe-ack                    # root-owned (root:root, 0755) synthetic-wake verifier (#208).
@@ -82,8 +85,14 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   NOC_PROBE_SECRET) but must NOT be agent-writable, or the
                                    #   account under test could rewrite its own verifier to
                                    #   always ack. Root-owned outside app/ for the same reason
-                                   #   wake-runner is: a router-owned copy could be swapped for
-                                   #   one that exfiltrates the agent env it runs inside.
+                                   #   wake-runner is: a copy any other account could write could
+                                   #   be swapped for one that exfiltrates the agent env it runs
+                                   #   inside — and `bin/` is the path THIS repo's contract
+                                   #   declares root-owned, so it does not depend on how the
+                                   #   app tree happens to be owned.
+  bin/reboot-if-required.sh        # root-owned (root:root, 0755) clean-reboot orchestrator (#297) —
+                                   #   the one unit of ours that genuinely runs as root, so its
+                                   #   ExecStart points here rather than into app/.
 /etc/basecradle-router/
   router.env                       # daemon config (owner router, 0600) — see below
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
@@ -98,13 +107,42 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   daemon start (#281).
 ```
 
-The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app`, `uv sync`ed by the
-deploy (the NOC's `deploy-router` op) on each run. The unit starts it with **`UV_NO_CACHE=1`** (#280). A start
+#### Who owns the daemon tree (and why root does)
+
+**`/opt/basecradle-router/app` is root-owned; `router` owns `.venv` and nothing else.** Until
+basecradle-noc#777 (closed on the box 2026-09-20) the deploy `chown router:router`'d the whole mirrored
+tree, and two root-run paths then executed out of it — the NOC's own installer, and this repo's two
+scheduled units. A compromised `router` therefore had a *standing* path to root that needed no deploy at
+all. What the op does now:
+
+1. **Narrow ownership BEFORE the mirror** — root takes the tree, `router` keeps `.venv`; a symlinked
+   `app` or `.venv` is **refused**, never resolved (the same rule this repo's
+   `tests/test_privileged_path_safety.py` pins for our own privileged paths).
+2. **Mirror** the SHA into it.
+3. **Read ownership back** — and only then install anything root-owned.
+4. **`uv sync --locked` as `router`** (the lock gate; CI runs the identical command, under the box's
+   pinned uv version, so a stale lock is red on the PR rather than on the wake path).
+5. **Install helpers and units from the NOC's own root-owned staging clone** — never from the deployed
+   tree.
+
+`introspect-router` reports the ownership, and it is audited hourly on *Fleet Config Drift Detection*.
+Two consequences are this repo's to hold, and both are now structural rather than remembered: **no unit
+of ours runs root out of the app tree** (`basecradle-router-reboot.service` runs its orchestrator from
+root-owned `/opt/basecradle-router/bin/`; the two read-only oneshots run `User=router`), and **the
+daemon's own start never writes into the tree** (`uv run --no-sync`). `tests/test_privileged_path_safety.py`
+fails the build if a new unit breaks either.
+
+The daemon's own Python is a **`uv`-managed venv** under `/opt/basecradle-router/app/.venv` — the one
+`router`-owned path in the tree — `uv sync --locked`ed by the deploy (the NOC's `deploy-router` op) on each
+run. The unit starts it with **`uv run --no-sync`** and **`UV_NO_CACHE=1`** (#280, #297): a bare `uv run`
+re-locks and would try to write `uv.lock` into a tree `router` cannot write, so the start is made
+structurally independent of that write instead of depending on the lock always being current. A start
 against a venv in sync opens no network connection at all, so a durable cache buys it nothing, and it keeps
 none under `/home/router/.cache/uv`, where nothing ever removed one. Each start's throwaway cache lives in the
-unit's private `/tmp` and is gone when uv exits, so a restart never needs PyPI and leaves nothing behind. A
-start after the tree changed *without* that sync rebuilds the project and does need PyPI, which is why the
-deploy syncs before it restarts. The daemon's only system dependency on the box is the privilege-drop
+unit's private `/tmp` and is gone when uv exits, so a restart never needs PyPI and leaves nothing behind.
+Since #297 the start also carries `--no-sync`, so a start against a venv the deploy did *not* sync cannot
+rebuild the project and cannot reach PyPI either — it fails loudly, which is the deploy's rollback
+trigger. The daemon's only system dependency on the box is the privilege-drop
 chain (`sudo` → `wake-runner` → `systemd-cat` → `runuser` → the agent's `claude`); everything an agent needs to *run* is
 part of that agent's own onboarding, not the daemon's.
 
@@ -1048,10 +1086,11 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   `install -o root -g root -m 0755 deploy/bin/wake-runner /opt/basecradle-router/bin/` and
   `install -o root -g root -m 0440 deploy/sudoers/basecradle-router /etc/sudoers.d/basecradle-router`
   (validate with `visudo -cf`). **After this first install, the NOC's `deploy-router` op reinstalls the
-  wrapper from the deployed tree on every deploy**, so the live wrapper can never silently drift from
-  `main` (it is code on the launch path, but lives root-owned outside the router-owned `app/` tree the
-  app-mirror covers). The `sudoers` rule is *not* auto-rewritten — it changes rarely and a bad rule is
-  dangerous, so it stays this documented manual step.
+  wrapper from the NOC's root-owned staging clone on every deploy**, so the live wrapper can never
+  silently drift from `main` (it is code on the launch path, and lives root-owned in `bin/`, outside the
+  `app/` tree the mirror covers — never installed *out of* the mirrored tree). The `sudoers` rule is
+  *not* auto-rewritten — it changes rarely and a bad rule is dangerous, so it stays this documented
+  manual step.
 - **`HomeServerWaker`** in `wake.py` assembles the wrapper argv (`--user`/`--cwd`/`--`); env is empty
   (the wrapper loads the agent's `agent.env` after the drop).
 - **Fast-ack** in `server.py`: `accept` runs inline → `202`, `execute` (the wake) runs as a tracked
@@ -1130,9 +1169,12 @@ crown-jewels box carries **no GitHub credential** — a public repo needs no rea
 a scoped one) and runs the same Definition-of-Done loop **on-box**, plus a **rollback** to the prior good
 SHA on any failure. github.com TLS authenticates the source; the content-addressed SHA verifies the bytes;
 the driver's offline gate confirms that SHA is the tip of branch-protected, CI-gated `main`
-(basecradle#395). The op's on-box steps are: mirror into `/opt/basecradle-router/app` (protecting `.venv`) +
-`chown router`, `uv sync`, reinstall every `deploy/bin/*` helper + the systemd unit files, stamp the SHA,
-`daemon-reload` + restart + settle + `is-active`, then the live smoke test — and the NOC's driver adds the
+(basecradle#395). The op's on-box steps are: **narrow ownership** of `/opt/basecradle-router/app` to
+`root:root` with `.venv` left `router:router` (refusing a symlinked `app` or `.venv` rather than resolving
+it), mirror the SHA into it (protecting `.venv`), **read the ownership back**, `uv sync --locked` as
+`router`, reinstall every `deploy/bin/*` helper + the systemd unit files **from the NOC's own root-owned
+staging clone**, stamp the SHA, `daemon-reload` + restart + settle + `is-active`, then the live smoke
+test — and the NOC's driver adds the
 out-of-band `GET /up` check over the public TLS path (a broken `/up` after an on-box success is a FAIL).
 
 #### Unattended: Every NOC `auto-converge` Tick Deploys `main` (basecradle-noc#672)
@@ -1168,15 +1210,16 @@ Mechanics: basecradle-noc `docs/fleet-ops.md` §2 → *The router daemon, deploy
 #### The on-box contract the op consumes — the router repo owns these (confirmed, basecradle#395)
 The router owns the **contract** (the *what* — stable paths, names, and artifacts); the NOC owns the deploy
 **mechanism** (the *how* — pulling, installing, restarting on the box). The `deploy-router` op reads these
-from the deployed tree / box, and they are this repo's to keep stable:
+from the box and from the SHA it is deploying (root-owned files are installed from its own staging clone,
+never out of the mirrored tree), and they are this repo's to keep stable:
 
 | Contract | What the op does with it |
 |---|---|
-| `/opt/basecradle-router/app` | the router-owned daemon tree the op mirrors into (protecting its `.venv`), then `chown router:router` + `uv sync` as `router`. The sync must land **before** the restart: the unit starts cache-less, and a cache-less start is network-free only against a venv in sync (#280). |
-| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), and `router-admin` (the NOC calls the `app/` copy). `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
+| `/opt/basecradle-router/app` | the **root-owned** daemon tree the op mirrors into (protecting its `.venv`, the one `router:router` path). Ownership is narrowed **before** the mirror and **read back after** it, and only then is anything root-owned installed (basecradle-noc#777). The op then runs **`uv sync --locked`** as `router`. The sync must land **before** the restart: the unit starts cache-less and `--no-sync`, so it neither rebuilds nor reaches the network — it runs exactly what the sync left (#280, #297). |
+| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written world-readable (`0644`) — the drift source `drift-check.sh` reads. |
-| `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. |
+| `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. It is the **one** root-run script of ours that stays inside the mirrored tree, deliberately: it is invoked in-band by the op, in the same run that just narrowed ownership and read it back (steps 1 and 3 above), so its safety rests on a check made *seconds earlier in the same process* rather than on a standing property. The **scheduled** root path — a unit firing days later against whatever the tree has become — is the one that cannot rest on that, which is why `reboot-if-required.sh` moved to `deploy/bin/` (#297). Moving the smoke test too would be a cross-repo re-point of a contract row for no gain. |
 
 > **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The NOC op never
 > re-`enable`s `basecradle-router-recovery.service`, because it cannot distinguish a service that must be
@@ -1195,7 +1238,7 @@ from the deployed tree / box, and they are this repo's to keep stable:
 > An absent verifier still fails *safe and loud* — `wake-runner` refuses the probe with `75` naming the exact
 > `install` command, and nothing else on the box changes.
 
-> **Why the op globs units rather than a router-owned `deploy/apply.sh`?** Considered and declined
+> **Why the op globs units rather than a `deploy/apply.sh` of ours?** Considered and declined
 > (basecradle#395). The unit glob already drift-proofs the common evolution (adding a unit), so an
 > `apply.sh` would protect only the rare provisioning-class changes above — for which it would add a
 > cross-repo NOC re-point PR and put a privileged install sequence in a repo whose agent has no on-box
@@ -1357,12 +1400,16 @@ post-boot recovery gate below: the box reboots cleanly, then proves it came back
 
 Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 
-- **Perform the reboot cleanly — [`deploy/reboot-if-required.sh`](reboot-if-required.sh).** A no-op
+- **Perform the reboot cleanly — [`deploy/bin/reboot-if-required.sh`](bin/reboot-if-required.sh).** A no-op
   unless `/var/run/reboot-required` exists (the flag apt drops when an installed package needs a
   reboot). When it does: it **drains** the router first — `systemctl stop basecradle-router`, which
   blocks on the unit's lifespan drain (bounded by `TimeoutStopSec`) so in-flight wakes finish rather
   than being severed — then performs a controlled `systemctl reboot`. A drain failure is logged but does
-  **not** abort the reboot (a stuck unit must never pin an unpatched kernel forever).
+  **not** abort the reboot (a stuck unit must never pin an unpatched kernel forever). It is the one
+  scheduled unit of ours that **genuinely needs root** — `systemctl stop` and `systemctl reboot` are not
+  things an unprivileged account can do — so it lives in `deploy/bin/`, installed root-owned to
+  `/opt/basecradle-router/bin/reboot-if-required.sh`, and the unit's `ExecStart=` points there rather
+  than into the mirrored `app/` tree (#297).
 - **Verify recovery after boot — [`deploy/verify-recovery.sh`](verify-recovery.sh).** Asserts the
   services are active **and** `/up` is green (polling, since `After=` only orders start, not health),
   and **exits nonzero + loud** if the box did not come back. It checks `/up` on the **local** app
@@ -1370,10 +1417,14 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
   (the `caddy` service check covers the front end). Run by the
   `basecradle-router-recovery.service` oneshot unit at every boot, a failure lands in `systemctl
   --failed` and the journal — the **same alarm convention as the drift check** — instead of the box
-  silently serving nothing.
+  silently serving nothing. It runs **unprivileged** (`User=router`, like the drift check): reading unit
+  state and GETting `/up` need nothing root can give, and a unit fails in `systemctl --failed` whatever
+  user it ran as (#297). Having no privilege is also why this one may keep its `ExecStart=` inside the
+  `app/` tree while the reboot orchestrator may not.
 
 ### systemd units (`deploy/systemd/`)
-> Since issue #71, the deploy **installs all of these unit files from the deployed tree on every run**
+> Since issue #71, the deploy **installs all of these unit files on every run** — since
+> basecradle-noc#777 from the NOC's own root-owned staging clone of the SHA, not from the mirrored tree
 > (the NOC's `deploy-router` op globs `deploy/systemd/*.{service,timer}`), then `daemon-reload`, **arms
 > every timer** (`enable --now`), and keeps `basecradle-router.service` enabled. It does **not** enable
 > `*.service` units generically — the recovery gate below is enabled **once at provisioning** and its
@@ -1383,8 +1434,8 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 
 | Unit | Role | Enable? |
 |---|---|---|
-| `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |
-| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `reboot-if-required.sh`) | `static` (timer-driven). Install (`daemon-reload`). |
+| `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) — runs `User=router`, unprivileged | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |
+| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `/opt/basecradle-router/bin/reboot-if-required.sh`) — the one unit that runs as **root** | `static` (timer-driven). Install (`daemon-reload`). |
 | `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
 
 ### The reboot policy (decided: automatic)
@@ -1396,7 +1447,8 @@ actual reboot happens only on the days an OS update staged one. This is the foun
 was verified working — now it is, so the box reboots itself to take security/kernel patches, and the
 recovery gate confirms it came back (or alarms). It pairs with the hardening duty
 (`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works
-(`systemctl start basecradle-router-reboot.service`, or `reboot-if-required.sh` by hand) for an
+(`systemctl start basecradle-router-reboot.service`, or `/opt/basecradle-router/bin/reboot-if-required.sh`
+by hand as root) for an
 out-of-window reboot.
 
 ---

@@ -5,7 +5,7 @@
 # that left the fleet home serving nothing surfaces in `systemctl --failed` and the
 # journal instead of going unnoticed (the same alarm convention as the drift timer).
 # This is the post-boot half of the clean-reboot mechanism (issue #66); it pairs
-# with deploy/reboot-if-required.sh.
+# with deploy/bin/reboot-if-required.sh.
 #
 # Safe to ENABLE NOW: it is read-only and purely observational, and it checks
 # recovery after ANY reboot (manual or automatic), so it adds value before the
@@ -26,6 +26,27 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# UNPRIVILEGED — the check needs nothing root can give (#297). It reads unit state
+# (`systemctl is-active`, a read on the system bus that needs no privilege) and GETs
+# http://127.0.0.1:8000/up. It writes nothing and touches no protected path, so it
+# runs as the daemon user, exactly like basecradle-router-drift.service — the other
+# read-only oneshot. That is why this one may keep its ExecStart inside the app tree
+# while basecradle-router-reboot.service (genuinely root) may not: with no privilege
+# to abuse, the tree's ownership is not load-bearing for this unit.
+#   A failure still alarms identically — a unit fails in `systemctl --failed`
+# whatever user it ran as.
+#   Proven on real systemd 255 (Ubuntu 24.04, the box's version) before this landed:
+# as `router` the gate reports RECOVERY OK when the services are up and /up is green,
+# and on a stopped service it exits 1 and lands in `systemctl --failed` — both
+# directions. The one dependency the unprivileged form has that root does not is the
+# D-Bus system bus: without `dbus`, systemctl falls back to systemd's root-only
+# private socket and an unprivileged `is-active` answers "Failed to connect to bus"
+# (measured). `dbus` is present on the box, and the fail direction is loud, not silent.
+User=router
+Group=router
+# Nothing here needs to gain privilege, and no setuid binary is on the path
+# (systemctl, curl, sleep). Set so it cannot.
+NoNewPrivileges=yes
 # verify-recovery.sh polls for up to RETRIES*RETRY_INTERVAL (~150s by default) while
 # services finish coming up. That exceeds systemd's default oneshot start timeout
 # (~90s), which would kill the check mid-poll and mark it failed spuriously. Give it

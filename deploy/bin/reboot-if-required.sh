@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy/reboot-if-required.sh — perform a CLEAN, observable reboot, but ONLY when
+# deploy/bin/reboot-if-required.sh — perform a CLEAN, observable reboot, but ONLY when
 # an OS update has actually staged one.
 #
 # The fleet home box was found running an unpatched kernel while a newer one sat
@@ -26,8 +26,13 @@
 # post-boot basecradle-router-recovery.service confirms the box came back (and
 # alarms if it did not) — that gate is what makes the unattended reboot safe.
 #
-# Runs ON THE BOX as root (the reboot timer runs as root). It is a no-op on a box
-# that does not need a reboot, so it is safe to run anytime.
+# Runs ON THE BOX as root (the reboot timer runs as root) — root is genuine here:
+# `systemctl stop` and `systemctl reboot` are not things an unprivileged account can
+# do. BECAUSE it runs as root it lives in deploy/bin/ and is executed from the
+# root-owned install path /opt/basecradle-router/bin/reboot-if-required.sh, never out
+# of the mirrored /opt/basecradle-router/app tree whose ownership another repo's deploy
+# op decides (#297, basecradle-noc#777). It is a no-op on a box that does not need a
+# reboot, so it is safe to run anytime.
 #
 # Config (env overrides — also the test seams; the daemon needs none of them):
 #   REBOOT_REQUIRED_FILE  the apt flag file       (default /var/run/reboot-required)

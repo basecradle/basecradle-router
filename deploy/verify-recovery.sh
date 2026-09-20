@@ -5,7 +5,7 @@
 #
 # The danger a clean reboot introduces is a box that reboots and never fully comes
 # back — a service that failed to start, an app bound but wedged. This is the
-# post-boot health gate that pairs with deploy/reboot-if-required.sh (issue #66):
+# post-boot health gate that pairs with deploy/bin/reboot-if-required.sh (issue #66):
 # it asserts the services are active AND the app's liveness route is green, then
 # exits nonzero + loud on any failure. Wired as a oneshot systemd unit
 # (basecradle-router-recovery.service, WantedBy=multi-user.target), a failure lands
@@ -20,7 +20,12 @@
 # wait for health, and Restart=on-failure means a unit can flap for a few seconds
 # right after boot. So each check retries up to a bounded budget before failing.
 #
-# Runs ON THE BOX. Safe to run by hand anytime (read-only): `deploy/verify-recovery.sh`.
+# Runs ON THE BOX as the UNPRIVILEGED `router` user (basecradle-router-recovery.service
+# sets User=router) — reading unit state and GETting /up need nothing root can give, and
+# the unit alarms in `systemctl --failed` whatever user it ran as (#297). Having no
+# privilege is also why this one may stay inside the mirrored app tree while the reboot
+# orchestrator moved to the root-owned /opt/basecradle-router/bin/.
+# Safe to run by hand anytime (read-only): `deploy/verify-recovery.sh`.
 #
 # Config (env overrides — also the test seams):
 #   SERVICES        space-separated units to require active  (default "caddy basecradle-router")

@@ -50,23 +50,38 @@ SyslogIdentifier=basecradle-router
 # start a throwaway cache in this unit's private /tmp (PrivateTmp= below): uv removes
 # it when it exits, and systemd removes that /tmp with the unit even if uv is killed.
 # Proven offline (#280): with the venv in sync, a start opens no network connection,
-# so this daemon (the fleet's only wake path) never needs PyPI to come back up. A
-# start after the tree changed WITHOUT that sync rebuilds the project and does need
-# PyPI; the deploy always syncs before it restarts. Nothing past the sudo boundary
-# inherits this variable: sudoers env_resets wake-runner.
+# so this daemon (the fleet's only wake path) never needs PyPI to come back up. Since
+# #297 the start also carries `--no-sync` (below), so it cannot rebuild the project
+# and cannot reach PyPI even against a venv the deploy did NOT sync — it fails loudly
+# instead. Nothing past the sudo boundary inherits this variable: sudoers env_resets
+# wake-runner.
 Environment=UV_NO_CACHE=1
 
 # SINGLE WORKER — load-bearing, never add --workers. The per-repo threading.Lock
 # only serializes wakes within one process; multiple worker processes would each
 # hold their own locks and could double-wake a repo's clone. Bind to localhost
 # only — Caddy (the TLS front end, #31) reverse-proxies to this port.
-ExecStart=/home/router/.local/bin/uv run --project /opt/basecradle-router/app \
+#
+# --no-sync (#297): A BARE `uv run` SYNCS FIRST — it re-locks the project and writes
+# `uv.lock` when it thinks the lock is stale. The app tree is root-owned
+# (basecradle-noc#777) and this unit is `router`, so that write cannot succeed: the
+# daemon's start would depend on writing into a tree it must not own. `--no-sync`
+# removes the dependency structurally rather than relying on the lock always being
+# current. It is safe because the environment is established exactly once, by the
+# deploy: `uv sync --locked` as `router`, BEFORE the restart (Part 3's contract).
+# Chosen over `--frozen`, which still syncs the venv and so can still reach PyPI on a
+# start — this is the fleet's only wake path, and #280's "a restart never needs the
+# network" should be a property of the unit, not of the venv happening to be in sync.
+# The failure mode is right, too: a venv the deploy did not sync makes the start fail
+# loudly (the deploy's rollback trigger) instead of silently rebuilding the project
+# under the wake path.
+ExecStart=/home/router/.local/bin/uv run --no-sync --project /opt/basecradle-router/app \
     uvicorn --factory basecradle_router.app:create_app --host 127.0.0.1 --port 8000
 
 Restart=on-failure
 RestartSec=2s
 # GRACEFUL DRAIN OF IN-FLIGHT WAKES on stop/restart (and on the pre-reboot drain in
-# deploy/reboot-if-required.sh). Two directives make the drain real:
+# deploy/bin/reboot-if-required.sh). Two directives make the drain real:
 #   KillMode=mixed — SIGTERM at stop goes to the MAIN process ONLY, so uvicorn's
 #     lifespan shutdown can drain `self._pending` while the wake subtree
 #     (sudo -> wake-runner -> runuser -> claude) keeps running. NOTE: the main process
