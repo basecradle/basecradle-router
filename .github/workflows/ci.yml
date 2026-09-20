@@ -17,6 +17,14 @@ jobs:
       - name: Injection-marker guard
         run: .github/scripts/injection-guard.sh
 
+      # Shell was the unlinted half of this repo (#299): the root-run wake path and
+      # the reboot helper had no gate while Python had two. `shellcheck` is
+      # preinstalled on `ubuntu-latest`, so this is ~1s and no install step. A STEP
+      # in this job, not a job of its own, so the required status context stays the
+      # single `CI` above and no ruleset change is needed.
+      - name: Shell lint
+        run: .github/scripts/lint-shell.sh
+
       # PINNED TO THE BOX'S uv (#297). ai.basecradle.com runs uv 0.11.19, and the
       # deploy's lock gate (`uv sync --locked` as `router`) runs under THAT resolver.
       # Unpinned, this step installs whatever uv is newest, so CI could green a lock
