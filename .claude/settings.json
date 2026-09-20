@@ -1,0 +1,10 @@
+{
+  "env": {
+    "GH_CONFIG_DIR": "/var/empty",
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+    "GIT_CONFIG_VALUE_1": "!f() { if [ \"$1\" = get ]; then if [ -z \"$GH_TOKEN\" ]; then echo 'fail-closed: no GH_TOKEN in this shell. Mint one in this same call (.claude/skills/bot-auth-setup); the stored login is unreachable by design.' >&2; echo quit=1; else echo username=x-access-token; echo \"password=$GH_TOKEN\"; fi; fi; }; f"
+  }
+}

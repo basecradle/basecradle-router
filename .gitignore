@@ -17,6 +17,10 @@ build/
 .env
 .env.*
 
+# Claude Code per-session local overrides — never committed (the tracked
+# .claude/settings.json is the shared, fail-closed one)
+.claude/settings.local.json
+
 # macOS
 .DS_Store
 ._*
