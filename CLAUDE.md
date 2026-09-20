@@ -250,6 +250,9 @@ When your work is done **and verified live**, post your completion comment, clos
 ```bash
 uv sync                  # install deps (creates .venv)
 uv run pytest            # tests (offline — the default)
-uv run ruff check .      # lint
+uv run ruff check .      # lint (Python)
 uv run ruff format .     # format
+.github/scripts/lint-shell.sh   # lint (shell) — shellcheck over every tracked script
 ```
+
+`lint-shell.sh` runs as a step in the `CI` job, so shell is gated the same way Python is; run it locally before opening a PR that touches any `.sh` or `deploy/bin/` script (`brew install shellcheck`).
