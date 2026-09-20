@@ -33,7 +33,7 @@ from basecradle_router.server import WebhookServer, configure_logging, deployed_
 from basecradle_router.wake import WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
-SECRET = "whsec_" + "0" * 32
+SECRET = "fake-github-webhook-secret-" + "0" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
 TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
 NOVA = Agent(

@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 # Every shell metacharacter that matters, in one correctly-shaped fake: command
 # substitution in both spellings, a variable reference, and both quote characters.
-HOSTILE_SECRET = "whsec_$(id -u)`whoami`$HOME'\"x"
+HOSTILE_SECRET = "fake-secret-$(id -u)`whoami`$HOME'\"x"
 
 
 def _run_wrapper(tmp_path, env_body: str, *args: str) -> subprocess.CompletedProcess:
@@ -85,19 +85,21 @@ def test_one_layer_of_surrounding_quotes_is_stripped_as_systemd_does(tmp_path) -
     # systemd's EnvironmentFile= strips one layer, so the CLI's view of the config has
     # to match the running daemon's exactly or the manifest describes a router that
     # does not exist.
-    result = _run_wrapper(tmp_path, 'BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET="whsec_quoted"\n')
+    result = _run_wrapper(
+        tmp_path, 'BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET="fake-quoted-secret"\n'
+    )
 
-    assert result.stdout.strip() == "whsec_quoted"
+    assert result.stdout.strip() == "fake-quoted-secret"
 
 
 def test_comments_and_non_assignments_are_skipped(tmp_path) -> None:
     result = _run_wrapper(
         tmp_path,
         "# a comment\n\nnot an assignment\n"
-        "export BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=whsec_exported\n",
+        "export BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-exported-secret\n",
     )
 
-    assert result.stdout.strip() == "whsec_exported"
+    assert result.stdout.strip() == "fake-exported-secret"
 
 
 def test_an_unreadable_env_file_is_the_unprovable_exit_code(tmp_path) -> None:

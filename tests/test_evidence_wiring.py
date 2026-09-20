@@ -34,7 +34,7 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-SECRET = "whsec_" + "0" * 32  # correctly-shaped fake
+SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 DELIVERY = "0192f3a4-5b6c-7d8e-9f01-00000000000a"
 ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
 
@@ -122,7 +122,9 @@ def test_a_verified_delivery_records_the_sinks_proof() -> None:
 def test_a_bad_signature_records_a_rejection_not_an_accept() -> None:
     evidence = EvidenceStore(None)
 
-    _pipeline(evidence).handle("github", _handoff_request(secret="whsec_" + "9" * 32))
+    _pipeline(evidence).handle(
+        "github", _handoff_request(secret="fake-github-webhook-secret-" + "9" * 32)
+    )
 
     sink = evidence.snapshot().delivery_sinks["github"]
     assert (sink.accepted, sink.rejected) == (0, 1)

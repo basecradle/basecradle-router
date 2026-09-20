@@ -18,7 +18,7 @@ from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX
 from basecradle_router.wake import HomeServerWaker, WakeResult
 
-SECRET = "whsec_" + "0" * 32
+SECRET = "fake-github-webhook-secret-" + "0" * 32
 NOVA = Agent(
     key="basecradle/basecradle-python",
     os_user="nova",

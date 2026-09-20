@@ -36,7 +36,7 @@ JT = Agent(
 CONFIG = Config(
     agents=MappingProxyType({NOVA.key: NOVA, JT.key: JT}),
     enabled_routes=frozenset({"github", "basecradle"}),
-    webhook_secrets=MappingProxyType({"github": "whsec_" + "0" * 32}),
+    webhook_secrets=MappingProxyType({"github": "fake-github-webhook-secret-" + "0" * 32}),
     recipient_index=MappingProxyType({JT.recipient_uuid: JT}),
 )
 

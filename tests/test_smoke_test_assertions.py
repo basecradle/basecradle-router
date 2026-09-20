@@ -216,7 +216,7 @@ def test_control_the_original_shape_really_did_fail_on_this_fixture(tmp_path: Pa
 ENV_FILE = textwrap.dedent(
     """\
     # basecradle-router daemon env (fabricated values)
-    BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=whsec_0123456789abcdef0123456789abcdef
+    BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-github-webhook-secret-0123456789abcdef
     BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=drawkkwast,basecradle-ai[bot],basecradle-router-ai[bot]
     BASECRADLE_ROUTER_WAKE_BREAKER_MAX=12
     """
@@ -239,7 +239,7 @@ def test_env_value_reads_the_key(tmp_path: Path) -> None:
     out = _run_parsers(
         ENV_FILE, "env_value BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET; echo", tmp_path
     )
-    assert out.strip() == "whsec_0123456789abcdef0123456789abcdef"
+    assert out.strip() == "fake-github-webhook-secret-0123456789abcdef"
 
 
 def test_env_value_is_empty_for_a_missing_key(tmp_path: Path) -> None:

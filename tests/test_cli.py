@@ -24,7 +24,7 @@ NOVA_ENTRY = {
     "clone_path": "/home/nova/basecradle-python",
     "bot_slug": "basecradle-python-ai",
 }
-SECRET = "whsec_" + "0" * 32  # correctly-shaped fake
+SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 
 
 @pytest.fixture
@@ -276,7 +276,9 @@ def test_evidence_on_a_box_that_has_produced_none_is_empty_not_an_error(box, cap
 
 def _arm_probe_route(monkeypatch) -> None:
     monkeypatch.setenv("BASECRADLE_ROUTER_ENABLED_ROUTES", "github,probe")
-    monkeypatch.setenv("BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET", "whsec_" + "1" * 32)
+    monkeypatch.setenv(
+        "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET", "fake-probe-route-secret-" + "1" * 32
+    )
 
 
 def _marker(nonce: str = "0" * 32) -> str:
