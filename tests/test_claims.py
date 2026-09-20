@@ -54,7 +54,7 @@ JT = Agent(
     recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
     wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
 )
-SECRET = "whsec_" + "0" * 32  # correctly-shaped fake
+SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 DELIVERY = "0192f3a4-5b6c-7d8e-9f01-00000000000a"
 EVIDENCE_PATH = "/var/lib/basecradle-router/evidence.json"
 

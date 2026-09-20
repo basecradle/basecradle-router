@@ -67,7 +67,7 @@ from basecradle_router.wakelock import WakeLockGuard
 PROBE_ACK = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "probe-ack"
 WAKE_RUNNER = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "wake-runner"
 
-PROBE_SECRET = "whsec_" + "1" * 32  # the ROUTE's secret: authorises injection
+PROBE_SECRET = "fake-probe-route-secret-" + "1" * 32  # the ROUTE's secret: authorises injection
 NOVA_AGENT_SECRET = "noc-probe-secret-for-nova-fabricated"  # the AGENT's own secret
 JT_AGENT_SECRET = "noc-probe-secret-for-jt-fabricated"
 

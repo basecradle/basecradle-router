@@ -48,7 +48,7 @@ HARNESS_ENTRY = {
     "recipient_uuid": JT_UUID,
     "wake_bin": "/home/jt/venv/bin/basecradle-harness-wake",
 }
-FAKE_SECRET = "whsec_" + "0" * 32  # correctly-shaped fake
+FAKE_SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 
 
 def _write_registry(tmp_path, registry=REGISTRY, name="agents.json") -> str:

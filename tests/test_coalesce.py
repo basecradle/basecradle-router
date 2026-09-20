@@ -37,7 +37,7 @@ from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegis
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.wake import WakeError, WakeResult
 
-SECRET = "whsec_" + "0" * 32
+SECRET = "fake-github-webhook-secret-" + "0" * 32
 BASECRADLE_SECRET = "bc_isk_" + "1" * 32
 JOHN = "john"  # John Doe, a trusted human org member — files the handoff, comments
 AGENT_BOT = "basecradle-python-ai[bot]"  # Nova Digital's builder bot — closes the issue
