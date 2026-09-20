@@ -520,7 +520,7 @@ class EvidenceStore:
             self._remove_orphaned_temps(path)
         self._doc = _load(path) if path else EvidenceDocument()
         # One warning per process for an unwritable store, not one per delivery: a
-        # broken state dir must be visible exactly once, never a firehose that buries
+        # broken state dir must be visible exactly once, never a flood that buries
         # the wake lines an operator is actually reading.
         self._write_failed = False
         self._discard_stale_queue_depths()

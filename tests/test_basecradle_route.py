@@ -159,7 +159,7 @@ def test_normalize_message_created_round_trips() -> None:
 def test_normalize_wakes_on_the_other_actionable_events(event: str) -> None:
     # The founder's required wake set beyond message.created: a peer's asset (#95),
     # a scheduled task coming due, and an inbound webhook delivery (#90). All ride
-    # the same firehose envelope — recipient_uuid + timeline_uuid — and must wake
+    # the same Event Delivery envelope — recipient_uuid + timeline_uuid — and must wake
     # the agent for that timeline, not fall on the floor.
     e = BasecradleRoute().normalize(_request(event=event))
     assert e is not None
@@ -253,15 +253,15 @@ def test_normalize_logs_ignored_event_type_none_when_header_absent(caplog) -> No
 
 # --- per-recipient verification keys (basecradle/basecradle#497) -------------
 #
-# One `integration_secret` per agent, not one per route. The route picks the key by
+# One Integration Signing Key per agent, not one per route. The route picks the key by
 # the delivery's `recipient_uuid`, falls back to the route-wide secret while the
 # cutover runs, and — once that fallback is retired — rejects a recipient it holds no
 # key for. Fabricated cast: @jt and @nova, two harness agents with well-formed
-# UUIDv7 user uuids and correctly-shaped fake integration secrets.
+# UUIDv7 user uuids and correctly-shaped fake Integration Signing Keys.
 
 NOVA_UUID = "019e916c-7f45-700e-afc0-f45557b2aaaa"  # @nova's BaseCradle user uuid
-JT_KEY = "bc_isk_fakejtintegrationsigningkey0001"
-NOVA_KEY = "bc_isk_fakenovaintegrationsigningkey02"
+JT_KEY = "bc_isk_fakejtintegrationsigningkey00001"
+NOVA_KEY = "bc_isk_fakenovaintegrationsigningkey002"
 
 JT_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}JT"
 NOVA_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}NOVA"

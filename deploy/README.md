@@ -325,16 +325,16 @@ BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
 BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
 BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. drawkkwast,basecradle-router-ai[bot]>
 # BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"; set to "github,basecradle"
-#   to also accept BaseCradle platform events (then the basecradle secret is required):
+#   to also accept the platform's Event Delivery (then the basecradle secret is required):
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
-# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the shared fallback integration_secret>
+# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the shared fallback Integration Signing Key>
 #
 # Per-recipient signing keys (issue #236) — ONE key per harness agent, named by its slug
 # upper-cased with every character outside [A-Za-z0-9_] replaced by _ (glm-5.2 -> GLM_5_2;
 # a name systemd will not pass through never reaches the daemon at all).
 # A delivery is verified with its own recipient's key; an agent with no key here
 # falls back to the shared value above, so agents rotate one at a time:
-# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT=<@jt's own bc_isk_… integration secret>
+# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT=<@jt's own bc_isk_… Integration Signing Key>
 # BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK=1   # set 0 to retire the shared value
 #
 # The synthetic wake (issue #208) — add "probe" to enable the router's own lever for the
@@ -423,17 +423,17 @@ the core and both opt-in per route, so the platform route and the probe pass the
   holds no GitHub credential. Reopening an issue wakes nothing by itself — re-engage it with a comment or
   by re-applying `handoff` once it is open.
 
-The **basecradle route** (issue #87) accepts signed BaseCradle platform events at
-`POST /webhooks/basecradle`. Enable it by adding `basecradle` to
-`BASECRADLE_ROUTER_ENABLED_ROUTES` (the platform signs each delivery with the recipient's
-`integration_secret`, HMAC-SHA256 over the raw body in `X-BaseCradle-Signature`, exactly like GitHub).
-The platform decides what to deliver to whom, so a valid signature *is* the trust — there is no extra
-actor allow-list here. A `message.created` delivery resolves to the agent by its BaseCradle user uuid
+The **basecradle route** (issue #87) is where the platform's **Event Delivery**, sent through the
+agent's **integration**, arrives: signed deliveries at `POST /webhooks/basecradle`. Enable it by
+adding `basecradle` to `BASECRADLE_ROUTER_ENABLED_ROUTES` (the platform signs each delivery with the
+recipient's **Integration Signing Key**, HMAC-SHA256 over the raw body in `X-BaseCradle-Signature`,
+exactly like GitHub). The platform decides what to deliver to whom, so a valid signature *is* the
+trust — there is no extra actor allow-list here. A `message.created` delivery resolves to the agent by its BaseCradle user uuid
 (`recipient_uuid`) and wakes that agent's harness for the event's `timeline_uuid`.
 
 ##### Per-recipient verification keys (issue #236)
 
-An `integration_secret` belongs to **one agent**, so the route selects the verification key by the
+An Integration Signing Key belongs to **one agent**, so the route selects the verification key by the
 delivery's `recipient_uuid` rather than verifying everything with one route-wide value. A single shared
 value made all seven harness agents interchangeable at the signature: any holder of it could forge a
 delivery addressed to any other agent, and one leak meant rotating every one of them
@@ -444,7 +444,7 @@ route uses.
 
 | Variable | Holds |
 |---|---|
-| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_<SLUG>` | that agent's own `integration_secret` |
+| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_<SLUG>` | that agent's own Integration Signing Key |
 | `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` | the shared fallback, during the cutover |
 | `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK` | `1` (default) or `0` to retire the fallback |
 
@@ -490,7 +490,7 @@ through the NOC's deploy/converge path**, the same way every other value in `rou
 capital coordinates the sequencing, the router-AI never touches the box. A secret **never transits a
 GitHub issue, a PR, a session transcript, or a log line** — the issue coordinates *which agent is
 next*, never the value. Per agent, in this order: the capital rotates the agent's
-`integration_secret` on the platform → @origin adds `…_WEBHOOK_SECRET_<SLUG>=<new value>` to
+Integration Signing Key on the platform → @origin adds `…_WEBHOOK_SECRET_<SLUG>=<new value>` to
 `router.env` and the daemon is restarted → the capital live-verifies one delivery reaching that agent
 (`key_path=recipient` in the journal, and the agent's `last_ok_at` moving in the evidence document). Keeping
 the gap between the first two steps short is what keeps that agent's deliveries from failing five
@@ -502,8 +502,8 @@ to start if the flip would strand an agent, and the `event=route_config` line at
 `shared_fallback=false` so the retirement is visible rather than assumed.
 
 Both prefixes are scrubbed from the box's telemetry (`deploy/vector.yaml` redacts `bc_isk_…`
-integration secrets alongside `bc_uat_…` user tokens), so a value that ever reaches a log line does not
-reach Better Stack.
+Integration Signing Keys alongside `bc_uat_…` user tokens), so a value that ever reaches a log line
+does not reach Better Stack.
 
 The **wake-rate circuit breaker** (issue #110) is the router's cross-agent runaway backstop. The router
 is the single chokepoint for every wake, so it alone can catch a runaway loop the per-agent harness layer

@@ -219,7 +219,7 @@ JT = Agent(
     recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
     wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
 )
-JT_KEY = "bc_isk_fakejtintegrationsigningkey0001"
+JT_KEY = "bc_isk_fakejtintegrationsigningkey00001"
 
 
 def _env_with_harness_agent(tmp_path) -> dict[str, str]:

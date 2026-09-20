@@ -27,7 +27,7 @@ from basecradle_router.wake import WakeError, WakeResult
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 SECRET = "whsec_" + "0" * 32
-BASECRADLE_SECRET = "whsec_" + "1" * 32
+BASECRADLE_SECRET = "bc_isk_" + "1" * 32
 HANDOFF_SENDER = "john"  # John Doe, a trusted human org member, files the handoff
 TRUSTED_ACTORS = frozenset({HANDOFF_SENDER})
 UNTRUSTED_SENDER = "drive-by-stranger"

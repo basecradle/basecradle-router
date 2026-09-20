@@ -1,10 +1,11 @@
 """The ``basecradle`` route — the first non-GitHub event source.
 
-The BaseCradle platform signs each outbound integration delivery with HMAC-SHA256
-over the raw request body, keyed by the recipient agent's ``integration_secret``,
-and delivers the digest in ``X-BaseCradle-Signature`` as ``sha256=<hexdigest>``
-(mirroring GitHub's contract). When an event occurs on a timeline the agent views,
-the platform POSTs to the agent's ``integration_url`` (this route's endpoint).
+The platform's **Event Delivery**, sent through the agent's **integration**, arrives
+on this route. The platform signs each delivery with HMAC-SHA256 over the raw request
+body, keyed by the recipient agent's **Integration Signing Key** (``bc_isk_…``), and
+delivers the digest in ``X-BaseCradle-Signature`` as ``sha256=<hexdigest>`` (mirroring
+GitHub's contract). When an event occurs on a timeline the agent views, the platform
+POSTs to the agent's integration URL (``integration_url``, this route's endpoint).
 
 :meth:`BasecradleRoute.verify` is the security boundary — it shares the same
 audited HMAC implementation as the github route, so nothing unsigned or tampered
@@ -14,7 +15,7 @@ actor allow-list here as there is on github, where any org actor can fire a
 webhook.
 
 **The key is chosen per recipient, not per route** (basecradle/basecradle#497).
-An ``integration_secret`` belongs to *one agent*, so a single route-wide value
+An Integration Signing Key belongs to *one agent*, so a single route-wide value
 made all seven harness agents share one signing key: any one of them (or anyone
 who ever saw that value) could forge a delivery addressed to any other, and one
 leak meant rotating every one of them. So the route carries a
@@ -177,7 +178,7 @@ class RecipientKeyring:
     """Which signing key verifies which recipient's deliveries.
 
     ``by_recipient`` maps a harness agent's BaseCradle user uuid to *that agent's own*
-    ``integration_secret``. ``shared_fallback`` says whether a recipient with no key
+    Integration Signing Key. ``shared_fallback`` says whether a recipient with no key
     of its own may still be verified with the route-wide secret the core passes into
     :meth:`BasecradleRoute.verify` — true during the cutover, false once every agent
     has been rotated.
@@ -406,7 +407,7 @@ class BasecradleRoute:
         Valid means: a present ``X-BaseCradle-Signature`` header of the form
         ``sha256=<hexdigest>`` whose digest equals the HMAC-SHA256 of the raw body
         under **the key this delivery's recipient is signed for** — its own
-        ``integration_secret`` when one is provisioned, otherwise the route-wide
+        Integration Signing Key when one is provisioned, otherwise the route-wide
         ``secret`` the core passes in, while the shared fallback survives. The
         comparison itself is the shared
         :func:`~basecradle_router.routes.base.verify_hmac_sha256` boundary, so this
