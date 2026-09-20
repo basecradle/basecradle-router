@@ -74,7 +74,11 @@
 #     registered in the agent registry with exactly the requested clone path;
 #   - only the registry-sanctioned binary for that agent may be launched —
 #     `claude` for a builder, the pinned `wake_bin` for a harness agent — and a
-#     harness `wake_bin` must resolve inside the agent's own home;
+#     harness `wake_bin` must lie inside the agent's own home;
+#   - every path that lives inside an account's own directory goes through ONE gate,
+#     `confined_path` below: walked component-wise from a trusted root, refusing `..`
+#     itself and refusing any symlink component rather than resolving it. Root never
+#     follows a link an unprivileged account can rewrite (basecradle/basecradle#576);
 #   - the agent's secrets are read by the AGENT, after the privilege drop, and
 #     parsed literally (KEY=VALUE), never evaluated as shell.
 # Even a fully-compromised router can therefore only do what it can already do
@@ -126,6 +130,104 @@ refuse() {
 	printf 'wake-runner: %s\n' "$*" >&2
 	exit "$code"
 }
+
+# >>> confined_path >>>
+# Is PATH safe for the PRIVILEGED side to act on, when ROOT and everything under it
+# belong to an account that is NOT root? The ONE gate every such path goes through.
+#
+# WHY IT IS NOT `realpath` + a prefix test (basecradle/basecradle#576). `realpath`
+# FOLLOWS every symlink it walks and hands back the target; a prefix test then judges
+# the target, and the privileged side acts on a path the unprivileged owner chose. The
+# NOC's root deploy wrapper had 21 sites of exactly that shape, and a systemd fence is
+# no defence: measured on systemd 255, `ReadWritePaths=-/home/%i/x` binds a symlink's
+# TARGET read-write into the unit's namespace. Only refusing the link closes it. So this
+# resolves NOTHING. It walks the path one component at a time from a trusted root and
+# refuses the first component that is a link, which is a decision about the path the
+# caller named rather than about wherever that path happened to point.
+#
+# `..` and `.` are refused HERE, by us, never delegated to a resolver — delegating is
+# what makes a check a resolution again.
+#
+# A REFUSAL NAMES THE COMPONENT, NEVER THE TARGET. The target is the attacker's text;
+# printing it into root's journal is a second, smaller version of trusting it, and it is
+# never the thing an operator has to go fix. The component relative to the root is.
+#
+# Nothing here writes, creates, or removes: a refusal changes nothing, and so does a
+# pass. The caller decides the consequence.
+#
+#   confined_path <label> <root> <path>
+#     -> stdout: PATH verbatim (it is already canonical, or we refused it)
+#     -> stderr + return 1: one line naming what is wrong and where
+#
+# The root must itself be a real, non-symlink directory. For a wake that is
+# `/home/<agent>`: the agent owns everything *under* it, but replacing the directory
+# entry itself needs write access to `/home`, which is root's — so it is the one
+# component in the path that the account being confined cannot swap.
+confined_path() {
+	local label=$1 root=$2 path=$3
+	local rest component walked
+
+	# The root is checked as strictly as the path, and for the same reason: a gate that
+	# assumes its caller validated its own arguments is a gate with a door beside it.
+	# A dot segment here would move the whole confinement somewhere else.
+	if [[ $root != /* || $root == */ || $root == *//* ]] ||
+		[[ $root == */. || $root == */.. || $root == */./* || $root == */../* ]]; then
+		printf 'wake-runner: refusing: %s: trusted root %s is not a canonical absolute path\n' \
+			"$label" "$root" >&2
+		return 1
+	fi
+	if [[ -L $root || ! -d $root ]]; then
+		printf 'wake-runner: refusing: %s: trusted root %s is not a real directory\n' \
+			"$label" "$root" >&2
+		return 1
+	fi
+	if [[ $path != /* || $path == */ || $path == *//* ]]; then
+		printf 'wake-runner: refusing: %s %s is not a canonical absolute path\n' \
+			"$label" "$path" >&2
+		return 1
+	fi
+	if [[ $path != "$root"/?* ]]; then
+		printf 'wake-runner: refusing: %s %s is not under %s\n' "$label" "$path" "$root" >&2
+		return 1
+	fi
+
+	rest=${path#"$root"/}
+	walked=$root
+	while [[ -n $rest ]]; do
+		component=${rest%%/*}
+		if [[ $component == "$rest" ]]; then
+			rest=""
+		else
+			rest=${rest#*/}
+		fi
+		case "$component" in
+		"." | "..")
+			printf 'wake-runner: refusing: %s %s has a %s segment\n' "$label" "$path" "$component" >&2
+			return 1
+			;;
+		esac
+		walked="$walked/$component"
+		# -L first: a dangling link is a link, and saying "does not exist" about one
+		# would send an operator to create the very thing we are refusing to follow.
+		if [[ -L $walked ]]; then
+			printf 'wake-runner: refusing: %s: component %s under %s is a symlink; the privileged side does not follow it\n' \
+				"$label" "${walked#"$root"/}" "$root" >&2
+			return 1
+		fi
+		if [[ ! -e $walked ]]; then
+			printf 'wake-runner: refusing: %s: %s does not exist under %s\n' \
+				"$label" "${walked#"$root"/}" "$root" >&2
+			return 1
+		fi
+		if [[ -n $rest && ! -d $walked ]]; then
+			printf 'wake-runner: refusing: %s: %s under %s is not a directory\n' \
+				"$label" "${walked#"$root"/}" "$root" >&2
+			return 1
+		fi
+	done
+	printf '%s' "$path"
+}
+# <<< confined_path <<<
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (via the sudoers rule)"
 
@@ -213,13 +315,15 @@ entry="$(jq -r --arg u "$user" --arg c "$cwd" \
 [[ -n $entry ]] || die "refusing: ($user, $cwd) is not a registered agent clone"
 IFS=$'\t' read -r match kind wake_bin <<<"$entry"
 
-# Defence in depth against a poisoned registry: the clone must resolve (no `..`,
-# no symlink escape) to a path inside the agent's own home, never elsewhere.
-real_cwd="$(realpath -e -- "$cwd" 2>/dev/null)" || die "clone path does not exist: $cwd"
-case "$real_cwd/" in
-"/home/$user/"*) : ;;
-*) die "refusing: clone $cwd resolves outside /home/$user" ;;
-esac
+# Defence in depth against a poisoned registry AND against the account that owns
+# /home/$user: every component of the clone path, from the agent's own home down, must
+# be a real, non-symlink entry. See `confined_path` for why this refuses a link rather
+# than resolving one — the agent can rewrite anything under its home between our check
+# and anyone's use of the answer, so the only honest check is one that never followed.
+#
+# The `cd` itself happens AFTER the privilege drop, as the agent, which is what keeps
+# root out of the loop entirely; this is the belt to that structure's braces.
+real_cwd="$(confined_path "clone path" "/home/$user" "$cwd")" || exit 1
 
 # Resolve the binary to launch from the REGISTRY's kind for this agent — never
 # from the caller's argv path verbatim. The launched program is whatever the
@@ -254,11 +358,13 @@ harness)
 	[[ -n $probe ]] ||
 		[[ "$1" == "$wake_bin" ]] ||
 		die "refusing: command must be the registered wake_bin '$wake_bin', got '$1'"
-	launch_bin="$(realpath -e -- "$wake_bin" 2>/dev/null)" || die "wake_bin does not exist: $wake_bin"
-	case "$launch_bin/" in
-	"/home/$user/"*) : ;;
-	*) die "refusing: wake_bin $wake_bin resolves outside /home/$user" ;;
-	esac
+	# Same gate as the clone path, and it matters more here: this path is an EXECUTABLE
+	# inside a directory the agent writes, so `realpath` would have handed root a target
+	# the agent chose. `confined_path` refuses a link instead, and the `-x` below then
+	# stats the component-verified path itself. Root still only stats it — the `exec`
+	# happens after the drop, as the agent, which is why a swap racing this check can
+	# reach nothing the agent could not already reach.
+	launch_bin="$(confined_path "wake_bin" "/home/$user" "$wake_bin")" || exit 1
 	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
 	;;
 *)
