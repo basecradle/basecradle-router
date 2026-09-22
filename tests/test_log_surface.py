@@ -148,6 +148,109 @@ def test_provider_api_keys_are_redacted() -> None:
     assert r"AIza[A-Za-z0-9_-]{20,}" in source
 
 
+# One `msg = replace(msg, r'…', "…")` statement, in the only shape this file may carry: a raw
+# string with no single quote inside it (one would close it early), and a fixed replacement
+# with no dollar sign (a capture-group back-reference needs one, and Vector interpolates every
+# dollar sign in the file before parsing it — basecradle-router#305).
+_REPLACE = re.compile(
+    r"""^ *msg = replace\(msg, r'(?P<pattern>[^']*)', "(?P<replacement>[^"$]*)"\)$"""
+)
+
+
+def _redact(message: str) -> str:
+    """`message` after every `msg = replace(…)` rule in `ai_scrub`, applied in file order.
+
+    Python's `re` stands in for VRL's Rust `regex`: the two agree on everything these
+    patterns use (classes, `\\s`/`\\S`, bounded repeats, a leading `(?i)`). Every replace
+    statement must parse, so a rule written in any other shape fails here by name rather
+    than being skipped — a redaction this helper never ran would pass vacuously.
+    """
+    # Every non-comment line that mentions `replace` — so a `replace!(` or a respaced
+    # statement must match the strict shape too, instead of slipping past the filter.
+    statements = [
+        line
+        for line in _scrub_source().splitlines()
+        if "replace" in line and not line.lstrip().startswith("#")
+    ]
+    assert statements, "ai_scrub carries no replace rules"
+    for line in statements:
+        rule = _REPLACE.match(line)
+        assert rule, (
+            f"ai_scrub replace rule is not a closed raw string + fixed replacement: {line!r}"
+        )
+        # A function, not a template: the replacement is literal, as VRL's is with no `$`.
+        literal = rule.group("replacement")
+        message = re.sub(rule.group("pattern"), lambda _, fixed=literal: fixed, message)
+    return message
+
+
+# Fabricated: the real keys are `ste-` + 99 alphanumerics, so this matches their length.
+STEEL_KEY = "ste-" + "Fab1cated" * 11
+SESSION_ID = "0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"
+
+
+def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
+    # Steel (steel.dev), the browser backend behind Playwright MCP, takes its key two ways:
+    # the `steel-api-key` header, and `apiKey=` on the wss://connect.steel.dev URL
+    # (basecradle-noc#797). The `ste-` rule catches the key wherever it lands; the query
+    # rule catches `apiKey=` whatever its value, so a future key format in a URL is covered.
+    source = _scrub_source()
+    assert r"ste-[A-Za-z0-9]{20,}" in source
+    assert r"""(?i)api[-_]?key=[^&\s"]+""" in source
+    top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
+    for rule in ("msg = replace(msg, r'ste-", "msg = replace(msg, r'(?i)api[-_]?key="):
+        assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
+
+
+def test_a_steel_key_in_the_connect_url_is_redacted_and_the_rest_survives() -> None:
+    redacted = _redact(
+        f"connecting to wss://connect.steel.dev?sessionId={SESSION_ID}&apiKey={STEEL_KEY}"
+    )
+    assert "Fab1cated" not in redacted
+    assert (
+        redacted
+        == f"connecting to wss://connect.steel.dev?sessionId={SESSION_ID}&apiKey=[REDACTED]"
+    )
+
+
+def test_the_query_rule_stops_at_the_next_parameter() -> None:
+    # `&` ends the value: redact the key, never the parameters after it.
+    redacted = _redact(f"wss://connect.steel.dev?apiKey={STEEL_KEY}&sessionId={SESSION_ID}")
+    assert redacted == f"wss://connect.steel.dev?apiKey=[REDACTED]&sessionId={SESSION_ID}"
+
+
+def test_a_steel_key_outside_a_url_is_redacted_by_its_prefix() -> None:
+    # The header form carries no `apiKey=`, so only the `ste-` rule can catch it.
+    redacted = _redact(f"POST https://api.steel.dev/v1/sessions steel-api-key: {STEEL_KEY}")
+    assert redacted == "POST https://api.steel.dev/v1/sessions steel-api-key: [REDACTED_API_KEY]"
+
+
+def test_the_query_rule_redacts_a_value_of_any_shape() -> None:
+    # No known prefix, any spelling of the name: the query rule stands on its own.
+    for name in ("apiKey", "api_key", "API-KEY", "apikey"):
+        redacted = _redact(f'GET /v1/tools?{name}=novaOpaqueFabricatedValue0001 "ok"')
+        assert "novaOpaqueFabricatedValue0001" not in redacted
+        assert redacted == 'GET /v1/tools?apiKey=[REDACTED] "ok"'
+
+
+def test_an_env_dump_api_key_is_redacted_whatever_its_provider() -> None:
+    # Case-insensitive and unanchored, the query rule also catches the `NAME_API_KEY=value`
+    # shape of an env dump — the name is normalised, the value never ships, even for a
+    # provider no prefix rule knows.
+    assert _redact("STEEL_API_KEY=novaOpaqueFabricatedValue0001") == "STEEL_apiKey=[REDACTED]"
+    assert _redact("ANTHROPIC_API_KEY=sk-ant-" + "0" * 40) == "ANTHROPIC_apiKey=[REDACTED]"
+
+
+def test_the_only_dollar_signs_in_vector_yaml_are_the_sink_tokens() -> None:
+    # Vector interpolates environment variables across the WHOLE file before it parses the
+    # YAML — comments and the VRL source included — so a dollar sign anywhere else is never
+    # literal: a `$1` back-reference in a replacement, or a regex end anchor, becomes an
+    # environment lookup and can fail the NOC's pre-install validation, refusing the apply.
+    # The header promises the two sink tokens are the only ones; this holds it to that.
+    carriers = [line.strip() for line in VECTOR.read_text().splitlines() if "$" in line]
+    assert carriers == ['token: "${BETTERSTACK_AI_SOURCE_TOKEN}"'] * 2
+
+
 def test_the_process_command_line_is_never_shipped() -> None:
     # journald attaches the emitting process's full argv as the `_CMDLINE` metadata FIELD,
     # and Vector ships the whole journal record — so every redaction above, which operates

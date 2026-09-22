@@ -40,8 +40,9 @@
 #   * DELETES `_CMDLINE` from EVERY event — journald attaches the emitting process's full argv as
 #     a metadata FIELD, which no message-level redaction reaches (basecradle-noc#443);
 #   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`
-#     user tokens, `bc_isk_` integration signing keys, and provider API keys — `sk-…`, `xai-…`,
-#     `AIza…` and kin) from the message as defense in depth.
+#     user tokens, `bc_isk_` integration signing keys, provider API keys — `sk-…`, `xai-…`,
+#     `AIza…` and kin — and Steel's `ste-…` keys plus any `apiKey=` query value) from the
+#     message as defense in depth.
 #
 # The `_CMDLINE` deletion is UNCONDITIONAL — the guard is on the field, never on an allow-list of
 # identifiers known to be dangerous. The `sudo` drop above was written as if `sudo` were *the* argv
@@ -148,6 +149,20 @@ transforms:
       msg = replace(msg, r'AIza[A-Za-z0-9_-]{20,}', "[REDACTED_API_KEY]")
       msg = replace(msg, r'hf_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
       msg = replace(msg, r'r8_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
+      # Steel (steel.dev), the browser backend behind Playwright MCP (basecradle/basecradle#582,
+      # basecradle-noc#797). A Steel agent's launcher carries its key two ways: as the
+      # `steel-api-key` header on calls to api.steel.dev, and as the `apiKey=` query parameter
+      # of its wss://connect.steel.dev URL. The first rule catches the key by its own `ste-`
+      # prefix wherever it lands, header or not; the second catches the query shape whatever
+      # the value looks like, so a key of any future format is still covered inside a URL.
+      # Case-insensitive and unanchored, it also catches an env dump's `NAME_API_KEY=value`
+      # and prints `NAME_apiKey=[REDACTED]`: the name is normalised, the value never ships.
+      # The launcher already redacts the exact key from what it forwards to the harness; this
+      # is the journald layer. Both replacements are fixed strings on purpose: a capture-group
+      # back-reference needs a dollar sign, which Vector interpolates (see the header), and the
+      # character class carries no single quote, which would close the raw string.
+      msg = replace(msg, r'ste-[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
+      msg = replace(msg, r'(?i)api[-_]?key=[^&\s"]+', "apiKey=[REDACTED]")
       # PRESENTATION — prefix the message with the emitting program's journald identifier, so a
       # Live Tail line is self-describing: `[basecradle-router] stage=wake outcome=ok agent=… `.
       # Fall back to the process comm, then to "unknown", so a line with no identifier (a kernel
