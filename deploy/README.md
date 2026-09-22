@@ -1480,7 +1480,9 @@ Caddy, no database) and has three load-bearing properties:
    `_CMDLINE` field from every event** (below), and **redacts**
    secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`, and **provider API
    keys** — `sk-…` covering the whole `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`,
-   `hf_…`, `r8_…`) as defense in depth. The provider-key rules are the belt for the braces
+   `hf_…`, `r8_…`; and Steel's `ste-…` keys plus any `apiKey=` query value, since a Steel launcher
+   puts its key on the `wss://connect.steel.dev` URL — basecradle-noc#797) as defense in depth.
+   The provider-key rules are the belt for the braces
    (basecradle-router#170): agents run with those keys in their env, and a wake's stdout+stderr now
    flows into journald (#168) and therefore through here — nothing is *known* to print one, and a
    traceback that did would otherwise ship it. The drop + redaction rules are byte-faithful to NOC's
