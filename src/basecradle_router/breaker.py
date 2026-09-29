@@ -84,13 +84,24 @@ STREAM_SCOPE = "stream"
 #: never two vocabularies for one fact (see :mod:`basecradle_router.wakelock`).
 BREAKER_OPEN = "breaker_open"
 
-#: The trip line's leading token — **the grammar the fleet's Circuit Breaker Tripped
-#: alarm matches on**, spelled once in this repository and imported everywhere else it
-#: is named (the claims emitter's ``log-grammar:breaker_tripped`` row, the probe that
-#: proves it). A second literal is how the manifest comes to describe a line the daemon
-#: no longer writes, which is the whole failure this claim exists to catch
-#: (basecradle-noc#509, basecradle-router#232).
+#: The trip line's grammar token — **what the fleet's Circuit Breaker Tripped alarm
+#: matches on**, spelled once in this repository and imported everywhere else it is named
+#: (the claims emitter's ``log-grammar:breaker_tripped`` row, the probe that proves it). A
+#: second literal is how the manifest comes to describe a line the daemon no longer
+#: writes, which is the whole failure this claim exists to catch (basecradle-noc#509,
+#: basecradle-router#232). It leads a genuine trip; a synthetic one puts
+#: :data:`PROBE_MARKER` in front of it.
 TRIP_EVENT = "event=breaker_tripped"
+
+#: The bare token a **synthetic** breaker's every line leads with — the human reader's cue,
+#: where ``source=probe`` is the machines' (basecradle-router#315, basecradle-noc#857).
+#: The stamp trails the line, so the one thing that says "manufactured" was the last thing
+#: the eye reached, and a founder filtering Live Tail on ``[basecradle-router]`` was one
+#: glance from reading a red probe trip as a real one. Uppercase and bare — the same word
+#: the harness's log-grammar probe carries (basecradle-harness#593), so the fleet has one
+#: word for this; not ``kind=probe``, which would duplicate a key other lines carry, and
+#: not the stamp moved forward, which every alert predicate reads where it is.
+PROBE_MARKER = "PROBE"
 
 # The per-(agent, stream) window dict accumulates one entry per distinct timeline
 # or issue ever seen — unbounded over a long-running daemon, unlike the per-agent
@@ -197,8 +208,11 @@ class WakeRateBreaker:
     - **the message** gains a trailing ``source=<value>`` token (``probe``, the fleet's
       founder-ratified wake-origin stamp — reused rather than re-minted, capital ruling
       on basecradle-noc#509 §1), which is what the *Circuit Breaker Tripped* alarm
-      block-lists. It is appended **last**, so the synthetic is a strict
-      prefix-extension of the genuine line;
+      block-lists, and a leading bare :data:`PROBE_MARKER`, which is what a *person*
+      reads first (capital ruling 3 as amended 2026-09-29 on basecradle-noc#857). Between
+      the two the bytes are the genuine line's exactly — never altered, split, or
+      repainted, the red on :data:`TRIP_EVENT` included — so every byte the synthetic
+      adds sits outside the grammar under proof;
     - **the level** drops from ``ERROR`` to ``INFO``, which is what keeps the
       *severity*-fed alarms clean **with no filter at all** — *Server Errors* counts
       ERROR/CRITICAL on this identifier, and a blanket synthetic filter there would be a
@@ -227,6 +241,9 @@ class WakeRateBreaker:
         # out of its own alarm), so there is deliberately no way to set half.
         self._synthetic_source = synthetic_source
         self._trip_level = logging.INFO if synthetic_source else logging.ERROR
+        # The reader's cue rides the same switch, so a line can never say `source=probe`
+        # at the end without saying PROBE at the front — or the reverse.
+        self._head = f"{PROBE_MARKER} " if synthetic_source else ""
         self._lock = threading.Lock()
         self._windows: dict[tuple, _Window] = {}
         self._admits_since_gc = 0
@@ -281,7 +298,8 @@ class WakeRateBreaker:
                     continue
                 if now < window.tripped_until:
                     logger.warning(
-                        "%s %s",
+                        "%s%s %s",
+                        self._head,
                         paint("event=wake_refused"),
                         log_fields(
                             reason=BREAKER_OPEN,
@@ -295,7 +313,8 @@ class WakeRateBreaker:
                 window.timestamps.clear()
                 window.tripped_until = None
                 logger.info(
-                    "%s %s",
+                    "%s%s %s",
+                    self._head,
                     paint("event=breaker_reset"),
                     log_fields(
                         agent=agent_key,
@@ -317,7 +336,8 @@ class WakeRateBreaker:
                     window.tripped_until = now + cfg.cooldown
                     logger.log(
                         self._trip_level,
-                        "%s %s",
+                        "%s%s %s",
+                        self._head,
                         paint(TRIP_EVENT),
                         log_fields(
                             agent=agent_key,
@@ -327,10 +347,11 @@ class WakeRateBreaker:
                             threshold=threshold,
                             window=f"{cfg.window:.0f}s",
                             cooldown=f"{cfg.cooldown:.0f}s",
-                            # LAST, always. The stamp trails the grammar under proof so a
-                            # synthetic line is a strict prefix-extension of the genuine
-                            # one: no re-point of the NOC's expression can match the
-                            # synthetic while failing on a real trip.
+                            # LAST, always. The stamp trails the grammar under proof and
+                            # the PROBE head leads it, so the genuine line sits whole
+                            # between them: a re-point of the NOC's expression that
+                            # matches the grammar matches a synthetic and a real trip
+                            # alike.
                             source=self._synthetic_source,
                         ),
                     )

@@ -34,13 +34,24 @@ probe), and they are two because their consumers are two:
 - the message carries a trailing ``source=probe`` — the fleet's founder-ratified
   wake-origin stamp (basecradle-noc#473), **reused rather than re-minted**, which the
   *Circuit Breaker Tripped* alarm block-lists exactly as four production charts already
-  do. Appended **last**, so the synthetic is a strict prefix-extension of a genuine trip:
-  no re-point can pass here and fail on the real thing;
+  do. Appended **last**, after the grammar under proof;
 - the line is logged at **INFO** rather than ``ERROR``, which keeps the *severity*-fed
   alarms clean with no filter at all.
 
-Both are one switch on the breaker (``synthetic_source``) precisely so neither can be set
-without the other.
+**And one cue for the person reading it:** the message leads with a bare
+:data:`~basecradle_router.breaker.PROBE_MARKER` (basecradle-router#315). Neither channel
+above reaches a human first — the stamp is the last token on the line and the level is
+the envelope's — so a red ``event=breaker_tripped`` under the daemon's own identifier,
+twice an hour, was one glance from being read as a real trip. The capital's ruling 3
+(2026-08-18) had every probe-only field trail the grammar; as amended on 2026-09-29
+(basecradle-noc#857) it allows this one leading token, because it never alters, splits, or
+repaints the bytes under proof. So a synthetic is exactly ``PROBE <genuine trip>
+source=probe``: the genuine line sits **whole between** the synthetic-only bytes, and a
+re-point that matches the grammar matches a synthetic and a real trip alike. The NOC
+measured the token against every live column before it was ruled: zero changed.
+
+All three are one switch on the breaker (``synthetic_source``) precisely so none can be
+set without the others.
 
 **Rendered is ours; landed is the guard's** (capital ruling on basecradle-noc#509,
 2026-08-18; basecradle-router#234). This probe used to read its own line back out of the
@@ -96,7 +107,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from basecradle_router.breaker import TRIP_EVENT, BreakerConfig, BreakerState, WakeRateBreaker
+from basecradle_router.breaker import (
+    PROBE_MARKER,
+    TRIP_EVENT,
+    BreakerConfig,
+    BreakerState,
+    WakeRateBreaker,
+)
 from basecradle_router.logfmt import LOG_FORMAT
 from basecradle_router.probe import BROKEN, EXIT_CODES, PROVEN
 from basecradle_router.routes.probe import ProbeRoute
@@ -213,7 +230,8 @@ def capture_trip(*, synthetic: bool) -> logging.LogRecord:
     grammar fault.
 
     ``synthetic=False`` renders what a **genuine** trip writes, which is what makes the
-    prefix invariant checkable at exercise time rather than only in the test suite.
+    "genuine line whole between the synthetic-only bytes" invariant checkable at exercise
+    time rather than only in the test suite.
 
     **This must not run inside the daemon, and it refuses to.** Capturing means muting the
     breaker's logger for the duration — otherwise the genuine render would print an
@@ -347,23 +365,28 @@ class LogGrammarProbe:
         Two checks, and each one catches a change the other cannot. The **grammar** check
         is the declaration↔reality tie: it fails the moment ``breaker.py`` renames the
         token without :mod:`basecradle_router.claims` following, which is precisely the
-        drift that made the manifest able to lie. The **prefix** check is the
-        synthetic↔genuine tie: it fails if the stamp ever stops trailing the grammar under
-        proof, at which point a re-point could pass here and still go dark on a real trip.
+        drift that made the manifest able to lie. The **bracket** check is the
+        synthetic↔genuine tie: the synthetic must be exactly ``PROBE <genuine trip>
+        source=probe``, so it fails if the head or the stamp ever moves into the grammar
+        under proof, or the synthetic renders any byte between them differently from a real
+        trip — at which point a re-point could pass here and still go dark on a real trip.
 
         What neither can catch is a rename made in both files at once — and that is the
         NOC's half, which goes deaf because *its* expression did not move.
         """
         if TRIP_EVENT not in message:
             return f"the rendered line does not carry the declared grammar {TRIP_EVENT!r}"
+        head = f"{PROBE_MARKER} "
+        if not message.startswith(head):
+            return f"the synthetic line does not lead with {PROBE_MARKER!r}"
         stamp = f"source={SOURCE}"
         if not message.endswith(stamp):
             return f"the synthetic stamp {stamp!r} does not trail the line"
         genuine = trip_message(synthetic=False)
-        if message != f"{genuine} {stamp}":
+        if message != f"{head}{genuine} {stamp}":
             return (
-                "the synthetic line is not a strict prefix-extension of a genuine trip "
-                f"({genuine!r} + {stamp!r})"
+                "the synthetic line is not a genuine trip between its head and its stamp "
+                f"({head!r} + {genuine!r} + {stamp!r})"
             )
         return None
 

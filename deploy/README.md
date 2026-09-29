@@ -770,16 +770,23 @@ Two discriminators keep it out of production alerting, and they are two because 
 | a trailing `source=probe` in the message | *manufactured, not real traffic* — the fleet's founder-ratified wake-origin stamp (`basecradle-noc#473`), **reused rather than re-minted** | extraction-fed alarms: *Circuit Breaker Tripped* block-lists it, byte-identically to four production charts |
 | the level drops `ERROR` → `INFO` | *not an incident* | severity-fed alarms: `error_lines` is identifier-scoped, so *Server Errors* never sees it **with no filter at all** |
 
-Both ride **one** switch (`WakeRateBreaker(synthetic_source=…)`) precisely so neither can be set
-without the other. The stamp is appended **last**, which makes a synthetic line a strict
-**prefix-extension** of a genuine trip: no re-point of the NOC's expression can match the synthetic
-while failing on the real thing. And with the switch left empty — the daemon's only construction —
-`log_fields` drops the field, so a genuine trip is **byte-identical** to what it wrote before the
-probe existed.
+Neither reaches a *person* first — the stamp is the last token and the level sits in the envelope — so
+a red `event=breaker_tripped` under `[basecradle-router]`, twice an hour, was one glance from being read
+as a real trip. So the message also **leads with a bare `PROBE`** (#315; the capital's ruling 3 as
+amended on `basecradle-noc#857`, which the NOC measured against every live column first: zero changed).
+It is for the reader only; no alarm or extraction reads it.
+
+All three ride **one** switch (`WakeRateBreaker(synthetic_source=…)`) precisely so none can be set
+without the others. `PROBE` leads and the stamp trails, so the genuine trip sits **whole between** the
+synthetic-only bytes: a re-point of the NOC's expression that matches the grammar matches the synthetic
+and a real trip alike, and the probe's own self-check refuses (`broken`) a synthetic that is not exactly
+`PROBE <genuine trip> source=probe`. And with the switch left empty — the daemon's only construction —
+no head is rendered and `log_fields` drops the field, so a genuine trip is **byte-identical** to what it
+wrote before the probe existed.
 
 ```
-genuine   … ERROR … event=breaker_tripped agent=nova scope=agent key=nova count=21 threshold=20 window=60s cooldown=60s
-synthetic … INFO  … event=breaker_tripped agent=probe scope=agent key=probe count=21 threshold=20 window=60s cooldown=60s source=probe
+genuine   … ERROR basecradle_router.breaker event=breaker_tripped agent=nova scope=agent key=nova count=21 threshold=20 window=60s cooldown=60s
+synthetic … INFO  basecradle_router.breaker PROBE event=breaker_tripped agent=probe scope=agent key=probe count=21 threshold=20 window=60s cooldown=60s source=probe
 ```
 
 **Rendered is the router's half; landed is the NOC's** (capital ruling on `basecradle-noc#509`,

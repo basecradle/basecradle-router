@@ -12,12 +12,14 @@ import logging
 from basecradle_router import breaker as breaker_mod
 from basecradle_router.breaker import (
     AGENT_SCOPE,
+    PROBE_MARKER,
     STREAM_SCOPE,
     TRIP_EVENT,
     BreakerConfig,
     BreakerState,
     WakeRateBreaker,
 )
+from basecradle_router.logfmt import paint
 
 NOVA = "nova"  # the agent's harness_key (its OS-user slug)
 TIMELINE = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
@@ -354,17 +356,29 @@ def test_the_switch_moves_the_stamp_and_the_level_together() -> None:
     # keeps the SEVERITY-fed alarms clean with no filter at all. Setting half would
     # either page on a manufactured line or filter a real trip out of its own alarm, so
     # there is no way to set half.
+    # The PROBE head (#315) is the reader's cue on the same switch, so it moves with them.
     trip = _trip("probe")
     assert trip.getMessage().endswith("source=probe")
+    assert trip.getMessage().startswith(f"{PROBE_MARKER} ")
     assert trip.levelno == logging.INFO
 
 
-def test_the_stamp_trails_the_grammar_so_a_synthetic_extends_a_genuine_line() -> None:
-    # THE load-bearing invariant. The synthetic's message is the genuine message plus one
-    # trailing token, so no re-point of the NOC's expression can match the synthetic while
-    # failing on a real trip. An interleaved stamp would let the probe prove a pattern
-    # production traffic never satisfies — the gap re-opened one level down.
-    assert _trip("probe").getMessage() == f"{_trip('').getMessage()} source=probe"
+def test_a_synthetic_is_a_genuine_line_between_the_probe_head_and_the_stamp() -> None:
+    # THE load-bearing invariant. Every byte the synthetic adds sits outside the genuine
+    # line — PROBE before it (#315, capital ruling 3 as amended on basecradle-noc#857),
+    # the stamp after it — so a re-point of the NOC's expression that matches the grammar
+    # matches a synthetic and a real trip alike. An interleaved token would let the probe
+    # prove a pattern production traffic never satisfies — the gap re-opened one level
+    # down.
+    assert _trip("probe").getMessage() == f"PROBE {_trip('').getMessage()} source=probe"
+
+
+def test_a_genuine_trip_never_leads_with_the_probe_marker() -> None:
+    # The cue is only worth anything if it is never on a real trip: a founder who learns
+    # "PROBE means ignore it" must never meet it on the line that matters.
+    genuine = _trip("").getMessage()
+    assert genuine.startswith(paint(TRIP_EVENT))
+    assert PROBE_MARKER not in genuine
 
 
 def test_severity_lives_in_the_envelope_and_never_in_the_message() -> None:
@@ -399,3 +413,6 @@ def test_the_refusal_and_reset_lines_carry_the_stamp_too(caplog) -> None:
     for event in ("event=wake_refused", "event=breaker_reset"):
         line = next(r.getMessage() for r in caplog.records if event in r.getMessage())
         assert line.endswith("source=probe"), line
+        # …and so is the PROBE head (#315): one switch, so a line can never carry one
+        # without the other.
+        assert line.startswith(f"{PROBE_MARKER} "), line
