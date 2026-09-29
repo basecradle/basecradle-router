@@ -22,8 +22,12 @@ content:
   ``X-GitHub-Delivery`` GUID constant for every delivery of one event, which is
   exactly the duplication observed live in #133 (the same GUID logged twice). So
   deduping on it provably collapses the duplicate.
-- It is **globally unique per genuine delivery**, so dedup can *never* drop a
-  *distinct* event — the dangerous failure (lost work). Worst case, if some
+- Paired with the **recipient**, it is **globally unique per genuine delivery**, so
+  dedup can *never* drop a *distinct* delivery — the dangerous failure (lost work).
+  The pairing is load-bearing, not tidiness: the platform shares one ``event_id``
+  across every recipient of an event, so the id alone named every agent's delivery
+  of one message at once, and the first agent's wake silently suppressed the rest
+  (#312; see :attr:`~basecradle_router.models.Event.dedup_key`). Worst case, if some
   future duplication path ever used *distinct* GUIDs, dedup degrades to a no-op
   (the harmless, serialized double-wake of today) — never an over-collapse. A
   content-derived key would trade that safety for breadth; here the conservative
