@@ -21,8 +21,10 @@ import logging
 import pytest
 
 from basecradle_router import log_grammar as grammar_mod
+from basecradle_router.breaker import PROBE_MARKER, TRIP_EVENT
 from basecradle_router.claims import _log_grammar_claim
 from basecradle_router.log_grammar import (
+    BREAKER_LOGGER,
     BROKEN,
     IDENTIFIER,
     LINE_CLASS,
@@ -35,6 +37,7 @@ from basecradle_router.log_grammar import (
     render_trip,
     trip_message,
 )
+from basecradle_router.logfmt import paint
 
 
 class _Journal:
@@ -127,18 +130,30 @@ def test_a_stamp_that_stops_trailing_the_grammar_is_refused() -> None:
     probe = _probe(_Journal())
     genuine = trip_message(synthetic=False)
 
-    interleaved = genuine.replace("agent=probe", f"source={SOURCE} agent=probe")
+    interleaved = f"{PROBE_MARKER} " + genuine.replace(
+        "agent=probe", f"source={SOURCE} agent=probe"
+    )
     assert "does not trail the line" in (probe._grammar_fault(interleaved) or "")
 
 
-def test_a_synthetic_that_is_not_the_genuine_line_is_refused() -> None:
-    # Ends with the stamp and is still not a prefix-extension: a field the synthetic
-    # renders differently from a real trip. The probe would otherwise prove a pattern
-    # production traffic never satisfies.
+def test_a_synthetic_without_the_probe_head_is_refused() -> None:
+    # The pre-#315 shape: correct grammar, correct stamp, and nothing at the front telling a
+    # person reading Live Tail that the red trip in front of them was manufactured.
     probe = _probe(_Journal())
-    mutated = f"{trip_message(synthetic=False).replace('count=21', 'count=99')} source={SOURCE}"
+    headless = f"{trip_message(synthetic=False)} source={SOURCE}"
 
-    assert "prefix-extension" in (probe._grammar_fault(mutated) or "")
+    assert f"does not lead with {PROBE_MARKER!r}" in (probe._grammar_fault(headless) or "")
+
+
+def test_a_synthetic_that_is_not_the_genuine_line_is_refused() -> None:
+    # Leads with the head and ends with the stamp, and the bytes between are still not a
+    # real trip's: a field the synthetic renders differently. The probe would otherwise
+    # prove a pattern production traffic never satisfies.
+    probe = _probe(_Journal())
+    genuine = trip_message(synthetic=False).replace("count=21", "count=99")
+    mutated = f"{PROBE_MARKER} {genuine} source={SOURCE}"
+
+    assert "between its head and its stamp" in (probe._grammar_fault(mutated) or "")
 
 
 def test_journald_tooling_that_does_not_answer_is_unprovable() -> None:
@@ -155,8 +170,26 @@ def test_journald_tooling_that_does_not_answer_is_unprovable() -> None:
 # --- the probe owns no renderer --------------------------------------------
 
 
-def test_the_synthetic_is_the_genuine_line_plus_one_trailing_token() -> None:
-    assert trip_message(synthetic=True) == f"{trip_message(synthetic=False)} source={SOURCE}"
+def test_the_synthetic_is_the_genuine_line_between_a_probe_head_and_a_trailing_stamp() -> None:
+    assert trip_message(synthetic=True) == (
+        f"{PROBE_MARKER} {trip_message(synthetic=False)} source={SOURCE}"
+    )
+
+
+def test_the_bytes_after_the_probe_head_are_the_bytes_the_probe_rendered_before_it() -> None:
+    # #315's DoD, pinned as a literal: the head is the ONLY change. Everything after it is
+    # byte-identical to the line this probe rendered before the head existed — the red on
+    # the grammar token included, which is the production bytes' own colour and stays.
+    before = (
+        f"{paint('event=breaker_tripped')} agent=probe scope=agent key=probe count=21 "
+        "threshold=20 window=60s cooldown=60s source=probe"
+    )
+    assert trip_message(synthetic=True) == f"PROBE {before}"
+
+
+def test_the_journal_line_reads_probe_straight_after_the_envelope() -> None:
+    # Where a person's eye lands in Live Tail: the logger name, then PROBE, then the trip.
+    assert f" {BREAKER_LOGGER} {PROBE_MARKER} {paint(TRIP_EVENT)} " in render_trip(synthetic=True)
 
 
 def test_one_trip_emits_exactly_one_line() -> None:
