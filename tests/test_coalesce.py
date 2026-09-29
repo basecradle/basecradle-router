@@ -1,22 +1,25 @@
-"""One handoff, one wake — coalescing and the dispatch-time recheck (basecradle-router#272).
+"""One handoff, one wake — coalescing and the dispatch-time recheck (#272, #311).
 
 basecradle/basecradle#548 measured it: one handoff produced **five** full agent sessions
 in 23 minutes, because every accepted delivery became its own queued wake. These pin the
 fix end to end through the real github route and the real pipeline — every collaborator
 at the boundary mocked, nothing on the network — with payloads shaped the way GitHub
-sends them:
+sends them (the platform's the way it sends them too):
 
 - deliveries that queued behind a wake collapse into **at most one** follow-up;
 - a queued delivery whose issue closed (or lost ``handoff``, or gained ``Do Not Work``)
   while it waited launches nothing;
 - the ``opened`` and ``labeled`` of one create wake the agent **once**, for both ways a
   create is labeled, in either arrival order;
-- the platform route's semantics are untouched.
+- a platform timeline's messages that queued behind a long wake cost **one** follow-up,
+  per agent and per timeline, in arrival order (basecradle-router#311).
 
 The queue is driven the way :class:`~basecradle_router.scheduler.WakeScheduler` drives it
 for one agent: every delivery is *accepted* the moment it arrives, and the pending ones
 are *executed* in arrival order once the wake ahead of them has run. Test cast: John Doe
-(``john``) hands off; Nova Digital's builder (``nova``) is woken. All data is fabricated.
+(``john``) hands off and posts; Nova Digital's builder (``nova``) is woken for a handoff,
+and the harness agents @jt and Nova Digital (``nova``) for a timeline. All data is
+fabricated.
 """
 
 import hashlib
@@ -57,6 +60,19 @@ JT = Agent(
     recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
     wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
 )
+# Nova Digital as a harness agent viewing @jt's timeline — never registered beside the
+# builder above, which is the same OS user.
+NOVA_HARNESS = Agent(
+    key="nova",
+    os_user="nova",
+    clone_path="/home/nova/harness",
+    wake_kind=WakeKind.HARNESS,
+    recipient_uuid="019e916c-7f45-7aaa-8bbb-0123456789ab",
+    wake_bin="/home/nova/venv/bin/basecradle-harness-wake",
+)
+JOHN_UUID = "019e916c-7f45-7123-8456-0123456789ab"  # John Doe's BaseCradle user uuid
+TIMELINE_A = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001"
+TIMELINE_B = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0002"
 
 _ids = itertools.count(1)
 
@@ -108,7 +124,12 @@ class _WallClock:
 
 
 def _pipeline(
-    *, waker: _Waker | None = None, now: _WallClock | None = None, evidence=None, attempts=3
+    *,
+    waker: _Waker | None = None,
+    now: _WallClock | None = None,
+    evidence=None,
+    attempts=3,
+    agents: tuple[Agent, ...] = (NOVA, JT),
 ) -> tuple[Pipeline, _Waker, _WallClock]:
     waker = waker or _Waker()
     now = now or _WallClock(_moment("03:14:08.415000"))
@@ -116,9 +137,12 @@ def _pipeline(
     registry.register(GithubRoute(frozenset({JOHN})))
     registry.register(BasecradleRoute())
     config = Config(
-        agents=MappingProxyType({NOVA.key: NOVA, JT.key: JT}),
+        agents=MappingProxyType({agent.key: agent for agent in agents}),
         enabled_routes=frozenset({"github", "basecradle"}),
         webhook_secrets=MappingProxyType({"github": SECRET, "basecradle": BASECRADLE_SECRET}),
+        recipient_index=MappingProxyType(
+            {agent.recipient_uuid: agent for agent in agents if agent.recipient_uuid}
+        ),
     )
     pipeline = Pipeline(
         registry=registry,
@@ -207,6 +231,51 @@ def _comment(issue: dict, *, at: str, sender: str = JOHN):
     return _signed("issue_comment", payload)
 
 
+# --- platform-shaped payloads -------------------------------------------------------
+#
+# A `message.created` Event Delivery as the platform sends it (`docs/api.md` → Event
+# Delivery): `occurred_at` is the message's `created_at`, whole seconds, `Z`-suffixed; the
+# `event_id` rides in the body and again as `X-BaseCradle-Delivery`.
+
+
+def _message(
+    timeline: str,
+    *,
+    at: str,
+    to: Agent = JT,
+    delivery: str | None = None,
+    stamped: bool = True,
+) -> InboundRequest:
+    delivery = delivery or _uuid7()
+    message = _uuid7()
+    payload = {
+        "event_id": delivery,
+        "version": 1,
+        "event": "message.created",
+        "occurred_at": _at(at),
+        "actor_uuid": JOHN_UUID,
+        "recipient_uuid": to.recipient_uuid,
+        "timeline_uuid": timeline,
+        "resource": {
+            "type": "message",
+            "uuid": message,
+            "url": f"https://basecradle.com/messages/{message}",
+        },
+    }
+    if not stamped:
+        del payload["occurred_at"]
+    body = json.dumps(payload).encode("utf-8")
+    digest = hmac.new(BASECRADLE_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return InboundRequest(
+        headers={
+            "X-BaseCradle-Event": "message.created",
+            "X-BaseCradle-Delivery": delivery,
+            "X-BaseCradle-Signature": f"sha256={digest}",
+        },
+        body=body,
+    )
+
+
 # --- driving the queue --------------------------------------------------------
 
 
@@ -218,9 +287,9 @@ class _Queue:
         self.pending: list[tuple[Agent, Event, PipelineResult]] = []
         self.results: dict[str, PipelineResult] = {}
 
-    def arrive(self, request: InboundRequest) -> str | None:
+    def arrive(self, request: InboundRequest, source: str = "github") -> str | None:
         """Accept a delivery the moment it arrives; queue it if it asks for a wake."""
-        accepted = self.pipeline.accept("github", request)
+        accepted = self.pipeline.accept(source, request)
         if accepted.pending is None:
             return None
         agent, event = accepted.pending
@@ -562,29 +631,101 @@ def test_a_coalesce_is_evidence_of_a_success_and_a_drop_is_no_evidence(tmp_path)
     assert (wake.ok, wake.deduped, wake.refused, wake.failed) == (1, 1, 0, 0)
 
 
-# --- ask 5: the platform route is untouched ------------------------------------
+# --- the platform route: one follow-up per agent and timeline (#311) ---------------
+#
+# 2026-09-29, replayed with fabricated ids: while an agent ran long wakes on one timeline,
+# every message that landed on it queued behind the per-agent lock, and the router drained
+# them one wake each — ten wakes in 24 seconds, each finding nothing, because the harness
+# reads everything past its marks on every wake. The eleventh tripped the harness's own
+# per-timeline breaker, which declined the live delivery behind it.
 
 
-def _platform_event(delivery: str) -> Event:
-    """A basecradle timeline delivery as its route normalizes one: no event time."""
-    return Event(
-        source="basecradle",
-        kind=EventKind.PLATFORM_EVENT,
-        recipient=Recipient(by="recipient_uuid", value=JT.recipient_uuid),
-        wake_arg="0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
-        delivery_id=delivery,
-    )
+@pytest.mark.parametrize("burst", [3, 10], ids=["three-queued", "the-incident's-ten"])
+def test_messages_queued_behind_a_long_wake_cost_one_follow_up(burst: int) -> None:
+    pipeline, waker, now = _pipeline()
+    queue = _Queue(pipeline)
+    first = queue.arrive(_message(TIMELINE_A, at="03:14:07"), "basecradle")
+    queue.run_next()  # the long wake launches at 03:14:08.415 and runs for minutes
+    queued = [
+        queue.arrive(_message(TIMELINE_A, at=f"03:2{n}:0{n}"), "basecradle") for n in range(burst)
+    ]
+
+    now.at = _moment("03:30:00.000000")  # the long wake is done; the lock frees now
+    queue.drain()
+
+    # The first message behind the lock wakes the agent once, and that session reads
+    # every message that queued with it — each one accounted for, by the wake it joined.
+    assert waker.deliveries == [first, queued[0]]
+    for delivery in queued[1:]:
+        assert queue.fate(delivery) == COALESCED
+        assert f"into={queued[0]}" in queue.results[delivery].records[-1].detail
 
 
-def test_platform_wakes_are_not_coalesced_or_rechecked() -> None:
-    # The shared queue is the same, but neither new gate opens for a route that stamps
-    # no event time and answers no recheck: two messages on one timeline, two wakes.
+def test_two_timelines_of_one_agent_each_get_their_own_wake_in_arrival_order() -> None:
+    pipeline, waker, now = _pipeline()
+    queue = _Queue(pipeline)
+    queue.arrive(_message(TIMELINE_A, at="03:14:07"), "basecradle")
+    queue.run_next()
+    b1 = queue.arrive(_message(TIMELINE_B, at="03:20:00"), "basecradle")
+    a1 = queue.arrive(_message(TIMELINE_A, at="03:20:01"), "basecradle")
+    b2 = queue.arrive(_message(TIMELINE_B, at="03:20:02"), "basecradle")
+    a2 = queue.arrive(_message(TIMELINE_A, at="03:20:03"), "basecradle")
+
+    now.at = _moment("03:30:00.000000")
+    queue.drain()
+
+    # A session reads its own timeline and no other, so neither covers the other's.
+    assert waker.deliveries[1:] == [b1, a1]
+    assert [event.wake_arg for event in waker.calls[1:]] == [TIMELINE_B, TIMELINE_A]
+    assert f"into={b1}" in queue.results[b2].records[-1].detail
+    assert f"into={a1}" in queue.results[a2].records[-1].detail
+
+
+def test_one_agents_wake_never_covers_another_agents_delivery_of_the_same_message() -> None:
+    # One message on a timeline two agents view is a delivery to each, under the one
+    # event_id the platform shares across recipients. @jt's session read it; Nova's did
+    # not, however early the message was and however well @jt's wake went.
+    pipeline, waker, _ = _pipeline(agents=(JT, NOVA_HARNESS))
+    queue = _Queue(pipeline)
+    shared = _uuid7()
+    for agent in (JT, NOVA_HARNESS):
+        queue.arrive(_message(TIMELINE_A, at="03:14:07", to=agent, delivery=shared), "basecradle")
+    fates = [queue.run_next().stages[-1] for _ in range(2)]
+
+    assert fates == [WOKE, WOKE]
+    assert [event.recipient.value for event in waker.calls] == [
+        JT.recipient_uuid,
+        NOVA_HARNESS.recipient_uuid,
+    ]
+
+
+def test_a_platform_delivery_without_a_time_is_never_coalesced() -> None:
+    # The opt-in holds per delivery: an unstamped message wakes on its own and covers
+    # nothing, the behaviour before the platform route opted in.
     pipeline, waker, _ = _pipeline()
-    for delivery in ("evt_0192f3a4000000000001", "evt_0192f3a4000000000002"):
-        result = PipelineResult()
-        pipeline.execute(JT, _platform_event(delivery), result)
-        assert result.stages[-1] == WOKE
+    queue = _Queue(pipeline)
+    for _ in range(2):
+        queue.arrive(_message(TIMELINE_A, at="03:14:07", stamped=False), "basecradle")
+    queue.drain()
+
     assert len(waker.calls) == 2
+
+
+def test_a_coalesced_platform_delivery_names_its_event_type_and_the_wake(caplog) -> None:
+    pipeline, _, _ = _pipeline()
+    queue = _Queue(pipeline)
+    with caplog.at_level("INFO", logger="basecradle_router"):
+        woke = queue.arrive(_message(TIMELINE_A, at="03:14:06"), "basecradle")
+        collapsed = queue.arrive(_message(TIMELINE_A, at="03:14:07"), "basecradle")
+        queue.drain()
+
+    mine = [line for line in _decisions(caplog) if f"delivery={collapsed}" in line]
+    assert mine == [
+        f"event=delivery_decision source=basecradle event_type=message.created decision=woke "
+        f"recipient={JT.recipient_uuid} delivery={collapsed}",
+        f"event=delivery_decision source=basecradle event_type=message.created "
+        f"decision=coalesced recipient={JT.recipient_uuid} delivery={collapsed} into={woke}",
+    ]
 
 
 # --- WakeCoverage, the unit ------------------------------------------------------
@@ -604,28 +745,38 @@ def _event(occurred: datetime | None, delivery: str = "0192f3a4-5b6c-7d8e-9f01-0
 def test_coverage_is_strict_on_the_start_instant() -> None:
     start = _moment("03:14:08.000000")
     coverage = WakeCoverage()
-    coverage.record(_event(_moment("03:14:07.000000")), start)
+    coverage.record("nova", _event(_moment("03:14:07.000000")), start)
 
-    assert coverage.covering(_event(start - timedelta(microseconds=1))) is not None
-    assert coverage.covering(_event(start)) is None  # not strictly before: not covered
+    assert coverage.covering("nova", _event(start - timedelta(microseconds=1))) is not None
+    assert coverage.covering("nova", _event(start)) is None  # not strictly before: not covered
 
 
 def test_coverage_only_moves_forward() -> None:
     coverage = WakeCoverage()
-    coverage.record(_event(_moment("03:00:00.000000"), "later"), _moment("03:30:00.000000"))
-    coverage.record(_event(_moment("03:00:00.000000"), "earlier"), _moment("03:10:00.000000"))
+    coverage.record("nova", _event(_moment("03:00:00.000000"), "later"), _moment("03:30:00.000000"))
+    coverage.record(
+        "nova", _event(_moment("03:00:00.000000"), "earlier"), _moment("03:10:00.000000")
+    )
 
-    covering = coverage.covering(_event(_moment("03:20:00.000000")))
+    covering = coverage.covering("nova", _event(_moment("03:20:00.000000")))
     assert covering is not None and covering.delivery == "later"
 
 
 def test_coverage_ignores_events_without_a_time_both_ways() -> None:
     coverage = WakeCoverage()
-    coverage.record(_event(None), _moment("03:30:00.000000"))
-    assert coverage.covering(_event(_moment("03:00:00.000000"))) is None
+    coverage.record("nova", _event(None), _moment("03:30:00.000000"))
+    assert coverage.covering("nova", _event(_moment("03:00:00.000000"))) is None
 
-    coverage.record(_event(_moment("03:00:00.000000")), _moment("03:30:00.000000"))
-    assert coverage.covering(_event(None)) is None
+    coverage.record("nova", _event(_moment("03:00:00.000000")), _moment("03:30:00.000000"))
+    assert coverage.covering("nova", _event(None)) is None
+
+
+def test_coverage_of_one_agent_never_covers_another_on_the_same_stream() -> None:
+    coverage = WakeCoverage()
+    coverage.record("jt", _event(_moment("03:00:00.000000")), _moment("03:10:00.000000"))
+
+    assert coverage.covering("jt", _event(_moment("03:05:00.000000"))) is not None
+    assert coverage.covering("nova", _event(_moment("03:05:00.000000"))) is None
 
 
 def test_coverage_is_bounded_and_evicts_the_least_recent_stream() -> None:
@@ -645,10 +796,10 @@ def test_coverage_is_bounded_and_evicts_the_least_recent_stream() -> None:
 
     early, start = _moment("03:00:00.000000"), _moment("03:10:00.000000")
     for issue in (1, 2, 3):
-        coverage.record(on(issue, early), start)
+        coverage.record("nova", on(issue, early), start)
 
-    assert coverage.covering(on(1, early)) is None  # evicted
-    assert coverage.covering(on(3, early)) is not None
+    assert coverage.covering("nova", on(1, early)) is None  # evicted
+    assert coverage.covering("nova", on(3, early)) is not None
 
 
 def test_coverage_rejects_a_non_positive_capacity() -> None:

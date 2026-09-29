@@ -10,6 +10,7 @@ from basecradle_router.routes.base import (
     UntrustedSenderError,
     log_delivery_decision,
     parse_json_object,
+    parse_timestamp,
     route_recheck,
     verify_hmac_sha256,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "load_recipient_keyring",
     "log_delivery_decision",
     "parse_json_object",
+    "parse_timestamp",
     "route_recheck",
     "verify_hmac_sha256",
 ]

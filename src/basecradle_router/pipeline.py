@@ -293,8 +293,9 @@ class Pipeline:
     locks: AgentLocks = field(default_factory=AgentLocks)
     breaker: WakeRateBreaker = field(default_factory=WakeRateBreaker)
     deduper: DeliveryDeduper = field(default_factory=DeliveryDeduper)
-    # Which successful wake already covered each stream, and when it started — the
-    # collapse of N queued deliveries for one issue into at most one follow-up (#272).
+    # Which successful wake already covered each agent's stream, and when it started — the
+    # collapse of N queued deliveries for one issue or timeline into at most one
+    # follow-up (#272, #311).
     coverage: WakeCoverage = field(default_factory=WakeCoverage)
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
     # Durable proof of what this router has actually done, for the NOC's
@@ -379,20 +380,20 @@ class Pipeline:
         here, at dispatch, because a delivery can wait minutes behind its agent's running
         wake and the answer changes in that time (basecradle-router#272, one handoff that
         cost five sessions). **Coalesce** first: a delivery whose event happened before a
-        *successful* wake on the same stream started was read by that session, so it is
-        collapsed into it — recorded ``COALESCE``/``IGNORED`` naming that wake, and counted
-        as a dedup, because like one it is reachable only through a success. Every
-        delivery that queued behind a running wake collapses into the first follow-up the
-        same way, so a burst costs at most one more session. See
+        *successful* wake of the same agent on the same stream started was read by that
+        session, so it is collapsed into it — recorded ``COALESCE``/``IGNORED`` naming that
+        wake, and counted as a dedup, because like one it is reachable only through a
+        success. Every delivery that queued behind a running wake collapses into the first
+        follow-up the same way, so a burst costs at most one more session. See
         :mod:`basecradle_router.coalesce`. Then **recheck**: the delivery's route is asked
         whether the work still stands — a github issue closed, or its ``handoff`` label
         gone, while the delivery waited — and a ``RECHECK``/``IGNORED`` drop launches
         nothing. It records no wake evidence, because it says nothing about the edge: the
         work ended, the agent was never gated. Each gate also logs the delivery's
         ``decision=coalesced``/``decision=dropped`` line, so ``delivery=<id>`` accounts for
-        it the way ``decision=woke`` accounted for its arrival. A route that stamps no
-        event time and implements no ``recheck`` — the platform route, the probe — passes
-        both gates untouched.
+        it the way ``decision=woke`` accounted for its arrival. The platform route stamps an
+        event time but implements no ``recheck`` (#311), so its deliveries coalesce and are
+        never dropped; the probe does neither, and passes both gates untouched.
 
         Then the **NOC wake-lock** is honoured (basecradle-router#120): while the
         NOC converges (upgrades) this agent's
@@ -454,7 +455,7 @@ class Pipeline:
                         result, Stage.DEDUP, Outcome.IGNORED, **who, reason=DUPLICATE_DELIVERY
                     )
                     return
-                covering = self.coverage.covering(event)
+                covering = self.coverage.covering(agent.harness_key, event)
                 if covering is not None:
                     # A session already read this event: it started after the event and
                     # succeeded. Counted as a dedup for the reason the dedup is — only a
@@ -713,7 +714,7 @@ class Pipeline:
             # own chance to wake the agent, exactly as a duplicate behind one does. (The
             # start is always set here — a success means an attempt ran.)
             if last_started_at is not None:
-                self.coverage.record(event, last_started_at)
+                self.coverage.record(agent.harness_key, event, last_started_at)
             how = {"exit": woke.exit_code, "duration": _seconds(last_duration)}
             self._record(result, Stage.WAKE, Outcome.OK, **who, **how)
             verdict = {"outcome": Outcome.OK.value, **how}
