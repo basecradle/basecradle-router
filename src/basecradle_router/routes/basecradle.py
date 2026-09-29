@@ -47,6 +47,16 @@ BaseCradle user uuid (``recipient_uuid``) and wakes its harness for the delivery
 error — the same shape as github's non-handoff ignore, and logged as a deliberate
 ignore so it is never a silent drop.
 
+Each event is also stamped with **when it happened** — the delivery's ``occurred_at``,
+which the platform takes from the record itself (a message's, asset's or webhook event's
+``created_at``; a task's activation for ``task.activated``) — which opts this route's
+timelines into the core's collapse of a delivery into a wake that already read it
+(:mod:`basecradle_router.coalesce`, basecradle-router#311). A harness wake reconciles
+every unseen item past its marks on the timeline, whatever delivery woke it, so the
+messages that queue behind one long wake cost one follow-up rather than one process
+start each — and on 2026-09-29 ten such starts in 24 seconds, each finding nothing,
+tripped the harness's own per-timeline breaker and dropped the live delivery behind them.
+
 The route is deliberately **actor-agnostic**: it wakes timeline-scoped and never
 reads ``actor_uuid``, so it cannot itself tell a peer's post from the agent's own.
 That is why ``asset.created`` — which the agent self-authors via ``generate_image``
@@ -76,6 +86,7 @@ from basecradle_router.routes.base import (
     SignatureError,
     log_delivery_decision,
     parse_json_object,
+    parse_timestamp,
     verify_hmac_sha256,
 )
 
@@ -449,6 +460,10 @@ class BasecradleRoute:
         recipient uuid, or the timeline uuid the wake needs. Emits a structured
         decision line either way (basecradle-router#91) so an ignore is a
         *visible* deliberate ignore, never a silent drop.
+
+        An absent or unparseable ``occurred_at`` is not malformed: the event is simply
+        stamped with no time, so it wakes on its own and covers nothing — the behaviour
+        before this route opted into the coalesce (#311), never a lost wake.
         """
         event_type = request.header(EVENT_HEADER)
         # A *header*, so it is known even on the ignore path that never parses the
@@ -476,6 +491,8 @@ class BasecradleRoute:
                 recipient=Recipient(by="recipient_uuid", value=recipient_uuid),
                 wake_arg=timeline_uuid,
                 delivery_id=delivery_id,
+                occurred_at=parse_timestamp(data.get("occurred_at")),
+                event_type=event_type,
             )
         except ValueError as exc:
             raise PayloadError(f"malformed basecradle payload: {exc}") from exc

@@ -444,7 +444,8 @@ case-insensitively.
 accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`
 *and* the `labeled` of a single labeled create, comments that arrived mid-session, a label re-applied to
 a closed issue. Two gates now run when a queued delivery reaches the front of its agent's queue, both in
-the core and both opt-in per route, so the platform route and the probe pass them untouched:
+the core and both opt-in per route: the platform route opts into the coalesce but has no recheck (#311), and
+the probe passes both untouched:
 
 - **Coalesce.** The route stamps each event with when it happened (the issue's creation for `opened`, its
   last update for `labeled`, the comment's creation for `issue_comment`). A delivery whose event happened
@@ -453,6 +454,11 @@ the core and both opt-in per route, so the platform route and the probe pass the
   everything that queued behind a running session collapses into the **first** follow-up, never N. A
   failed wake covers nothing, so the delivery behind it keeps its own chance. GitHub timestamps are whole
   seconds and never later than the truth, so every clock error errs towards an extra wake, never a lost one.
+  The platform route stamps the delivery's `occurred_at` (the record's own `created_at`, also whole seconds)
+  and coalesces per **timeline** (#311): a harness wake reads everything past its marks on its timeline,
+  whatever delivery woke it, so the messages that queue behind one long wake cost one follow-up, not one
+  empty wake each. Coverage is kept **per agent** — a timeline is shared by every agent viewing it, and one
+  agent's session read nothing for another.
 - **Recheck.** A session's life is its issue's life. The route keeps the newest state of each handoff
   issue *as GitHub's own deliveries report it* — `closed`, `reopened` and `unlabeled` included, which
   the App subscription always sent and the router used to ignore — ordered by the payload's `updated_at`

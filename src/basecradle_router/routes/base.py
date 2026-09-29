@@ -13,6 +13,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import Any, Protocol, runtime_checkable
@@ -111,6 +112,31 @@ def parse_json_object(body: bytes) -> dict[str, Any]:
     return data
 
 
+def parse_timestamp(value: object) -> datetime | None:
+    """A source's ISO-8601 timestamp (``2026-09-19T03:14:07Z``) as an aware datetime.
+
+    The shared reader for the moment a route stamps on
+    :attr:`~basecradle_router.models.Event.occurred_at` — github's and the platform's
+    timestamps are the same shape, so one parse means the two routes cannot disagree
+    about what a time says.
+
+    ``None`` for anything absent, unparseable, or without a zone — never a guess, and
+    never an exception: an unparseable time only means the event is not collapsed (and,
+    on github, the observation not recorded), which is the router's behaviour before
+    either existed. The ``Z`` is spelled out as ``+00:00`` because
+    :meth:`datetime.fromisoformat` only reads it from Python 3.11, and this package
+    supports 3.10.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 class DeliveryDecision(Enum):
     """What the router decided to do with one *verified* inbound delivery.
 
@@ -127,8 +153,9 @@ class DeliveryDecision(Enum):
 
     ``COALESCED`` and ``DROPPED`` are the core's **later** word on a delivery the route
     classified ``WOKE`` — decided when it reaches the front of its agent's queue, not
-    when it arrives (basecradle-router#272). ``COALESCED``: a successful wake on the
-    same stream already covered it (the line names that wake's delivery as ``into=``).
+    when it arrives (basecradle-router#272). ``COALESCED``: a successful wake of the same
+    agent on the same stream already covered it (the line names that wake's delivery as
+    ``into=``).
     ``DROPPED``: its route says the work it asked for has ended — the issue was closed,
     say — so no session is launched for it (the line carries ``reason=``). Each is its
     own line, so a delivery's whole fate reads off ``delivery=<id>``: one ``woke``, then

@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import re
+from datetime import datetime, timezone
 
 import pytest
 
@@ -153,6 +154,33 @@ def test_normalize_message_created_round_trips() -> None:
     assert event.delivery_id == DELIVERY
     # No GitHub-style issue to report on — the harness replies on the timeline itself.
     assert event.origin is None
+
+
+def test_normalize_stamps_when_the_platform_says_the_event_happened() -> None:
+    # The stamp opts the timeline into the core's coalesce (#311); the event type rides
+    # along so a later coalesce decision names what arrived.
+    event = BasecradleRoute().normalize(_request())
+    assert event is not None
+    assert event.occurred_at == datetime(2026, 6, 9, tzinfo=timezone.utc)
+    assert event.event_type == "message.created"
+
+
+@pytest.mark.parametrize(
+    "occurred_at",
+    [None, "", "not-a-time", "2026-06-09T00:00:00", 1780963200],
+    ids=["absent", "empty", "unparseable", "no-zone", "not-a-string"],
+)
+def test_normalize_leaves_an_unreadable_time_unstamped(occurred_at) -> None:
+    # Never a rejection and never a guess: the delivery still wakes its agent, on its
+    # own, exactly as before the route opted into the coalesce.
+    payload = _payload()
+    if occurred_at is None:
+        del payload["occurred_at"]
+    else:
+        payload["occurred_at"] = occurred_at
+    event = BasecradleRoute().normalize(_request(payload))
+    assert event is not None
+    assert event.occurred_at is None
 
 
 @pytest.mark.parametrize("event", ["asset.created", "task.activated", "webhook_event.received"])

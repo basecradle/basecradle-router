@@ -75,6 +75,7 @@ from basecradle_router.routes.base import (
     UntrustedSenderError,
     log_delivery_decision,
     parse_json_object,
+    parse_timestamp,
     verify_hmac_sha256,
 )
 
@@ -240,7 +241,7 @@ class IssueLedger:
         url = issue.get("html_url")
         state = issue.get("state")
         labels = issue.get("labels")
-        updated_at = _timestamp(issue.get("updated_at"))
+        updated_at = parse_timestamp(issue.get("updated_at"))
         if (
             not isinstance(url, str)
             or not url
@@ -427,7 +428,7 @@ class GithubRoute:
         # When it happened: an `opened` is the issue's creation; a `labeled` carries no
         # time of its own, so the issue's last update — never earlier than the label.
         stamp = issue.get("created_at") if action == "opened" else issue.get("updated_at")
-        return self._wake_event(data, issue, event_type, delivery, _timestamp(stamp))
+        return self._wake_event(data, issue, event_type, delivery, parse_timestamp(stamp))
 
     def _normalize_comment(
         self, request: InboundRequest, event_type: str, delivery: str | None
@@ -482,7 +483,7 @@ class GithubRoute:
         self._require_trusted_sender(data)
         comment = data.get("comment")
         stamp = comment.get("created_at") if isinstance(comment, dict) else None
-        return self._wake_event(data, issue, event_type, delivery, _timestamp(stamp))
+        return self._wake_event(data, issue, event_type, delivery, parse_timestamp(stamp))
 
     def _wake_event(
         self,
@@ -661,25 +662,6 @@ def _has_label(issue: dict[str, Any], name: str) -> bool:
     if not isinstance(labels, list):
         return False
     return any(isinstance(label, dict) and label.get("name") == name for label in labels)
-
-
-def _timestamp(value: object) -> datetime | None:
-    """A GitHub ISO-8601 timestamp (``2026-09-19T03:14:07Z``) as an aware datetime.
-
-    ``None`` for anything absent, unparseable, or without a zone — never a guess, and
-    never an exception: an unparseable time only means the event is not collapsed and
-    the observation not recorded, which is the router's behaviour before either existed.
-    The ``Z`` is spelled out as ``+00:00`` because :meth:`datetime.fromisoformat` only
-    reads it from Python 3.11, and this package supports 3.10.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
 
 
 def _text(obj: dict[str, Any], key: str, label: str) -> str:
