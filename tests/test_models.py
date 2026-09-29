@@ -63,20 +63,32 @@ def test_event_origin_is_optional_for_sources_without_one() -> None:
     assert event.recipient.by == "recipient_uuid"
 
 
-def test_dedup_key_pairs_the_source_with_the_delivery_id() -> None:
-    # The dedup key is source-prefixed so two sources' id-spaces can't collide,
-    # and identical across duplicate deliveries of one event (same delivery_id).
-    assert _event().dedup_key == f"github:{DELIVERY_ID}"
-    basecradle_event = Event(
+def _platform_event(recipient_uuid: str = JT_UUID) -> Event:
+    return Event(
         source="basecradle",
         kind=EventKind.PLATFORM_EVENT,
-        recipient=Recipient(by="recipient_uuid", value=JT_UUID),
+        recipient=Recipient(by="recipient_uuid", value=recipient_uuid),
         wake_arg="0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
         delivery_id=DELIVERY_ID,
     )
+
+
+def test_dedup_key_joins_the_source_the_recipient_and_the_delivery_id() -> None:
+    # The dedup key is source-prefixed so two sources' id-spaces can't collide,
+    # and identical across duplicate deliveries of one event (same delivery_id).
+    assert _event().dedup_key == f"github:basecradle/basecradle-python:{DELIVERY_ID}"
+    assert _event().dedup_key == _event().dedup_key
     # Same delivery_id, different source → distinct keys (no cross-source collision).
-    assert basecradle_event.dedup_key == f"basecradle:{DELIVERY_ID}"
-    assert basecradle_event.dedup_key != _event().dedup_key
+    assert _platform_event().dedup_key == f"basecradle:{JT_UUID}:{DELIVERY_ID}"
+    assert _platform_event().dedup_key != _event().dedup_key
+
+
+def test_dedup_key_tells_two_recipients_of_one_platform_event_apart() -> None:
+    # The platform shares one event_id across every recipient of an event (#312), so
+    # @jt's and Nova's deliveries of one message carry the same delivery id. They are
+    # two deliveries, and a key that named them as one suppressed the second agent's.
+    nova_uuid = "019e916c-7f45-7aaa-8bbb-0123456789ab"
+    assert _platform_event(JT_UUID).dedup_key != _platform_event(nova_uuid).dedup_key
 
 
 def test_builder_agent_round_trips() -> None:

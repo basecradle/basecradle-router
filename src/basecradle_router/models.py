@@ -252,14 +252,25 @@ class Event:
 
         The delivery-dedup cache keys on this to collapse a duplicate webhook
         delivery (the same logical event arriving more than once — e.g. two fleet
-        Apps on one repo) into a single wake (basecradle-router#133). It pairs the
-        ``source`` with the source's per-delivery id (a github ``X-GitHub-Delivery``
-        GUID, a basecradle ``X-BaseCradle-Delivery`` id), so it is identical across
-        the duplicate deliveries of one event yet unique per genuine delivery — and
-        the ``source`` prefix keeps two sources' id-spaces from ever colliding. Core
-        vocabulary, like :attr:`stream_key`, so dedup stays source-agnostic.
+        Apps on one repo) into a single wake (basecradle-router#133). It joins the
+        ``source``, the ``recipient``, and the source's delivery id (a github
+        ``X-GitHub-Delivery`` GUID, a basecradle ``X-BaseCradle-Delivery`` id), so it
+        is identical across the duplicate deliveries of one event to one recipient yet
+        unique per genuine delivery — and the ``source`` prefix keeps two sources'
+        id-spaces from ever colliding. Core vocabulary, like :attr:`stream_key`, so
+        dedup stays source-agnostic.
+
+        **A delivery is one event to one recipient, so the recipient is in the key**
+        (basecradle-router#312). The platform mints one ``event_id`` per event and
+        *shares it across every recipient* of that event, and its delivery id is that
+        ``event_id`` — the platform's own contract says to dedupe on ``(event_id,
+        recipient_uuid)``. Keyed on the id alone, one message on a timeline two agents
+        view was two deliveries under one key: the first agent's wake marked it, and
+        the other agent's delivery was collapsed as its "duplicate" and never woke that
+        agent. A github GUID resolves to the one repo it was sent for, so the recipient
+        changes nothing there.
         """
-        return f"{self.source}:{self.delivery_id}"
+        return f"{self.source}:{self.recipient.value}:{self.delivery_id}"
 
     @property
     def stream_key(self) -> str:

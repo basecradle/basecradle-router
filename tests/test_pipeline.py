@@ -45,6 +45,16 @@ JT = Agent(
     recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
     wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
 )
+# Nova Digital as a *harness* agent, beside @jt on one timeline — the shape in which one
+# platform event is delivered to two agents under one shared event_id (#312).
+NOVA_HARNESS = Agent(
+    key="nova",
+    os_user="nova",
+    clone_path="/home/nova/harness",
+    wake_kind=WakeKind.HARNESS,
+    recipient_uuid="019e916c-7f45-7aaa-8bbb-0123456789ab",
+    wake_bin="/home/nova/venv/bin/basecradle-harness-wake",
+)
 ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
 TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
 # Well-formed UUIDv7 delivery ids for the dedup tests (an X-GitHub-Delivery value
@@ -239,15 +249,17 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
 # --- the basecradle route: a platform event wakes a harness agent ----------
 
 
-def _basecradle_pipeline(waker: _StubWaker | None = None) -> tuple[Pipeline, _StubWaker]:
+def _basecradle_pipeline(
+    waker: _StubWaker | None = None, *, agents: tuple[Agent, ...] = (JT,)
+) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     registry = RouteRegistry()
     registry.register(BasecradleRoute())
     config = Config(
-        agents=MappingProxyType({JT.key: JT}),
+        agents=MappingProxyType({agent.key: agent for agent in agents}),
         enabled_routes=frozenset({"basecradle"}),
         webhook_secrets=MappingProxyType({"basecradle": BASECRADLE_SECRET}),
-        recipient_index=MappingProxyType({JT.recipient_uuid: JT}),
+        recipient_index=MappingProxyType({agent.recipient_uuid: agent for agent in agents}),
     )
     return (
         Pipeline(registry=registry, config=config, waker=waker, sleep=lambda _d: None),
@@ -585,6 +597,32 @@ def test_dedup_entry_expires_after_ttl_and_allows_a_rewake() -> None:
         Outcome.OK,
     )  # window cleared: wakes again
     assert len(waker.calls) == 2
+
+
+def test_one_platform_event_delivered_to_two_agents_wakes_both() -> None:
+    # The platform shares one event_id across every recipient of an event, so @jt's and
+    # Nova's deliveries of one message carry one delivery id (#312). They are two
+    # deliveries to two agents: the first agent's successful wake must not collapse the
+    # second's as its duplicate — that agent was never woken, 43 times in one week.
+    pipeline, waker = _basecradle_pipeline(agents=(JT, NOVA_HARNESS))
+    for agent in (JT, NOVA_HARNESS):
+        result = pipeline.handle(
+            "basecradle",
+            _basecradle_request(recipient_uuid=agent.recipient_uuid, delivery=DELIVERY_DUP),
+        )
+        assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert [agent for agent, _ in waker.calls] == [JT, NOVA_HARNESS]
+
+
+def test_a_platform_redelivery_to_one_agent_still_collapses() -> None:
+    # The pairing narrows the key to one recipient; it does not stop the #133 collapse.
+    # The platform delivers at-least-once, and a retry to the same agent is a duplicate.
+    pipeline, waker = _basecradle_pipeline()
+    first = pipeline.handle("basecradle", _basecradle_request(delivery=DELIVERY_DUP))
+    again = pipeline.handle("basecradle", _basecradle_request(delivery=DELIVERY_DUP))
+    assert first.stages[-1] == (Stage.WAKE, Outcome.OK)
+    assert again.stages[-1] == (Stage.DEDUP, Outcome.IGNORED)
+    assert len(waker.calls) == 1
 
 
 def test_dedup_disabled_by_zero_ttl_lets_every_delivery_wake() -> None:
