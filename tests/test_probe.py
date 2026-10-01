@@ -59,6 +59,7 @@ from basecradle_router.routes.base import InboundRequest, PayloadError
 from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.probe import DELIVERY_HEADER, SIGNATURE_HEADER, ProbeRoute
+from basecradle_router.secret import Secret
 from basecradle_router.selftest import EXIT_UNPROVABLE
 from basecradle_router.server import WebhookServer
 from basecradle_router.wake import HomeServerWaker, SubprocessWaker, WakeError, WakeResult
@@ -108,7 +109,7 @@ def config(*, agents=(NOVA, JT), routes=("github", "basecradle", "probe")) -> Co
     return Config(
         agents=MappingProxyType(by_key),
         enabled_routes=frozenset(routes),
-        webhook_secrets=MappingProxyType({r: PROBE_SECRET for r in routes}),
+        webhook_secrets=MappingProxyType({r: Secret(PROBE_SECRET) for r in routes}),
         recipient_index=MappingProxyType({a.recipient_uuid: a for a in agents if a.recipient_uuid}),
         harness_index=MappingProxyType({a.harness_key: a for a in agents}),
     )
@@ -197,10 +198,10 @@ def test_a_route_that_declares_no_provenance_is_rejected_by_the_registry() -> No
 def test_the_probe_route_verifies_like_every_other_source() -> None:
     route = ProbeRoute()
     marker = a_marker()
-    route.verify(probe_request("nova", marker), PROBE_SECRET)  # the real HMAC boundary
+    route.verify(probe_request("nova", marker), Secret(PROBE_SECRET))  # the real HMAC boundary
 
     with pytest.raises(SignatureError):
-        route.verify(probe_request("nova", marker, secret="the-wrong-secret"), PROBE_SECRET)
+        route.verify(probe_request("nova", marker, secret="the-wrong-secret"), Secret(PROBE_SECRET))
 
 
 def test_a_verified_probe_normalizes_to_a_synthetic_event_addressed_by_harness_key() -> None:
@@ -566,7 +567,7 @@ class FakeBox:
 
     def probe(self, **kwargs) -> WakeProbe:
         return WakeProbe(
-            secret=PROBE_SECRET,
+            secret=Secret(PROBE_SECRET),
             evidence_path=self.evidence_path,
             self_url="http://127.0.0.1:8000",
             post=self.post,
@@ -824,7 +825,7 @@ def test_a_collapsed_injection_reads_unprovable_naming_the_dedup(tmp_path) -> No
         return Injection(status=202, stages=(("resolve", "ok"),))
 
     result = WakeProbe(
-        secret=PROBE_SECRET,
+        secret=Secret(PROBE_SECRET),
         evidence_path=box.evidence_path,
         self_url="http://127.0.0.1:8000",
         post=collapsed,
@@ -870,7 +871,7 @@ def test_the_probe_reports_proven_only_for_its_own_delivery(tmp_path) -> None:
     probe = box.probe(timeout=0.0)
     # Injection that goes nowhere: the daemon "accepts" but no wake is ever recorded.
     result = WakeProbe(
-        secret=PROBE_SECRET,
+        secret=Secret(PROBE_SECRET),
         evidence_path=box.evidence_path,
         self_url="http://127.0.0.1:8000",
         post=lambda *_a: Injection(status=202, stages=(("resolve", "ok"),)),
@@ -896,7 +897,7 @@ def test_the_probe_cannot_write_the_evidence_it_reads(box) -> None:
 def test_a_daemon_that_does_not_serve_the_route_is_unprovable_not_broken() -> None:
     # Nothing was asked, so nothing can be concluded — and the message names the fix.
     result = WakeProbe(
-        secret=PROBE_SECRET,
+        secret=Secret(PROBE_SECRET),
         evidence_path=None,
         self_url="http://127.0.0.1:8000",
         post=lambda *_a: Injection(status=404),
@@ -910,7 +911,7 @@ def test_a_daemon_that_does_not_serve_the_route_is_unprovable_not_broken() -> No
 
 def test_a_rejected_signature_at_injection_is_a_definite_negative() -> None:
     result = WakeProbe(
-        secret=PROBE_SECRET,
+        secret=Secret(PROBE_SECRET),
         evidence_path=None,
         self_url="http://127.0.0.1:8000",
         post=lambda *_a: Injection(status=401),
@@ -934,7 +935,7 @@ def test_a_probe_cannot_be_attempted_with_an_unusable_marker() -> None:
     # Not a verdict about the wake edge — the probe could not be *attempted* — so it is
     # raised rather than reported, and the CLI turns it into the inconclusive sentinel.
     probe = WakeProbe(
-        secret=PROBE_SECRET,
+        secret=Secret(PROBE_SECRET),
         evidence_path=None,
         self_url="http://127.0.0.1:8000",
         post=lambda *_a: pytest.fail("nothing may be posted for an unusable marker"),
@@ -947,13 +948,13 @@ def test_a_probe_cannot_be_attempted_with_an_unusable_marker() -> None:
 def test_the_body_the_probe_signs_is_the_body_the_route_verifies() -> None:
     # The round trip, against the real route: a signature over anything but these exact
     # bytes is a rejected delivery. Pinned because the two halves are written apart.
-    probe = WakeProbe(secret=PROBE_SECRET, evidence_path=None, self_url="http://x")
+    probe = WakeProbe(secret=Secret(PROBE_SECRET), evidence_path=None, self_url="http://x")
     marker = a_marker()
     body = probe.body_for("nova", marker)
     headers = probe.headers_for(body, "round-trip")
 
     request = InboundRequest(headers=headers, body=body)
-    ProbeRoute().verify(request, PROBE_SECRET)
+    ProbeRoute().verify(request, Secret(PROBE_SECRET))
     event = ProbeRoute().normalize(request)
     assert (event.recipient.value, event.wake_arg) == ("nova", marker)
 
@@ -965,7 +966,7 @@ def test_a_minted_delivery_id_identifies_the_delivery_and_types_it_with_nothing(
     # high-cardinality key label extraction cannot lift, so every wake chart mixed the
     # fleet's probe traffic with its real work while the raw line looked informative.
     # That question is `source=probe`'s now, and the id goes back to identifying.
-    probe = WakeProbe(secret=PROBE_SECRET, evidence_path=None, self_url="http://x")
+    probe = WakeProbe(secret=Secret(PROBE_SECRET), evidence_path=None, self_url="http://x")
     minted = {probe.mint_delivery_id() for _ in range(8)}
 
     assert len(minted) == 8  # still unique per run: the join key still joins
@@ -1100,7 +1101,7 @@ def test_the_probe_route_needs_its_own_secret_like_every_other_route(tmp_path) -
         load_config(env)
 
     loaded = load_config({**env, "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET": PROBE_SECRET})
-    assert loaded.webhook_secret("probe") == PROBE_SECRET
+    assert loaded.webhook_secret("probe") == Secret(PROBE_SECRET)
     # And every registered agent is addressable by its harness key, from the registry.
     assert loaded.harness_index["nova"].key == NOVA.key
 

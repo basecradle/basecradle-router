@@ -88,6 +88,7 @@ from basecradle_router.routes.probe import (
     WAKE_EVENT,
     ProbeRoute,
 )
+from basecradle_router.secret import Secret
 from basecradle_router.selftest import EXIT_UNPROVABLE
 
 logger = logging.getLogger("basecradle_router.probe")
@@ -309,7 +310,7 @@ class WakeProbe:
     daemon can never disagree about the secret, the route, or where the evidence lives.
     """
 
-    secret: str
+    secret: Secret
     evidence_path: str | None
     self_url: str
     route: str = ProbeRoute.name
@@ -395,7 +396,7 @@ class WakeProbe:
         the probe is signed the way real traffic is signed, because injecting at the
         front door is the whole point.
         """
-        digest = hmac.new(self.secret.encode("utf-8"), body, sha256).hexdigest()
+        digest = hmac.new(self.secret.reveal().encode("utf-8"), body, sha256).hexdigest()
         return {
             "Content-Type": "application/json",
             "Content-Length": str(len(body)),

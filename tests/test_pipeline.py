@@ -23,6 +23,7 @@ from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKin
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
+from basecradle_router.secret import Secret
 from basecradle_router.wake import WakeError, WakeResult
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
@@ -85,7 +86,7 @@ def _config(agents: dict[str, Agent] | None = None) -> Config:
     return Config(
         agents=MappingProxyType({NOVA.key: NOVA} if agents is None else agents),
         enabled_routes=frozenset({"github"}),
-        webhook_secrets=MappingProxyType({"github": SECRET}),
+        webhook_secrets=MappingProxyType({"github": Secret(SECRET)}),
     )
 
 
@@ -258,7 +259,7 @@ def _basecradle_pipeline(
     config = Config(
         agents=MappingProxyType({agent.key: agent for agent in agents}),
         enabled_routes=frozenset({"basecradle"}),
-        webhook_secrets=MappingProxyType({"basecradle": BASECRADLE_SECRET}),
+        webhook_secrets=MappingProxyType({"basecradle": Secret(BASECRADLE_SECRET)}),
         recipient_index=MappingProxyType({agent.recipient_uuid: agent for agent in agents}),
     )
     return (

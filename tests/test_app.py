@@ -16,6 +16,7 @@ from basecradle_router.app import build_registry, create_app
 from basecradle_router.config import ConfigError, load_config
 from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX
+from basecradle_router.secret import Secret
 from basecradle_router.wake import HomeServerWaker, WakeResult
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -257,7 +258,7 @@ def test_create_app_wires_the_per_recipient_keyring(tmp_path) -> None:
     env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY}
     route = build_registry(load_config(env), env).get("basecradle")
 
-    assert dict(route.keyring.by_recipient) == {JT.recipient_uuid: JT_KEY}
+    assert dict(route.keyring.by_recipient) == {JT.recipient_uuid: Secret(JT_KEY)}
     assert route.keyring.shared_fallback is True
 
 

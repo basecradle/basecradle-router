@@ -38,6 +38,7 @@ from basecradle_router.models import Agent, WakeKind
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.basecradle import BasecradleRoute
 from basecradle_router.routes.github import GithubRoute
+from basecradle_router.secret import Secret
 from basecradle_router.wakelock import WakeLockGuard
 
 NOVA = Agent(
@@ -63,7 +64,7 @@ def _config(agents=(NOVA,), routes=("github",)) -> Config:
     return Config(
         agents=MappingProxyType({a.key: a for a in agents}),
         enabled_routes=frozenset(routes),
-        webhook_secrets=MappingProxyType({r: SECRET for r in routes}),
+        webhook_secrets=MappingProxyType({r: Secret(SECRET) for r in routes}),
         recipient_index=MappingProxyType({a.recipient_uuid: a for a in agents if a.recipient_uuid}),
     )
 

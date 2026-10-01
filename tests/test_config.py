@@ -21,6 +21,7 @@ from basecradle_router.config import (
     load_wake_lock_dir,
 )
 from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
+from basecradle_router.secret import Secret
 from basecradle_router.wakelock import DEFAULT_LOCK_DIR
 
 _BREAKER_MAX_VAR = "BASECRADLE_ROUTER_WAKE_BREAKER_MAX"
@@ -69,7 +70,7 @@ def _env(tmp_path, **overrides) -> dict[str, str]:
 def test_loads_with_defaults(tmp_path) -> None:
     config = load_config(_env(tmp_path))
     assert config.enabled_routes == frozenset({"github"})
-    assert config.webhook_secret("github") == FAKE_SECRET
+    assert config.webhook_secret("github") == Secret(FAKE_SECRET)
     agent = config.agent_for("basecradle/basecradle-python")
     assert agent.os_user == "nova"
     assert agent.bot_slug == "basecradle-python-ai"

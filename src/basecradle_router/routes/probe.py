@@ -74,6 +74,7 @@ from basecradle_router.routes.base import (
     parse_json_object,
     verify_hmac_sha256,
 )
+from basecradle_router.secret import Secret
 
 SIGNATURE_HEADER = "X-BaseCradle-Probe-Signature"
 DELIVERY_HEADER = "X-BaseCradle-Probe-Delivery"
@@ -96,7 +97,7 @@ class ProbeRoute:
     #: production edge count and out of the production sinks — see the module docstring.
     synthetic = True
 
-    def verify(self, request: InboundRequest, secret: str) -> None:
+    def verify(self, request: InboundRequest, secret: Secret) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         The same audited HMAC-SHA256 boundary the github and basecradle routes use, over

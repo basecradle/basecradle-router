@@ -20,6 +20,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from basecradle_router.logfmt import log_fields
 from basecradle_router.models import Event
+from basecradle_router.secret import Secret
 
 HMAC_SHA256_PREFIX = "sha256="
 
@@ -69,7 +70,7 @@ class InboundRequest:
         return None
 
 
-def verify_hmac_sha256(request: InboundRequest, secret: str, *, header: str) -> None:
+def verify_hmac_sha256(request: InboundRequest, secret: Secret, *, header: str) -> None:
     """Raise :class:`SignatureError` unless ``request`` carries a valid signature.
 
     The shared signature boundary for every HMAC-signed source (GitHub's
@@ -79,6 +80,10 @@ def verify_hmac_sha256(request: InboundRequest, secret: str, *, header: str) -> 
     prefixed header whose digest equals the HMAC of the exact body bytes under
     ``secret``; the comparison is constant-time. One audited implementation keeps
     every route's security boundary identical and impossible to subtly diverge.
+
+    It is also the one place a route's key is read in the clear: ``secret`` is
+    revealed inside the HMAC expression and bound to no name, so no frame on the
+    verify path holds the plaintext (basecradle-router#317).
     """
     provided = request.header(header)
     if provided is None:
@@ -86,9 +91,8 @@ def verify_hmac_sha256(request: InboundRequest, secret: str, *, header: str) -> 
     if not provided.startswith(HMAC_SHA256_PREFIX):
         raise SignatureError(f"malformed {header}: expected '{HMAC_SHA256_PREFIX}<hexdigest>'")
 
-    expected = (
-        HMAC_SHA256_PREFIX + hmac.new(secret.encode("utf-8"), request.body, sha256).hexdigest()
-    )
+    digest = hmac.new(secret.reveal().encode("utf-8"), request.body, sha256).hexdigest()
+    expected = HMAC_SHA256_PREFIX + digest
 
     # Compare as bytes: hmac.compare_digest raises TypeError on a str with
     # non-ASCII chars, and the header value is attacker-controlled.
@@ -247,7 +251,7 @@ class Route(Protocol):
     recipient_kind: str
     synthetic: bool
 
-    def verify(self, request: InboundRequest, secret: str) -> None:
+    def verify(self, request: InboundRequest, secret: Secret) -> None:
         """Raise :class:`SignatureError` if the request is unsigned or tampered."""
         ...
 

@@ -89,6 +89,7 @@ from basecradle_router.routes.base import (
     parse_timestamp,
     verify_hmac_sha256,
 )
+from basecradle_router.secret import Secret
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +206,10 @@ class RecipientKeyring:
     before rather than silently rejecting everything.
     """
 
-    by_recipient: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    by_recipient: Mapping[str, Secret] = field(default_factory=lambda: MappingProxyType({}))
     shared_fallback: bool = True
 
-    def select(self, recipient_uuid: str | None, shared_secret: str) -> tuple[str, str]:
+    def select(self, recipient_uuid: str | None, shared_secret: Secret) -> tuple[Secret, str]:
         """The ``(secret, key_path)`` to verify a delivery for ``recipient_uuid`` with.
 
         Per-recipient key first, shared secret second, and — once the fallback is
@@ -287,7 +288,7 @@ def load_recipient_keyring(
             )
         var_for_agent[var] = (uuid, agent)
 
-    by_recipient: dict[str, str] = {}
+    by_recipient: dict[str, Secret] = {}
     for var, value in env.items():
         if not var.startswith(RECIPIENT_SECRET_PREFIX):
             continue
@@ -297,7 +298,7 @@ def load_recipient_keyring(
             raise ConfigError(f"{var} names no registered agent; expected one of: {known}")
         if not value.strip():
             raise ConfigError(f"{var} is set but empty; unset it to fall back, or give it a key")
-        by_recipient[entry[0]] = value
+        by_recipient[entry[0]] = Secret(value)
 
     if not fallback:
         unprovisioned = sorted(
@@ -412,7 +413,7 @@ class BasecradleRoute:
             shared_fallback=self.keyring.shared_fallback,
         )
 
-    def verify(self, request: InboundRequest, secret: str) -> None:
+    def verify(self, request: InboundRequest, secret: Secret) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         Valid means: a present ``X-BaseCradle-Signature`` header of the form
