@@ -7,7 +7,10 @@ router-AI never deploys, so a regression would surface only as lost webhooks on 
 box. This is the offline gate instead, in the same posture as test_shutdown_drain.py:
 it asserts the properties the live retry depends on, against the file as it ships.
 
-No network or Caddy binary is involved. This test reads one file off disk.
+Every host's Caddyfile is checked (#326): each box fronts its own daemon, so each one
+must hold a delivery across that daemon's restart.
+
+No network or Caddy binary is involved. This test reads files off disk.
 """
 
 from __future__ import annotations
@@ -15,7 +18,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-CADDYFILE = Path(__file__).resolve().parents[1] / "deploy" / "caddy" / "Caddyfile"
+import pytest
+
+CADDYFILES = sorted((Path(__file__).resolve().parents[1] / "deploy" / "hosts").glob("*/Caddyfile"))
 
 #: GitHub abandons a webhook delivery that has not been answered within 10 s.
 GITHUB_DELIVERY_TIMEOUT = 10.0
@@ -31,9 +36,9 @@ def _to_seconds(duration: str) -> float:
     return sum(float(n) * _DURATION_UNITS[u] for n, u in parts)
 
 
-def _reverse_proxy_block() -> list[str]:
+def _reverse_proxy_block(caddyfile: Path) -> list[str]:
     """The directive lines inside the daemon's ``reverse_proxy`` block, comments dropped."""
-    lines = [line.strip() for line in CADDYFILE.read_text().splitlines()]
+    lines = [line.strip() for line in caddyfile.read_text().splitlines()]
     lines = [line for line in lines if line and not line.startswith("#")]
     start = next(i for i, line in enumerate(lines) if line.startswith("reverse_proxy "))
     assert lines[start].endswith("{"), "reverse_proxy has no block, so it sets no retry"
@@ -52,30 +57,38 @@ def _directive(block: list[str], name: str) -> str | None:
     return values[0] if values else None
 
 
-def test_the_proxy_holds_a_delivery_across_a_restart() -> None:
+def test_the_glob_found_every_hosts_caddyfile() -> None:
+    # An empty glob would parametrize the tests below over nothing and pass them all.
+    assert len(CADDYFILES) >= 2, "deploy/hosts/ carries suspiciously few Caddyfiles"
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_the_proxy_holds_a_delivery_across_a_restart(caddyfile: Path) -> None:
     # Without it a delivery arriving while the listener is down is answered 502 at
     # once, and GitHub never redelivers it, so the wake it carried is lost.
-    duration = _directive(_reverse_proxy_block(), "lb_try_duration")
+    duration = _directive(_reverse_proxy_block(caddyfile), "lb_try_duration")
     assert duration is not None, "reverse_proxy must set lb_try_duration (#264)"
     assert _to_seconds(duration) >= 1.0, (
         f"lb_try_duration {duration} is too short to cover a daemon restart"
     )
 
 
-def test_a_held_delivery_is_still_answered_inside_githubs_timeout() -> None:
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_a_held_delivery_is_still_answered_inside_githubs_timeout(caddyfile: Path) -> None:
     # A hold longer than GitHub's timeout buys nothing: GitHub gives up first and
     # records a failure anyway, and meanwhile Caddy keeps the request open.
-    duration = _to_seconds(_directive(_reverse_proxy_block(), "lb_try_duration") or "0s")
+    duration = _to_seconds(_directive(_reverse_proxy_block(caddyfile), "lb_try_duration") or "0s")
     assert duration < GITHUB_DELIVERY_TIMEOUT, (
         f"lb_try_duration {duration:.1f}s reaches GitHub's {GITHUB_DELIVERY_TIMEOUT:.0f}s "
         "delivery timeout"
     )
 
 
-def test_only_a_failed_dial_is_retried_so_no_delivery_runs_twice() -> None:
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_only_a_failed_dial_is_retried_so_no_delivery_runs_twice(caddyfile: Path) -> None:
     # Caddy's default retries a non-GET only when the dial failed, which means the
     # request never reached the daemon. An lb_retry_match would widen that to a POST
     # that reached the daemon and then failed, and so could deliver one webhook twice.
-    assert _directive(_reverse_proxy_block(), "lb_retry_match") is None, (
+    assert _directive(_reverse_proxy_block(caddyfile), "lb_retry_match") is None, (
         "lb_retry_match would let Caddy re-send a delivery the daemon already received"
     )

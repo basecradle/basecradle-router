@@ -18,7 +18,9 @@ from pathlib import Path
 _DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 UNIT = _DEPLOY / "systemd" / "basecradle-router.service"
 WAKE_RUNNER = _DEPLOY / "bin" / "wake-runner"
-VECTOR = _DEPLOY / "vector.yaml"
+# The reference host's copy. Every other host's copy differs from it only by its sink
+# (pinned in test_per_host_deploy.py), so the scrub proven here is the scrub on every box.
+VECTOR = _DEPLOY / "hosts" / "ai.basecradle.com" / "vector.yaml"
 
 
 # --- 1. name the program ---------------------------------------------------

@@ -109,6 +109,7 @@ def _deploy_contract_paths() -> list[str]:
     # `deploy/verify-recovery.sh` — a script the box executes at every boot — was never
     # in it at all. A glob cannot develop either hole.
     paths += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "deploy").glob("*.sh"))]
+    paths += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "deploy/hosts").glob("*/*"))]
     paths += [
         "deploy/vector.yaml",
         "pyproject.toml",
