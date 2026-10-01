@@ -359,7 +359,7 @@ def test_the_five_deliveries_cost_one_wake_when_the_issue_ends_closed() -> None:
 
 
 def test_the_five_deliveries_cost_one_follow_up_when_the_issue_stays_open() -> None:
-    # A handoff stamped `CLOSER: capital` stays open after the agent reports. Deliveries
+    # A handoff stamped `CLOSER: @basecradle-ai` stays open after the agent reports. Deliveries
     # during the first session then earn exactly ONE follow-up — the running session
     # may have missed them — and everything queued behind that follow-up is read by it.
     pipeline, waker, now = _pipeline()
