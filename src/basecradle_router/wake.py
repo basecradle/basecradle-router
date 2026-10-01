@@ -6,11 +6,12 @@ tests mock. The router *delivers a trigger*; it never becomes the agent. The
 woken ``claude`` is an independent, separately-chartered context running in the
 agent's own repo clone under the agent's own identity.
 
-The boundary is shaped for the home-server model — **run-as-user is carried on
-every invocation** — but the privilege drop itself (and live per-agent
-credentials) is deferred with the home server. The v0 subprocess runner does not
-drop privileges; it assembles and runs the command, and the home-server runner
-will consume :attr:`WakeInvocation.run_as_user` to execute as that OS user.
+Run-as-user is carried on every invocation, and two wakers consume it. The
+deployed :class:`HomeServerWaker` escalates through the root-owned wake-runner,
+which drops to the agent's own OS user and loads that agent's ``agent.env`` *after*
+the drop. So the router passes no environment and never holds an agent credential.
+The :class:`SubprocessWaker` does not drop privileges: it assembles and runs the
+command directly, and it is the seam tests drive.
 """
 
 from __future__ import annotations
@@ -148,8 +149,9 @@ class WakeResult:
 # real subprocess; tests inject a fake so the boundary is never actually crossed.
 Runner = Callable[[WakeInvocation], WakeResult]
 
-# Per-agent environment provider. The home-server impl reads the agent OS user's
-# credentials (GitHub App token, later ANTHROPIC_API_KEY); v0 defaults to empty.
+# Per-agent environment provider for the SubprocessWaker; defaults to empty. The
+# deployed HomeServerWaker takes none: the wake-runner loads the agent's own
+# agent.env after the privilege drop, so no agent credential passes through the router.
 EnvProvider = Callable[[Agent], Mapping[str, str]]
 
 
