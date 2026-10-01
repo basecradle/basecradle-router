@@ -78,6 +78,7 @@ from basecradle_router.routes.base import (
     parse_timestamp,
     verify_hmac_sha256,
 )
+from basecradle_router.secret import Secret
 
 logger = logging.getLogger("basecradle_router.routes.github")
 
@@ -362,7 +363,7 @@ class GithubRoute:
             return None
         return self._ledger.reason_to_drop(event.origin.url)
 
-    def verify(self, request: InboundRequest, secret: str) -> None:
+    def verify(self, request: InboundRequest, secret: Secret) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         Valid means: a present ``X-Hub-Signature-256`` header of the form

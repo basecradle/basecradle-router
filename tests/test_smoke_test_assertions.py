@@ -64,6 +64,7 @@ from basecradle_router.routes.basecradle import (
     _bool_env,
     _slug_suffix,
 )
+from basecradle_router.secret import Secret
 
 SMOKE_TEST = Path(__file__).resolve().parents[1] / "deploy" / "smoke-test.sh"
 
@@ -501,12 +502,18 @@ def _basecradle_journal_patterns(key_path: str) -> list[str]:
     return [_SHELL_VAR.sub(lambda m: values[m.group(1)], pattern) for pattern in patterns]
 
 
+#: The route-wide secret the core would pass in; the fallback-path case signs with it.
+ROUTE_WIDE_FALLBACK = Secret("bc_isk_fakeroutewidefallbackkey00000001")
+
+
 @pytest.mark.parametrize(
     ("key_path", "keyring"),
     [
         (
             KEY_PATH_RECIPIENT,
-            RecipientKeyring(by_recipient={NOVA_UUID: "bc_isk_fakenovarecipientkey000000000001"}),
+            RecipientKeyring(
+                by_recipient={NOVA_UUID: Secret("bc_isk_fakenovarecipientkey000000000001")}
+            ),
         ),
         (KEY_PATH_FALLBACK, RecipientKeyring()),
     ],
@@ -525,7 +532,7 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
     """
     delivery = _smoke_literal("BC_DELIVERY")
     event_type = _smoke_literal("BC_IGNORED_EVENT")
-    secret = keyring.by_recipient.get(NOVA_UUID, "bc_isk_fakeroutewidefallbackkey00000001")
+    secret = keyring.by_recipient.get(NOVA_UUID, ROUTE_WIDE_FALLBACK)
     body = json.dumps(
         {
             "event": event_type,
@@ -536,7 +543,7 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
             "timeline_uuid": "0192dddd-eeee-7fff-8000-111122223333",
         }
     ).encode("utf-8")
-    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    digest = hmac.new(secret.reveal().encode("utf-8"), body, hashlib.sha256).hexdigest()
     request = InboundRequest(
         headers={
             SIGNATURE_HEADER: f"sha256={digest}",
@@ -548,7 +555,7 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
 
     route = BasecradleRoute(keyring)
     with caplog.at_level(logging.INFO, logger="basecradle_router"):
-        route.verify(request, "bc_isk_fakeroutewidefallbackkey00000001")
+        route.verify(request, ROUTE_WIDE_FALLBACK)
         assert route.normalize(request) is None  # non-actionable => no wake, ever
 
     rendered = [record.getMessage() for record in caplog.records]

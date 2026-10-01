@@ -16,6 +16,7 @@ from types import MappingProxyType
 from basecradle_router.breaker import BreakerConfig
 from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
 from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
+from basecradle_router.secret import Secret
 from basecradle_router.wakelock import DEFAULT_LOCK_DIR
 
 _EMPTY: Mapping[str, Agent] = MappingProxyType({})
@@ -78,13 +79,15 @@ class Config:
     resolves by repo; ``harness_index`` maps every agent's ``harness_key`` (its OS
     user — the universal identity) to it, which is how a source that addresses an
     agent *as an agent* rather than through one platform's naming resolves;
-    ``webhook_secrets`` maps a route name to its signing secret; ``enabled_routes``
+    ``webhook_secrets`` maps a route name to its signing secret, held as a
+    :class:`~basecradle_router.secret.Secret` so no representation of the config can
+    print it (#317); ``enabled_routes``
     is the set of routes the daemon will accept events for.
     """
 
     agents: Mapping[str, Agent]
     enabled_routes: frozenset[str]
-    webhook_secrets: Mapping[str, str]
+    webhook_secrets: Mapping[str, Secret]
     recipient_index: Mapping[str, Agent] = field(default_factory=lambda: _EMPTY)
     harness_index: Mapping[str, Agent] = field(default_factory=lambda: _EMPTY)
 
@@ -158,7 +161,7 @@ class Config:
             kinds.add("harness_key")
         return frozenset(kinds)
 
-    def webhook_secret(self, route: str) -> str:
+    def webhook_secret(self, route: str) -> Secret:
         try:
             return self.webhook_secrets[route]
         except KeyError:
@@ -324,14 +327,14 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         if not enabled:
             raise ConfigError(f"{_ENABLED_ROUTES_VAR} is set but lists no routes")
 
-    secrets: dict[str, str] = {}
+    secrets: dict[str, Secret] = {}
     for route in enabled:
         secret = env.get(route_secret_var(route))
         if not secret:
             raise ConfigError(
                 f"route {route!r} is enabled but {route_secret_var(route)} is not set"
             )
-        secrets[route] = secret
+        secrets[route] = Secret(secret)
 
     return Config(
         agents=MappingProxyType(agents),

@@ -39,6 +39,7 @@ from basecradle_router.routes.basecradle import (
     SIGNATURE_HEADER,
     _slug_suffix,
 )
+from basecradle_router.secret import Secret
 
 SECRET = "s3cret-fake-integration-secret"
 JT_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"  # @jt's BaseCradle user uuid
@@ -109,26 +110,26 @@ def test_basecradle_route_satisfies_the_protocol() -> None:
 
 def test_verify_accepts_a_correct_signature() -> None:
     body = json.dumps(_payload()).encode("utf-8")
-    BasecradleRoute().verify(_request(raw_body=body, signature=_sign(body)), SECRET)
+    BasecradleRoute().verify(_request(raw_body=body, signature=_sign(body)), Secret(SECRET))
 
 
 def test_verify_accepts_regardless_of_header_case() -> None:
     body = b'{"event":"message.created"}'
     req = InboundRequest(headers={"x-basecradle-signature": _sign(body)}, body=body)
-    BasecradleRoute().verify(req, SECRET)
+    BasecradleRoute().verify(req, Secret(SECRET))
 
 
 def test_verify_rejects_a_tampered_body() -> None:
     body = json.dumps(_payload()).encode("utf-8")
     tampered = InboundRequest(headers={SIGNATURE_HEADER: _sign(body)}, body=body + b" ")
     with pytest.raises(SignatureError, match="does not match"):
-        BasecradleRoute().verify(tampered, SECRET)
+        BasecradleRoute().verify(tampered, Secret(SECRET))
 
 
 def test_verify_rejects_a_missing_header() -> None:
     body = b"{}"
     with pytest.raises(SignatureError, match="missing"):
-        BasecradleRoute().verify(InboundRequest(headers={}, body=body), SECRET)
+        BasecradleRoute().verify(InboundRequest(headers={}, body=body), Secret(SECRET))
 
 
 def test_verify_rejects_a_malformed_header() -> None:
@@ -136,7 +137,7 @@ def test_verify_rejects_a_malformed_header() -> None:
     bare = _sign(body).removeprefix("sha256=")
     req = InboundRequest(headers={SIGNATURE_HEADER: bare}, body=body)
     with pytest.raises(SignatureError, match="malformed"):
-        BasecradleRoute().verify(req, SECRET)
+        BasecradleRoute().verify(req, Secret(SECRET))
 
 
 # --- normalize -------------------------------------------------------------
@@ -329,58 +330,60 @@ def _verify_key_lines(caplog) -> list[str]:
 
 
 def test_a_provisioned_recipient_is_verified_with_its_own_key() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
-    route.verify(_keyed_request(JT_KEY), SECRET)
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route.verify(_keyed_request(JT_KEY), Secret(SECRET))
 
 
 def test_a_provisioned_recipient_no_longer_accepts_the_shared_secret() -> None:
     # The whole point of the change: once @jt is rotated, the value the other six
     # agents still share stops being able to speak for @jt. Without this assertion the
     # feature could be entirely inert and every other test here would still pass.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with pytest.raises(SignatureError, match="does not match"):
-        route.verify(_keyed_request(SECRET), SECRET)
+        route.verify(_keyed_request(SECRET), Secret(SECRET))
 
 
 def test_one_agents_key_cannot_sign_for_another() -> None:
     # The forgery the shared secret allowed: @nova signing a delivery addressed to @jt.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY, NOVA_UUID: NOVA_KEY}))
+    route = BasecradleRoute(
+        RecipientKeyring({JT_UUID: Secret(JT_KEY), NOVA_UUID: Secret(NOVA_KEY)})
+    )
     with pytest.raises(SignatureError, match="does not match"):
-        route.verify(_keyed_request(NOVA_KEY, recipient_uuid=JT_UUID), SECRET)
+        route.verify(_keyed_request(NOVA_KEY, recipient_uuid=JT_UUID), Secret(SECRET))
 
 
 def test_an_unprovisioned_recipient_still_verifies_against_the_shared_secret() -> None:
     # The backward-compatible half: @nova has not been rotated yet, so its deliveries
     # keep verifying while @jt's already use @jt's own key. This is what lets the
     # platform rotate one agent at a time.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
-    route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), SECRET)
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
 def test_an_empty_keyring_verifies_exactly_as_before() -> None:
     # The default construction — every caller that predates per-recipient keys.
-    BasecradleRoute(RecipientKeyring()).verify(_keyed_request(SECRET), SECRET)
-    BasecradleRoute().verify(_keyed_request(SECRET), SECRET)
+    BasecradleRoute(RecipientKeyring()).verify(_keyed_request(SECRET), Secret(SECRET))
+    BasecradleRoute().verify(_keyed_request(SECRET), Secret(SECRET))
 
 
 def test_a_retired_fallback_rejects_a_recipient_with_no_key_of_its_own() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}, shared_fallback=False))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
     with pytest.raises(SignatureError, match="shared fallback is retired"):
-        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), SECRET)
+        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
 def test_a_retired_fallback_still_verifies_a_provisioned_recipient() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}, shared_fallback=False))
-    route.verify(_keyed_request(JT_KEY), SECRET)
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route.verify(_keyed_request(JT_KEY), Secret(SECRET))
 
 
 def test_the_no_key_rejection_never_names_the_untrusted_recipient() -> None:
     # The message reaches the journal AND the evidence document, and at this point the
     # uuid is an unauthenticated claim. Naming the key path is the diagnosis; echoing
     # attacker-supplied bytes is not.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}, shared_fallback=False))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
     with pytest.raises(SignatureError) as caught:
-        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), SECRET)
+        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
     assert NOVA_UUID not in str(caught.value)
 
 
@@ -401,18 +404,18 @@ def test_a_body_that_names_no_usable_recipient_falls_back_to_the_shared_secret(
     # The pre-verification parse must never be able to fail *open* or crash: whatever
     # the body is, it selects no per-recipient key and the delivery is verified — and
     # for a malformed body, rejected — exactly as it is today.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
-    route.verify(InboundRequest(headers={SIGNATURE_HEADER: _sign(body)}, body=body), SECRET)
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route.verify(InboundRequest(headers={SIGNATURE_HEADER: _sign(body)}, body=body), Secret(SECRET))
 
 
 def test_a_malformed_body_is_still_rejected_at_the_signature_not_as_a_bad_payload() -> None:
     # `verify` reads the body before verifying it, so it must not start answering an
     # unauthenticated caller "your JSON is bad" — that is normalize's job, after trust.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     body = b"{not json"
     with pytest.raises(SignatureError):
         route.verify(
-            InboundRequest(headers={SIGNATURE_HEADER: "sha256=deadbeef"}, body=body), SECRET
+            InboundRequest(headers={SIGNATURE_HEADER: "sha256=deadbeef"}, body=body), Secret(SECRET)
         )
 
 
@@ -420,9 +423,9 @@ def test_a_malformed_body_is_still_rejected_at_the_signature_not_as_a_bad_payloa
 
 
 def test_a_verified_delivery_logs_the_key_path_and_who_it_was_for(caplog) -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
-        route.verify(_keyed_request(JT_KEY), SECRET)
+        route.verify(_keyed_request(JT_KEY), Secret(SECRET))
     line = _verify_key_line(caplog)
     assert "source=basecradle" in line
     assert f"key_path={KEY_PATH_RECIPIENT}" in line
@@ -434,9 +437,9 @@ def test_a_verified_delivery_logs_the_key_path_and_who_it_was_for(caplog) -> Non
 def test_a_fallback_verified_delivery_says_so(caplog) -> None:
     # What makes the cutover watchable: `key=fallback` is the count that must fall to
     # zero before the shared secret can be retired.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
-        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), SECRET)
+        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
     assert f"key_path={KEY_PATH_FALLBACK}" in _verify_key_line(caplog)
 
 
@@ -444,20 +447,20 @@ def test_a_rejected_delivery_logs_no_verify_key_line_but_names_the_path(caplog) 
     # Before the signature checks out the recipient is a claim, not a fact — so the
     # line that asserts one is emitted only after verification. The key path still
     # reaches the operator, through the rejection reason the core logs and stores.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with (
         caplog.at_level("INFO", logger="basecradle_router.routes"),
         pytest.raises(SignatureError, match=f"key_path={KEY_PATH_RECIPIENT}") as caught,
     ):
-        route.verify(_keyed_request(SECRET), SECRET)
+        route.verify(_keyed_request(SECRET), Secret(SECRET))
     assert _verify_key_lines(caplog) == []
     assert "does not match" in str(caught.value)
 
 
 def test_the_rejection_names_the_fallback_path_when_that_is_what_was_tried(caplog) -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with pytest.raises(SignatureError, match=f"key_path={KEY_PATH_FALLBACK}"):
-        route.verify(_keyed_request(JT_KEY, recipient_uuid=NOVA_UUID), SECRET)
+        route.verify(_keyed_request(JT_KEY, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
 # --- loading the keyring from the environment --------------------------------
@@ -474,7 +477,7 @@ def test_a_key_is_loaded_under_the_agents_uuid_not_its_slug() -> None:
     # The registry is what maps @jt's readable slug to the uuid the platform signs
     # for, so an operator never transcribes a uuid into router.env.
     keyring = load_recipient_keyring(RECIPIENTS, {JT_SECRET_VAR: JT_KEY})
-    assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
+    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
 
 
 def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
@@ -482,7 +485,7 @@ def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
     keyring = load_recipient_keyring(
         recipients, {f"{RECIPIENT_SECRET_PREFIX}BASECRADLE_HARNESS": JT_KEY}
     )
-    assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
+    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
 
 
 def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
@@ -493,7 +496,7 @@ def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
     # every guard below, because the variable simply never arrives.
     recipients = {JT_UUID: _harness_agent("glm-5.2", JT_UUID)}
     keyring = load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": JT_KEY})
-    assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY}
+    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
 
 
 #: systemd's own rule for an environment variable name (`env_name_is_valid`): ASCII
@@ -526,7 +529,9 @@ def test_a_derived_variable_name_is_always_one_systemd_will_pass_through(key: st
     assert _SYSTEMD_ENV_NAME.fullmatch(var), var
     # And that legal name is the one the loader actually provisions the agent from.
     recipients = {JT_UUID: _harness_agent(key, JT_UUID)}
-    assert dict(load_recipient_keyring(recipients, {var: JT_KEY}).by_recipient) == {JT_UUID: JT_KEY}
+    assert dict(load_recipient_keyring(recipients, {var: JT_KEY}).by_recipient) == {
+        JT_UUID: Secret(JT_KEY)
+    }
 
 
 def test_the_unknown_slug_error_names_the_normalised_variable_not_the_raw_slug() -> None:
@@ -614,7 +619,7 @@ def test_retiring_the_fallback_is_accepted_once_every_agent_is_provisioned() -> 
         RECIPIENTS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
     )
     assert keyring.shared_fallback is False
-    assert dict(keyring.by_recipient) == {JT_UUID: JT_KEY, NOVA_UUID: NOVA_KEY}
+    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY), NOVA_UUID: Secret(NOVA_KEY)}
 
 
 def test_the_loader_ignores_environment_it_does_not_own() -> None:
@@ -631,7 +636,7 @@ def test_the_route_states_its_keyring_at_boot() -> None:
     # Once every agent is keyed, an armed fallback and a retired one produce
     # identical traffic — every delivery reads key=recipient either way. Nothing but
     # a boot statement can tell a finished cutover from a forgotten last step.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}, shared_fallback=False))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
     summary = route.boot_summary()
     assert "recipient_keys=1" in summary
     assert "shared_fallback=false" in summary
@@ -650,6 +655,8 @@ def test_a_hostile_body_that_breaks_the_decoder_falls_back_rather_than_escaping(
     # runs on unauthenticated input, ahead of the signature check. It must degrade to
     # "no per-recipient key", never propagate out of the verify boundary.
     body = b"[" * 60_000 + b"]" * 60_000
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: JT_KEY}))
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
     with pytest.raises(SignatureError):
-        route.verify(InboundRequest(headers={SIGNATURE_HEADER: "sha256=00"}, body=body), SECRET)
+        route.verify(
+            InboundRequest(headers={SIGNATURE_HEADER: "sha256=00"}, body=body), Secret(SECRET)
+        )

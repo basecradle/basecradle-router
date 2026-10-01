@@ -27,6 +27,7 @@ from basecradle_router.routes.github import (
     SIGNATURE_HEADER,
     IssueLedger,
 )
+from basecradle_router.secret import Secret
 
 SECRET = "s3cret-fake-webhook-signing-key"
 BODY = b'{"action":"opened","issue":{"number":42}}'
@@ -55,48 +56,48 @@ def test_github_route_satisfies_the_protocol() -> None:
 
 
 def test_verify_accepts_a_correct_signature() -> None:
-    GithubRoute(TRUSTED).verify(_request(signature=_sign(BODY, SECRET)), SECRET)
+    GithubRoute(TRUSTED).verify(_request(signature=_sign(BODY, SECRET)), Secret(SECRET))
 
 
 def test_verify_accepts_regardless_of_header_case() -> None:
     req = InboundRequest(headers={"x-hub-signature-256": _sign(BODY, SECRET)}, body=BODY)
-    GithubRoute(TRUSTED).verify(req, SECRET)
+    GithubRoute(TRUSTED).verify(req, Secret(SECRET))
 
 
 def test_verify_rejects_a_tampered_body() -> None:
     signature = _sign(BODY, SECRET)
     tampered = _request(body=BODY + b" ", signature=signature)
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute(TRUSTED).verify(tampered, SECRET)
+        GithubRoute(TRUSTED).verify(tampered, Secret(SECRET))
 
 
 def test_verify_rejects_the_wrong_secret() -> None:
     signature = _sign(BODY, "a-different-secret")
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute(TRUSTED).verify(_request(signature=signature), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=signature), Secret(SECRET))
 
 
 def test_verify_rejects_a_missing_header() -> None:
     with pytest.raises(SignatureError, match="missing"):
-        GithubRoute(TRUSTED).verify(_request(signature=None), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=None), Secret(SECRET))
 
 
 def test_verify_rejects_a_malformed_header() -> None:
     # A bare hexdigest with no 'sha256=' prefix is malformed.
     bare = _sign(BODY, SECRET).removeprefix("sha256=")
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute(TRUSTED).verify(_request(signature=bare), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=bare), Secret(SECRET))
 
 
 def test_verify_rejects_the_wrong_algorithm_prefix() -> None:
     sha1ish = "sha1=" + _sign(BODY, SECRET).removeprefix("sha256=")
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute(TRUSTED).verify(_request(signature=sha1ish), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=sha1ish), Secret(SECRET))
 
 
 def test_verify_rejects_an_empty_signature_header() -> None:
     with pytest.raises(SignatureError, match="malformed"):
-        GithubRoute(TRUSTED).verify(_request(signature=""), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature=""), Secret(SECRET))
 
 
 def test_verify_binds_the_signature_to_the_exact_body() -> None:
@@ -104,14 +105,14 @@ def test_verify_binds_the_signature_to_the_exact_body() -> None:
     other_body = b'{"action":"closed"}'
     signature = _sign(BODY, SECRET)
     with pytest.raises(SignatureError):
-        GithubRoute(TRUSTED).verify(_request(body=other_body, signature=signature), SECRET)
+        GithubRoute(TRUSTED).verify(_request(body=other_body, signature=signature), Secret(SECRET))
 
 
 def test_verify_rejects_a_non_ascii_signature_without_crashing() -> None:
     # A header digest with non-ASCII bytes must reject as a SignatureError, not
     # leak a TypeError from hmac.compare_digest's str/ASCII restriction.
     with pytest.raises(SignatureError, match="does not match"):
-        GithubRoute(TRUSTED).verify(_request(signature="sha256=café"), SECRET)
+        GithubRoute(TRUSTED).verify(_request(signature="sha256=café"), Secret(SECRET))
 
 
 # --- normalize -------------------------------------------------------------

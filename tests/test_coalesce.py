@@ -38,6 +38,7 @@ from basecradle_router.models import Agent, Event, EventKind, IssueRef, Recipien
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
+from basecradle_router.secret import Secret
 from basecradle_router.wake import WakeError, WakeResult
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -139,7 +140,9 @@ def _pipeline(
     config = Config(
         agents=MappingProxyType({agent.key: agent for agent in agents}),
         enabled_routes=frozenset({"github", "basecradle"}),
-        webhook_secrets=MappingProxyType({"github": SECRET, "basecradle": BASECRADLE_SECRET}),
+        webhook_secrets=MappingProxyType(
+            {"github": Secret(SECRET), "basecradle": Secret(BASECRADLE_SECRET)}
+        ),
         recipient_index=MappingProxyType(
             {agent.recipient_uuid: agent for agent in agents if agent.recipient_uuid}
         ),

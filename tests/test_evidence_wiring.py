@@ -25,6 +25,7 @@ from basecradle_router.pipeline import Pipeline, PipelineResult
 from basecradle_router.routes import InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.scheduler import WakeScheduler
+from basecradle_router.secret import Secret
 from basecradle_router.wake import WakeError, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
@@ -53,7 +54,7 @@ def _config() -> Config:
     return Config(
         agents=MappingProxyType({NOVA.key: NOVA}),
         enabled_routes=frozenset({"github"}),
-        webhook_secrets=MappingProxyType({"github": SECRET}),
+        webhook_secrets=MappingProxyType({"github": Secret(SECRET)}),
     )
 
 
