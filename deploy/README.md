@@ -1182,13 +1182,6 @@ fails the suite. `tests/test_caddyfile.py` checks the retry contract in every ho
    host to `INGEST_HOSTS` in `tests/test_per_host_deploy.py`. The suite fails until all three agree.
 3. The NOC adds the host to its inventory and reads the host's files from the deployed tree.
 
-> **The legacy single-host paths are transitional.** `deploy/vector.yaml` and `deploy/caddy/Caddyfile`
-> are byte-identical copies of `ai.basecradle.com`'s files, kept only because the NOC's
-> `fleet-deploy-runner` on ai still reads them by fixed path. They are deleted once it reads
-> `deploy/hosts/<fqdn>/` instead (basecradle-noc#892; the removal is #327). Until then, change ai's copy
-> under `deploy/hosts/` and copy it to the legacy path in the same change;
-> `test_the_legacy_paths_still_carry_the_reference_hosts_bytes` fails until they match.
-
 ### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
 clean-reboot mechanism in Part 4), retention for the pipeline's structured stage log, backup of

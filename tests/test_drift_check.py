@@ -111,7 +111,6 @@ def _deploy_contract_paths() -> list[str]:
     paths += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "deploy").glob("*.sh"))]
     paths += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "deploy/hosts").glob("*/*"))]
     paths += [
-        "deploy/vector.yaml",
         "pyproject.toml",
         "uv.lock",
     ]
