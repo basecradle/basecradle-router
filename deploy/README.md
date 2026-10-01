@@ -545,7 +545,7 @@ secret for every enabled route, and with the flag off it is simply never consult
 to start if the flip would strand an agent, and the `event=route_config` line at boot states
 `shared_fallback=false` so the retirement is visible rather than assumed.
 
-Both prefixes are scrubbed from the box's telemetry (`deploy/vector.yaml` redacts `bc_isk_…`
+Both prefixes are scrubbed from the box's telemetry (each host's `vector.yaml` redacts `bc_isk_…`
 Integration Signing Keys alongside `bc_uat_…` user tokens), so a value that ever reaches a log line
 does not reach Better Stack.
 
@@ -1108,16 +1108,16 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   (the wrapper loads the agent's `agent.env` after the drop).
 - **Fast-ack** in `server.py`: `accept` runs inline → `202`, `execute` (the wake) runs as a tracked
   background task drained on shutdown.
-- **The Caddyfile** (`deploy/caddy/Caddyfile`): TLS via Let's Encrypt for `ai.basecradle.com`,
-  reverse-proxy to the local uvicorn (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then
-  `caddy validate` + `systemctl reload caddy`.
+- **The Caddyfile** (`deploy/hosts/<fqdn>/Caddyfile`, one per host — see *One router, many hosts*
+  below): TLS via Let's Encrypt for that host's FQDN, reverse-proxy to the local uvicorn
+  (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then `caddy validate` + `systemctl reload caddy`.
   - **It holds a delivery across a daemon restart (#264).** `lb_try_duration 5s` re-dials the daemon
     every 250 ms for up to 5 s, instead of answering 502 while uvicorn's listener is down. GitHub never
     redelivers a failed webhook, so each 502 in that gap was a lost wake. Only a failed *dial* is
     retried for a POST, which means the request never reached the daemon, so no delivery can run twice.
     5 s is under GitHub's 10 s delivery timeout. This needs Caddy ≥ 2.11.4, the first release whose
     retry re-sends an unread POST body intact. The comment in the file carries the full reasoning, and
-    `tests/test_caddyfile.py` pins the directive.
+    `tests/test_caddyfile.py` pins the directive in every host's copy.
   - **The deploy tick does not carry it.** `deploy-router` installs only the paths in the contract
     table below, and the Caddyfile is not among them. The NOC installs the deployed tree's copy with its
     box-level Caddyfile step, which today is the idempotent `arm-probe-route` op. So a merged Caddyfile
@@ -1141,6 +1141,53 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 > token on the crown-jewels box, contradicting "the router holds no secret." Per-repo prerequisite:
 > branch protection with required status checks, **Allow auto-merge**, and **Automatically delete head
 > branches** all enabled.
+
+### One router, many hosts (#326)
+
+One router codebase runs on more than one box, each deployed by the NOC. Two files differ per box, and
+each host carries its own copy of both under **`deploy/hosts/<fqdn>/`**:
+
+| Host | What it is | Better Stack source (ingest host) |
+|---|---|---|
+| `ai.basecradle.com` | the production router box | **"AI"** (`s2531770.eu-fsn-3.betterstackdata.com`) |
+| `ubuntu-1.landfill.click` | @steve's box (Organization Landfill); no daemon deployed yet | **`landfill.click Fleet Servers`**, id 2780873 (`s2780873.eu-central-1a.betterstackdata.com`) |
+
+- **`deploy/hosts/<fqdn>/Caddyfile`** — the daemon-fronting Caddyfile, its site name the host's FQDN.
+  The NOC installs it only on a box whose daemon is deployed; until then that box's bootstrap `/up`
+  responder stays. There is deliberately no "no daemon" Caddyfile here.
+- **`deploy/hosts/<fqdn>/vector.yaml`** — the scrubbed telemetry config (Part 5), its two sinks pointed at
+  that host's **own** Better Stack source. A User on one source never writes to another (@origin,
+  2026-09-21), so a box's telemetry never lands in another box's source.
+
+Everything else is shared by every host: the units, the wrappers, the Vector drop-in
+`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`, and the token variable name
+`BETTERSTACK_AI_SOURCE_TOKEN`. That name is only a name; each box's own `/etc/vector/betterstack.env`
+holds that box's own token, placed by the capital out of band.
+
+**How the NOC finds a host's files:** by the host's FQDN, at `deploy/hosts/<fqdn>/Caddyfile` and
+`deploy/hosts/<fqdn>/vector.yaml` in the deployed tree. The bytes are installed as they are, with no
+rendering step and **no fallback**: a host with no directory has no config, never ai's.
+
+**What keeps the copies honest:** `tests/test_per_host_deploy.py`. Each host's files must equal the
+reference host's (`ai.basecradle.com`) with only that host's own values swapped in (the site name; the
+ingest host), so a scrub rule or a proxy directive can never land on one box and miss another. Hosts on
+different root domains can never share a source, and a host directory missing from the test's table
+fails the suite. `tests/test_caddyfile.py` checks the retry contract in every host's Caddyfile.
+
+**Adding a host:**
+
+1. The capital creates the host's Better Stack source and provisions the box to the fleet baseline.
+2. Here: create `deploy/hosts/<fqdn>/`, copy the reference host's two files into it, change the
+   Caddyfile's site line to the FQDN and the two sink `uri:` lines to the new ingest host, and add the
+   host to `INGEST_HOSTS` in `tests/test_per_host_deploy.py`. The suite fails until all three agree.
+3. The NOC adds the host to its inventory and reads the host's files from the deployed tree.
+
+> **The legacy single-host paths are transitional.** `deploy/vector.yaml` and `deploy/caddy/Caddyfile`
+> are byte-identical copies of `ai.basecradle.com`'s files, kept only because the NOC's
+> `fleet-deploy-runner` on ai still reads them by fixed path. They are deleted once it reads
+> `deploy/hosts/<fqdn>/` instead (basecradle-noc#892; the removal is #327). Until then, change ai's copy
+> under `deploy/hosts/` and copy it to the legacy path in the same change;
+> `test_the_legacy_paths_still_carry_the_reference_hosts_bytes` fails until they match.
 
 ### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
@@ -1472,9 +1519,10 @@ Out-of-band liveness (the capital's `/up` monitor) answers *"is the box alive?"*
 answers *"what is the box and the daemon actually doing?"* — host metrics (CPU / memory / disk /
 load / network) and the journald stream (system logs **plus** the router's own software: the
 `basecradle-router.service` uvicorn daemon and the drift/reboot/recovery units, which log to journald
-via stdout/stderr). It is the Better Stack **Vector** agent, shipping both to Telemetry Source
-**"AI"** (ingest host `s2531770.eu-fsn-3.betterstackdata.com`, EU `eu-fsn-3`). This mirrors the
-proven, scrubbed config `basecradle-noc` already runs (basecradle-noc#31/#33).
+via stdout/stderr). It is the Better Stack **Vector** agent, shipping both to **that host's own**
+Telemetry Source — **"AI"** (ingest host `s2531770.eu-fsn-3.betterstackdata.com`, EU `eu-fsn-3`) for
+`ai.basecradle.com`; the per-host table in Part 2 (*One router, many hosts*) names every host's. This
+mirrors the proven, scrubbed config `basecradle-noc` already runs (basecradle-noc#31/#33).
 
 > **⚠️ SECURITY — never ship raw journald to an external store (basecradle-noc#33 / basecradle#338).**
 > An unscrubbed install on the NOC box shipped the *entire* journal and leaked three live secrets:
@@ -1484,8 +1532,10 @@ proven, scrubbed config `basecradle-noc` already runs (basecradle-noc#31/#33).
 > `sudo -> wake-runner`, so the same `sudo` argv path is live here. The scrub below closes the class
 > and is **mandatory before telemetry is enabled** (basecradle#338 class guard).
 
-**The config is version-controlled — [`deploy/vector.yaml`](vector.yaml) is the single source of
-truth**, not Better Stack's generated kitchen-sink. It is tailored to this box (a webhook daemon +
+**The config is version-controlled — `deploy/hosts/<fqdn>/vector.yaml` is each host's single source
+of truth** (for example [`deploy/hosts/ai.basecradle.com/vector.yaml`](hosts/ai.basecradle.com/vector.yaml)),
+not Better Stack's generated kitchen-sink. Every host's copy is the same config with only its two sink
+URIs differing (Part 2, *One router, many hosts*). It is tailored to a router box (a webhook daemon +
 Caddy, no database) and has three load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
@@ -1560,7 +1610,7 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 > over a config the NOC itself shipped** (basecradle-noc#677 / #680). The router's own `drift-check.sh`
 > cannot see this file (it compares the *deploy stamp* against `origin/main`), so the whole path is the
 > NOC's. Its `auto-converge` tick runs `deploy-router` on every `main` move (Part 3), which mirrors the new
-> `deploy/vector.yaml` into the deployed tree without touching Vector, and **the same tick's Vector phase
+> `vector.yaml` into the deployed tree without touching Vector, and **the same tick's Vector phase
 > then runs the NOC's `deploy-vector` op** (basecradle-noc#202) to install it at `/etc/vector/vector.yaml`.
 > The op installs from the *deployed* tree — never a fetch of its own, so it can apply only bytes
 > `deploy-router`'s offline gate already vetted — validates the VRL before install, rolls back on failure,
@@ -1621,16 +1671,17 @@ sudo systemctl daemon-reload
 # First install only — every later vector.yaml update is the NOC's `deploy-vector` op, run unattended
 # by its auto-converge tick, which installs from the deployed router tree, validates, rolls back on
 # failure, and reads back.
-sudo install -o root -g vector -m 640 deploy/vector.yaml /etc/vector/vector.yaml
+# <fqdn> is this box's own: never another host's file, whose sinks name another source.
+sudo install -o root -g vector -m 640 deploy/hosts/<fqdn>/vector.yaml /etc/vector/vector.yaml
 sudo bash -c 'set -a; . /etc/vector/betterstack.env; vector validate /etc/vector/vector.yaml'
 sudo systemctl enable --now vector
 ```
 
 ### Verify (the definition of done — capital)
 
-In **Better Stack → Live Tail** for the **"AI"** source: (a) system/journald logs flow, (b) the
-router's own daemon/unit logs flow, (c) host metrics populate the **"Host (Vector)"** dashboard
-(source = AI) — and **zero secret values** anywhere (the scrub is the gate). To test the scrub
+In **Better Stack → Live Tail** for **the host's own** source (**"AI"** for `ai.basecradle.com`): (a)
+system/journald logs flow, (b) the router's own daemon/unit logs flow, (c) host metrics populate the
+**"Host (Vector)"** dashboard (source = the host's) — and **zero secret values** anywhere (the scrub is the gate). To test the scrub
 offline, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`: a
 synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and a message carrying a
 `ghs_…`/`…/heartbeat/…` token must come back `[REDACTED_…]`. Re-test after a reboot:

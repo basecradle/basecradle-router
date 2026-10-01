@@ -44,7 +44,7 @@ _SELF_URL_VAR = f"{ENV_PREFIX}SELF_URL"
 #: own loopback listener**, the same socket the systemd unit binds
 #: (``uvicorn --host 127.0.0.1 --port 8000``). Loopback and not the public hostname on
 #: purpose — the probe must exercise the daemon, not Caddy's TLS front end, and the
-#: injection point is deliberately not reachable from the internet (``deploy/caddy``
+#: injection point is deliberately not reachable from the internet (every host's Caddyfile
 #: answers ``/webhooks/probe`` with a 404).
 DEFAULT_SELF_URL = "http://127.0.0.1:8000"
 
