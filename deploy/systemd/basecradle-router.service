@@ -39,8 +39,9 @@ StateDirectoryMode=0755
 # without this journald stamps every line SYSLOG_IDENTIFIER=uv — the router's own
 # log was attributed to its *launcher*. `journalctl -t basecradle-router` now reads
 # the daemon (as `-t basecradle-wake-<slug>` reads one agent's wake), and the
-# identifier is what deploy/vector.yaml prefixes each shipped line with, so a Better
-# Stack Live Tail line says which program on the box emitted it.
+# identifier is what each host's deploy/hosts/<fqdn>/vector.yaml prefixes each
+# shipped line with, so a Better Stack Live Tail line says which program on the
+# box emitted it.
 SyslogIdentifier=basecradle-router
 
 # NO DURABLE uv CACHE (#280). `uv run` below starts the daemon from the venv the

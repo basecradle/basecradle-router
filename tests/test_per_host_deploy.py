@@ -84,13 +84,3 @@ def test_a_hosts_caddyfile_differs_from_the_reference_only_by_its_site_name(host
     site = f"\n{REFERENCE} {{\n"
     assert reference.count(site) == 1, "the reference Caddyfile must carry exactly one site block"
     assert _read(host, "Caddyfile") == reference.replace(site, f"\n{host} {{\n")
-
-
-def test_the_legacy_paths_still_carry_the_reference_hosts_bytes() -> None:
-    # The NOC's fleet-deploy-runner on ai.basecradle.com reads deploy/vector.yaml and
-    # deploy/caddy/Caddyfile from the deployed tree by fixed path. Until it reads
-    # deploy/hosts/<fqdn>/ instead (basecradle-noc#892), those two paths must stay
-    # byte-identical to ai's own copy, or the next deploy tick installs bytes nobody
-    # reviewed for that box. Delete both paths, and this test, once nothing reads them.
-    assert (DEPLOY / "vector.yaml").read_text() == _read(REFERENCE, "vector.yaml")
-    assert (DEPLOY / "caddy" / "Caddyfile").read_text() == _read(REFERENCE, "Caddyfile")
