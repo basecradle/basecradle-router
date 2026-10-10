@@ -59,13 +59,26 @@
 # It is asserted unconditionally for the same reason as case 7.
 #
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
-# router.env, which is root-readable only). The NOC's deploy-router op runs it on-box
-# after a restart, rolling the deploy back on failure; you can also run it by hand:
-#   sudo deploy/smoke-test.sh
+# router.env, which is router:router 0600 — the daemon's account and root only). The
+# NOC's deploy-router op runs it on-box after a restart, rolling the deploy back on
+# failure; you can also run it by hand:
+#   sudo deploy/smoke-test.sh <fqdn>
+#
+# <fqdn> is the router host this box IS — the same token the NOC's per-host ops take,
+# naming a deploy/hosts/<fqdn>/ directory in this tree (#334). Every public URL the test
+# hits is derived from it, so on a second router host the gate tests that host's own
+# endpoint, never ai's. It is NAMED BY THE CALLER, never derived from `hostname`: two
+# programs disagreeing about a box's name is how a check reports a capability absent
+# (basecradle-noc#409), and the NOC binds the same token to the same tree.
+#
+# Omitting <fqdn> is the expand half of an expand-then-contract roll, and only that: the
+# installed NOC wrapper calls this script with no argument, and an unattended deploy of
+# this very change must not fail its own smoke gate. With no argument it targets
+# ai.basecradle.com — the only router host with a daemon until the NOC passes the host —
+# and says so loudly. The fallback is retired once every caller passes the host.
 #
 # Config (env overrides):
 #   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
-#   SMOKE_URL         the endpoint to hit            (default https://ai.basecradle.com/webhooks/github)
 #
 # It never waits on a wake and never touches a real agent, so it is safe to run
 # against production at any time.
@@ -73,7 +86,7 @@
 set -euo pipefail
 
 ROUTER_ENV_FILE="${ROUTER_ENV_FILE:-/etc/basecradle-router/router.env}"
-SMOKE_URL="${SMOKE_URL:-https://ai.basecradle.com/webhooks/github}"
+HOSTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hosts"
 
 # A repo that is never in the registry, so case 3 resolves to no agent => no wake.
 UNREGISTERED_REPO="basecradle/__router-smoke-test-do-not-register__"
@@ -86,6 +99,57 @@ die() {
 	red "smoke-test: $*" >&2
 	exit 1
 }
+
+# The router host under test, validated and bound to this tree before anything is sent.
+# A lowercase DNS name — two or more dot-separated labels of [a-z0-9-], none starting or
+# ending with `-`, the last starting with a letter, at most 63 bytes a label and 253 the
+# name (the NOC's ROUTER_FQDN_RE, basecradle-noc#895) — that names a real, non-symlinked
+# deploy/hosts/<fqdn>/ directory under $HOSTS_DIR — this script's own tree, never a value
+# a caller chooses. The shape check also keeps the name from carrying a `/`, `:` or `@`
+# into the URLs built from it. Prints the host; on a refusal prints the reason to stderr
+# and returns 1, so the caller dies before a single request is made.
+#
+# The markers let tests/test_smoke_test_host.py run this EXACT body offline.
+# >>> smoke_host >>>
+SMOKE_FALLBACK_HOST="ai.basecradle.com"
+smoke_host() {
+	local fqdn=$1 label
+	local -a labels=()
+	if [[ -z "$fqdn" ]]; then
+		printf 'smoke-test: no <fqdn> given — targeting %s, the transitional default (#334).\n' \
+			"$SMOKE_FALLBACK_HOST" >&2
+		printf 'smoke-test: pass the router host this box is; the default is retired once every caller does.\n' >&2
+		fqdn="$SMOKE_FALLBACK_HOST"
+	fi
+	if ((${#fqdn} > 253)) ||
+		[[ ! "$fqdn" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?$ ]]; then
+		printf 'smoke-test: invalid <fqdn> %q (a lowercase DNS name naming a deploy/hosts/<fqdn>/ directory)\n' "$fqdn" >&2
+		return 1
+	fi
+	IFS='.' read -ra labels <<<"$fqdn"
+	for label in "${labels[@]}"; do
+		if ((${#label} > 63)); then
+			printf 'smoke-test: invalid <fqdn> %s (a label longer than 63 bytes)\n' "$fqdn" >&2
+			return 1
+		fi
+	done
+	if [[ -L "$HOSTS_DIR" || -L "$HOSTS_DIR/$fqdn" ]]; then
+		printf 'smoke-test: deploy/hosts or deploy/hosts/%s is a symlink — refusing to read through it\n' "$fqdn" >&2
+		return 1
+	fi
+	if [[ ! -d "$HOSTS_DIR/$fqdn" ]]; then
+		printf 'smoke-test: this tree has no deploy/hosts/%s/ — not a router host this tree knows\n' "$fqdn" >&2
+		return 1
+	fi
+	printf '%s' "$fqdn"
+	return 0
+}
+# <<< smoke_host <<<
+
+(($# <= 1)) || die "takes at most one argument, the router host's <fqdn> (got $#)"
+SMOKE_HOST="$(smoke_host "${1-}")" || exit 1
+SMOKE_BASE="https://${SMOKE_HOST}/webhooks"
+SMOKE_URL="${SMOKE_BASE}/github"
 
 [[ -r "$ROUTER_ENV_FILE" ]] || die "cannot read $ROUTER_ENV_FILE (run with sudo / as root)"
 
@@ -256,7 +320,7 @@ assert_journal_has() {
 }
 # <<< assert_journal_has <<<
 
-log "Smoke-testing live daemon at ${SMOKE_URL}"
+log "Smoke-testing the live daemon on ${SMOKE_HOST} at ${SMOKE_URL}"
 log "Trusted actor under test: ${trusted_login}"
 
 # Journald boundary for the observability assertions below: capture it before any
@@ -333,7 +397,7 @@ assert_journal_has "delivery id threaded onto the decision line (#170)" \
 # actionable event — which is precisely the delivery that wakes a real harness — so it
 # stays offline (tests/test_basecradle_route.py, tests/test_server_e2e.py). The github
 # route still covers accept -> normalize -> resolve-miss live, in case 3.
-BC_URL="${BC_URL:-${SMOKE_URL%/*}/basecradle}"
+BC_URL="${SMOKE_BASE}/basecradle"
 BC_SECRET_VAR="BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET"
 # The daemon derives a per-recipient variable as the route-wide name plus `_<SLUG>`
 # (`config.route_secret_var` + `basecradle.RECIPIENT_SECRET_PREFIX`), so deriving it from
@@ -356,6 +420,8 @@ BC_FALLBACK_DELIVERY="smoke-basecradle-fallback-00000000-0000-0000-0000-00000000
 
 bc_secret="$(env_value "$BC_SECRET_VAR")"
 
+# `resource.url` is fabricated payload data describing a platform resource; nothing ever
+# fetches it, so it is not one of the URLs derived from <fqdn> and stays fixed on every host.
 bc_payload() {
 	local recipient=$1 delivery=$2
 	cat <<-JSON
@@ -532,7 +598,7 @@ fi
 # the running daemon does not serve the route (a bad-sig probe returns 404, not 401).
 # Both cases are safe against production — neither carries a valid signature, so
 # nothing is ever normalized and no agent is ever woken.
-PROBE_PUBLIC_URL="${PROBE_PUBLIC_URL:-${SMOKE_URL%/*}/probe}"
+PROBE_PUBLIC_URL="${SMOKE_BASE}/probe"
 PROBE_LOCAL_URL="${PROBE_LOCAL_URL:-http://127.0.0.1:8000/webhooks/probe}"
 
 probe_post() {

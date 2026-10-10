@@ -94,7 +94,7 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   the one unit of ours that genuinely runs as root, so its
                                    #   ExecStart points here rather than into app/.
 /etc/basecradle-router/
-  router.env                       # daemon config (owner router, 0600) — see below
+  router.env                       # daemon config (router:router, 0600) — see below
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
                                    #   read-only (0640) — it is the wake-runner's trusted allowlist
                                    #   so the daemon must not be able to write it; NO secrets
@@ -528,7 +528,7 @@ on exactly one agent instead of a mute rise in 401s. The line is emitted only *a
 before that the recipient is an unauthenticated claim.
 
 **Provisioning a key.** The value is the router's own verification key, not an agent credential, so it
-belongs in `router.env` (chmod-640, root-owned, read by the daemon) — **never** in an agent's
+belongs in `router.env` (`router:router`, `0600`, read by the daemon) — **never** in an agent's
 `agent.env`, which the unprivileged daemon deliberately cannot read. It is placed by **@origin's hands
 through the NOC's deploy/converge path**, the same way every other value in `router.env` is; the
 capital coordinates the sequencing, the router-AI never touches the box. A secret **never transits a
@@ -1144,13 +1144,13 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 
 ### One router, many hosts (#326)
 
-One router codebase runs on more than one box, each deployed by the NOC. Two files differ per box, and
-each host carries its own copy of both under **`deploy/hosts/<fqdn>/`**:
+One router codebase runs on more than one box, each deployed by the NOC. Three files differ per box, and
+each host carries its own copy of all three under **`deploy/hosts/<fqdn>/`**:
 
-| Host | What it is | Better Stack source (ingest host) |
-|---|---|---|
-| `ai.basecradle.com` | the production router box | **"AI"** (`s2531770.eu-fsn-3.betterstackdata.com`) |
-| `ubuntu-1.landfill.click` | @steve's box (Organization Landfill); no daemon deployed yet | **`landfill.click Fleet Servers`**, id 2780873 (`s2780873.eu-central-1a.betterstackdata.com`) |
+| Host | What it is | Better Stack source (ingest host) | Reboot window |
+|---|---|---|---|
+| `ai.basecradle.com` | the production router box | **"AI"** (`s2531770.eu-fsn-3.betterstackdata.com`) | `05:00 America/Chicago` + ≤15 min |
+| `ubuntu-1.landfill.click` | @steve's box (Organization Landfill); no daemon deployed yet | **`landfill.click Fleet Servers`**, id 2780873 (`s2780873.eu-central-1a.betterstackdata.com`) | `12:00 UTC` + ≤15 min (interim slot) |
 
 - **`deploy/hosts/<fqdn>/Caddyfile`** — the daemon-fronting Caddyfile, its site name the host's FQDN.
   The NOC installs it only on a box whose daemon is deployed; until then that box's bootstrap `/up`
@@ -1158,28 +1158,35 @@ each host carries its own copy of both under **`deploy/hosts/<fqdn>/`**:
 - **`deploy/hosts/<fqdn>/vector.yaml`** — the scrubbed telemetry config (Part 5), its two sinks pointed at
   that host's **own** Better Stack source. A User on one source never writes to another (@origin,
   2026-09-21), so a box's telemetry never lands in another box's source.
+- **`deploy/hosts/<fqdn>/basecradle-router-reboot.timer`** — the clean-reboot timer (Part 4), its
+  `OnCalendar=` the host's slot in the fleet's reboot stagger registry (`basecradle/basecradle` →
+  `provision-server` §2.3), which the capital assigns. Two router boxes rebooting in one window is what the
+  registry forbids, so the timer is never shared (#334).
 
-Everything else is shared by every host: the units, the wrappers, the Vector drop-in
+Everything else is shared by every host: the other units, the wrappers, the Vector drop-in
 `deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`, and the token variable name
 `BETTERSTACK_AI_SOURCE_TOKEN`. That name is only a name; each box's own `/etc/vector/betterstack.env`
 holds that box's own token, placed by the capital out of band.
 
-**How the NOC finds a host's files:** by the host's FQDN, at `deploy/hosts/<fqdn>/Caddyfile` and
-`deploy/hosts/<fqdn>/vector.yaml` in the deployed tree. The bytes are installed as they are, with no
+**How the NOC finds a host's files:** by the host's FQDN, at `deploy/hosts/<fqdn>/Caddyfile`,
+`deploy/hosts/<fqdn>/vector.yaml` and `deploy/hosts/<fqdn>/basecradle-router-reboot.timer` in the deployed
+tree; the smoke test takes the same `<fqdn>`. The bytes are installed as they are, with no
 rendering step and **no fallback**: a host with no directory has no config, never ai's.
 
 **What keeps the copies honest:** `tests/test_per_host_deploy.py`. Each host's files must equal the
 reference host's (`ai.basecradle.com`) with only that host's own values swapped in (the site name; the
-ingest host), so a scrub rule or a proxy directive can never land on one box and miss another. Hosts on
-different root domains can never share a source, and a host directory missing from the test's table
+ingest host; the reboot window), so a scrub rule, a proxy directive or a timer setting can never land on one
+box and miss another. Each host's window is pinned to its registry slot, and no two hosts may share one.
+Hosts on different root domains can never share a source, and a host directory missing from the test's table
 fails the suite. `tests/test_caddyfile.py` checks the retry contract in every host's Caddyfile.
 
 **Adding a host:**
 
 1. The capital creates the host's Better Stack source and provisions the box to the fleet baseline.
-2. Here: create `deploy/hosts/<fqdn>/`, copy the reference host's two files into it, change the
-   Caddyfile's site line to the FQDN and the two sink `uri:` lines to the new ingest host, and add the
-   host to `INGEST_HOSTS` in `tests/test_per_host_deploy.py`. The suite fails until all three agree.
+2. Here: create `deploy/hosts/<fqdn>/`, copy the reference host's three files into it, change the
+   Caddyfile's site line to the FQDN, the two sink `uri:` lines to the new ingest host, and the timer's
+   `OnCalendar=` to the host's registry slot, and add the host to `INGEST_HOSTS` and `REBOOT_WINDOWS` in
+   `tests/test_per_host_deploy.py`. The suite fails until they all agree.
 3. The NOC adds the host to its inventory and reads the host's files from the deployed tree.
 
 ### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
@@ -1270,9 +1277,10 @@ never out of the mirrored tree), and they are this repo's to keep stable:
 |---|---|
 | `/opt/basecradle-router/app` | the **root-owned** daemon tree the op mirrors into (protecting its `.venv`, the one `router:router` path). Ownership is narrowed **before** the mirror and **read back after** it, and only then is anything root-owned installed (basecradle-noc#777). The op then runs **`uv sync --locked`** as `router`. The sync must land **before** the restart: the unit starts cache-less and `--no-sync`, so it neither rebuilds nor reaches the network — it runs exactly what the sync left (#280, #297). |
 | `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
-| `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). |
+| `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). **The reboot timer is not here**: it is per host (next row). |
+| `deploy/hosts/<fqdn>/basecradle-router-reboot.timer` | the host's **own** reboot window (#334), installed `0644` to `/etc/systemd/system/` and armed (`enable --now`) like the shared timers. There is deliberately no shared copy: a host whose directory lacks it gets no reboot timer, never another box's window. |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written `0644` — the drift source `drift-check.sh` reads. The file mode is world-readable but its directory is not: `/etc/basecradle-router` is `750 root:router` (it also holds `router.env`), so only root and the `router` group reach the stamp. That is by design — the drift unit runs `User=router` and traverses as a group member; any other reader (an operator account included) needs `sudo`. |
-| `deploy/smoke-test.sh` | run as root post-restart as the live smoke gate; a smoke failure rolls the deploy back. It is the **one** root-run script of ours that stays inside the mirrored tree, deliberately: it is invoked in-band by the op, in the same run that just narrowed ownership and read it back (steps 1 and 3 above), so its safety rests on a check made *seconds earlier in the same process* rather than on a standing property. The **scheduled** root path — a unit firing days later against whatever the tree has become — is the one that cannot rest on that, which is why `reboot-if-required.sh` moved to `deploy/bin/` (#297). Moving the smoke test too would be a cross-repo re-point of a contract row for no gain. |
+| `deploy/smoke-test.sh <fqdn>` | run as root post-restart as the live smoke gate, given the host being deployed (`deploy/hosts/<fqdn>/`, #334); a smoke failure rolls the deploy back. It is the **one** root-run script of ours that stays inside the mirrored tree, deliberately: it is invoked in-band by the op, in the same run that just narrowed ownership and read it back (steps 1 and 3 above), so its safety rests on a check made *seconds earlier in the same process* rather than on a standing property. The **scheduled** root path — a unit firing days later against whatever the tree has become — is the one that cannot rest on that, which is why `reboot-if-required.sh` moved to `deploy/bin/` (#297). Moving the smoke test too would be a cross-repo re-point of a contract row for no gain. |
 
 > **`recovery.service` enable is a provisioning concern, not a routine-deploy one.** The NOC op never
 > re-`enable`s `basecradle-router-recovery.service`, because it cannot distinguish a service that must be
@@ -1364,14 +1372,23 @@ unit that opts into a private mount namespace.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
-the trusted-actor list, and the registry path from `router.env` (root-readable only), so it runs on the box
-(the `deploy-router` op runs it as root post-restart; or `sudo deploy/smoke-test.sh` by hand); the basecradle
-cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`. It defaults
-`SMOKE_URL` to the live endpoint, so it needs no argument. The same status-code outcomes are pinned offline in
-`tests/test_server_e2e.py`, and the gate's own shell mirrors of the daemon's rules — the `<SLUG>` scrub, the
-boolean env parse, the registry read, and both journal regexes — are run against the daemon's own functions
-and rendered bytes in `tests/test_smoke_test_assertions.py`, so the smoke test can't bit-rot against the route
-logic unnoticed.
+the trusted-actor list, and the registry path from `router.env` (`router:router 0600`), so it runs on the box
+(the `deploy-router` op runs it as root post-restart; or `sudo deploy/smoke-test.sh <fqdn>` by hand); the
+basecradle cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`.
+
+**It targets the host it is given (#334).** `<fqdn>` is the router host the box *is* — the same token the
+NOC's per-host ops take — and must name a `deploy/hosts/<fqdn>/` directory in the tree, or the test refuses
+before sending anything. Every public URL it sends to (`https://<fqdn>/webhooks/{github,basecradle,probe}`) is
+derived from it; there is no URL override. The host is named by the caller, never read from `hostname`
+(basecradle-noc#409). With **no** argument it targets `ai.basecradle.com` and says so on stderr: that is the
+expand half of an expand-then-contract roll, kept only because the installed NOC wrapper still calls it bare,
+and it is retired once every caller passes the host. `tests/test_smoke_test_host.py` runs the whole shipped
+script against a fake `curl` once per host in `deploy/hosts/` and asserts every request it makes.
+
+The same status-code outcomes are pinned offline in `tests/test_server_e2e.py`, and the gate's own shell
+mirrors of the daemon's rules — the `<SLUG>` scrub, the boolean env parse, the registry read, and both
+journal regexes — are run against the daemon's own functions and rendered bytes in
+`tests/test_smoke_test_assertions.py`, so the smoke test can't bit-rot against the route logic unnoticed.
 
 ### Drift can never be silent: `deploy/drift-check.sh` + the timer
 `drift-check.sh` compares the stamped deployed SHA against the live tip of `origin/main`, fetched
@@ -1489,20 +1506,22 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 |---|---|---|
 | `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) — runs `User=router`, unprivileged | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |
 | `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `/opt/basecradle-router/bin/reboot-if-required.sh`) — the one unit that runs as **root** | `static` (timer-driven). Install (`daemon-reload`). |
-| `basecradle-router-reboot.timer` | schedules the reboot check in a low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
+| `basecradle-router-reboot.timer` (per host: `deploy/hosts/<fqdn>/`) | schedules the reboot check in the host's own low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
 
 ### The reboot policy (decided: automatic)
-**Automatic reboots are on.** The `basecradle-router-reboot.timer` fires daily at **5:00 AM US Central**
+**Automatic reboots are on.** The `basecradle-router-reboot.timer` fires daily in **each host's own
+window** — its slot in the fleet's reboot stagger registry, one `OnCalendar=` per host under
+`deploy/hosts/<fqdn>/` (#334; the table in Part 2 → *One router, many hosts* lists them), plus
+`RandomizedDelaySec=15min`. On `ai.basecradle.com` that is **5:00 AM US Central**
 (`OnCalendar=*-*-* 05:00:00 America/Chicago` — the timezone is named in the spec so it stays 5 AM Central
-across DST; the box's systemd 255 supports this, vs. a fixed UTC value that would drift an hour;
-`RandomizedDelaySec=15min`). `reboot-if-required.sh` no-ops unless a reboot is actually pending, so an
-actual reboot happens only on the days an OS update staged one. This is the founder's call (issue #66): the deferral was only until the mechanism existed and
-was verified working — now it is, so the box reboots itself to take security/kernel patches, and the
-recovery gate confirms it came back (or alarms). It pairs with the hardening duty
+across DST; the box's systemd 255 supports this, vs. a fixed UTC value that would drift an hour).
+`reboot-if-required.sh` no-ops unless a reboot is actually pending, so an actual reboot happens only on the
+days an OS update staged one. This is the founder's call (issue #66): the deferral was only until the
+mechanism existed and was verified working — now it is, so the box reboots itself to take security/kernel
+patches, and the recovery gate confirms it came back (or alarms). It pairs with the hardening duty
 (`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works
 (`systemctl start basecradle-router-reboot.service`, or `/opt/basecradle-router/bin/reboot-if-required.sh`
-by hand as root) for an
-out-of-window reboot.
+by hand as root) for an out-of-window reboot.
 
 ---
 

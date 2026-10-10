@@ -1,0 +1,43 @@
+# Schedule for the clean-reboot check (basecradle-router-reboot.service).
+#
+# ENABLED — automatic reboots are ON (founder decision, issue #66: "done" means
+# auto-reboot is operational, not deferred). Enabling this timer is what turns
+# automatic reboots on:
+#   systemctl daemon-reload && systemctl enable --now basecradle-router-reboot.timer
+#
+# PER HOST (#334): every router host carries its own copy of this timer under
+# deploy/hosts/<fqdn>/, and the copies differ ONLY in the OnCalendar= line — the host's
+# slot in the fleet's reboot stagger registry (basecradle/basecradle → provision-server
+# §2.3). Two router boxes rebooting in the same window is what the registry forbids, so
+# there is deliberately no shared copy under deploy/systemd/ and no default window: a
+# host with no copy of its own has no reboot timer, never another box's.
+# tests/test_per_host_deploy.py holds the copies to that one-line difference and pins
+# every host's window to its registry slot. Each window names its timezone in the
+# calendar spec; systemd 255 (Ubuntu 24.04) supports that, and a zone that observes DST
+# keeps its local hour all year where a fixed UTC value would drift an hour.
+#
+# The orchestrator (reboot-if-required.sh) NO-OPS unless a reboot is actually pending, so
+# the timer firing daily is cheap; an actual reboot happens only on the days an OS update
+# staged one. RandomizedDelaySec spreads the wake off the exact minute, so a slot is its
+# OnCalendar= time plus up to 15 minutes. The post-boot recovery gate
+# (basecradle-router-recovery.service) confirms the box came back and alarms
+# (systemctl --failed) if it did not — that gate is what makes an unattended reboot safe.
+
+[Unit]
+Description=Run the BaseCradle router clean-reboot check in a low-traffic window
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 UTC
+RandomizedDelaySec=15min
+# Persistent=false (the default) ON PURPOSE: a reboot must happen ONLY in this host's
+# window, never as a catch-up at an arbitrary time. Persistent=true would fire the
+# service immediately when the timer starts after a missed run (box was off across
+# its window, or the NOC's deploy-router op re-arms it with `enable --now` after
+# inactivity) — and if a reboot were pending that would reboot the box off-window.
+# Missing one day's window is harmless: the next day's window catches the
+# still-pending reboot. (Contrast the DRIFT timer, which keeps Persistent=true —
+# catching up a missed SHA comparison is both harmless and useful.)
+Persistent=false
+
+[Install]
+WantedBy=timers.target
