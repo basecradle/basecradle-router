@@ -8,7 +8,10 @@
 # this rule — decides which agent user, clone, and command are permitted; this
 # rule's job is only to narrow root access to that single binary. Its safety
 # depends on /opt/basecradle-router/bin/wake-runner (and its directory) being
-# root-owned and not writable by `router`; see deploy/bootstrap.sh.
+# root-owned and not writable by `router`. The NOC's deploy-router op reinstalls it
+# root:root 0755 from its own root-owned staging clone on every deploy; see
+# deploy/README.md → Part 2 (the wake-runner wrapper) and Part 3 (the `deploy/bin/*`
+# contract row).
 #
 # Pin a scrubbed environment and a trusted PATH for this command, so the boundary
 # never depends on the base sudoers defaults staying put.
