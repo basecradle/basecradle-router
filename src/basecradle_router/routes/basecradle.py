@@ -118,7 +118,10 @@ RECIPIENT_SECRET_PREFIX = f"{route_secret_var(ROUTE_NAME)}_"
 #: Env flag retiring the shared route-wide fallback at the end of the cutover.
 #: Defaults to **enabled**, which is today's behaviour exactly; setting it false is
 #: the single act that ends the shared-secret era. See :func:`load_recipient_keyring`
-#: for why flipping it cannot silently strand an agent.
+#: for why flipping it cannot silently strand an agent. Retired, the route-wide
+#: ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET`` is no longer demanded either (#337):
+#: it may stay set or be removed, and is never consulted — see
+#: :attr:`BasecradleRoute.requires_route_secret`.
 SHARED_FALLBACK_VAR = f"{ENV_PREFIX}{ROUTE_NAME.upper()}_SHARED_SECRET_FALLBACK"
 
 #: The two values of the ``key=`` field on a ``verify_key`` line — the whole point of
@@ -209,7 +212,9 @@ class RecipientKeyring:
     by_recipient: Mapping[str, Secret] = field(default_factory=lambda: MappingProxyType({}))
     shared_fallback: bool = True
 
-    def select(self, recipient_uuid: str | None, shared_secret: Secret) -> tuple[Secret, str]:
+    def select(
+        self, recipient_uuid: str | None, shared_secret: Secret | None
+    ) -> tuple[Secret | None, str]:
         """The ``(secret, key_path)`` to verify a delivery for ``recipient_uuid`` with.
 
         Per-recipient key first, shared secret second, and — once the fallback is
@@ -225,6 +230,11 @@ class RecipientKeyring:
         The message names the key path but never the recipient: at this point the uuid
         is still attacker-supplied, and this string reaches both the journal and the
         evidence document.
+
+        ``shared_secret`` is ``None`` when the box holds no route-wide value, which boot
+        allows only once the fallback is retired — so the retired branch never reads it,
+        and the armed branch never sees ``None`` on a daemon that started. Were that ever
+        to break, the ``None`` reaches the HMAC boundary, which refuses it.
         """
         if recipient_uuid is not None:
             secret = self.by_recipient.get(recipient_uuid)
@@ -398,6 +408,19 @@ class BasecradleRoute:
         """
         self.keyring = keyring if keyring is not None else RecipientKeyring()
 
+    @property
+    def requires_route_secret(self) -> bool:
+        """Whether the core must hold ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET`` (#337).
+
+        Only while the shared fallback is armed: that value is the fallback, and nothing
+        else on this route reads it. Retired, every delivery verifies under its
+        recipient's own key or is refused before any digest is computed, so demanding the
+        shared value would demand a secret that can verify nothing. The core reads this
+        through :func:`~basecradle_router.routes.base.route_requires_secret` and so never
+        learns what a fallback is.
+        """
+        return self.keyring.shared_fallback
+
     def boot_summary(self) -> str:
         """What this route booted with, for the line beside the startup banner.
 
@@ -413,14 +436,15 @@ class BasecradleRoute:
             shared_fallback=self.keyring.shared_fallback,
         )
 
-    def verify(self, request: InboundRequest, secret: Secret) -> None:
+    def verify(self, request: InboundRequest, secret: Secret | None) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         Valid means: a present ``X-BaseCradle-Signature`` header of the form
         ``sha256=<hexdigest>`` whose digest equals the HMAC-SHA256 of the raw body
         under **the key this delivery's recipient is signed for** — its own
         Integration Signing Key when one is provisioned, otherwise the route-wide
-        ``secret`` the core passes in, while the shared fallback survives. The
+        ``secret`` the core passes in, while the shared fallback survives (``None``
+        once it is retired and the box holds no route-wide value). The
         comparison itself is the shared
         :func:`~basecradle_router.routes.base.verify_hmac_sha256` boundary, so this
         route still verifies byte-for-byte identically to github.

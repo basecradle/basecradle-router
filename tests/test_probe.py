@@ -39,6 +39,7 @@ from types import MappingProxyType
 
 import pytest
 
+from basecradle_router.app import build_registry
 from basecradle_router.claims import build_manifests
 from basecradle_router.config import Config, ConfigError, load_config, load_self_url
 from basecradle_router.evidence import EvidenceStore, read_evidence
@@ -1096,9 +1097,10 @@ def test_the_probe_route_needs_its_own_secret_like_every_other_route(tmp_path) -
         "BASECRADLE_ROUTER_AGENTS": str(registry_file),
         "BASECRADLE_ROUTER_ENABLED_ROUTES": "github,probe",
         "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET": "s",
+        "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": "john",
     }
     with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET"):
-        load_config(env)
+        build_registry(load_config(env), env)
 
     loaded = load_config({**env, "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET": PROBE_SECRET})
     assert loaded.webhook_secret("probe") == Secret(PROBE_SECRET)

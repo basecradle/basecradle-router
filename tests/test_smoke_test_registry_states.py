@@ -160,7 +160,12 @@ def _fake_bin(tmp_path: Path, log: Path) -> Path:
 
 
 def _run(
-    tmp_path: Path, *, registry: dict[str, object], keys: dict[str, str]
+    tmp_path: Path,
+    *,
+    registry: dict[str, object],
+    keys: dict[str, str],
+    shared_secret: bool = True,
+    fallback: str = "0",
 ) -> tuple[subprocess.CompletedProcess[str], list[tuple[str, str, str]]]:
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps(registry))
@@ -168,9 +173,9 @@ def _run(
     env_file.write_text(
         f"BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET={GITHUB_SECRET}\n"
         "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=nova\n"
-        f"BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET={BC_SECRET}\n"
-        f"{SHARED_FALLBACK_VAR}=0\n"
-        f"BASECRADLE_ROUTER_AGENTS={agents}\n"
+        + (f"BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET={BC_SECRET}\n" if shared_secret else "")
+        + (f"{SHARED_FALLBACK_VAR}={fallback}\n" if fallback else "")
+        + f"BASECRADLE_ROUTER_AGENTS={agents}\n"
         + "".join(f"{RECIPIENT_SECRET_PREFIX}{suffix}={key}\n" for suffix, key in keys.items())
     )
     log = tmp_path / "requests.log"
@@ -236,3 +241,46 @@ def test_a_registered_agent_with_no_key_and_the_fallback_retired_still_dies(
         result.stderr
     )
     assert CASE_45_DELIVERY not in {d for _, d, _ in requests}
+
+
+# --- a retired fallback with no shared value on the box (#337) ----------------
+#
+# Once the fallback is retired the daemon no longer demands the shared value, so a new
+# host's router.env need never carry one. The gate must still run every basecradle case
+# it can there — skipping on the value's absence would silently drop the route's whole
+# live proof on exactly those hosts.
+
+
+def test_a_new_host_with_no_shared_secret_still_runs_the_basecradle_cases(
+    tmp_path: Path,
+) -> None:
+    result, requests = _run(tmp_path, registry={}, keys={}, shared_secret=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "basecradle route:" not in result.stdout  # neither skip line: the route ran
+    assert "PASS  basecradle unsigned delivery rejected" in result.stdout
+    assert "nothing to refuse" in result.stdout
+    # The route probe alone: no key for cases 4 and 5, no shared value for case 6.
+    assert _basecradle(requests) == [(CASE_6_DELIVERY, "401")]
+
+
+def test_a_keyed_host_with_no_shared_secret_runs_cases_4_and_5(tmp_path: Path) -> None:
+    result, requests = _run(tmp_path, registry=NOVA, keys={"NOVA": NOVA_KEY}, shared_secret=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS  basecradle verified on key_path=recipient" in result.stdout
+    assert "nothing to refuse" in result.stdout
+    assert _basecradle(requests) == [
+        (CASE_6_DELIVERY, "401"),  # the route probe
+        (CASE_45_DELIVERY, "401"),  # case 4, forged digest
+        (CASE_45_DELIVERY, "200"),  # case 5, valid digest
+    ]
+
+
+def test_an_armed_fallback_with_no_shared_secret_is_not_wired(tmp_path: Path) -> None:
+    """The daemon demands the shared value while the fallback is armed, so there is no
+    basecradle route to test — the pre-#337 skip, kept for exactly this state."""
+    result, requests = _run(
+        tmp_path, registry=NOVA, keys={"NOVA": NOVA_KEY}, shared_secret=False, fallback=""
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "the shared fallback is armed — not wired yet; skipping" in result.stdout
+    assert _basecradle(requests) == []

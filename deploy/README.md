@@ -363,8 +363,10 @@ BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
 BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
 BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. drawkkwast,basecradle-router-ai[bot]>
 # BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"; set to "github,basecradle"
-#   to also accept the platform's Event Delivery (then the basecradle secret is required):
+#   to also accept the platform's Event Delivery:
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
+# The shared fallback Integration Signing Key — required ONLY while the fallback below is
+# armed; with ..._SHARED_SECRET_FALLBACK=0 it can verify nothing, so omit it (issue #337):
 # BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET=<the shared fallback Integration Signing Key>
 #
 # Per-recipient signing keys (issue #236) — ONE key per harness agent, named by its slug
@@ -489,7 +491,7 @@ route uses.
 | Variable | Holds |
 |---|---|
 | `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_<SLUG>` | that agent's own Integration Signing Key |
-| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` | the shared fallback, during the cutover |
+| `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` | the shared fallback, during the cutover — required while the fallback is armed, optional and never consulted once it is retired |
 | `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK` | `1` (default) or `0` to retire the fallback |
 
 `<SLUG>` is the agent's **`agents.json` key**, upper-cased with **every character outside
@@ -540,10 +542,15 @@ Integration Signing Key on the platform → @origin adds `…_WEBHOOK_SECRET_<SL
 the gap between the first two steps short is what keeps that agent's deliveries from failing five
 times and auto-disabling its integration. Once every agent reads `key_path=recipient`, retire the shared value: set
 `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK=0` and decommission the shared secret on the
-platform side. `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` itself **stays set** — the core requires a
-secret for every enabled route, and with the flag off it is simply never consulted; the daemon refuses
-to start if the flip would strand an agent, and the `event=route_config` line at boot states
-`shared_fallback=false` so the retirement is visible rather than assumed.
+platform side. `BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET` then becomes **optional**: with the flag off
+it can verify nothing, so the daemon no longer demands it — absent or present, it is never consulted
+(issue #337). A box that already carries it boots unchanged and may drop the line at any converge; a
+new host never mints one. The route itself states the requirement (`requires_route_secret`, true exactly
+while the fallback is armed), so the core still demands the value of every route that reads one. The
+daemon refuses to start if the flip would strand an agent, and the `event=route_config` line at boot
+states `shared_fallback=false` so the retirement is visible rather than assumed. The live smoke test
+follows the same rule: it runs the basecradle cases whenever the fallback is retired, shared value or
+not, and treats the route as unwired only when the value is absent while the fallback is armed.
 
 Both prefixes are scrubbed from the box's telemetry (each host's `vector.yaml` redacts `bc_isk_…`
 Integration Signing Keys alongside `bc_uat_…` user tokens), so a value that ever reaches a log line

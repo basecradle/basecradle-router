@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping
 from basecradle_router.breaker import WakeRateBreaker
 from basecradle_router.config import (
     Config,
+    ConfigError,
     load_breaker_config,
     load_config,
     load_dedup_ttl,
@@ -30,11 +31,12 @@ from basecradle_router.config import (
     load_github_trusted_actors,
     load_wake_lanes,
     load_wake_lock_dir,
+    route_secret_var,
 )
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.pipeline import Pipeline
-from basecradle_router.routes import RouteRegistry
+from basecradle_router.routes import RouteRegistry, route_requires_secret
 from basecradle_router.routes.basecradle import BasecradleRoute, load_recipient_keyring
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.probe import ProbeRoute
@@ -78,7 +80,9 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
 
     A route is registered only when its source is enabled, so each route's own
     required config — the github trust allow-list, the basecradle per-recipient
-    keyring — is demanded only when in use.
+    keyring — is demanded only when in use. The route-wide signing secret is demanded
+    here too, last, because only a built route can say whether it needs one (see
+    :func:`_require_route_secrets`).
     """
     registry = RouteRegistry()
     if "github" in config.enabled_routes:
@@ -103,7 +107,28 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
         # has no lever — the emitter then publishes no synthetic claim, so nothing
         # advertises a capability this deployment does not have.
         registry.register(ProbeRoute())
+    _require_route_secrets(config, registry)
     return registry
+
+
+def _require_route_secrets(config: Config, registry: RouteRegistry) -> None:
+    """Refuse to boot unless every enabled route that needs a route-wide secret has one.
+
+    Every enabled route needs ``BASECRADLE_ROUTER_<ROUTE>_WEBHOOK_SECRET`` unless its own
+    configuration says it reads none (:func:`route_requires_secret`) — today, only the
+    basecradle route with its shared fallback retired, where the value can verify
+    nothing and so is optional: absent or present, never consulted (#337). The question
+    goes to the route, so this names no source.
+
+    An enabled name with no route behind it is demanded a secret as before: there is no
+    route to vouch that it needs none, and the answer never fails open.
+    """
+    for name in sorted(config.enabled_routes):
+        if name in config.webhook_secrets:
+            continue
+        if name in registry and not route_requires_secret(registry.get(name)):
+            continue
+        raise ConfigError(f"route {name!r} is enabled but {route_secret_var(name)} is not set")
 
 
 def _bot_login_for_repo(config: Config) -> Callable[[str], str | None]:

@@ -363,7 +363,7 @@ class GithubRoute:
             return None
         return self._ledger.reason_to_drop(event.origin.url)
 
-    def verify(self, request: InboundRequest, secret: Secret) -> None:
+    def verify(self, request: InboundRequest, secret: Secret | None) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         Valid means: a present ``X-Hub-Signature-256`` header of the form

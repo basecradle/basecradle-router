@@ -12,6 +12,7 @@ from basecradle_router.routes.base import (
     parse_json_object,
     parse_timestamp,
     route_recheck,
+    route_requires_secret,
     verify_hmac_sha256,
 )
 from basecradle_router.routes.basecradle import (
@@ -42,5 +43,6 @@ __all__ = [
     "parse_json_object",
     "parse_timestamp",
     "route_recheck",
+    "route_requires_secret",
     "verify_hmac_sha256",
 ]
