@@ -38,7 +38,9 @@
 #
 # These self-gate: skipped if the basecradle route-wide secret is unset, and skipped if
 # the running daemon does not yet serve the route, so a deploy made before the capital
-# enables basecradle stays green.
+# enables basecradle stays green. Cases 4 and 5 are also skipped, with case 6 still
+# asserted, on a host with no registered harness agent and the fallback retired — a new
+# router host's first deploy, where there is no key to verify under at all (#338).
 #
 # Two more prove the synthetic wake's injection point is where it is supposed to be —
 # on the box and nowhere else (#208):
@@ -472,9 +474,18 @@ registry_harness_agents() {
 
 # The first registered harness agent holding a per-recipient signing key on THIS box, as
 # bc_slug / bc_uuid / bc_key. All three are left empty when no agent has a key of its
-# own — a pre-cutover box, where the shared fallback is necessarily still armed, because
-# `load_recipient_keyring` refuses to boot a daemon whose fallback is retired while any
-# registered agent is unprovisioned.
+# own. That is one of two boxes, and bc_registered — `true` when the registry holds any
+# harness agent at all, else `false` — tells them apart:
+#
+#   * a pre-cutover box (agents registered, none keyed), where the shared fallback is
+#     necessarily still armed, because `load_recipient_keyring` refuses to boot a daemon
+#     whose fallback is retired while any registered agent is unprovisioned;
+#   * a box with no harness agent registered — every new router host until its first
+#     agent lands — where that refusal has no one to name, so the daemon boots with the
+#     fallback in either state (#338).
+#
+# `registry_harness_agents` selects exactly the entries the daemon indexes by recipient
+# uuid, so "registered" here is the same set the daemon's refusal is computed over.
 #
 # The registry output is CAPTURED before it is iterated: `break`ing out of a loop reading
 # straight from a live producer SIGPIPEs it, which under `pipefail` is the #172 class of
@@ -484,9 +495,11 @@ discover_recipient() {
 	bc_slug=""
 	bc_uuid=""
 	bc_key=""
+	bc_registered=false
 	agents="$(registry_harness_agents "$1")"
 	while IFS=$'\t' read -r slug uuid; do
 		[[ -n "$slug" && -n "$uuid" ]] || continue
+		bc_registered=true
 		var="${BC_RECIPIENT_SECRET_PREFIX}$(slug_suffix "$slug")"
 		value="$(env_value "$var")"
 		if [[ -n "$value" ]]; then
@@ -536,35 +549,44 @@ else
 			bc_case_secret="$bc_secret"
 			bc_case_key_path="fallback"
 			log "basecradle recipient under test: none provisioned yet; using the shared fallback"
+		elif [[ "$bc_registered" == "false" ]]; then
+			# No harness agent is registered and the fallback is retired, so the keyring holds
+			# no key at all and every delivery is rejected before its digest is read. There
+			# is no key for cases 4 and 5 to separate the HMAC boundary under; case 6 below
+			# still proves the retired fallback refuses the route-wide secret (#338).
+			bc_case_recipient=""
+			log "basecradle recipient under test: none — no harness agent is registered and the shared fallback is retired; skipping cases 4 and 5 (no key exists to verify under)"
 		else
-			die "no per-recipient signing key is provisioned and $BC_FALLBACK_VAR is off — the daemon could not have booted in this state"
+			die "a harness agent is registered but none holds a per-recipient signing key, and $BC_FALLBACK_VAR is off — the daemon could not have booted in this state"
 		fi
 
-		bc_payload "$bc_case_recipient" "$BC_DELIVERY" >"$workdir/bc.json"
+		if [[ -n "$bc_case_recipient" ]]; then
+			bc_payload "$bc_case_recipient" "$BC_DELIVERY" >"$workdir/bc.json"
 
-		# Case 4 — a FORGED digest on the very body case 5 sends. 401 here and 200 there
-		# differ in the digest alone, so this pair is the HMAC boundary and nothing else.
-		check "basecradle forged digest rejected (key_path=${bc_case_key_path})" 401 \
-			"$(bc_post "$workdir/bc.json" "0000000000000000000000000000000000000000000000000000000000000000" "$BC_DELIVERY")"
+			# Case 4 — a FORGED digest on the very body case 5 sends. 401 here and 200 there
+			# differ in the digest alone, so this pair is the HMAC boundary and nothing else.
+			check "basecradle forged digest rejected (key_path=${bc_case_key_path})" 401 \
+				"$(bc_post "$workdir/bc.json" "0000000000000000000000000000000000000000000000000000000000000000" "$BC_DELIVERY")"
 
-		# Case 5 — the same body, correctly signed. Verify admits it; the event is not in
-		# the actionable set, so normalize records a deliberate ignore and NOTHING wakes.
-		check "basecradle valid sig, non-actionable event => no wake" 200 \
-			"$(bc_post "$workdir/bc.json" "$(bc_sign "$workdir/bc.json" "$bc_case_secret")" "$BC_DELIVERY")"
+			# Case 5 — the same body, correctly signed. Verify admits it; the event is not in
+			# the actionable set, so normalize records a deliberate ignore and NOTHING wakes.
+			check "basecradle valid sig, non-actionable event => no wake" 200 \
+				"$(bc_post "$workdir/bc.json" "$(bc_sign "$workdir/bc.json" "$bc_case_secret")" "$BC_DELIVERY")"
 
-		# ...and it verified under the key we expected it to. This is the live proof that
-		# the per-recipient keyring is in force on the box: the status code alone cannot
-		# tell `key_path=recipient` from `key_path=fallback`.
-		assert_journal_has "basecradle verified on key_path=${bc_case_key_path}" \
-			"event=verify_key source=basecradle .*key_path=${bc_case_key_path} .*delivery=${BC_DELIVERY}" \
-			"$obs_since"
+			# ...and it verified under the key we expected it to. This is the live proof that
+			# the per-recipient keyring is in force on the box: the status code alone cannot
+			# tell `key_path=recipient` from `key_path=fallback`.
+			assert_journal_has "basecradle verified on key_path=${bc_case_key_path}" \
+				"event=verify_key source=basecradle .*key_path=${bc_case_key_path} .*delivery=${BC_DELIVERY}" \
+				"$obs_since"
 
-		# The route's INFO observability must reach journald too — this is the route the
-		# #91 silent drop was found on, and the decision here is an *ignore*, which is
-		# exactly the outcome that must never be indistinguishable from a silent drop.
-		assert_journal_has "basecradle decision line emitted (#91)" \
-			"event=delivery_decision source=basecradle event_type=${BC_IGNORED_EVENT} decision=ignored .*delivery=${BC_DELIVERY}" \
-			"$obs_since"
+			# The route's INFO observability must reach journald too — this is the route the
+			# #91 silent drop was found on, and the decision here is an *ignore*, which is
+			# exactly the outcome that must never be indistinguishable from a silent drop.
+			assert_journal_has "basecradle decision line emitted (#91)" \
+				"event=delivery_decision source=basecradle event_type=${BC_IGNORED_EVENT} decision=ignored .*delivery=${BC_DELIVERY}" \
+				"$obs_since"
+		fi
 
 		# Case 6 — an unregistered recipient signed with the ROUTE-WIDE secret: the live
 		# state of the shared fallback, which nothing else on the box states per delivery.

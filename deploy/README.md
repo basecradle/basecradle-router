@@ -1333,6 +1333,14 @@ merely self-gated on the fallback flag would have kept the deploy green while pr
 verified, which the status code cannot carry, and the one thing that distinguishes a completed cutover from
 a half-landed one.
 
+A host with **no harness agent registered** and the fallback retired — every new router host until its
+first agent lands — has no key to verify under at all, so cases 4 and 5 are **skipped, saying why**, and
+case 6's 401 is still asserted. The daemon boots there (`load_recipient_keyring` refuses a retired fallback
+only by naming an unprovisioned agent, and there is none), so a gate that died on it failed every new host's
+first deploy (#338). A harness agent registered with **no** key and the fallback retired is still a death:
+the daemon cannot boot in that state, so a pass would describe a box that does not exist.
+`tests/test_smoke_test_registry_states.py` runs the whole script over all three registry states.
+
 The agent under test and its signing key are **discovered from the box** — the registry
 (`BASECRADLE_ROUTER_AGENTS`) paired with `router.env`, read exactly the way `load_recipient_keyring` reads
 them — so no agent is ever hardcoded here. What keeps case 5 safe against production is the
