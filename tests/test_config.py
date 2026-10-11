@@ -83,17 +83,20 @@ def test_missing_agents_var_fails_loudly(tmp_path) -> None:
         load_config(env)
 
 
-def test_enabled_route_without_secret_fails(tmp_path) -> None:
-    env = _env(tmp_path)
+def test_the_loader_holds_only_the_secrets_that_are_set(tmp_path) -> None:
+    # Loaded here, demanded at boot (`app.build_registry`, tests/test_app.py) — only a
+    # built route can say whether it needs one (#337). A blank value is unset, never an
+    # empty HMAC key.
+    env = _env(
+        tmp_path,
+        BASECRADLE_ROUTER_ENABLED_ROUTES="github, basecradle",
+        BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET="",
+    )
     del env["BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET"]
-    with pytest.raises(ConfigError, match="GITHUB_WEBHOOK_SECRET is not set"):
-        load_config(env)
-
-
-def test_explicit_enabled_routes_require_each_secret(tmp_path) -> None:
-    env = _env(tmp_path, BASECRADLE_ROUTER_ENABLED_ROUTES="github, basecradle")
-    with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET"):
-        load_config(env)
+    config = load_config(env)
+    assert dict(config.webhook_secrets) == {}
+    with pytest.raises(ConfigError, match="set BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET"):
+        config.webhook_secret("github")
 
 
 def test_empty_enabled_routes_list_fails(tmp_path) -> None:

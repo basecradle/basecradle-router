@@ -124,13 +124,16 @@ from basecradle_router.routes import (
     DeliveryDecision,
     InboundRequest,
     PayloadError,
+    Route,
     RouteRegistry,
     SignatureError,
     UnknownRouteError,
     UntrustedSenderError,
     log_delivery_decision,
     route_recheck,
+    route_requires_secret,
 )
+from basecradle_router.secret import Secret
 from basecradle_router.wake import WakeError, Waker, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
@@ -540,7 +543,7 @@ class Pipeline:
         # unauthenticated, and counting an unknown source would let anyone grow the
         # evidence document one bogus `/webhooks/<anything>` at a time.
         try:
-            route.verify(request, self.config.webhook_secret(source))
+            route.verify(request, self._route_secret(route, source))
         except SignatureError as exc:
             self.evidence.record_delivery_rejected(source, str(exc))
             self._record(result, Stage.VERIFY, Outcome.REJECTED, source=source, error=str(exc))
@@ -797,6 +800,19 @@ class Pipeline:
             delivery=event.delivery_id,
             **detail,
         )
+
+    def _route_secret(self, route: Route, source: str) -> Secret | None:
+        """The route-wide secret to hand ``route``'s verify, or ``None`` if it needs none.
+
+        A route that needs one gets it through :meth:`Config.webhook_secret`, which raises
+        a :class:`ConfigError` naming the variable — so a box that somehow lost it fails
+        the stage loudly, as it always has. Boot already refuses that state; this keeps
+        the failure named rather than letting a ``None`` stand in for it. A route that
+        declared it needs none (#337) gets whatever the box holds, which it never reads.
+        """
+        if route_requires_secret(route):
+            return self.config.webhook_secret(source)
+        return self.config.webhook_secrets.get(source)
 
     def _record(
         self, result: PipelineResult, stage: Stage, outcome: Outcome, **detail: object

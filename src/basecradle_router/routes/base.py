@@ -70,7 +70,7 @@ class InboundRequest:
         return None
 
 
-def verify_hmac_sha256(request: InboundRequest, secret: Secret, *, header: str) -> None:
+def verify_hmac_sha256(request: InboundRequest, secret: Secret | None, *, header: str) -> None:
     """Raise :class:`SignatureError` unless ``request`` carries a valid signature.
 
     The shared signature boundary for every HMAC-signed source (GitHub's
@@ -84,7 +84,15 @@ def verify_hmac_sha256(request: InboundRequest, secret: Secret, *, header: str) 
     It is also the one place a route's key is read in the clear: ``secret`` is
     revealed inside the HMAC expression and bound to no name, so no frame on the
     verify path holds the plaintext (basecradle-router#317).
+
+    ``None`` — no key at all — never verifies. The core passes ``None`` only to a route
+    that declared it needs no route-wide secret (:func:`route_requires_secret`), and boot
+    refuses every other route without one, so this is unreachable on a daemon that
+    started; it is here so that if that ever stops holding, the boundary fails closed
+    rather than computing a digest under some stand-in key.
     """
+    if secret is None:
+        raise SignatureError(f"no signing key is configured to verify {header}")
     provided = request.header(header)
     if provided is None:
         raise SignatureError(f"missing {header} header")
@@ -251,8 +259,13 @@ class Route(Protocol):
     recipient_kind: str
     synthetic: bool
 
-    def verify(self, request: InboundRequest, secret: Secret) -> None:
-        """Raise :class:`SignatureError` if the request is unsigned or tampered."""
+    def verify(self, request: InboundRequest, secret: Secret | None) -> None:
+        """Raise :class:`SignatureError` if the request is unsigned or tampered.
+
+        ``secret`` is the route-wide signing secret from ``router.env``, or ``None`` when
+        the box holds none — which boot allows only for a route that declared it needs
+        none (see :func:`route_requires_secret`).
+        """
         ...
 
     def normalize(self, request: InboundRequest) -> Event | None:
@@ -275,6 +288,11 @@ class Route(Protocol):
     # when a queued delivery reaches the front of its agent's queue, whether the work
     # it asked for still stands — ``None`` to wake, or a short reason to drop it (see
     # :func:`route_recheck`). Optional for the same reason.
+    #
+    # A route MAY likewise define ``requires_route_secret: bool``: whether, as configured,
+    # it verifies anything with the route-wide secret the core holds for it. Absent means
+    # yes — every route but one needs it — so only a route whose own config can retire
+    # that secret says otherwise (see :func:`route_requires_secret`).
 
 
 def route_boot_summary(route: object) -> str | None:
@@ -297,6 +315,25 @@ def route_boot_summary(route: object) -> str | None:
         return None
     text = summary()
     return text if isinstance(text, str) and text.strip() else None
+
+
+def route_requires_secret(route: object) -> bool:
+    """Whether ``route``, as configured, needs the route-wide secret the core holds for it.
+
+    The core demands ``BASECRADLE_ROUTER_<ROUTE>_WEBHOOK_SECRET`` for an enabled route
+    because that is the key it hands the route to verify with. But whether the route will
+    ever *read* it is the route's own business: the basecradle route verifies each
+    recipient under its own Integration Signing Key and consults the route-wide value only
+    while its shared fallback is armed (#337). Once the fallback is retired the value can
+    verify nothing, and demanding it anyway made every new host mint a secret for no
+    purpose and carry it in a 0600 file forever. So the route states the answer, the core
+    asks without learning why, and adding a route still touches only that route.
+
+    Read by duck-typing, like :func:`route_boot_summary`, and **fails toward requiring**:
+    an absent member, or one that is not literally ``False``, means the secret is needed —
+    so no route can stop being demanded a key by accident.
+    """
+    return getattr(route, "requires_route_secret", True) is not False
 
 
 def route_recheck(route: object, event: Event) -> str | None:

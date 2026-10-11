@@ -97,7 +97,7 @@ class ProbeRoute:
     #: production edge count and out of the production sinks — see the module docstring.
     synthetic = True
 
-    def verify(self, request: InboundRequest, secret: Secret) -> None:
+    def verify(self, request: InboundRequest, secret: Secret | None) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.
 
         The same audited HMAC-SHA256 boundary the github and basecradle routes use, over

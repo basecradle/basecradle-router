@@ -351,7 +351,8 @@ assert_journal_has "delivery id threaded onto the decision line (#170)" \
 # --- basecradle route (only once the capital has wired it) -----------------
 #
 # The same security-boundary proof for the basecradle route, and equally safe against
-# production. It self-gates twice — skipped if the route-wide secret is unset, and
+# production. It self-gates twice — skipped if the route-wide secret is unset while the
+# shared fallback is armed (the one state in which the daemon demands it, #337), and
 # skipped if the live daemon does not yet serve the route (a bad-sig probe returns 404,
 # not 401) — so a deploy made before the capital enables basecradle stays green.
 #
@@ -505,12 +506,16 @@ discover_recipient() {
 }
 # <<< registry_parsers <<<
 
-if [[ -z "$bc_secret" ]]; then
-	log "basecradle route: $BC_SECRET_VAR not set in $ROUTER_ENV_FILE — not wired yet; skipping"
-else
-	bc_fallback="$(bool_env "$BC_FALLBACK_VAR" true)" ||
-		die "$BC_FALLBACK_VAR is set to a value the daemon would refuse to boot on: $(env_value "$BC_FALLBACK_VAR")"
+bc_fallback="$(bool_env "$BC_FALLBACK_VAR" true)" ||
+	die "$BC_FALLBACK_VAR is set to a value the daemon would refuse to boot on: $(env_value "$BC_FALLBACK_VAR")"
 
+# The shared value is required only while the fallback is armed: retired, it can verify
+# nothing, so a box may carry it or not and the daemon serves the route either way (#337).
+# Skipping on its absence alone would silently drop every basecradle case on exactly the
+# hosts that never minted one — so it is "not wired" only when the daemon would demand it.
+if [[ -z "$bc_secret" && "$bc_fallback" == "true" ]]; then
+	log "basecradle route: $BC_SECRET_VAR not set in $ROUTER_ENV_FILE and the shared fallback is armed — not wired yet; skipping"
+else
 	bc_payload "$UNREGISTERED_RECIPIENT" "$BC_FALLBACK_DELIVERY" >"$workdir/bc-unregistered.json"
 	# Route-enabled probe: an unsigned delivery answers 404 only when the daemon does not
 	# serve the route at all. Everything else it can answer is a real assertion — an
@@ -584,6 +589,11 @@ else
 		# state of the shared fallback, which nothing else on the box states per delivery.
 		if [[ "$bc_case_recipient" == "$UNREGISTERED_RECIPIENT" ]]; then
 			log "basecradle shared fallback: already asserted by case 5 on this box; skipping"
+		elif [[ -z "$bc_secret" ]]; then
+			# Retired with no shared value on the box (#337): there is no route-wide secret
+			# to refuse. The route probe above already sent this exact unregistered
+			# recipient and asserted the 401, so a second send would prove nothing new.
+			log "basecradle shared fallback: retired and $BC_SECRET_VAR is not set — nothing to refuse; the route probe already asserted an unknown recipient is rejected"
 		elif [[ "$bc_fallback" == "true" ]]; then
 			check "basecradle shared fallback armed, unknown recipient => no wake" 200 \
 				"$(bc_post "$workdir/bc-unregistered.json" "$(bc_sign "$workdir/bc-unregistered.json" "$bc_secret")" "$BC_FALLBACK_DELIVERY")"

@@ -79,9 +79,11 @@ class Config:
     resolves by repo; ``harness_index`` maps every agent's ``harness_key`` (its OS
     user — the universal identity) to it, which is how a source that addresses an
     agent *as an agent* rather than through one platform's naming resolves;
-    ``webhook_secrets`` maps a route name to its signing secret, held as a
+    ``webhook_secrets`` maps a route name to its route-wide signing secret, held as a
     :class:`~basecradle_router.secret.Secret` so no representation of the config can
-    print it (#317); ``enabled_routes``
+    print it (#317) — one entry per enabled route whose variable is set, which every
+    route that needs one is required to have at boot (see
+    :func:`~basecradle_router.app.build_registry`); ``enabled_routes``
     is the set of routes the daemon will accept events for.
     """
 
@@ -308,8 +310,16 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     """Build a :class:`Config` from ``env`` (defaults to ``os.environ``).
 
     Raises :class:`ConfigError`, naming the missing/invalid variable, if any
-    required configuration is absent — required means: the agent registry, and
-    a webhook secret for every enabled route.
+    required configuration is absent — required here means the agent registry and a
+    non-empty route list.
+
+    Each enabled route's signing secret is *loaded* here but *demanded* by
+    :func:`~basecradle_router.app.build_registry`, once the routes exist to say whether
+    they need one: whether a route ever reads its route-wide secret depends on that
+    route's own config (the basecradle route stops reading it when its shared fallback
+    is retired, #337), which this loader cannot see without learning a source's
+    vocabulary. A blank value is treated as unset, so it is demanded exactly as an
+    absent one is and never becomes an empty HMAC key.
     """
 
     env = os.environ if env is None else env
@@ -330,11 +340,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     secrets: dict[str, Secret] = {}
     for route in enabled:
         secret = env.get(route_secret_var(route))
-        if not secret:
-            raise ConfigError(
-                f"route {route!r} is enabled but {route_secret_var(route)} is not set"
-            )
-        secrets[route] = Secret(secret)
+        if secret:
+            secrets[route] = Secret(secret)
 
     return Config(
         agents=MappingProxyType(agents),

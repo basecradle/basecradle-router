@@ -377,6 +377,38 @@ def test_a_retired_fallback_still_verifies_a_provisioned_recipient() -> None:
     route.verify(_keyed_request(JT_KEY), Secret(SECRET))
 
 
+# --- the shared secret is needed only while the fallback is armed (#337) ------
+
+
+@pytest.mark.parametrize("fallback", [True, False])
+def test_the_route_needs_the_shared_secret_exactly_while_the_fallback_is_armed(
+    fallback: bool,
+) -> None:
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=fallback))
+    assert route.requires_route_secret is fallback
+
+
+def test_a_retired_fallback_verifies_with_no_shared_secret_on_the_box() -> None:
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route.verify(_keyed_request(JT_KEY), None)
+
+
+def test_a_retired_fallback_with_no_shared_secret_still_names_the_retirement() -> None:
+    # The rejection a box with no shared value gives an unkeyed recipient is the same
+    # one it always gave — the keyring refuses before any digest is computed.
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    with pytest.raises(SignatureError, match="shared fallback is retired"):
+        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), None)
+
+
+def test_an_armed_fallback_handed_no_shared_secret_fails_closed() -> None:
+    # Boot refuses this state; were it ever reached, the HMAC boundary refuses the
+    # missing key rather than verifying under a stand-in.
+    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    with pytest.raises(SignatureError, match="no signing key is configured"):
+        route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), None)
+
+
 def test_the_no_key_rejection_never_names_the_untrusted_recipient() -> None:
     # The message reaches the journal AND the evidence document, and at this point the
     # uuid is an unauthenticated claim. Naming the key path is the diagnosis; echoing

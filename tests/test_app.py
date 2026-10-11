@@ -275,3 +275,105 @@ def test_the_keyring_is_not_built_when_the_basecradle_route_is_disabled(tmp_path
     # running github only is never asked for keys it has no route to verify with.
     env = _env(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
     create_app(env, waker=_RecordingWaker())
+
+
+# --- the route-wide secret is demanded at boot, and only where it can verify (#337) --
+
+SHARED_FALLBACK = "BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK"
+SHARED_SECRET = "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET"
+UNREGISTERED_UUID = "019e916c-7f45-700e-afc0-000000000000"
+
+
+def _signed_basecradle(recipient_uuid: str, key: str) -> tuple[bytes, dict[str, str]]:
+    # `timeline.locked` is outside the actionable set, so a delivery that verifies is a
+    # logged ignore (200) and one that does not is a 401 — the status is the verify.
+    body = json.dumps(
+        {
+            "event": "timeline.locked",
+            "event_id": "019e916c-7f45-700e-afc0-00000000beef",
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "actor_uuid": None,
+            "recipient_uuid": recipient_uuid,
+            "timeline_uuid": "019e916c-7f45-700e-afc0-0000000000aa",
+            "resource": {"type": "timeline", "uuid": "019e916c-7f45-700e-afc0-0000000000aa"},
+        }
+    ).encode("utf-8")
+    digest = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+    return body, {
+        "X-BaseCradle-Event": "timeline.locked",
+        "X-BaseCradle-Delivery": "019e916c-7f45-700e-afc0-00000000beef",
+        "X-BaseCradle-Signature": f"sha256={digest}",
+        "Content-Type": "application/json",
+    }
+
+
+def _retired_env_without_the_shared_secret(tmp_path) -> dict[str, str]:
+    """A new host's router.env: per-recipient keys, the fallback off, no shared value."""
+    env = _env_with_harness_agent(tmp_path) | {
+        f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY,
+        SHARED_FALLBACK: "0",
+    }
+    del env[SHARED_SECRET]
+    return env
+
+
+def test_an_enabled_route_without_its_secret_refuses_to_boot(tmp_path) -> None:
+    env = _env(tmp_path)
+    del env["BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET"]
+    with pytest.raises(ConfigError, match="GITHUB_WEBHOOK_SECRET is not set"):
+        create_app(env, waker=_RecordingWaker())
+
+
+def test_an_enabled_name_with_no_route_behind_it_is_still_demanded_a_secret(tmp_path) -> None:
+    # No route exists to vouch that it needs none, so the answer never fails open.
+    env = _env(tmp_path) | {"BASECRADLE_ROUTER_ENABLED_ROUTES": "github,nosuch"}
+    with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_NOSUCH_WEBHOOK_SECRET is not set"):
+        create_app(env, waker=_RecordingWaker())
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["absent", "empty"])
+def test_an_armed_fallback_still_requires_the_shared_secret(tmp_path, value) -> None:
+    # Armed, the shared value IS the fallback: a box without one could not verify any
+    # recipient that holds no key of its own, so it does not boot. Empty is absent —
+    # never an empty HMAC key.
+    env = _env_with_harness_agent(tmp_path)
+    if value is None:
+        del env[SHARED_SECRET]
+    else:
+        env[SHARED_SECRET] = value
+    with pytest.raises(ConfigError, match=f"{SHARED_SECRET} is not set"):
+        create_app(env, waker=_RecordingWaker())
+
+
+def test_a_retired_fallback_boots_without_the_shared_secret(tmp_path) -> None:
+    # The #337 shape: per-recipient keys only, fallback off — the daemon boots, a keyed
+    # recipient verifies, and the boot line still states the retirement.
+    env = _retired_env_without_the_shared_secret(tmp_path)
+    route = build_registry(load_config(env), env).get("basecradle")
+    assert route.requires_route_secret is False
+    assert "shared_fallback=false" in route.boot_summary()
+
+    server = create_app(env, waker=_RecordingWaker())
+    assert _post(
+        server, "/webhooks/basecradle", *_signed_basecradle(JT.recipient_uuid, JT_KEY)
+    ) == (200)
+    # A recipient with no key of its own is refused — there is nothing to fall back to.
+    assert (
+        _post(server, "/webhooks/basecradle", *_signed_basecradle(UNREGISTERED_UUID, JT_KEY)) == 401
+    )
+
+
+def test_a_retired_fallback_boots_unchanged_with_the_shared_secret_still_set(tmp_path) -> None:
+    # `ai`'s router.env still carries the shared value: it boots exactly as before, and
+    # the value is never consulted — signing an unregistered recipient with it is refused.
+    env = _env_with_harness_agent(tmp_path) | {
+        f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY,
+        SHARED_FALLBACK: "0",
+    }
+    server = create_app(env, waker=_RecordingWaker())
+    assert _post(
+        server, "/webhooks/basecradle", *_signed_basecradle(JT.recipient_uuid, JT_KEY)
+    ) == (200)
+    assert (
+        _post(server, "/webhooks/basecradle", *_signed_basecradle(UNREGISTERED_UUID, SECRET)) == 401
+    )

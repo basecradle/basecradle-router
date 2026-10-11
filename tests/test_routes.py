@@ -13,6 +13,8 @@ from basecradle_router.routes import (
     RouteRegistry,
     SignatureError,
     UnknownRouteError,
+    route_requires_secret,
+    verify_hmac_sha256,
 )
 
 DELIVERY_ID = "0192f3a4-5b6c-7d8e-9f01-23456789abcd"  # well-formed UUIDv7
@@ -134,3 +136,30 @@ def test_registry_unknown_source_fails_with_known_list() -> None:
     registry.register(FakeRoute())
     with pytest.raises(UnknownRouteError, match="known routes: fake"):
         registry.get("github")
+
+
+# --- a route may declare it needs no route-wide secret (#337) ------------------
+
+
+def test_a_route_that_says_nothing_needs_its_route_wide_secret() -> None:
+    assert route_requires_secret(FakeRoute()) is True
+
+
+@pytest.mark.parametrize("declared", [True, 0, None, "false"])
+def test_only_a_literal_false_releases_the_route_wide_secret(declared: object) -> None:
+    # Fails toward requiring: a falsy-but-not-False declaration never drops the demand.
+    route = FakeRoute()
+    route.requires_route_secret = declared  # type: ignore[attr-defined]
+    assert route_requires_secret(route) is True
+
+
+def test_a_route_that_declares_false_needs_none() -> None:
+    route = FakeRoute()
+    route.requires_route_secret = False  # type: ignore[attr-defined]
+    assert route_requires_secret(route) is False
+
+
+def test_the_hmac_boundary_never_verifies_without_a_key() -> None:
+    request = InboundRequest(headers={"X-Sig": "sha256=" + "0" * 64}, body=b"{}")
+    with pytest.raises(SignatureError, match="no signing key is configured to verify X-Sig"):
+        verify_hmac_sha256(request, None, header="X-Sig")
