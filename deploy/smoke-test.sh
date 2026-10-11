@@ -71,13 +71,8 @@
 # hits is derived from it, so on a second router host the gate tests that host's own
 # endpoint, never ai's. It is NAMED BY THE CALLER, never derived from `hostname`: two
 # programs disagreeing about a box's name is how a check reports a capability absent
-# (basecradle-noc#409), and the NOC binds the same token to the same tree.
-#
-# Omitting <fqdn> is the expand half of an expand-then-contract roll, and only that: the
-# installed NOC wrapper calls this script with no argument, and an unattended deploy of
-# this very change must not fail its own smoke gate. With no argument it targets
-# ai.basecradle.com — the only router host with a daemon until the NOC passes the host —
-# and says so loudly. The fallback is retired once every caller passes the host.
+# (basecradle-noc#409), and the NOC binds the same token to the same tree. It is
+# required: with no <fqdn> the script refuses and sends nothing (#336).
 #
 # Config (env overrides):
 #   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
@@ -113,15 +108,12 @@ die() {
 #
 # The markers let tests/test_smoke_test_host.py run this EXACT body offline.
 # >>> smoke_host >>>
-SMOKE_FALLBACK_HOST="ai.basecradle.com"
 smoke_host() {
 	local fqdn=$1 label
 	local -a labels=()
 	if [[ -z "$fqdn" ]]; then
-		printf 'smoke-test: no <fqdn> given — targeting %s, the transitional default (#334).\n' \
-			"$SMOKE_FALLBACK_HOST" >&2
-		printf 'smoke-test: pass the router host this box is; the default is retired once every caller does.\n' >&2
-		fqdn="$SMOKE_FALLBACK_HOST"
+		printf 'smoke-test: no <fqdn> given — pass the router host this box is (a deploy/hosts/<fqdn>/ directory)\n' >&2
+		return 1
 	fi
 	if ((${#fqdn} > 253)) ||
 		[[ ! "$fqdn" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?$ ]]; then

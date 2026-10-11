@@ -15,10 +15,10 @@ Two layers pin that:
   it must refuse, so a typo, a path, or a host this tree does not carry dies before a
   single request is sent.
 
-The no-argument case is the expand half of an expand-then-contract roll: the installed
-NOC wrapper calls the script bare, so until it passes the host the gate keeps targeting
-ai and says so on stderr. That is pinned too, so the fallback cannot quietly become
-something other than ai — or silent.
+The host is required. The no-argument fallback to ai was the expand half of an
+expand-then-contract roll, kept only while the NOC wrapper called the script bare; every
+caller now passes the host, so a bare run refuses and sends nothing (#336). That is
+pinned too, so a default host cannot quietly come back.
 
 No network, journal, or real secret is touched. Secrets are correctly-shaped fakes; the
 trusted actor is the fabricated `nova`.
@@ -38,7 +38,7 @@ import pytest
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 SMOKE_TEST = DEPLOY / "smoke-test.sh"
 HOSTS = sorted(p.name for p in (DEPLOY / "hosts").iterdir() if p.is_dir())
-FALLBACK = "ai.basecradle.com"
+AI = "ai.basecradle.com"
 LOOPBACK = "http://127.0.0.1:8000/webhooks/probe"
 
 pytestmark = pytest.mark.skipif(
@@ -124,23 +124,21 @@ def test_every_public_request_goes_to_the_host_it_was_given(host: str, tmp_path:
 
 
 def test_a_second_host_never_reaches_ai(tmp_path: Path) -> None:
-    others = [h for h in HOSTS if h != FALLBACK]
+    others = [h for h in HOSTS if h != AI]
     assert others, "this pin needs a router host other than ai in deploy/hosts/"
     for host in others:
         run_dir = tmp_path / host
         run_dir.mkdir()
         result, urls = _run_smoke(run_dir, host)
         assert urls, result.stderr
-        assert not [u for u in urls if FALLBACK in u]
-        assert "transitional default" not in result.stderr
+        assert not [u for u in urls if AI in u]
 
 
-def test_with_no_host_it_targets_ai_and_says_so(tmp_path: Path) -> None:
+def test_with_no_host_it_refuses_and_sends_nothing(tmp_path: Path) -> None:
     result, urls = _run_smoke(tmp_path)
-    assert {urlsplit(u).netloc for u in _public(urls)} == {FALLBACK}
-    assert f"no <fqdn> given — targeting {FALLBACK}, the transitional default (#334)" in (
-        result.stderr
-    )
+    assert result.returncode == 1
+    assert urls == []
+    assert "no <fqdn> given" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -150,7 +148,8 @@ def test_with_no_host_it_targets_ai_and_says_so(tmp_path: Path) -> None:
         ("AI.BASECRADLE.COM",),
         ("ai.basecradle.com/../x",),
         ("https://ai.basecradle.com",),
-        (FALLBACK, "extra"),
+        ("",),  # an explicitly empty host is no host
+        (AI, "extra"),
     ],
 )
 def test_a_refused_host_sends_nothing(args: tuple[str, ...], tmp_path: Path) -> None:
@@ -254,14 +253,9 @@ def test_smoke_host_refuses_a_symlinked_hosts_directory(tmp_path: Path) -> None:
     assert "symlink" in result.stderr
 
 
-def test_smoke_host_falls_back_to_ai_loudly_and_only_while_ai_is_carried(tmp_path: Path) -> None:
-    result = _smoke_host("", _hosts_dir(tmp_path, FALLBACK), tmp_path)
-    assert result.returncode == 0
-    assert result.stdout == FALLBACK
-    assert "transitional default (#334)" in result.stderr
-    # The fallback goes through the same binding as a named host: it is never a bypass.
-    other = tmp_path / "other"
-    other.mkdir()
-    result = _smoke_host("", _hosts_dir(other, "ubuntu-1.landfill.click"), other)
+def test_smoke_host_refuses_an_empty_host_even_where_ai_is_carried(tmp_path: Path) -> None:
+    # No default host survives: an empty <fqdn> is refused even when ai's directory exists.
+    result = _smoke_host("", _hosts_dir(tmp_path, AI), tmp_path)
     assert result.returncode == 1
     assert result.stdout == ""
+    assert "no <fqdn> given" in result.stderr

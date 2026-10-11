@@ -1388,10 +1388,9 @@ basecradle cases additionally need `jq`, which the box already requires for `dep
 NOC's per-host ops take — and must name a `deploy/hosts/<fqdn>/` directory in the tree, or the test refuses
 before sending anything. Every public URL it sends to (`https://<fqdn>/webhooks/{github,basecradle,probe}`) is
 derived from it; there is no URL override. The host is named by the caller, never read from `hostname`
-(basecradle-noc#409). With **no** argument it targets `ai.basecradle.com` and says so on stderr: that is the
-expand half of an expand-then-contract roll, kept only because the installed NOC wrapper still calls it bare,
-and it is retired once every caller passes the host. `tests/test_smoke_test_host.py` runs the whole shipped
-script against a fake `curl` once per host in `deploy/hosts/` and asserts every request it makes.
+(basecradle-noc#409). The host is **required**: with no argument the test refuses and sends nothing — there is
+no default host (#336). `tests/test_smoke_test_host.py` runs the whole shipped script against a fake `curl`
+once per host in `deploy/hosts/` and asserts every request it makes.
 
 The same status-code outcomes are pinned offline in `tests/test_server_e2e.py`, and the gate's own shell
 mirrors of the daemon's rules — the `<SLUG>` scrub, the boolean env parse, the registry read, and both
