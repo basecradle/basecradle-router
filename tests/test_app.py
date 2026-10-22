@@ -336,6 +336,100 @@ def test_create_app_keeps_a_dependabot_merge_silent(tmp_path) -> None:
     assert len(waker.calls) == 1  # the handoff alone
 
 
+# --- the startup warm-up refills the handoff ledger before any delivery (#370) --
+#
+# A deploy restarts the daemon, and the ledger the merge path reads is memory. The
+# reader is injected (no test reaches GitHub); the lifespan is driven as uvicorn drives
+# it, with its global logging set-up stubbed so nothing leaks into other tests.
+
+
+def _start(server) -> list[str]:
+    """Drive the ASGI lifespan startup; return what it sent, in order.
+
+    As under uvicorn, the lifespan then waits on ``receive`` until shutdown; the test has
+    no shutdown to send (it would close the wake pool the next delivery needs), so it
+    cancels that wait once the startup is answered.
+    """
+
+    async def _drive() -> list[str]:
+        sent: list[str] = []
+        started = asyncio.Event()
+        messages = [{"type": "lifespan.startup"}]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await asyncio.Event().wait()  # no shutdown ever comes
+
+        async def send(message):
+            sent.append(message["type"])
+            started.set()
+
+        lifespan = asyncio.create_task(server({"type": "lifespan"}, receive, send))
+        await started.wait()
+        lifespan.cancel()
+        return sent
+
+    return asyncio.run(_drive())
+
+
+def _open_issue_42() -> dict:
+    return {
+        "number": 42,
+        "title": "Mirror the wire-shape change",
+        "html_url": f"https://github.com/{NOVA.key}/issues/42",
+        "labels": [{"name": "handoff"}],
+        "state": "open",
+        "created_at": "2026-09-19T03:14:07Z",
+        "updated_at": "2026-09-19T03:14:07Z",
+    }
+
+
+def test_a_merge_right_after_a_restart_wakes_on_the_issue_the_startup_warmed(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+    order: list[str] = []
+
+    def reader(repo: str, timeout: float) -> list[dict]:
+        order.append(f"read {repo}")
+        return [_open_issue_42()]
+
+    waker = _RecordingWaker()
+    server = create_app(_env(tmp_path), waker=waker, read_open_handoffs=reader)
+    order.extend(_start(server))
+    # Read before the startup completes, so before uvicorn binds and any delivery lands.
+    assert order == [f"read {NOVA.key}", "lifespan.startup.complete"]
+
+    body, headers = _signed_merge(author=NOVA_BOT)  # no delivery taught this daemon #42
+    assert _post(server, "/webhooks/github", body, headers) == 202
+    ((agent, event),) = waker.calls
+    assert agent == NOVA
+    assert event.origin.url == f"https://github.com/{NOVA.key}/issues/42"
+
+
+def test_a_warm_up_that_cannot_reach_github_never_stops_the_start(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+
+    def reader(repo: str, timeout: float) -> list[dict]:
+        raise OSError("network is unreachable")
+
+    server = create_app(_env(tmp_path), waker=_RecordingWaker(), read_open_handoffs=reader)
+    assert _start(server) == ["lifespan.startup.complete"]
+
+
+def test_the_warm_up_reads_only_the_repos_a_github_builder_captains(tmp_path) -> None:
+    # A harness agent is keyed by its slug, not a repo: there is nothing to read for it.
+    asked: list[str] = []
+    server = create_app(
+        _env_with_harness_agent(tmp_path),
+        waker=_RecordingWaker(),
+        read_open_handoffs=lambda repo, timeout: asked.append(repo) or [],
+    )
+    server.warm_routes()
+    assert asked == [NOVA.key]
+
+
 # --- the basecradle route's per-recipient keyring is wired here (#497) --------
 #
 # Fabricated cast: @orion, a harness agent registered alongside Nova's builder entry.

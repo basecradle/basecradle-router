@@ -46,7 +46,7 @@ from basecradle_router.logfmt import LOG_FORMAT, log_fields
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
-from basecradle_router.routes.base import route_boot_summary
+from basecradle_router.routes.base import route_boot_summary, route_warm
 from basecradle_router.scheduler import WakeScheduler
 from basecradle_router.selftest import log_freeze_selftest, run_freeze_selftest
 
@@ -328,6 +328,18 @@ class WebhookServer:
             # the traceback is the whole diagnosis.
             logger.error("event=freeze_selftest status=error detail=%s", exc, exc_info=True)
 
+    def warm_routes(self) -> None:
+        """Let each route rebuild what a restart emptied, before the first delivery (#370).
+
+        uvicorn binds its socket only after the lifespan startup completes, so whatever a
+        route warms here is in place before any delivery can arrive — the github route's
+        ledger of open handoff issues, without which a merge delivered just after a deploy
+        would find no issue to wake its captain on. Each route bounds and logs its own
+        warm-up; :func:`route_warm` keeps any one of them from stopping the daemon.
+        """
+        for route in self.pipeline.registry.routes():
+            route_warm(route)
+
     async def _lifespan(self, receive, send) -> None:
         while True:
             message = await receive()
@@ -343,6 +355,10 @@ class WebhookServer:
                 # Then prove the freeze surface is readable — for the same reason the
                 # banner exists: state it at boot rather than discover it mid-incident.
                 self.run_boot_selftest()
+                # Last, and off the event loop (a route may read the network): until the
+                # startup completes, uvicorn accepts no connection, so no delivery can
+                # arrive ahead of what the routes warm.
+                await asyncio.to_thread(self.warm_routes)
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart
