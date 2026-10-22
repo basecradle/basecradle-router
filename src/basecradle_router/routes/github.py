@@ -26,7 +26,9 @@ Work`` wins, so a stale or accidental handoff on a parked issue can't trigger a
 wake (basecradle-router#146). The skip is logged with the issue URL, never silent.
 
 As defense-in-depth both paths gate on the webhook ``sender``: a wake only fires
-if a **trusted fleet actor** triggered it (the label applier, or the commenter).
+if a **trusted fleet actor** triggered it (the label applier, or the commenter) —
+the founders' accounts and the capital bot, never a captain's bot. (The merge path
+below admits one more sender, and only there: the repo's own captain bot.)
 Because that check runs *after* :meth:`verify`, the ``sender`` is GitHub-attested
 and not attacker-spoofable. The comment path adds one more gate the issue path
 does not need — the **self-comment guard**: a comment authored by the recipient
@@ -62,11 +64,14 @@ path leaves: a fleet-server captain arms auto-merge on its PR and ends its turn,
 merge itself reached no one — so the completion report and the by-hand close waited on a
 capital nudge, three times on 2026-10-22. A merged PR **authored by the repo's own captain
 bot** now wakes that captain on its open handoff issue in the same repo; a PR by anyone
-else (Dependabot, a human, a peer bot) wakes no one. A PR payload carries no issue, so
-the issue comes from the :class:`IssueLedger`: the open handoff issue the PR names by
-number, or — when it names none — the repo's only open handoff issue; with none, or more
-than one and no name to choose between them, the merge is a visible skip. Its trigger is the issues
-path's, verbatim, plus one line naming the merged PR.
+else (Dependabot, a human, a peer bot) wakes no one. Its ``sender`` is that same captain
+bot (its own auto-merge) or a trusted actor (a human merging it by hand): the one place
+a captain bot is trusted, and only on its own repo's merge (basecradle-router#367). A
+PR payload carries no issue, so the issue comes from the :class:`IssueLedger`: the open
+handoff issue the PR names by number, or — when it names none — the repo's only open
+handoff issue; with none, or more than one and no name to choose between them, the merge
+is a visible skip. Its trigger is the issues path's, verbatim, plus one line naming the
+merged PR.
 """
 
 from __future__ import annotations
@@ -410,8 +415,11 @@ class GithubRoute:
     """The GitHub webhook route. ``name`` is the source key the registry uses.
 
     ``trusted_actors`` is the allow-list of GitHub logins permitted to trigger a
-    wake — the fleet's org members and App bots. A handoff whose ``sender`` is not
-    on it is rejected (defense-in-depth behind GitHub's own permission model).
+    wake — the founders' accounts and the capital bot, and never a captain's
+    bot (the star: a sibling captain's label or comment wakes no one). A handoff whose
+    ``sender`` is not on it is rejected (defense-in-depth behind GitHub's own
+    permission model); the one exception is a captain's own merge, whose ``sender`` is
+    admitted as the repo's registered captain bot (:meth:`_normalize_pull_request`).
     GitHub logins are case-insensitive, so the list is matched case-insensitively.
     """
 
@@ -473,7 +481,8 @@ class GithubRoute:
         event is a well-formed *ignore*.
         Raises :class:`PayloadError` when an actionable payload is structurally
         malformed and :class:`UntrustedSenderError` when a wake was triggered by
-        an actor who is not a trusted fleet member. Emits a structured decision
+        an actor who is not on the trusted-actor allow-list (on a merge, nor the repo's
+        own captain bot). Emits a structured decision
         line for each quiet outcome (basecradle-router#91) so a deliberate ignore
         is visible in observability, never indistinguishable from a silent drop.
         """
@@ -569,7 +578,7 @@ class GithubRoute:
         # loop. Suppressing it here — ahead of the trusted-sender check — makes a
         # self-comment a clean IGNORED no-op regardless of the allow-list, so the
         # loop backstop never depends on the agent's own bot being a trusted actor.
-        if self._is_recipient_own_comment(data):
+        if self._sender_is_captain_bot(data):
             return self._ignore(event_type, delivery)
 
         # Sender scope: every other commenter must be a trusted fleet actor (the
@@ -589,12 +598,16 @@ class GithubRoute:
         true``), of a PR **authored by the repo's registered captain bot** (so a
         Dependabot, human or peer PR stays silent), with an **open handoff issue** in
         the ledger to wake it on, that is not parked under ``Do Not Work``, delivered with
-        a **trusted** ``sender`` (the actor GitHub attributes the merge to — for
-        auto-merge, the one that armed it, so a captain's own auto-merge is its own bot).
-        Waking the captain on its own merge cannot loop: the wake's comments and its
-        close are ``issues``/``issue_comment`` deliveries the existing guards already
-        stop, and a further merge is a further PR — capped, like any stream, by the
-        breaker.
+        a ``sender`` (the actor GitHub attributes the merge to — for auto-merge, the one
+        that armed it) that is **that same captain bot or a trusted actor**. A captain bot
+        is never on the allow-list — the allow-list is the founders and the capital bot,
+        so no captain's label or comment wakes another (#367) — which is why the captain's
+        own auto-merge is admitted by equality with the registered bot, never by the
+        allow-list; a human merging the captain's PR by hand still passes the allow-list,
+        and a peer bot's merge never does. Waking the captain on its own merge cannot
+        loop: the wake's comments and its close are ``issues``/``issue_comment``
+        deliveries the existing guards already stop, and a further merge is a further PR
+        — capped, like any stream, by the breaker.
         """
         data = parse_json_object(request.body)
         pull = data.get("pull_request")
@@ -625,7 +638,11 @@ class GithubRoute:
         if self._ledger.reason_to_drop(target.url) == DO_NOT_WORK:
             return self._skip_do_not_work(target.url, event_type, delivery)
 
-        self._require_trusted_sender(data)
+        # Sender scope: the captain's own merge is the one case a captain bot is trusted,
+        # because a captain bot is never on the allow-list (#367). Anyone else — a human
+        # merging by hand, a peer bot — is held to the allow-list, the other paths' gate.
+        if not self._sender_is_captain_bot(data):
+            self._require_trusted_sender(data)
         wake_arg = _HANDOFF_TRIGGER.format(url=target.url) + _MERGE_NOTE.format(
             number=number, url=pull_url
         )
@@ -729,11 +746,13 @@ class GithubRoute:
         )
         return self._ignore(event_type, delivery)
 
-    def _is_recipient_own_comment(self, data: dict[str, Any]) -> bool:
-        """Whether the comment was authored by the recipient agent's own bot.
+    def _sender_is_captain_bot(self, data: dict[str, Any]) -> bool:
+        """Whether the delivery's sender is the recipient agent's own bot.
 
-        The recipient is the captain of the repo the issue is on; re-waking it on
-        its own comment loops. We compare the GitHub-attested ``sender`` against
+        The recipient is the captain of the repo the delivery is on. Read by two
+        gates: the self-comment guard (re-waking a captain on its own comment loops)
+        and the merge path's sender scope (its own auto-merge is the one case a
+        captain bot is trusted). We compare the GitHub-attested ``sender`` against
         the recipient's *registered* bot login (not a name derived by convention —
         the registry is the authority). If the repo is unregistered the bot is
         unknown and this returns ``False``; that is safe, because resolution will
@@ -741,7 +760,7 @@ class GithubRoute:
         """
         repo = _repo_full_name(data)
         if repo is None:
-            return False  # malformed repo: _wake_event raises on it, consistently
+            return False  # malformed repo: each wake path raises on it, consistently
         login = _sender_login(data)
         return login is not None and self._is_captain_bot(repo, login)
 
@@ -766,7 +785,7 @@ class GithubRoute:
             raise UntrustedSenderError("handoff webhook has no identifiable sender")
         if login.lower() not in self._trusted_actors:
             raise UntrustedSenderError(
-                f"wake triggered by untrusted actor {login!r}; not a fleet member"
+                f"wake triggered by untrusted actor {login!r}; not on the trusted-actor allow-list"
             )
 
 
