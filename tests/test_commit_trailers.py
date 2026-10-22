@@ -28,8 +28,18 @@ HUMAN = ("John Doe", "john@example.com")
 TRAILER = "Co-Authored-By: Nova Digital <nova@example.com>"
 
 
+def _hermetic_env(**extra: str) -> dict[str, str]:
+    """No developer config (``core.abbrev`` would change ``%h``) and no inherited repo."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("GIT_DIR", "GIT_INDEX", "GIT_WORK"))
+    }
+    return {**env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, **extra}
+
+
 def _git(repo: Path, *args: str, author: tuple[str, str] | None = None) -> str:
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    env = _hermetic_env()
     if author is not None:
         name, email = author
         env |= {
@@ -60,7 +70,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _run(repo: Path, base: str, head: str, **extra: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "BOT": BOT_NAME, "BASE_SHA": base, "HEAD_SHA": head, **extra}
+    env = _hermetic_env(**{"BOT": BOT_NAME, "BASE_SHA": base, "HEAD_SHA": head, **extra})
     return subprocess.run(
         [str(SCRIPT)], cwd=repo, capture_output=True, text=True, check=False, env=env
     )
@@ -71,7 +81,8 @@ def test_a_bot_commit_without_a_trailer_passes(repo: Path) -> None:
     head = _commit(repo, "Fix a thing\n\nWhy it was wrong.")
     result = _run(repo, base, head)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "1 commit(s)" in result.stdout
+    assert "1 of 1 commit(s)" in result.stdout
+    assert "::warning::" not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -99,7 +110,8 @@ def test_a_commit_by_anyone_else_is_not_judged(repo: Path) -> None:
     head = _commit(repo, f"A human's commit\n\n{TRAILER}", author=HUMAN)
     result = _run(repo, base, head)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "0 commit(s)" in result.stdout
+    assert "0 of 1 commit(s)" in result.stdout
+    assert "::warning::" in result.stdout, "a PR with no bot commit is worth a look"
 
 
 def test_commits_already_on_the_base_are_never_relitigated(repo: Path) -> None:
@@ -127,12 +139,23 @@ def test_main_merged_into_the_branch_is_excluded_by_the_live_base_ref(repo: Path
 
 
 def test_an_identity_the_charter_no_longer_states_refuses(repo: Path) -> None:
-    (repo / "CLAUDE.md").write_text("| Commit-author | `someone-else[bot]` |\n")
+    # The old name surviving in prose must not satisfy the check — only the row does.
+    (repo / "CLAUDE.md").write_text(
+        f"Acts as **`{BOT_NAME}`**.\n\n| Commit-author | `someone-else[bot] <x@example.com>` |\n"
+    )
     base = _git(repo, "rev-parse", "HEAD")
     head = _commit(repo, "Fix a thing")
     result = _run(repo, base, head)
     assert result.returncode == 2
     assert "no longer the commit-author" in result.stderr
+
+
+@pytest.mark.parametrize("end", ["BASE_SHA", "HEAD_SHA"])
+def test_an_end_missing_from_the_clone_is_a_named_bad_invocation(repo: Path, end: str) -> None:
+    head = _git(repo, "rev-parse", "HEAD")
+    result = _run(repo, head, head, **{end: "0" * 40})
+    assert result.returncode == 2
+    assert f"{end} (" in result.stderr and "full-history" in result.stderr
 
 
 @pytest.mark.parametrize("missing", ["BOT", "BASE_SHA", "HEAD_SHA"])
@@ -157,4 +180,9 @@ def test_ci_runs_the_guard_on_pull_requests_only_with_full_history() -> None:
     step = ci[start : end if end != -1 else None]
     assert "if: github.event_name == 'pull_request'" in step
     assert "run: .github/scripts/commit-trailers.sh" in step
-    assert "fetch-depth: 0" in ci, "walking base..head needs both ends in the clone"
+    checkout_at = ci.index("uses: actions/checkout@")
+    checkout = ci[checkout_at : ci.index("\n      - ", checkout_at)]
+    assert ci.index("jobs:") < checkout_at < start, "the guard's own job checks out first"
+    assert "\n          fetch-depth: 0" in checkout, (
+        "walking base..head needs both ends in the clone"
+    )

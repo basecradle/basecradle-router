@@ -33,11 +33,22 @@ done
 
 # Single source of truth: the identity is CLAUDE.md's to state. If it changes
 # there and not in ci.yml, the author filter below would quietly match nothing and
-# the guard would pass everything — refuse instead.
-if ! grep -qF -- "$BOT" CLAUDE.md; then
+# the guard would pass everything — refuse instead. Anchored on the Commit-author
+# row itself: the bot's name also appears in the charter's prose, so a bare match
+# would survive a changed row.
+if ! grep -qF -- "| Commit-author | \`$BOT <" CLAUDE.md; then
   echo "commit-trailers: $BOT is no longer the commit-author in CLAUDE.md → Fleet Bot Identity; update ci.yml to match." >&2
   exit 2
 fi
+
+# An unresolvable end (a force-pushed base, a shallow clone) is a bad invocation
+# with a named cause, never git's bare 128 from the walk below.
+for var in BASE_SHA HEAD_SHA; do
+  if ! git rev-parse --verify --quiet "${!var}^{commit}" >/dev/null; then
+    echo "commit-trailers: $var (${!var}) is not a commit in this clone — is the checkout full-history?" >&2
+    exit 2
+  fi
+done
 
 excludes=("$BASE_SHA")
 if [[ -n "${BASE_REF:-}" ]] && git rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF" >/dev/null; then
@@ -50,7 +61,9 @@ shas="$(git log --format=%H "$HEAD_SHA" --not "${excludes[@]}")"
 
 bad=()
 examined=0
+total=0
 for sha in $shas; do
+  total=$((total + 1))
   author="$(git show -s --format='%an <%ae>' "$sha")"
   # Quoted, so the [bot] brackets stay literal and are not a glob class.
   case "$author" in *"$BOT"*) ;; *) continue ;; esac
@@ -74,4 +87,11 @@ if (( ${#bad[@]} > 0 )); then
   exit 1
 fi
 
-echo "commit-trailers: clean ($examined commit(s) by $BOT examined)."
+# Not a failure — a human's commit may carry a co-author — but a PR whose commits
+# are none of them the bot's is worth a look: it is also what a skipped git-author
+# step looks like (CLAUDE.md → Fleet Bot Identity).
+if (( total > 0 && examined == 0 )); then
+  echo "::warning::commit-trailers: none of this PR's $total commit(s) is authored by $BOT, so none was examined."
+fi
+
+echo "commit-trailers: clean ($examined of $total commit(s) by $BOT examined)."
