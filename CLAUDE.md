@@ -210,6 +210,16 @@ When the issue's definition of done is met in full — including its live verifi
 
 This section is shared law — it is carried verbatim in every laptop builder's CLAUDE.md (anchored in the capital; `constitution.md` → How We Communicate carries the principle: a session's life is its issue's life).
 
+## Session Guard (Laptop-Only)
+
+The leftovers check Laptop Builder Self-Exit requires is `.claude/session-guard.sh`, ported from basecradle-noc: `self-exit.sh` runs `session-guard.sh done` first and refuses on a finding, with no override. A `SessionStart` hook in `.claude/settings.json` takes the baseline, so there is nothing to arm, and `check` refuses when no baseline exists. Working under it:
+
+- **Docker.** Start Docker Desktop only with `session-guard.sh docker-up` (`open -a Docker` leaves no record, so its quit could never be proved ours); put `--label basecradle-router-builder=1` on every container and image, with `docker run --rm` for anything disposable; build on a throwaway `basecradle-router-builder-<name>` buildx builder. `session-guard.sh sweep` removes exactly that set and quits a Docker Desktop this session started; anything else is reported with the exact command and never touched.
+- **Listening ports.** A dev server or any other listener this session started is stopped when you are done with it; `check` reports a new one and never kills it.
+- **Browser.** A tab carries no attribution, so `tab-open`/`tab-close` is the ledger, and `tabs-checked` after one `tabs_context_mcp` call is what makes an empty ledger mean something.
+
+`session-guard.sh check` says where you stand at any point.
+
 ## Cross-Repo Handoffs
 
 BaseCradle is built across multiple repositories — the private Rails core (the capital), the public SDKs, and the ecosystem repos — each worked on by its own **builder agent** (see "Naming" below). Builder agents cannot reach across repos, so cross-repo work moves as a **handoff**: a self-sufficient issue on the target repo plus a trigger that wakes its agent. This section carries the invariants; **the step-by-step procedure — sending, receiving, delivery mechanics, propagation — lives in the `cross-repo-handoffs` skill (`.claude/skills/cross-repo-handoffs/`). Invoke that skill whenever you send a handoff, and before acting on any trigger beginning `Cross-repo handoff:`.** Both this block and that skill are carried verbatim in every BaseCradle repo (see "Propagation" below).
