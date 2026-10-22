@@ -248,8 +248,9 @@ def _signed_merge(author: str) -> tuple[bytes, dict[str, str]]:
 
 
 def _merge_server(tmp_path, waker: _RecordingWaker):
+    # The allow-list stays the box's shape — no captain bot on it (#367): Nova's own
+    # merge must be admitted by the registry's bot_slug, through the composition root.
     env = _env(tmp_path)
-    env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"] = f"{HANDOFF_SENDER},{NOVA_BOT}"
     server = create_app(env, waker=waker)
     opened = {
         "action": "opened",

@@ -499,8 +499,9 @@ def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozense
     """The github route's allow-list of actors permitted to trigger a wake.
 
     Read from ``BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS`` as a comma-separated
-    list of GitHub logins (the fleet's org members and App bots, e.g.
-    ``drawkkwast,basecradle-router-ai[bot]``). It is **required** and must be
+    list of GitHub logins: the founders' accounts and the capital bot, never a
+    captain's bot, which the github route trusts only as the sender of its own merge
+    (``deploy/README.md`` carries the box's value). It is **required** and must be
     non-empty: this is a security control, so a deployment that forgets it fails
     loudly at startup rather than silently disabling the gate. Source-specific
     config, so it lives on the github route (via the composition root), not on the

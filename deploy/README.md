@@ -361,7 +361,7 @@ fail-direction for a log filter is to log too much, never to silently swallow.
 ```
 BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=<the GitHub App webhook signing secret>
 BASECRADLE_ROUTER_AGENTS=/etc/basecradle-router/agents.json
-BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. drawkkwast,basecradle-router-ai[bot]>
+BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins: drawkkwast,basecradle-ai[bot]>
 # BASECRADLE_ROUTER_ENABLED_ROUTES defaults to "github"; set to "github,basecradle"
 #   to also accept the platform's Event Delivery:
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle
@@ -419,10 +419,13 @@ run only; on the box it would make every proven capability read as never-proven 
 
 `BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS` is the github route's **trust gate** (defense-in-depth): a
 wake only fires if the webhook `sender` — the actor who applied the `handoff` label, or who left the
-comment — is on this allow-list of fleet actors (org members + fleet App bots). It is **required and
-non-empty**; the daemon refuses to start without it, so the check can never be silently off. List human
-org members by their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched
-case-insensitively.
+comment — is on this allow-list. It is **required and non-empty**; the daemon refuses to start without
+it, so the check can never be silently off. **It lists the founders' GitHub accounts and the capital bot
+(on the box, `drawkkwast,basecradle-ai[bot]`), and never a captain's bot.** The fleet is a star — a sibling captain's
+`handoff` label or comment wakes no one — and listing the captain bots here would let any captain's
+comment wake any other. A captain bot is trusted in exactly one place, decided in code rather than by this
+list: as the `sender` of its **own** merge on its own repo (the `pull_request` path below, issue #367).
+Matched case-insensitively.
 
 **The github route consumes three webhook events** (subscribe each agent's App to all three — *Issues*,
 *Issue comment* **and** *Pull request*; an App not subscribed to an event never sends it, and nothing on
@@ -446,8 +449,11 @@ the router's side can tell):
   handoff issue is open** (issue #365). A fleet-server captain arms auto-merge and ends its turn, and the
   merge used to wake no one, so the completion report and the by-hand close waited for a capital nudge.
   Only a PR **authored by the repo's captain bot** (resolved from `agents.json`, like the self-comment
-  guard) counts — a Dependabot, human or peer PR wakes no one — and the delivery's `sender` must be a
-  trusted actor (for auto-merge, GitHub attributes the merge to the bot that armed it). A PR payload names no issue, so the target is
+  guard) counts — a Dependabot, human or peer PR wakes no one — and the delivery's `sender` must be that
+  **same captain bot** (its own auto-merge: GitHub attributes the merge to the bot that armed it) **or a
+  trusted actor** (a human merging it by hand). The captain bot is admitted by equality with the bot
+  `agents.json` registers for the repo, never through the allow-list, so a peer bot's merge is rejected and
+  the star holds (issue #367). A PR payload names no issue, so the target is
   found in the route's record of handoff issues (the recheck ledger below): the open handoff issue in that
   repo the PR's title or body names (`#N`, `owner/name#N`, or the issue's URL) — never another, when it
   names any issue in its repo — or, when it names none, the repo's **only** open handoff issue. None, or several with none named, is an `event=merge_wake_skip` line with
@@ -456,8 +462,12 @@ the router's side can tell):
   number and URL (never its author-written text): `Wake reason: your pull request #N (<url>) merged;
   finish the issue.` A merge stamps the event with `merged_at`, so it coalesces like any delivery: a
   successful wake on the issue that started after the merge already covers it. The record is memory: a handoff issue the daemon has not
-  seen a delivery for since it last started (a deploy restarts it) is one no merge can wake until a comment
-  or label delivery shows it again — the behaviour before #365, never a wrong wake.
+  seen a delivery for since it last started (a deploy restarts it) is one no merge can wake until an
+  `issues` or `issue_comment` delivery shows it again — the behaviour before #365, never a wrong wake. Any
+  such delivery teaches it, the ones the route ignores included, so it can be taught without a wake: the
+  captain's **own** comment on the issue (the self-comment guard ignores it), a label other than `handoff`
+  added or removed, or an edit of the issue. A comment from a trusted actor, or `handoff` re-applied by
+  one, teaches it too, but wakes the captain.
 
 **One handoff, one wake — and never for a closed issue** (#272). One handoff once cost five sessions: every
 accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`

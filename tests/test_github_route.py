@@ -32,10 +32,12 @@ from basecradle_router.secret import Secret
 SECRET = "s3cret-fake-webhook-signing-key"
 BODY = b'{"action":"opened","issue":{"number":42}}'
 
-# The fleet allow-list under test: John Doe (human org member) and a fabricated
-# fleet App bot. GitHub logins are case-insensitive, so "John" must match "john".
+# The fleet allow-list under test, shaped like the box's (#367): John Doe standing in
+# for the founder's account, and the capital bot — never a captain's bot, so a test
+# that passes here passes against the live trust model, not a wider one. GitHub
+# logins are case-insensitive, so "John" must match "john".
 TRUSTED_ACTOR = "john"
-FLEET_BOT = "basecradle-python-ai[bot]"
+FLEET_BOT = "basecradle-ai[bot]"
 TRUSTED = frozenset({TRUSTED_ACTOR, FLEET_BOT})
 UNTRUSTED_ACTOR = "drive-by-stranger"
 
@@ -308,7 +310,7 @@ def test_normalize_rejects_handoff_from_untrusted_sender() -> None:
 
 
 def test_normalize_accepts_handoff_from_trusted_fleet_bot() -> None:
-    # A fleet App bot (login like 'name[bot]') is a trusted actor.
+    # The capital bot (a `name[bot]` login) is a trusted actor.
     payload = _issues_payload(action="labeled", labels=(), sender=FLEET_BOT)
     event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
     assert event is not None
@@ -461,13 +463,12 @@ def test_the_decision_line_says_unknown_when_the_delivery_header_is_absent(caplo
 # agent's OWN comment must never re-wake it, or it loops on its own replies. The
 # repo's captain bot (for that guard) is resolved from the registry; here a stub.
 
-RECIPIENT_BOT = FLEET_BOT  # basecradle-python-ai[bot] — TARGET_REPO's own captain
-PEER_BOT = "basecradle-ai[bot]"  # a *different* fleet bot (the capital), a peer
-# A trust allow-list that admits the human filer and both bots used below.
-TRUSTED_WITH_BOTS = frozenset({TRUSTED_ACTOR, RECIPIENT_BOT, PEER_BOT})
+RECIPIENT_BOT = "basecradle-python-ai[bot]"  # TARGET_REPO's own captain — never trusted
+PEER_BOT = FLEET_BOT  # a *different* fleet bot (the capital), a trusted peer
+PEER_CAPTAIN_BOT = "basecradle-ruby-ai[bot]"  # another repo's captain — never trusted
 
 
-def _comment_route(trusted: frozenset[str] = TRUSTED_WITH_BOTS) -> GithubRoute:
+def _comment_route(trusted: frozenset[str] = TRUSTED) -> GithubRoute:
     """A github route wired so TARGET_REPO's captain bot is RECIPIENT_BOT."""
     return GithubRoute(trusted, bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT}.get)
 
@@ -583,6 +584,14 @@ def test_normalize_self_comment_guard_is_case_insensitive() -> None:
     # the agent itself and must not re-wake.
     payload = _comment_payload(sender="BaseCradle-Python-AI[bot]")
     assert _comment_route().normalize(_comment_request(payload)) is None
+
+
+def test_normalize_rejects_a_peer_captains_comment() -> None:
+    # The star: a sibling captain's comment wakes no one — captain bots are never on
+    # the allow-list, and the self-comment guard admits only the recipient's own bot.
+    payload = _comment_payload(sender=PEER_CAPTAIN_BOT)
+    with pytest.raises(UntrustedSenderError, match="untrusted actor"):
+        _comment_route().normalize(_comment_request(payload))
 
 
 def test_normalize_rewakes_on_a_different_fleet_bots_comment() -> None:
@@ -996,7 +1005,9 @@ def test_only_a_merge_rewakes(overrides) -> None:
 
 
 @pytest.mark.parametrize(
-    "author", [DEPENDABOT, TRUSTED_ACTOR, PEER_BOT], ids=["dependabot", "human", "peer-bot"]
+    "author",
+    [DEPENDABOT, TRUSTED_ACTOR, PEER_BOT, PEER_CAPTAIN_BOT],
+    ids=["dependabot", "human", "peer-bot", "peer-captain"],
 )
 def test_a_merge_of_anyone_elses_pr_wakes_no_one(author) -> None:
     # Dependabot's merges stay silent; so does a human's PR or another captain's.
@@ -1020,7 +1031,7 @@ def test_the_captain_bot_is_matched_case_insensitively() -> None:
 
 
 def test_an_unregistered_repo_has_no_captain_so_its_merge_wakes_no_one() -> None:
-    route = GithubRoute(TRUSTED_WITH_BOTS)  # no bot_login_for_repo: no captain known
+    route = GithubRoute(TRUSTED)  # no bot_login_for_repo: no captain known
     _open_handoff(route)
     assert route.normalize(_merge_request(_merge_payload())) is None
 
@@ -1053,13 +1064,11 @@ def test_an_issue_whose_handoff_label_came_off_is_not_a_merge_target() -> None:
 def test_a_handoff_in_another_repo_is_not_a_merge_target() -> None:
     other = "basecradle/basecradle-ruby"
     route = GithubRoute(
-        TRUSTED_WITH_BOTS | {"basecradle-ruby-ai[bot]"},
-        bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT, other: "basecradle-ruby-ai[bot]"}.get,
+        TRUSTED,
+        bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT, other: PEER_CAPTAIN_BOT}.get,
     )
     _open_handoff(route)  # open on TARGET_REPO, not on `other`
-    payload = _merge_payload(
-        repo=other, author="basecradle-ruby-ai[bot]", sender="basecradle-ruby-ai[bot]"
-    )
+    payload = _merge_payload(repo=other, author=PEER_CAPTAIN_BOT, sender=PEER_CAPTAIN_BOT)
     assert route.normalize(_merge_request(payload)) is None
 
 
@@ -1131,17 +1140,45 @@ def test_a_pr_names_an_issue_only_in_its_own_repo(text, named) -> None:
     assert _named_issues({"title": "", "body": text}, TARGET_REPO) == named
 
 
-def test_a_merge_by_an_untrusted_sender_is_rejected() -> None:
-    # The author gate passed (the captain wrote it), but whoever merged it must be a
-    # trusted fleet actor too — fail closed, exactly like the other two wake paths.
-    route = GithubRoute(
-        frozenset({TRUSTED_ACTOR}), bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT}.get
-    )
+def test_the_captains_own_auto_merge_wakes_it_though_its_bot_is_not_trusted() -> None:
+    # The live proof of #365 failed exactly here (#367): the box's allow-list is the
+    # founder and the capital bot, and GitHub attributes an auto-merge to the bot that
+    # armed it. The captain's own bot as sender is admitted by equality with the
+    # registered bot, never by the allow-list.
+    route = _comment_route()
+    assert RECIPIENT_BOT not in TRUSTED
+    _open_handoff(route)
+    event = route.normalize(_merge_request(_merge_payload(sender=RECIPIENT_BOT)))
+    assert event is not None
+    assert event.origin.url == ISSUE_URL
+
+
+def test_the_captains_own_merge_sender_is_matched_case_insensitively() -> None:
+    route = _comment_route()
+    _open_handoff(route)
+    payload = _merge_payload(sender="BaseCradle-Python-AI[bot]")
+    assert route.normalize(_merge_request(payload)) is not None
+
+
+def test_a_trusted_human_merging_the_captains_pr_by_hand_wakes_it() -> None:
+    route = _comment_route()
+    _open_handoff(route)
+    assert route.normalize(_merge_request(_merge_payload(sender=TRUSTED_ACTOR))) is not None
+
+
+@pytest.mark.parametrize(
+    "sender",
+    [PEER_CAPTAIN_BOT, "basecradle-python-ai", UNTRUSTED_ACTOR, None],
+    ids=["peer-captain", "lookalike-user", "untrusted-human", "no-sender"],
+)
+def test_a_merge_by_anyone_else_is_rejected(sender) -> None:
+    # The author gate passed (the captain wrote it), but the merge's sender must be that
+    # same captain bot or a trusted actor — fail closed, like the other two wake paths.
+    # A peer captain's merge is the star's case: no peer bot's anything wakes a captain.
+    route = _comment_route()
     _open_handoff(route)
     with pytest.raises(UntrustedSenderError):
-        route.normalize(_merge_request(_merge_payload(sender=UNTRUSTED_ACTOR)))
-    with pytest.raises(UntrustedSenderError):
-        route.normalize(_merge_request(_merge_payload(sender=None)))
+        route.normalize(_merge_request(_merge_payload(sender=sender)))
 
 
 def test_a_merge_payload_without_a_repository_is_malformed() -> None:
