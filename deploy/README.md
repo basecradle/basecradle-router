@@ -1071,7 +1071,7 @@ root-owned wrapper + `sudoers` rule is a one-time on-box step; thereafter the NO
 the wrapper and the managed units in lockstep with `main` on every deploy.)
 
 - **The systemd unit** `deploy/systemd/basecradle-router.service`: runs `uvicorn` (**single worker** —
-  the per-repo lock is per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
+  the wake scheduler and the per-agent lock are per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
   `Restart=on-failure`, `KillMode=mixed` + a generous `TimeoutStopSec` (30min) to let the app drain
   its (unbounded) in-flight wakes on shutdown, bound to localhost (Caddy fronts it).
   > **Sandboxing is constrained by the in-process wake.** The wake (`sudo`→`runuser`→`claude`) runs as a

@@ -58,9 +58,9 @@ SyslogIdentifier=basecradle-router
 # wake-runner.
 Environment=UV_NO_CACHE=1
 
-# SINGLE WORKER — load-bearing, never add --workers. The per-repo threading.Lock
-# only serializes wakes within one process; multiple worker processes would each
-# hold their own locks and could double-wake a repo's clone. Bind to localhost
+# SINGLE WORKER — load-bearing, never add --workers. The wake scheduler and the
+# per-agent threading.Lock only serialize wakes within one process; multiple worker
+# processes would each hold their own and could double-wake an agent. Bind to localhost
 # only — Caddy (the TLS front end, #31) reverse-proxies to this port.
 #
 # --no-sync (#297): A BARE `uv run` SYNCS FIRST — it re-locks the project and writes
