@@ -63,7 +63,7 @@ box fact, and if the NOC's helper ever learns to mint on demand, this claim must
 ## 1. Mint a token and route gh through it — one call, fail-closed
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 gh issue comment 123 --repo basecradle/basecradle-router --body "…"   # the write, in this same Bash call
 ```
 
@@ -83,7 +83,7 @@ With `GH_TOKEN` exported, `gh issue comment`, `gh pr create`, `gh pr merge`, and
 A misattributed write looks identical to a correct one from inside the session, so read the author back off GitHub after the first one — in the same call, so a failed re-mint cannot mask the answer:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 gh api repos/basecradle/basecradle-router/issues/123/comments --jq '.[-1].user.login'
 # → basecradle-router-ai[bot]     correct
 # → drawkkwast                    impossible while §0 holds — if you ever see it, the guard was unset: delete the write, redo it, restore the guard
@@ -102,7 +102,7 @@ session already carries that helper (§0), so the *bare* push is the fail-closed
 the point, since a `-c` prefix only protects the pushes someone remembered to prefix:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-router-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 git push origin <branch>
 ```
 
@@ -129,4 +129,4 @@ git config --local user.name "basecradle-router-ai[bot]"
 git config --local user.email "291153759+basecradle-router-ai[bot]@users.noreply.github.com"
 ```
 
-It lives in `.git/config` only — a fresh clone starts without it, so re-run after cloning. (`~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-router-ai --author` prints this string.)
+It lives in `.git/config` only — a fresh clone starts without it, so re-run after cloning. (`~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-router-ai --author` prints this string.)
