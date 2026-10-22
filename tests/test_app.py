@@ -154,6 +154,49 @@ def test_create_app_requires_the_trusted_actors_allow_list(tmp_path) -> None:
         create_app(env, waker=_RecordingWaker())
 
 
+# --- a captain's bot on the allow-list refuses to boot (#369) -----------------
+
+
+def test_a_captain_bot_on_the_allow_list_refuses_to_boot(tmp_path) -> None:
+    # Nova's own bot listed would let any captain's comment wake another: the daemon
+    # refuses to start, as with an absent or empty list.
+    env = _env(tmp_path)
+    env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"] = f"{HANDOFF_SENDER},{NOVA.bot_slug}[bot]"
+    with pytest.raises(ConfigError, match="lists a captain's bot"):
+        create_app(env, waker=_RecordingWaker())
+
+
+def test_the_claims_emitter_refuses_the_same_allow_list(tmp_path) -> None:
+    # The emitter builds the daemon's registry, so it cannot describe a router that
+    # would refuse to start.
+    env = _env(tmp_path)
+    env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"] = f"{HANDOFF_SENDER},{NOVA.bot_slug}[bot]"
+    with pytest.raises(ConfigError, match="lists a captain's bot"):
+        build_registry(load_config(env), env)
+
+
+def test_the_capital_bot_boots_even_when_the_capital_is_registered(tmp_path) -> None:
+    # The capital bot is the one bot the list must hold. A box that also registers the
+    # capital as an agent (its bot is then a registered bot like any captain's) still
+    # boots with it listed: the refusal is about the list, not the registry.
+    env = _env(tmp_path)
+    registry = tmp_path / "capital-agents.json"  # its own file: `_env` owns agents.json
+    registry.write_text(
+        json.dumps(
+            {
+                "basecradle/basecradle": {
+                    "os_user": "basecradle-ai",
+                    "clone_path": "/home/basecradle-ai/basecradle",
+                    "bot_slug": "basecradle-ai",
+                }
+            }
+        )
+    )
+    env["BASECRADLE_ROUTER_AGENTS"] = str(registry)
+    env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"] = f"{HANDOFF_SENDER},basecradle-ai[bot]"
+    assert "github" in create_app(env, waker=_RecordingWaker()).pipeline.registry
+
+
 # --- issue_comment re-wake is wired, self-comment guard included (#129) ------
 
 NOVA_BOT = f"{NOVA.bot_slug}[bot]"  # basecradle-python-ai[bot] — Nova's own bot

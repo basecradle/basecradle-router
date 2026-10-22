@@ -202,13 +202,12 @@ def test_config_maps_are_read_only(tmp_path) -> None:
 # --- github trusted-actor allow-list ---------------------------------------
 
 _ACTORS_VAR = "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"
+CAPITAL_BOT = "basecradle-ai[bot]"  # the capital's bot, the one bot the allow-list holds
 
 
 def test_trusted_actors_parse_a_comma_separated_list() -> None:
-    env = {_ACTORS_VAR: "john, basecradle-python-ai[bot] ,nova"}
-    assert load_github_trusted_actors(env) == frozenset(
-        {"john", "basecradle-python-ai[bot]", "nova"}
-    )
+    env = {_ACTORS_VAR: f"john, {CAPITAL_BOT} ,nova"}
+    assert load_github_trusted_actors(env) == frozenset({"john", CAPITAL_BOT, "nova"})
 
 
 def test_trusted_actors_ignore_blanks_and_whitespace() -> None:
@@ -225,6 +224,39 @@ def test_trusted_actors_required_when_unset() -> None:
 def test_trusted_actors_empty_list_fails() -> None:
     with pytest.raises(ConfigError, match="lists no actors"):
         load_github_trusted_actors({_ACTORS_VAR: " , , "})
+
+
+# A captain's bot on the list would let any captain's comment wake another, so it is
+# refused (#369) — by its shape, so a bot this box does not register is refused too.
+# GitHub logins are case-insensitive, so is the refusal.
+@pytest.mark.parametrize(
+    "captain",
+    [
+        "basecradle-python-ai[bot]",
+        "BaseCradle-Python-AI[bot]",
+        "BASECRADLE-PYTHON-AI[BOT]",
+        "basecradle-example-ai[bot]",
+    ],
+)
+def test_trusted_actors_refuse_a_captain_bot(captain) -> None:
+    with pytest.raises(ConfigError, match=r"(?i)lists a captain's bot \(.*\[bot\]\)"):
+        load_github_trusted_actors({_ACTORS_VAR: f"john,{CAPITAL_BOT},{captain}"})
+
+
+# The capital's bot is the one bot the list holds; a bot that is not a captain's (an
+# App acting for a founder, say) is not this refusal's to make; nor is a near-miss.
+@pytest.mark.parametrize(
+    "actor",
+    [
+        CAPITAL_BOT,
+        CAPITAL_BOT.upper(),
+        "example-founder-app[bot]",
+        "basecradle-python-ai",  # a user account, not the bot
+        "basecradle-python-ai[bot]-x",
+    ],
+)
+def test_trusted_actors_admit_anything_that_is_not_a_captain_bot(actor) -> None:
+    assert load_github_trusted_actors({_ACTORS_VAR: f"john,{actor}"}) == frozenset({"john", actor})
 
 
 # --- wake-rate breaker config ----------------------------------------------

@@ -218,7 +218,7 @@ ENV_FILE = textwrap.dedent(
     """\
     # basecradle-router daemon env (fabricated values)
     BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-github-webhook-secret-0123456789abcdef
-    BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=drawkkwast,basecradle-ai[bot],basecradle-router-ai[bot]
+    BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=drawkkwast,basecradle-ai[bot]
     BASECRADLE_ROUTER_WAKE_BREAKER_MAX=12
     """
 )

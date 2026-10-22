@@ -423,9 +423,12 @@ comment — is on this allow-list. It is **required and non-empty**; the daemon 
 it, so the check can never be silently off. **It lists the founders' GitHub accounts and the capital bot
 (on the box, `drawkkwast,basecradle-ai[bot]`), and never a captain's bot.** The fleet is a star — a sibling captain's
 `handoff` label or comment wakes no one — and listing the captain bots here would let any captain's
-comment wake any other. A captain bot is trusted in exactly one place, decided in code rather than by this
-list: as the `sender` of its **own** merge on its own repo (the `pull_request` path below, issue #367).
-Matched case-insensitively.
+comment wake any other. So **the daemon refuses to start when the list holds a captain's bot** — any
+`basecradle-<name>-ai[bot]` login, the shape every captain's slug takes — the same refusal as an absent or
+empty list (#369). The shape, not the box's registry, decides it, so a laptop builder's bot, which no box
+registers, is refused too; the capital's `basecradle-ai[bot]` never has that shape. A captain bot is trusted in
+exactly one place, decided in code rather than by this list: as the `sender` of its **own** merge on its
+own repo (the `pull_request` path below, issue #367). Matched case-insensitively.
 
 **The github route consumes three webhook events** (subscribe each agent's App to all three — *Issues*,
 *Issue comment* **and** *Pull request*; an App not subscribed to an event never sends it, and nothing on
