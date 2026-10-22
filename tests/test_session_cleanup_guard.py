@@ -229,7 +229,7 @@ if st.get("lsof_error"):
     sys.stderr.flush()
     if st.get("lsof_err_raced"):
         # A sibling run under the same key removing the shared stderr file mid-census.
-        root = os.environ["BASECRADLE_ROUTER_SESSION_STATE_ROOT"]
+        root = os.environ["SESSION_GUARD_STATE_ROOT"]
         for name in os.listdir(root):
             path = os.path.join(root, name, "lsof.err")
             if os.path.exists(path):
@@ -278,12 +278,12 @@ class Lab:
                 "DOCKER_STUB_STATE": str(self.state_file),
                 "DOCKER_STUB_CALLS": str(self.calls),
                 "DOCKER_STUB_LABEL": LABEL,
-                "BASECRADLE_ROUTER_SESSION_STATE_ROOT": str(self.state_root),
-                "BASECRADLE_ROUTER_DOCKER_APP_PREFIX": FAKE_APP_PREFIX,
+                "SESSION_GUARD_STATE_ROOT": str(self.state_root),
+                "SESSION_GUARD_DOCKER_APP_PREFIX": FAKE_APP_PREFIX,
                 "CLAUDE_CODE_SESSION_ID": "test-session",
-                "BASECRADLE_ROUTER_GUARD_STOP_WAIT": "2",
-                "BASECRADLE_ROUTER_GUARD_START_WAIT": "2",
-                "BASECRADLE_ROUTER_GUARD_POLL": "1",
+                "SESSION_GUARD_STOP_WAIT": "2",
+                "SESSION_GUARD_START_WAIT": "2",
+                "SESSION_GUARD_POLL": "1",
             }
         )
         return env
@@ -838,7 +838,8 @@ def test_a_session_with_no_listener_baseline_is_not_clean_until_it_attests_one(l
     assert "no listening-port baseline" in lab_obj.run("check").stdout
     late = lab_obj.run("baseline-listeners")
     assert late.returncode == 0 and "LATE" in late.stdout
-    assert "listening" not in lab_obj.run("check").stdout
+    after = lab_obj.run("check")
+    assert after.returncode == 0 and "not-clean" not in after.stdout, after.stdout
 
 
 def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
@@ -1051,18 +1052,28 @@ def test_an_engine_down_at_session_start_is_censused_by_docker_up(lab):
     assert IMAGE["id"] in lb.run("check").stdout  # what came after the census still shows
 
 
-def test_an_engine_that_came_up_from_outside_is_named_not_checked_never_blamed(lab):
-    """(b): an engine that came up after ``begin`` without a ``docker-up`` has no baseline to
-    compare against. The labelled checks still run; the unlabelled gap is named, never filed as
-    findings against what was already there."""
+def test_an_engine_that_came_up_from_outside_is_a_finding_never_blamed_on_what_was_there(lab):
+    """(b), as decided on basecradle#709 item 3: an engine that came up after ``begin`` without a
+    ``docker-up`` has no baseline to compare against. The labelled checks still run and nothing
+    that was already there is blamed — but the gap is a FINDING, because "we could not look" is
+    never clean and a session that used the engine out of protocol would otherwise exit clean. Its
+    lever is a late census, which every later ``check`` names."""
     lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
     assert lb.run("begin").returncode == 0
     lb.mutate(engine_up=True, images=[FOREIGN_IMAGE, IMAGE])
     lb.clean_tabs()
     got = lb.run("check")
-    assert "NOT CHECKED: unlabelled Docker artefacts" in got.stdout
     assert FOREIGN_IMAGE["id"] not in got.stdout
     assert f"labelled image still present: {IMAGE['id']}" in got.stdout
+
+    lb.mutate(images=[FOREIGN_IMAGE])  # the labelled finding is not what makes this one fail
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "not-clean: no Docker baseline" in got.stdout
+    assert lb.run("docker-up").returncode == 0
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
+    assert "LATE: the Docker baseline was taken at" in got.stdout
 
 
 def test_a_build_cache_that_shrank_is_not_a_build(lab):
