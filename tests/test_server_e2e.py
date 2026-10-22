@@ -743,7 +743,7 @@ def test_the_banner_is_followed_by_each_routes_own_config_line(caplog) -> None:
     registry.register(
         BasecradleRoute(
             RecipientKeyring(
-                {"019e916c-7f45-700e-afc0-f45557b237b7": "bc_isk_fakee2erecipientkey0000000000001"}
+                {"01a161c5-8102-71e0-82f0-2d53fa00c27b": "bc_isk_fakee2erecipientkey0000000000001"}
             )
         )
     )

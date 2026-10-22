@@ -19,9 +19,9 @@ What these tests pin, in the order the requirements were handed down:
    carrying this run's delivery id counts.
 
 Everything is fabricated and offline: the cast is John Doe (``john``) and Nova Digital
-(``nova``), plus the harness agent ``jt``. No network, no model, no live agent. The
-one real subprocess is ``deploy/bin/probe-ack``, which by construction can reach
-neither — it imports ``hmac`` and prints a line.
+(``nova``), plus Orion Digital (``orion``), a harness agent. No network, no model, no
+live agent. The one real subprocess is ``deploy/bin/probe-ack``, which by construction
+can reach neither — it imports ``hmac`` and prints a line.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ WAKE_RUNNER = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "wake-run
 
 PROBE_SECRET = "fake-probe-route-secret-" + "1" * 32  # the ROUTE's secret: authorises injection
 NOVA_AGENT_SECRET = "noc-probe-secret-for-nova-fabricated"  # the AGENT's own secret
-JT_AGENT_SECRET = "noc-probe-secret-for-jt-fabricated"
+ORION_AGENT_SECRET = "noc-probe-secret-for-orion-fabricated"
 
 NOVA = Agent(
     key="basecradle/basecradle-python",
@@ -79,13 +79,13 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
     recipient_uuid="0192f3a4-5b6c-7d8e-9f01-aaaaaaaaaaaa",
-    wake_bin="/home/jt/.venv/bin/basecradle-harness-wake",
+    wake_bin="/home/orion/.venv/bin/basecradle-harness-wake",
 )
 
 
@@ -105,7 +105,7 @@ def a_marker(secret: str = NOVA_AGENT_SECRET) -> str:
     return mint(uuid.uuid4().hex, secret)
 
 
-def config(*, agents=(NOVA, JT), routes=("github", "basecradle", "probe")) -> Config:
+def config(*, agents=(NOVA, ORION), routes=("github", "basecradle", "probe")) -> Config:
     by_key = {a.key: a for a in agents}
     return Config(
         agents=MappingProxyType(by_key),
@@ -256,13 +256,13 @@ def test_a_probe_is_never_a_silent_ignore() -> None:
 
 
 def test_every_registered_agent_is_reachable_by_the_probe_builder_and_harness_agent_alike() -> None:
-    # Requirement 4: one rule, every agent — including @jt, whose grandfathered trust
-    # edge the founder's ruling explicitly declined to preserve.
+    # Requirement 4: one rule, every agent — a harness agent like @orion included, with no
+    # grandfathered trust edge (the founder's ruling explicitly declined to preserve one).
     cfg = config()
     assert "harness_key" in cfg.resolvable_by(NOVA)
-    assert "harness_key" in cfg.resolvable_by(JT)
+    assert "harness_key" in cfg.resolvable_by(ORION)
     assert cfg.agent_for_recipient(Recipient(by="harness_key", value="nova")) is NOVA
-    assert cfg.agent_for_recipient(Recipient(by="harness_key", value="jt")) is JT
+    assert cfg.agent_for_recipient(Recipient(by="harness_key", value="orion")) is ORION
 
     with pytest.raises(ConfigError, match="no agent registered for harness_key"):
         cfg.agent_for_recipient(Recipient(by="harness_key", value="nobody"))
@@ -400,7 +400,7 @@ def test_one_agents_marker_does_not_verify_against_anothers_secret() -> None:
     # The per-agent secret is what stops any secret-holder minting a marker that any
     # other agent's harness would ack — the forgery risk the NOC caught in #424, which
     # carries over to this layer unchanged.
-    result = run_probe_ack(a_marker(JT_AGENT_SECRET), secret=NOVA_AGENT_SECRET)
+    result = run_probe_ack(a_marker(ORION_AGENT_SECRET), secret=NOVA_AGENT_SECRET)
     assert result.returncode == 1
 
 
@@ -583,7 +583,7 @@ class FakeBox:
 
 @pytest.fixture
 def box(tmp_path):
-    return FakeBox(tmp_path, {"nova": NOVA_AGENT_SECRET, "jt": JT_AGENT_SECRET})
+    return FakeBox(tmp_path, {"nova": NOVA_AGENT_SECRET, "orion": ORION_AGENT_SECRET})
 
 
 def test_the_probe_proves_the_edge_end_to_end_and_last_ok_at_moves(box) -> None:
@@ -844,14 +844,14 @@ def test_a_collapsed_injection_reads_unprovable_naming_the_dedup(tmp_path) -> No
 
 
 def test_the_probe_reaches_a_harness_agent_by_exactly_the_same_route(box) -> None:
-    # Requirement 4: @jt migrates to this mechanism, with no special case. The only
-    # difference is which binary the wrapper would have exec'd.
-    result = box.probe().run("jt", a_marker(JT_AGENT_SECRET))
+    # Requirement 4: a harness agent (@orion) is reached by this mechanism, with no special
+    # case. The only difference is which binary the wrapper would have exec'd.
+    result = box.probe().run("orion", a_marker(ORION_AGENT_SECRET))
 
     assert result.status == PROVEN
-    assert box.evidence().agent_wakes["jt"].last_ok_synthetic is True
+    assert box.evidence().agent_wakes["orion"].last_ok_synthetic is True
     argv = box.attempts[0]
-    assert argv[:6] == ("sudo", "/opt/wr", "--user", "jt", "--cwd", "/home/jt/harness")
+    assert argv[:6] == ("sudo", "/opt/wr", "--user", "orion", "--cwd", "/home/orion/harness")
     assert "--probe" in argv
 
 
@@ -981,7 +981,7 @@ def test_a_minted_delivery_id_identifies_the_delivery_and_types_it_with_nothing(
 # --- 8. the claims: a probe is a lever, never an edge ------------------------
 
 
-def manifests(box, *, routes=("github", "probe"), agents=(NOVA, JT), host="ai.basecradle.com"):
+def manifests(box, *, routes=("github", "probe"), agents=(NOVA, ORION), host="ai.basecradle.com"):
     return build_manifests(
         config(agents=agents, routes=routes),
         registry(routes),
@@ -1008,10 +1008,10 @@ def test_a_probe_is_not_a_wake_edge_and_never_inflates_the_edge_count(box) -> No
     retire the parked-builder finding — instance 4, greened by the very lever built to
     exercise it.
     """
-    box.probe().run("jt", a_marker(JT_AGENT_SECRET))
-    edge = claim(subject(manifests(box), "agent:jt"), "wake-edge:webhook-route")
+    box.probe().run("orion", a_marker(ORION_AGENT_SECRET))
+    edge = claim(subject(manifests(box), "agent:orion"), "wake-edge:webhook-route")
 
-    # jt is a harness agent: with only github+probe enabled, it has NO production edge at all.
+    # orion is a harness agent: with only github+probe enabled, it has NO production edge at all.
     assert edge["detail"]["edges"] == []
     assert edge["detail"]["edge_count"] == 0
     # ...and yet the terminus demonstrably answers. That pair IS the honest reading.
@@ -1037,8 +1037,8 @@ def test_the_synthetic_claim_is_emitted_per_armed_agent_and_points_at_its_own_ro
 
 
 def test_the_synthetic_claim_names_the_binary_a_harness_agent_would_have_run(box) -> None:
-    synthetic = claim(subject(manifests(box), "agent:jt"), "wake-edge:synthetic:probe")
-    assert synthetic["detail"]["stops_before"] == f"exec {JT.wake_bin}"
+    synthetic = claim(subject(manifests(box), "agent:orion"), "wake-edge:synthetic:probe")
+    assert synthetic["detail"]["stops_before"] == f"exec {ORION.wake_bin}"
 
 
 def test_a_box_that_has_not_enabled_the_probe_advertises_no_lever(box) -> None:

@@ -142,7 +142,7 @@ def test_a_line_without_equals_is_ignored(tmp_path: Path) -> None:
 
 
 def test_plain_unquoted_values_are_unaffected(tmp_path: Path) -> None:
-    # @jt-style files (no shell-special chars, no quotes) load exactly as before —
+    # Plain files (no shell-special chars, no quotes) load exactly as before —
     # the change is structural, not behavioural, for the common case.
     loaded = _load(
         "ANTHROPIC_API_KEY=sk-ant-deadbeef\nGH_APP_ID=123456\n",

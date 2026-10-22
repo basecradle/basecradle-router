@@ -196,7 +196,7 @@ first_entry() {
 
 # An agent registry key as the env-var suffix its per-recipient signing key is
 # provisioned under: upper-cased, with every character outside [A-Za-z0-9_] replaced by
-# `_` (`jt` -> `JT`, `glm-5.2` -> `GLM_5_2`). Mirrors the daemon's own
+# `_` (`nova` -> `NOVA`, `glm-5.2` -> `GLM_5_2`). Mirrors the daemon's own
 # `basecradle_router.routes.basecradle._slug_suffix`, and cannot drift from it:
 # tests/test_smoke_test_assertions.py runs THIS body and that function over one table of
 # keys and asserts they agree. Written with `tr` rather than `${x^^}` because macOS

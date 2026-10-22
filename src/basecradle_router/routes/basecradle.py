@@ -105,11 +105,11 @@ ROUTE_NAME = "basecradle"
 #: Env var prefix for a **per-recipient** signing key: the route-wide secret's own
 #: variable plus ``_<SLUG>``, where ``<SLUG>`` is the recipient agent's registry key
 #: upper-cased with every character outside ``[A-Za-z0-9_]`` normalised to ``_``
-#: (``jt`` → ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT``; ``glm-5.2`` →
+#: (``nova`` → ``BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_NOVA``; ``glm-5.2`` →
 #: ``…_SECRET_GLM_5_2``) — see :func:`_slug_suffix` for why the charset, not just the
 #: hyphen.
-#: Keyed by the *slug* and not the uuid on purpose: an operator provisioning @jt's
-#: rotated secret should be able to see, in ``router.env``, that it is @jt's — a
+#: Keyed by the *slug* and not the uuid on purpose: an operator provisioning @nova's
+#: rotated secret should be able to see, in ``router.env``, that it is @nova's — a
 #: 36-character uuid in the variable name is unreadable at exactly the moment it
 #: matters, and a mistyped one is indistinguishable from a correct one. The registry
 #: is the authority that maps the slug back to the uuid the platform signs for.
@@ -255,7 +255,7 @@ def load_recipient_keyring(
 
     ``recipients`` is the registry's by-``recipient_uuid`` index
     (:attr:`~basecradle_router.config.Config.recipient_index`) — the authority on which
-    uuid is which agent, so a key provisioned as ``…_SECRET_JT`` lands under @jt's
+    uuid is which agent, so a key provisioned as ``…_SECRET_NOVA`` lands under @nova's
     uuid without an operator ever transcribing one.
 
     Three things are loud here rather than silent, because each of them is a way the
@@ -336,7 +336,7 @@ _ENV_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 def _slug_suffix(key: str) -> str:
     """An agent's registry key as an env-var suffix — upper-cased, everything else ``_``.
 
-    ``jt`` → ``JT``; ``basecradle-harness`` → ``BASECRADLE_HARNESS``; ``glm-5.2`` →
+    ``nova`` → ``NOVA``; ``basecradle-harness`` → ``BASECRADLE_HARNESS``; ``glm-5.2`` →
     ``GLM_5_2``.
 
     The normalisation is over the *whole* character class and not just ``-`` because

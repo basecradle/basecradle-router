@@ -38,20 +38,20 @@ EVENT = Event(
     origin=IssueRef(repo=NOVA.key, number=42, url=ISSUE_URL, title="Mirror the wire-shape change"),
 )
 
-# A harness agent (@jt): woken via its own wake CLI, not claude.
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+# A harness agent (@orion): woken via its own wake CLI, not claude.
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
 TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
-JT_EVENT = Event(
+ORION_EVENT = Event(
     source="basecradle",
     kind=EventKind.PLATFORM_EVENT,
-    recipient=Recipient(by="recipient_uuid", value=JT.recipient_uuid),
+    recipient=Recipient(by="recipient_uuid", value=ORION.recipient_uuid),
     wake_arg=TIMELINE_UUID,
     delivery_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd",
 )
@@ -94,16 +94,16 @@ def test_wake_assembles_the_harness_command_for_a_harness_agent() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
     waker = SubprocessWaker(runner=runner)
 
-    waker.wake(JT, JT_EVENT)
+    waker.wake(ORION, ORION_EVENT)
 
     assert runner.invocation is not None
     assert runner.invocation.argv == (
-        "/home/jt/venv/bin/basecradle-harness-wake",
+        "/home/orion/venv/bin/basecradle-harness-wake",
         "--timeline",
         TIMELINE_UUID,
     )
-    assert runner.invocation.cwd == "/home/jt/harness"
-    assert runner.invocation.run_as_user == "jt"
+    assert runner.invocation.cwd == "/home/orion/harness"
+    assert runner.invocation.run_as_user == "orion"
 
 
 def test_env_provider_receives_the_agent() -> None:
@@ -283,26 +283,26 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
 
 def test_home_server_waker_assembles_the_harness_wake_command() -> None:
     # A harness agent is woken via its registry-pinned wake CLI, not claude:
-    # sudo <wrapper> --user jt --cwd <home> --delivery ID -- <wake_bin> --timeline <uuid>.
+    # sudo <wrapper> --user orion --cwd <home> --delivery ID -- <wake_bin> --timeline <uuid>.
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
-    result = HomeServerWaker(runner=runner).wake(JT, JT_EVENT)
+    result = HomeServerWaker(runner=runner).wake(ORION, ORION_EVENT)
 
     assert runner.invocation is not None
     assert runner.invocation.argv == (
         "sudo",
         WAKE_RUNNER,
         "--user",
-        "jt",
+        "orion",
         "--cwd",
-        "/home/jt/harness",
+        "/home/orion/harness",
         "--delivery",
-        JT_EVENT.delivery_id,
+        ORION_EVENT.delivery_id,
         "--",
-        "/home/jt/venv/bin/basecradle-harness-wake",
+        "/home/orion/venv/bin/basecradle-harness-wake",
         "--timeline",
         TIMELINE_UUID,
     )
-    assert runner.invocation.run_as_user == "jt"
+    assert runner.invocation.run_as_user == "orion"
     assert result.ok and result.stdout == "replied"
 
 

@@ -114,7 +114,7 @@ class Agent:
 
     ``key`` is the agent's stable slug — its identity in the registry and the
     target of resolution. For a GitHub builder it is the ``owner/name`` repo it
-    captains; for a harness agent it is its bare slug (e.g. ``jt``). The
+    captains; for a harness agent it is its bare slug (e.g. ``nova``). The
     home-server fields (``os_user``, ``clone_path``) describe *where* to run the
     wake; ``wake_kind`` describes *how*. The router only ever delivers a trigger —
     it never becomes the agent.

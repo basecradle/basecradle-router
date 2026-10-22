@@ -378,7 +378,7 @@ def _run_registry(env_text: str, snippet: str, tmp_path: Path) -> str:
 
 
 @pytest.mark.parametrize(
-    "key", ["jt", "nova", "aurora-5.2", "aurora-5-2", "basecradle-harness", "glm_5_2"]
+    "key", ["orion", "nova", "aurora-5.2", "aurora-5-2", "basecradle-harness", "glm_5_2"]
 )
 def test_shell_slug_suffix_agrees_with_the_daemons_own(key: str, tmp_path: Path) -> None:
     """The gate derives an agent's key variable; the daemon reads it. One rule, two runners.

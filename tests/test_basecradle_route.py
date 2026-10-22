@@ -5,7 +5,7 @@ verify boundary is the shared HMAC implementation (also exercised via github), s
 these tests focus on this route's header names and its normalize contract.
 
 Fabricated platform event: a new message lands on a timeline the harness
-agent @jt (``jt``, an AI user) views; the platform signs and POSTs it. @jt's
+agent Orion Digital (``orion``, AI) views; the platform signs and POSTs it. Orion's
 fabricated user uuid is a well-formed UUIDv7.
 """
 
@@ -42,7 +42,7 @@ from basecradle_router.routes.basecradle import (
 from basecradle_router.secret import Secret
 
 SECRET = "s3cret-fake-integration-secret"
-JT_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"  # @jt's BaseCradle user uuid
+ORION_UUID = "01a161c5-8102-71e0-82f0-2d53fa00c27b"  # @orion's BaseCradle user uuid
 TIMELINE_UUID = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
 DELIVERY = "0192f3a4-5b6c-7d8e-9f01-23456789abcd"  # the event_id / delivery id
 
@@ -54,7 +54,7 @@ def _sign(body: bytes, secret: str = SECRET) -> str:
 
 def _payload(
     *,
-    recipient_uuid: str | None = JT_UUID,
+    recipient_uuid: str | None = ORION_UUID,
     timeline_uuid: str | None = TIMELINE_UUID,
     event: str = "message.created",
 ) -> dict:
@@ -149,7 +149,7 @@ def test_normalize_message_created_round_trips() -> None:
     assert event.source == "basecradle"
     assert event.kind is EventKind.PLATFORM_EVENT
     # Resolved by the recipient's BaseCradle user uuid, not a repo.
-    assert event.recipient == Recipient(by="recipient_uuid", value=JT_UUID)
+    assert event.recipient == Recipient(by="recipient_uuid", value=ORION_UUID)
     # The wake hands the harness the timeline to process.
     assert event.wake_arg == TIMELINE_UUID
     assert event.delivery_id == DELIVERY
@@ -193,7 +193,7 @@ def test_normalize_wakes_on_the_other_actionable_events(event: str) -> None:
     e = BasecradleRoute().normalize(_request(event=event))
     assert e is not None
     assert e.kind is EventKind.PLATFORM_EVENT
-    assert e.recipient == Recipient(by="recipient_uuid", value=JT_UUID)
+    assert e.recipient == Recipient(by="recipient_uuid", value=ORION_UUID)
     assert e.wake_arg == TIMELINE_UUID
     assert e.delivery_id == DELIVERY
 
@@ -252,7 +252,7 @@ def test_normalize_logs_the_woke_decision_for_a_message(caplog) -> None:
     assert "source=basecradle" in line
     assert "event_type=message.created" in line
     assert f"decision={DeliveryDecision.WOKE.value}" in line
-    assert f"recipient={JT_UUID}" in line
+    assert f"recipient={ORION_UUID}" in line
     assert f"delivery={DELIVERY}" in line
 
 
@@ -285,14 +285,14 @@ def test_normalize_logs_ignored_event_type_none_when_header_absent(caplog) -> No
 # One Integration Signing Key per agent, not one per route. The route picks the key by
 # the delivery's `recipient_uuid`, falls back to the route-wide secret while the
 # cutover runs, and — once that fallback is retired — rejects a recipient it holds no
-# key for. Fabricated cast: @jt and @nova, two harness agents with well-formed
+# key for. Fabricated cast: @orion and @nova, two harness agents with well-formed
 # UUIDv7 user uuids and correctly-shaped fake Integration Signing Keys.
 
-NOVA_UUID = "019e916c-7f45-700e-afc0-f45557b2aaaa"  # @nova's BaseCradle user uuid
-JT_KEY = "bc_isk_fakejtintegrationsigningkey00001"
+NOVA_UUID = "01a161c5-9ff1-76f8-a04c-c476e36c30b7"  # @nova's BaseCradle user uuid
+ORION_KEY = "bc_isk_fakeorionintegrationsigningkey01"
 NOVA_KEY = "bc_isk_fakenovaintegrationsigningkey002"
 
-JT_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}JT"
+ORION_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}ORION"
 NOVA_SECRET_VAR = f"{RECIPIENT_SECRET_PREFIX}NOVA"
 
 
@@ -309,12 +309,12 @@ def _harness_agent(key: str, recipient_uuid: str) -> Agent:
 
 #: The registry's by-``recipient_uuid`` index, as ``load_recipient_keyring`` reads it.
 RECIPIENTS = {
-    JT_UUID: _harness_agent("jt", JT_UUID),
+    ORION_UUID: _harness_agent("orion", ORION_UUID),
     NOVA_UUID: _harness_agent("nova", NOVA_UUID),
 }
 
 
-def _keyed_request(secret: str, *, recipient_uuid: str | None = JT_UUID) -> InboundRequest:
+def _keyed_request(secret: str, *, recipient_uuid: str | None = ORION_UUID) -> InboundRequest:
     """A delivery for ``recipient_uuid``, signed with ``secret``."""
     body = json.dumps(_payload(recipient_uuid=recipient_uuid)).encode("utf-8")
     return _request(raw_body=body, signature=_sign(body, secret))
@@ -330,33 +330,33 @@ def _verify_key_lines(caplog) -> list[str]:
 
 
 def test_a_provisioned_recipient_is_verified_with_its_own_key() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
-    route.verify(_keyed_request(JT_KEY), Secret(SECRET))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
+    route.verify(_keyed_request(ORION_KEY), Secret(SECRET))
 
 
 def test_a_provisioned_recipient_no_longer_accepts_the_shared_secret() -> None:
-    # The whole point of the change: once @jt is rotated, the value the other six
-    # agents still share stops being able to speak for @jt. Without this assertion the
+    # The whole point of the change: once @orion is rotated, the value the other six
+    # agents still share stops being able to speak for @orion. Without this assertion the
     # feature could be entirely inert and every other test here would still pass.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with pytest.raises(SignatureError, match="does not match"):
         route.verify(_keyed_request(SECRET), Secret(SECRET))
 
 
 def test_one_agents_key_cannot_sign_for_another() -> None:
-    # The forgery the shared secret allowed: @nova signing a delivery addressed to @jt.
+    # The forgery the shared secret allowed: @nova signing a delivery addressed to @orion.
     route = BasecradleRoute(
-        RecipientKeyring({JT_UUID: Secret(JT_KEY), NOVA_UUID: Secret(NOVA_KEY)})
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY), NOVA_UUID: Secret(NOVA_KEY)})
     )
     with pytest.raises(SignatureError, match="does not match"):
-        route.verify(_keyed_request(NOVA_KEY, recipient_uuid=JT_UUID), Secret(SECRET))
+        route.verify(_keyed_request(NOVA_KEY, recipient_uuid=ORION_UUID), Secret(SECRET))
 
 
 def test_an_unprovisioned_recipient_still_verifies_against_the_shared_secret() -> None:
     # The backward-compatible half: @nova has not been rotated yet, so its deliveries
-    # keep verifying while @jt's already use @jt's own key. This is what lets the
+    # keep verifying while @orion's already use @orion's own key. This is what lets the
     # platform rotate one agent at a time.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
@@ -367,14 +367,18 @@ def test_an_empty_keyring_verifies_exactly_as_before() -> None:
 
 
 def test_a_retired_fallback_rejects_a_recipient_with_no_key_of_its_own() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
     with pytest.raises(SignatureError, match="shared fallback is retired"):
         route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
 def test_a_retired_fallback_still_verifies_a_provisioned_recipient() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
-    route.verify(_keyed_request(JT_KEY), Secret(SECRET))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
+    route.verify(_keyed_request(ORION_KEY), Secret(SECRET))
 
 
 # --- the shared secret is needed only while the fallback is armed (#337) ------
@@ -384,19 +388,25 @@ def test_a_retired_fallback_still_verifies_a_provisioned_recipient() -> None:
 def test_the_route_needs_the_shared_secret_exactly_while_the_fallback_is_armed(
     fallback: bool,
 ) -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=fallback))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=fallback)
+    )
     assert route.requires_route_secret is fallback
 
 
 def test_a_retired_fallback_verifies_with_no_shared_secret_on_the_box() -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
-    route.verify(_keyed_request(JT_KEY), None)
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
+    route.verify(_keyed_request(ORION_KEY), None)
 
 
 def test_a_retired_fallback_with_no_shared_secret_still_names_the_retirement() -> None:
     # The rejection a box with no shared value gives an unkeyed recipient is the same
     # one it always gave — the keyring refuses before any digest is computed.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
     with pytest.raises(SignatureError, match="shared fallback is retired"):
         route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), None)
 
@@ -404,7 +414,7 @@ def test_a_retired_fallback_with_no_shared_secret_still_names_the_retirement() -
 def test_an_armed_fallback_handed_no_shared_secret_fails_closed() -> None:
     # Boot refuses this state; were it ever reached, the HMAC boundary refuses the
     # missing key rather than verifying under a stand-in.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with pytest.raises(SignatureError, match="no signing key is configured"):
         route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), None)
 
@@ -413,7 +423,9 @@ def test_the_no_key_rejection_never_names_the_untrusted_recipient() -> None:
     # The message reaches the journal AND the evidence document, and at this point the
     # uuid is an unauthenticated claim. Naming the key path is the diagnosis; echoing
     # attacker-supplied bytes is not.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
     with pytest.raises(SignatureError) as caught:
         route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
     assert NOVA_UUID not in str(caught.value)
@@ -427,7 +439,7 @@ def test_the_no_key_rejection_never_names_the_untrusted_recipient() -> None:
         b'{"event":"message.created"}',  # no recipient_uuid at all
         b'{"recipient_uuid": 42}',  # not a string
         b'{"recipient_uuid": "not-a-uuid"}',  # not uuid-shaped
-        b'{"recipient_uuid": "019e916c-7f45-700e-afc0-f45557b237b7\\ninjected=1"}',
+        b'{"recipient_uuid": "01a161c5-8102-71e0-82f0-2d53fa00c27b\\ninjected=1"}',
     ],
 )
 def test_a_body_that_names_no_usable_recipient_falls_back_to_the_shared_secret(
@@ -436,14 +448,14 @@ def test_a_body_that_names_no_usable_recipient_falls_back_to_the_shared_secret(
     # The pre-verification parse must never be able to fail *open* or crash: whatever
     # the body is, it selects no per-recipient key and the delivery is verified — and
     # for a malformed body, rejected — exactly as it is today.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     route.verify(InboundRequest(headers={SIGNATURE_HEADER: _sign(body)}, body=body), Secret(SECRET))
 
 
 def test_a_malformed_body_is_still_rejected_at_the_signature_not_as_a_bad_payload() -> None:
     # `verify` reads the body before verifying it, so it must not start answering an
     # unauthenticated caller "your JSON is bad" — that is normalize's job, after trust.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     body = b"{not json"
     with pytest.raises(SignatureError):
         route.verify(
@@ -455,13 +467,13 @@ def test_a_malformed_body_is_still_rejected_at_the_signature_not_as_a_bad_payloa
 
 
 def test_a_verified_delivery_logs_the_key_path_and_who_it_was_for(caplog) -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
-        route.verify(_keyed_request(JT_KEY), Secret(SECRET))
+        route.verify(_keyed_request(ORION_KEY), Secret(SECRET))
     line = _verify_key_line(caplog)
     assert "source=basecradle" in line
     assert f"key_path={KEY_PATH_RECIPIENT}" in line
-    assert f"recipient={JT_UUID}" in line
+    assert f"recipient={ORION_UUID}" in line
     # The same join key every other line of this delivery's trip carries (#170).
     assert f"delivery={DELIVERY}" in line
 
@@ -469,7 +481,7 @@ def test_a_verified_delivery_logs_the_key_path_and_who_it_was_for(caplog) -> Non
 def test_a_fallback_verified_delivery_says_so(caplog) -> None:
     # What makes the cutover watchable: `key=fallback` is the count that must fall to
     # zero before the shared secret can be retired.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         route.verify(_keyed_request(SECRET, recipient_uuid=NOVA_UUID), Secret(SECRET))
     assert f"key_path={KEY_PATH_FALLBACK}" in _verify_key_line(caplog)
@@ -479,7 +491,7 @@ def test_a_rejected_delivery_logs_no_verify_key_line_but_names_the_path(caplog) 
     # Before the signature checks out the recipient is a claim, not a fact — so the
     # line that asserts one is emitted only after verification. The key path still
     # reaches the operator, through the rejection reason the core logs and stores.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with (
         caplog.at_level("INFO", logger="basecradle_router.routes"),
         pytest.raises(SignatureError, match=f"key_path={KEY_PATH_RECIPIENT}") as caught,
@@ -490,9 +502,9 @@ def test_a_rejected_delivery_logs_no_verify_key_line_but_names_the_path(caplog) 
 
 
 def test_the_rejection_names_the_fallback_path_when_that_is_what_was_tried(caplog) -> None:
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with pytest.raises(SignatureError, match=f"key_path={KEY_PATH_FALLBACK}"):
-        route.verify(_keyed_request(JT_KEY, recipient_uuid=NOVA_UUID), Secret(SECRET))
+        route.verify(_keyed_request(ORION_KEY, recipient_uuid=NOVA_UUID), Secret(SECRET))
 
 
 # --- loading the keyring from the environment --------------------------------
@@ -506,18 +518,18 @@ def test_the_keyring_defaults_to_empty_with_the_fallback_on() -> None:
 
 
 def test_a_key_is_loaded_under_the_agents_uuid_not_its_slug() -> None:
-    # The registry is what maps @jt's readable slug to the uuid the platform signs
+    # The registry is what maps @orion's readable slug to the uuid the platform signs
     # for, so an operator never transcribes a uuid into router.env.
-    keyring = load_recipient_keyring(RECIPIENTS, {JT_SECRET_VAR: JT_KEY})
-    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
+    keyring = load_recipient_keyring(RECIPIENTS, {ORION_SECRET_VAR: ORION_KEY})
+    assert dict(keyring.by_recipient) == {ORION_UUID: Secret(ORION_KEY)}
 
 
 def test_a_slugs_hyphens_become_underscores_in_the_variable_name() -> None:
-    recipients = {JT_UUID: _harness_agent("basecradle-harness", JT_UUID)}
+    recipients = {ORION_UUID: _harness_agent("basecradle-harness", ORION_UUID)}
     keyring = load_recipient_keyring(
-        recipients, {f"{RECIPIENT_SECRET_PREFIX}BASECRADLE_HARNESS": JT_KEY}
+        recipients, {f"{RECIPIENT_SECRET_PREFIX}BASECRADLE_HARNESS": ORION_KEY}
     )
-    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
+    assert dict(keyring.by_recipient) == {ORION_UUID: Secret(ORION_KEY)}
 
 
 def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
@@ -526,9 +538,9 @@ def test_a_slug_with_a_dot_still_yields_a_usable_variable_name() -> None:
     # through, so the value never reached the daemon and that agent stayed on the
     # shared secret after the platform had rotated it — silent, and unreachable by
     # every guard below, because the variable simply never arrives.
-    recipients = {JT_UUID: _harness_agent("glm-5.2", JT_UUID)}
-    keyring = load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": JT_KEY})
-    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY)}
+    recipients = {ORION_UUID: _harness_agent("glm-5.2", ORION_UUID)}
+    keyring = load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5_2": ORION_KEY})
+    assert dict(keyring.by_recipient) == {ORION_UUID: Secret(ORION_KEY)}
 
 
 #: systemd's own rule for an environment variable name (`env_name_is_valid`): ASCII
@@ -540,7 +552,7 @@ _SYSTEMD_ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 @pytest.mark.parametrize(
     "key",
     [
-        "jt",
+        "orion",
         "nova",
         "glm-5.2",
         "basecradle-harness",
@@ -560,9 +572,9 @@ def test_a_derived_variable_name_is_always_one_systemd_will_pass_through(key: st
     var = RECIPIENT_SECRET_PREFIX + _slug_suffix(key)
     assert _SYSTEMD_ENV_NAME.fullmatch(var), var
     # And that legal name is the one the loader actually provisions the agent from.
-    recipients = {JT_UUID: _harness_agent(key, JT_UUID)}
-    assert dict(load_recipient_keyring(recipients, {var: JT_KEY}).by_recipient) == {
-        JT_UUID: Secret(JT_KEY)
+    recipients = {ORION_UUID: _harness_agent(key, ORION_UUID)}
+    assert dict(load_recipient_keyring(recipients, {var: ORION_KEY}).by_recipient) == {
+        ORION_UUID: Secret(ORION_KEY)
     }
 
 
@@ -570,9 +582,9 @@ def test_the_unknown_slug_error_names_the_normalised_variable_not_the_raw_slug()
     # An operator following the old hyphens-only rule writes `…_GLM_5.2`. On the box
     # systemd drops that name before the daemon sees it; anywhere it does arrive it is
     # loud, and the error names the spelling that works.
-    recipients = {JT_UUID: _harness_agent("glm-5.2", JT_UUID)}
+    recipients = {ORION_UUID: _harness_agent("glm-5.2", ORION_UUID)}
     with pytest.raises(ConfigError) as caught:
-        load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5.2": JT_KEY})
+        load_recipient_keyring(recipients, {f"{RECIPIENT_SECRET_PREFIX}GLM_5.2": ORION_KEY})
     assert f"{RECIPIENT_SECRET_PREFIX}GLM_5_2" in str(caught.value)
 
 
@@ -588,30 +600,30 @@ def test_a_key_for_an_unknown_slug_is_a_loud_error() -> None:
     # shared secret after the platform has already rotated it, and five failed
     # deliveries auto-disable its integration.
     with pytest.raises(ConfigError, match="names no registered agent"):
-        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
+        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}ORIONN": ORION_KEY})
 
 
 def test_the_unknown_slug_error_lists_the_slugs_that_do_exist() -> None:
     with pytest.raises(ConfigError) as caught:
-        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY})
-    assert JT_SECRET_VAR in str(caught.value)
+        load_recipient_keyring(RECIPIENTS, {f"{RECIPIENT_SECRET_PREFIX}ORIONN": ORION_KEY})
+    assert ORION_SECRET_VAR in str(caught.value)
     assert NOVA_SECRET_VAR in str(caught.value)
 
 
 def test_an_empty_key_is_a_loud_error_never_an_empty_hmac_key() -> None:
     # "" is a perfectly usable HMAC key — one an attacker can also compute with.
     with pytest.raises(ConfigError, match="set but empty"):
-        load_recipient_keyring(RECIPIENTS, {JT_SECRET_VAR: "   "})
+        load_recipient_keyring(RECIPIENTS, {ORION_SECRET_VAR: "   "})
 
 
-@pytest.mark.parametrize("other", ["jt_one", "jt.one", "jt one"])
+@pytest.mark.parametrize("other", ["orion_one", "orion.one", "orion one"])
 def test_two_slugs_colliding_on_one_variable_are_a_loud_error(other: str) -> None:
     # Scrubbing the whole character class is lossy, so more keys collapse together than
     # the hyphen rule collapsed. Each collision is boot-fatal rather than resolved: two
     # agents sharing one variable means one agent's secret verifies the other's
     # deliveries, which is the property per-recipient keys exist to remove.
     recipients = {
-        JT_UUID: _harness_agent("jt-one", JT_UUID),
+        ORION_UUID: _harness_agent("orion-one", ORION_UUID),
         NOVA_UUID: _harness_agent(other, NOVA_UUID),
     }
     with pytest.raises(ConfigError, match="both map to"):
@@ -621,7 +633,8 @@ def test_two_slugs_colliding_on_one_variable_are_a_loud_error(other: str) -> Non
 @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off"])
 def test_the_fallback_can_be_retired_by_flag(raw: str) -> None:
     keyring = load_recipient_keyring(
-        RECIPIENTS, {SHARED_FALLBACK_VAR: raw, JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
+        RECIPIENTS,
+        {SHARED_FALLBACK_VAR: raw, ORION_SECRET_VAR: ORION_KEY, NOVA_SECRET_VAR: NOVA_KEY},
     )
     assert keyring.shared_fallback is False
 
@@ -642,16 +655,20 @@ def test_retiring_the_fallback_with_an_unprovisioned_agent_refuses_to_boot() -> 
     # looked perfectly healthy — the green-while-absent shape this repo instruments
     # everywhere else. It is caught at boot, by name.
     with pytest.raises(ConfigError, match="nova") as caught:
-        load_recipient_keyring(RECIPIENTS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY})
+        load_recipient_keyring(RECIPIENTS, {SHARED_FALLBACK_VAR: "0", ORION_SECRET_VAR: ORION_KEY})
     assert SHARED_FALLBACK_VAR in str(caught.value)
 
 
 def test_retiring_the_fallback_is_accepted_once_every_agent_is_provisioned() -> None:
     keyring = load_recipient_keyring(
-        RECIPIENTS, {SHARED_FALLBACK_VAR: "0", JT_SECRET_VAR: JT_KEY, NOVA_SECRET_VAR: NOVA_KEY}
+        RECIPIENTS,
+        {SHARED_FALLBACK_VAR: "0", ORION_SECRET_VAR: ORION_KEY, NOVA_SECRET_VAR: NOVA_KEY},
     )
     assert keyring.shared_fallback is False
-    assert dict(keyring.by_recipient) == {JT_UUID: Secret(JT_KEY), NOVA_UUID: Secret(NOVA_KEY)}
+    assert dict(keyring.by_recipient) == {
+        ORION_UUID: Secret(ORION_KEY),
+        NOVA_UUID: Secret(NOVA_KEY),
+    }
 
 
 def test_the_loader_ignores_environment_it_does_not_own() -> None:
@@ -668,7 +685,9 @@ def test_the_route_states_its_keyring_at_boot() -> None:
     # Once every agent is keyed, an armed fallback and a retired one produce
     # identical traffic — every delivery reads key=recipient either way. Nothing but
     # a boot statement can tell a finished cutover from a forgotten last step.
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}, shared_fallback=False))
+    route = BasecradleRoute(
+        RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}, shared_fallback=False)
+    )
     summary = route.boot_summary()
     assert "recipient_keys=1" in summary
     assert "shared_fallback=false" in summary
@@ -687,7 +706,7 @@ def test_a_hostile_body_that_breaks_the_decoder_falls_back_rather_than_escaping(
     # runs on unauthenticated input, ahead of the signature check. It must degrade to
     # "no per-recipient key", never propagate out of the verify boundary.
     body = b"[" * 60_000 + b"]" * 60_000
-    route = BasecradleRoute(RecipientKeyring({JT_UUID: Secret(JT_KEY)}))
+    route = BasecradleRoute(RecipientKeyring({ORION_UUID: Secret(ORION_KEY)}))
     with pytest.raises(SignatureError):
         route.verify(
             InboundRequest(headers={SIGNATURE_HEADER: "sha256=00"}, body=body), Secret(SECRET)
