@@ -374,7 +374,7 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins, e.g. dra
 # a name systemd will not pass through never reaches the daemon at all).
 # A delivery is verified with its own recipient's key; an agent with no key here
 # falls back to the shared value above, so agents rotate one at a time:
-# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_JT=<@jt's own bc_isk_… Integration Signing Key>
+# BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET_NOVA=<@nova's own bc_isk_… Integration Signing Key>
 # BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK=1   # set 0 to retire the shared value
 #
 # The synthetic wake (issue #208) — add "probe" to enable the router's own lever for the
@@ -495,7 +495,7 @@ route uses.
 | `BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK` | `1` (default) or `0` to retire the fallback |
 
 `<SLUG>` is the agent's **`agents.json` key**, upper-cased with **every character outside
-`[A-Za-z0-9_]` replaced by `_`** — `jt` → `…_WEBHOOK_SECRET_JT`, `glm-5.2` → `…_WEBHOOK_SECRET_GLM_5_2`.
+`[A-Za-z0-9_]` replaced by `_`** — `nova` → `…_WEBHOOK_SECRET_NOVA`, `glm-5.2` → `…_WEBHOOK_SECRET_GLM_5_2`.
 Not just the hyphen: an environment variable name systemd will pass through to the service is
 `[A-Za-z_][A-Za-z0-9_]*`, and a registry key like `glm-5.2` carries a dot, so a name that kept it would
 never reach the daemon at all — that agent would go on verifying against the *shared* secret after the
@@ -616,7 +616,7 @@ each layer on its own view.
 
 A JSON object of **agent key → fields** — the daemon's wake-resolution table, maintained on the box by
 the operator (the daemon reads it; it never writes it). The key is the agent's stable slug: a GitHub
-builder's key is the `owner/name` repo it captains; a harness agent's key is its bare slug (e.g. `jt`).
+builder's key is the `owner/name` repo it captains; a harness agent's key is its bare slug (e.g. `nova`).
 An entry's `kind` selects how it is read (absent ⇒ `github`); existing github entries are unchanged.
 
 ```jsonc
@@ -630,12 +630,12 @@ An entry's `kind` selects how it is read (absent ⇒ `github`); existing github 
   },
   // A harness agent: woken via its OWN wake CLI in its venv, resolved by its
   // BaseCradle user uuid. No bot_slug; carries kind/recipient_uuid/wake_bin.
-  "jt": {
+  "nova": {
     "kind": "harness",
-    "os_user": "jt",
-    "clone_path": "/home/jt/harness",
-    "recipient_uuid": "019e916c-7f45-700e-afc0-f45557b237b7",
-    "wake_bin": "/home/jt/venv/bin/basecradle-harness-wake"
+    "os_user": "nova",
+    "clone_path": "/home/nova/harness",
+    "recipient_uuid": "01a161c5-9ff1-76f8-a04c-c476e36c30b7",
+    "wake_bin": "/home/nova/venv/bin/basecradle-harness-wake"
   }
 }
 ```
@@ -1577,7 +1577,7 @@ Caddy, no database) and has three load-bearing properties:
    traceback that did would otherwise ship it. The drop + redaction rules are byte-faithful to NOC's
    `noc_scrub` plus these additions; do not weaken them.
    **It also PREFIXES each shipped message with the emitting program's journald identifier**, so a
-   Live Tail line reads `[basecradle-router] stage=wake outcome=ok …` or `[basecradle-wake-jt] step
+   Live Tail line reads `[basecradle-router] stage=wake outcome=ok …` or `[basecradle-wake-nova] step
    3/12 …` and says which program on the box emitted it (basecradle-router#170). Doing this in Vector,
    once, is what makes it *uniform*: every program gets it for free — sshd, Caddy, a wake, a timer —
    whereas hand-prefixing `[Router]` into the daemon's own log strings would cover only the daemon and

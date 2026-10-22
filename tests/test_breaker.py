@@ -108,7 +108,7 @@ def test_a_different_agent_is_unaffected_by_anothers_trip() -> None:
         breaker.admit(NOVA)  # trips nova
     assert not breaker.admit(NOVA).admitted
     # A different agent has its own window — it is not collateral damage.
-    assert breaker.admit("jt").admitted
+    assert breaker.admit("orion").admitted
 
 
 # --- auto-cooldown reset ---------------------------------------------------

@@ -9,7 +9,7 @@ asks for is
 Everything else here pins the Contract v1 shape the NOC's ledger reads
 (basecradle-noc#406) and the emitter's one architectural promise: it names no event
 source, so adding a route never edits it. No network, model, or live agent.
-Test cast: Nova Digital (``nova``, AI) and JT (``jt``, a harness agent).
+Test cast: Nova Digital (``nova``, AI) and Orion Digital (``orion``, AI, a harness agent).
 
 **The load-bearing test in this file is
 :func:`test_every_declared_evidence_pointer_resolves_from_its_own_detail`.** A claim
@@ -47,13 +47,13 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
 SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 DELIVERY = "0192f3a4-5b6c-7d8e-9f01-00000000000a"
@@ -135,9 +135,9 @@ def test_regression_instance_4_a_subject_with_no_wake_edge_is_visible_in_the_cla
 ) -> None:
     """A registered agent no enabled route can reach emits a claim that says so.
 
-    JT is a harness agent: the router resolves it by ``recipient_uuid``, which only
+    ORION is a harness agent: the router resolves it by ``recipient_uuid``, which only
     the ``basecradle`` route produces. With that route disabled — the fleet's actual
-    state today — JT is registered, healthy, and **unreachable**: no webhook can
+    state today — ORION is registered, healthy, and **unreachable**: no webhook can
     deliver to it, nothing is queued for it, and it has never been woken. Nothing
     else in the router says so, and every dashboard stays green.
 
@@ -148,9 +148,9 @@ def test_regression_instance_4_a_subject_with_no_wake_edge_is_visible_in_the_cla
     an agent woken last week may have lost its only edge since, and a freshly-armed
     edge has no history yet.
     """
-    manifests = _build(tmp_path, config=_config(agents=(NOVA, JT)), routes=("github",))
+    manifests = _build(tmp_path, config=_config(agents=(NOVA, ORION)), routes=("github",))
 
-    claim = _claim(_subject(manifests, "agent:jt"), "wake-edge:webhook-route")
+    claim = _claim(_subject(manifests, "agent:orion"), "wake-edge:webhook-route")
 
     assert claim["detail"]["edges"] == []
     assert claim["detail"]["edge_count"] == 0
@@ -167,11 +167,11 @@ def test_enabling_the_route_arms_the_edge_that_was_missing(tmp_path) -> None:
     # rather than restating the registry.
     manifests = _build(
         tmp_path,
-        config=_config(agents=(NOVA, JT), routes=("github", "basecradle")),
+        config=_config(agents=(NOVA, ORION), routes=("github", "basecradle")),
         routes=("github", "basecradle"),
     )
 
-    claim = _claim(_subject(manifests, "agent:jt"), "wake-edge:webhook-route")
+    claim = _claim(_subject(manifests, "agent:orion"), "wake-edge:webhook-route")
 
     assert claim["detail"]["edges"] == [
         {
@@ -289,7 +289,7 @@ def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_p
     **per-route** projection is green for `basecradle` (its secret demonstrably
     matches) and the **per-agent** projection is green for nova (something woke it).
     What is actually true is narrower: `basecradle` has never woken *anyone*, and
-    nothing has ever woken JT.
+    nothing has ever woken ORION.
 
     Only the per-(agent, route) proof draws that line, which is why the NOC declined to
     arm its per-recipient rows on either substitution (basecradle-noc#408). It is read
@@ -302,7 +302,7 @@ def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_p
         os_user=NOVA.os_user,
         clone_path=NOVA.clone_path,
         bot_slug=NOVA.bot_slug,
-        recipient_uuid="019e916c-7f45-700e-afc0-f45557b23800",
+        recipient_uuid="01a161c5-9ff1-76f8-a04c-c476e36c30b7",
     )
     evidence = EvidenceStore(None)
     evidence.record_delivery_accepted("github")
@@ -313,7 +313,7 @@ def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_p
 
     manifests = _build(
         tmp_path,
-        config=_config(agents=(nova_dual, JT), routes=("github", "basecradle")),
+        config=_config(agents=(nova_dual, ORION), routes=("github", "basecradle")),
         routes=("github", "basecradle"),
         evidence=evidence,
     )
@@ -331,14 +331,14 @@ def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_p
     assert edge("agent:nova", "basecradle")["last_ok_at"] is None
     # Same route, a different recipient: also never proven. The per-route projection
     # would have greened this off the basecradle accept above.
-    assert edge("agent:jt", "basecradle")["last_ok_at"] is None
+    assert edge("agent:orion", "basecradle")["last_ok_at"] is None
 
     # The same three readings off the rows the ledger arms. `null` here is not a miss:
     # the NOC reads a resolved null as FAIL — "the emitter publishes this field and
     # nothing has ever landed in it" — which is exactly instance 5's answer.
     assert _resolve(row("agent:nova", "github")) is not None
     assert _resolve(row("agent:nova", "basecradle")) is None
-    assert _resolve(row("agent:jt", "basecradle")) is None
+    assert _resolve(row("agent:orion", "basecradle")) is None
     assert row("agent:nova", "basecradle")["evidence"] is None
     assert row("agent:nova", "github")["evidence"].endswith("route=github")
 
@@ -355,7 +355,7 @@ def test_one_armable_row_per_armed_recipient_route_pair(tmp_path) -> None:
     """
     manifests = _build(
         tmp_path,
-        config=_config(agents=(NOVA, JT), routes=("github", "basecradle")),
+        config=_config(agents=(NOVA, ORION), routes=("github", "basecradle")),
         routes=("github", "basecradle"),
     )
 
@@ -363,10 +363,10 @@ def test_one_armable_row_per_armed_recipient_route_pair(tmp_path) -> None:
         "wake-edge:webhook-route",
         "wake-edge:webhook-route:github",  # nova is resolvable by repo, not by uuid
     ]
-    jt_row = _claim(_subject(manifests, "agent:jt"), "wake-edge:webhook-route:basecradle")
-    assert jt_row["detail"]["harness_key"] == "jt"
-    assert jt_row["detail"]["route"] == "basecradle"
-    assert jt_row["detail"]["resolves_by"] == "recipient_uuid"
+    orion_row = _claim(_subject(manifests, "agent:orion"), "wake-edge:webhook-route:basecradle")
+    assert orion_row["detail"]["harness_key"] == "orion"
+    assert orion_row["detail"]["route"] == "basecradle"
+    assert orion_row["detail"]["resolves_by"] == "recipient_uuid"
 
 
 def test_the_per_route_wake_record_survives_a_route_being_disarmed(tmp_path) -> None:
@@ -402,11 +402,11 @@ def test_a_departed_agents_kept_record_reaches_no_claim(tmp_path) -> None:
     evidence.record_delivery_accepted("basecradle")
 
     manifests = _build(
-        tmp_path, config=_config(agents=(JT,)), evidence=evidence, routes=("github",)
+        tmp_path, config=_config(agents=(ORION,)), evidence=evidence, routes=("github",)
     )
 
     subjects = [m["subject"] for m in manifests]
-    assert "agent:jt" in subjects  # the registered agent is still emitted
+    assert "agent:orion" in subjects  # the registered agent is still emitted
     assert "agent:nova" not in subjects  # the departed one's record stays a record
     box = _subject(manifests, "box:ai.basecradle.com")
     assert "delivery-sink:basecradle" not in [c["claim"] for c in box["claims"]]
@@ -500,7 +500,7 @@ def test_an_accepted_delivery_proves_the_sink(tmp_path) -> None:
 def test_one_sink_claim_per_enabled_route(tmp_path) -> None:
     manifests = _build(
         tmp_path,
-        config=_config(agents=(NOVA, JT), routes=("github", "basecradle")),
+        config=_config(agents=(NOVA, ORION), routes=("github", "basecradle")),
         routes=("github", "basecradle"),
     )
 
@@ -529,7 +529,7 @@ def _every_shape(tmp_path) -> list[dict]:
         os_user=NOVA.os_user,
         clone_path=NOVA.clone_path,
         bot_slug=NOVA.bot_slug,
-        recipient_uuid="019e916c-7f45-700e-afc0-f45557b23800",
+        recipient_uuid="01a161c5-9ff1-76f8-a04c-c476e36c30b7",
     )
     evidence = EvidenceStore(None)
     evidence.record_wake_ok("nova", DELIVERY, route="github", synthetic=False)
@@ -537,10 +537,10 @@ def _every_shape(tmp_path) -> list[dict]:
     evidence.record_delivery_accepted("basecradle")
     evidence.record_delivery_rejected("basecradle", "signature does not match")
     evidence.record_freeze_selftest("ok", "4 check(s) passed")
-    evidence.record_queue_depth("jt", 2)
+    evidence.record_queue_depth("orion", 2)
     return _build(
         tmp_path,
-        config=_config(agents=(nova_dual, JT), routes=("github", "basecradle")),
+        config=_config(agents=(nova_dual, ORION), routes=("github", "basecradle")),
         routes=("github", "basecradle"),
         evidence=evidence,
     )
@@ -619,7 +619,7 @@ def test_one_id_means_one_claim_within_a_subject(tmp_path) -> None:
 
 
 def test_every_manifest_carries_the_pinned_contract_envelope(tmp_path) -> None:
-    for manifest in _build(tmp_path, config=_config(agents=(NOVA, JT))):
+    for manifest in _build(tmp_path, config=_config(agents=(NOVA, ORION))):
         assert manifest["contract"] == CONTRACT_VERSION
         assert manifest["component"] == COMPONENT
         assert manifest["subject"].split(":")[0] in ("box", "agent")
@@ -628,7 +628,7 @@ def test_every_manifest_carries_the_pinned_contract_envelope(tmp_path) -> None:
 
 def test_every_claim_carries_the_pinned_contract_keys(tmp_path) -> None:
     pinned = {"claim", "class", "prove", "evidence", "ttl_hours"}
-    for manifest in _build(tmp_path, config=_config(agents=(NOVA, JT))):
+    for manifest in _build(tmp_path, config=_config(agents=(NOVA, ORION))):
         for claim in manifest["claims"]:
             assert pinned <= set(claim)
             assert claim["class"] in ("active", "rare", "dependency")
@@ -640,9 +640,9 @@ def test_every_claim_carries_the_pinned_contract_keys(tmp_path) -> None:
 def test_the_box_subject_comes_first_and_agents_are_ordered(tmp_path) -> None:
     # A manifest built twice from unchanged inputs must be byte-identical, or a
     # ledger diff shows churn that is not change.
-    subjects = [m["subject"] for m in _build(tmp_path, config=_config(agents=(JT, NOVA)))]
+    subjects = [m["subject"] for m in _build(tmp_path, config=_config(agents=(ORION, NOVA)))]
 
-    assert subjects == ["box:ai.basecradle.com", "agent:jt", "agent:nova"]
+    assert subjects == ["box:ai.basecradle.com", "agent:nova", "agent:orion"]
 
 
 def test_the_per_route_rows_and_edges_are_ordered_by_route(tmp_path) -> None:

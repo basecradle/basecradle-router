@@ -18,8 +18,8 @@ The queue is driven the way :class:`~basecradle_router.scheduler.WakeScheduler` 
 for one agent: every delivery is *accepted* the moment it arrives, and the pending ones
 are *executed* in arrival order once the wake ahead of them has run. Test cast: John Doe
 (``john``) hands off and posts; Nova Digital's builder (``nova``) is woken for a handoff,
-and the harness agents @jt and Nova Digital (``nova``) for a timeline. All data is
-fabricated.
+and the harness agents Orion Digital (``orion``) and Nova Digital (``nova``) for a
+timeline. All data is fabricated.
 """
 
 import hashlib
@@ -53,25 +53,25 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
-# Nova Digital as a harness agent viewing @jt's timeline — never registered beside the
+# Nova Digital as a harness agent viewing @orion's timeline — never registered beside the
 # builder above, which is the same OS user.
 NOVA_HARNESS = Agent(
     key="nova",
     os_user="nova",
     clone_path="/home/nova/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-7aaa-8bbb-0123456789ab",
+    recipient_uuid="01a161c5-9ff1-76f8-a04c-c476e36c30b7",
     wake_bin="/home/nova/venv/bin/basecradle-harness-wake",
 )
-JOHN_UUID = "019e916c-7f45-7123-8456-0123456789ab"  # John Doe's BaseCradle user uuid
+JOHN_UUID = "01a161c5-bee0-7d7e-8faf-607fb71aa430"  # John Doe's BaseCradle user uuid
 TIMELINE_A = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001"
 TIMELINE_B = "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0002"
 
@@ -130,7 +130,7 @@ def _pipeline(
     now: _WallClock | None = None,
     evidence=None,
     attempts=3,
-    agents: tuple[Agent, ...] = (NOVA, JT),
+    agents: tuple[Agent, ...] = (NOVA, ORION),
 ) -> tuple[Pipeline, _Waker, _WallClock]:
     waker = waker or _Waker()
     now = now or _WallClock(_moment("03:14:08.415000"))
@@ -245,7 +245,7 @@ def _message(
     timeline: str,
     *,
     at: str,
-    to: Agent = JT,
+    to: Agent = ORION,
     delivery: str | None = None,
     stamped: bool = True,
 ) -> InboundRequest:
@@ -686,18 +686,18 @@ def test_two_timelines_of_one_agent_each_get_their_own_wake_in_arrival_order() -
 
 def test_one_agents_wake_never_covers_another_agents_delivery_of_the_same_message() -> None:
     # One message on a timeline two agents view is a delivery to each, under the one
-    # event_id the platform shares across recipients. @jt's session read it; Nova's did
-    # not, however early the message was and however well @jt's wake went.
-    pipeline, waker, _ = _pipeline(agents=(JT, NOVA_HARNESS))
+    # event_id the platform shares across recipients. @orion's session read it; Nova's did
+    # not, however early the message was and however well @orion's wake went.
+    pipeline, waker, _ = _pipeline(agents=(ORION, NOVA_HARNESS))
     queue = _Queue(pipeline)
     shared = _uuid7()
-    for agent in (JT, NOVA_HARNESS):
+    for agent in (ORION, NOVA_HARNESS):
         queue.arrive(_message(TIMELINE_A, at="03:14:07", to=agent, delivery=shared), "basecradle")
     fates = [queue.run_next().stages[-1] for _ in range(2)]
 
     assert fates == [WOKE, WOKE]
     assert [event.recipient.value for event in waker.calls] == [
-        JT.recipient_uuid,
+        ORION.recipient_uuid,
         NOVA_HARNESS.recipient_uuid,
     ]
 
@@ -725,9 +725,9 @@ def test_a_coalesced_platform_delivery_names_its_event_type_and_the_wake(caplog)
     mine = [line for line in _decisions(caplog) if f"delivery={collapsed}" in line]
     assert mine == [
         f"event=delivery_decision source=basecradle event_type=message.created decision=woke "
-        f"recipient={JT.recipient_uuid} delivery={collapsed}",
+        f"recipient={ORION.recipient_uuid} delivery={collapsed}",
         f"event=delivery_decision source=basecradle event_type=message.created "
-        f"decision=coalesced recipient={JT.recipient_uuid} delivery={collapsed} into={woke}",
+        f"decision=coalesced recipient={ORION.recipient_uuid} delivery={collapsed} into={woke}",
     ]
 
 
@@ -776,9 +776,9 @@ def test_coverage_ignores_events_without_a_time_both_ways() -> None:
 
 def test_coverage_of_one_agent_never_covers_another_on_the_same_stream() -> None:
     coverage = WakeCoverage()
-    coverage.record("jt", _event(_moment("03:00:00.000000")), _moment("03:10:00.000000"))
+    coverage.record("orion", _event(_moment("03:00:00.000000")), _moment("03:10:00.000000"))
 
-    assert coverage.covering("jt", _event(_moment("03:05:00.000000"))) is not None
+    assert coverage.covering("orion", _event(_moment("03:05:00.000000"))) is not None
     assert coverage.covering("nova", _event(_moment("03:05:00.000000"))) is None
 
 

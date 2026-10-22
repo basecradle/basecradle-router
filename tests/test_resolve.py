@@ -25,19 +25,19 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
 CONFIG = Config(
-    agents=MappingProxyType({NOVA.key: NOVA, JT.key: JT}),
+    agents=MappingProxyType({NOVA.key: NOVA, ORION.key: ORION}),
     enabled_routes=frozenset({"github", "basecradle"}),
     webhook_secrets=MappingProxyType({"github": "fake-github-webhook-secret-" + "0" * 32}),
-    recipient_index=MappingProxyType({JT.recipient_uuid: JT}),
+    recipient_index=MappingProxyType({ORION.recipient_uuid: ORION}),
 )
 
 
@@ -79,9 +79,9 @@ def test_resolves_known_repo_to_its_agent() -> None:
 def test_resolves_basecradle_event_by_recipient_uuid() -> None:
     # A basecradle event resolves by the recipient's BaseCradle user uuid, not a
     # repo — the seam the whole route exists to prove.
-    agent = resolve_agent(_basecradle_event(JT.recipient_uuid), CONFIG)
-    assert agent is JT
-    assert agent.os_user == "jt"
+    agent = resolve_agent(_basecradle_event(ORION.recipient_uuid), CONFIG)
+    assert agent is ORION
+    assert agent.os_user == "orion"
 
 
 def test_unknown_repo_fails_loudly() -> None:

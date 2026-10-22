@@ -38,22 +38,22 @@ NOVA = Agent(
     clone_path="/home/nova/basecradle-python",
     bot_slug="basecradle-python-ai",
 )
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
-# Nova Digital as a *harness* agent, beside @jt on one timeline — the shape in which one
+# Nova Digital as a *harness* agent, beside @orion on one timeline — the shape in which one
 # platform event is delivered to two agents under one shared event_id (#312).
 NOVA_HARNESS = Agent(
     key="nova",
     os_user="nova",
     clone_path="/home/nova/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-7aaa-8bbb-0123456789ab",
+    recipient_uuid="01a161c5-9ff1-76f8-a04c-c476e36c30b7",
     wake_bin="/home/nova/venv/bin/basecradle-harness-wake",
 )
 ISSUE_URL = "https://github.com/basecradle/basecradle-python/issues/42"
@@ -251,7 +251,7 @@ def test_signed_handoff_wakes_the_right_agent_with_the_right_trigger() -> None:
 
 
 def _basecradle_pipeline(
-    waker: _StubWaker | None = None, *, agents: tuple[Agent, ...] = (JT,)
+    waker: _StubWaker | None = None, *, agents: tuple[Agent, ...] = (ORION,)
 ) -> tuple[Pipeline, _StubWaker]:
     waker = waker or _StubWaker()
     registry = RouteRegistry()
@@ -271,7 +271,7 @@ def _basecradle_pipeline(
 def _basecradle_request(
     *,
     event: str = "message.created",
-    recipient_uuid: str = JT.recipient_uuid,
+    recipient_uuid: str = ORION.recipient_uuid,
     timeline_uuid: str = TIMELINE_UUID,
     sign: bool = True,
     delivery: str = "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
@@ -310,7 +310,7 @@ def test_signed_platform_event_wakes_the_harness_agent() -> None:
     ]
     assert len(waker.calls) == 1
     woken_agent, woken_event = waker.calls[0]
-    assert woken_agent is JT  # resolved by recipient_uuid, not a repo
+    assert woken_agent is ORION  # resolved by recipient_uuid, not a repo
     assert woken_event.wake_arg == TIMELINE_UUID  # the timeline the harness processes
 
 
@@ -601,18 +601,18 @@ def test_dedup_entry_expires_after_ttl_and_allows_a_rewake() -> None:
 
 
 def test_one_platform_event_delivered_to_two_agents_wakes_both() -> None:
-    # The platform shares one event_id across every recipient of an event, so @jt's and
+    # The platform shares one event_id across every recipient of an event, so @orion's and
     # Nova's deliveries of one message carry one delivery id (#312). They are two
     # deliveries to two agents: the first agent's successful wake must not collapse the
     # second's as its duplicate — that agent was never woken, 43 times in one week.
-    pipeline, waker = _basecradle_pipeline(agents=(JT, NOVA_HARNESS))
-    for agent in (JT, NOVA_HARNESS):
+    pipeline, waker = _basecradle_pipeline(agents=(ORION, NOVA_HARNESS))
+    for agent in (ORION, NOVA_HARNESS):
         result = pipeline.handle(
             "basecradle",
             _basecradle_request(recipient_uuid=agent.recipient_uuid, delivery=DELIVERY_DUP),
         )
         assert result.stages[-1] == (Stage.WAKE, Outcome.OK)
-    assert [agent for agent, _ in waker.calls] == [JT, NOVA_HARNESS]
+    assert [agent for agent, _ in waker.calls] == [ORION, NOVA_HARNESS]
 
 
 def test_a_platform_redelivery_to_one_agent_still_collapses() -> None:

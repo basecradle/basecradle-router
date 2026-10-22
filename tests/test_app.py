@@ -210,17 +210,17 @@ def test_create_app_wires_the_self_comment_guard(tmp_path) -> None:
 
 # --- the basecradle route's per-recipient keyring is wired here (#497) --------
 #
-# Fabricated cast: @jt, a harness agent registered alongside Nova's builder entry.
+# Fabricated cast: @orion, a harness agent registered alongside Nova's builder entry.
 
-JT = Agent(
-    key="jt",
-    os_user="jt",
-    clone_path="/home/jt/harness",
+ORION = Agent(
+    key="orion",
+    os_user="orion",
+    clone_path="/home/orion/harness",
     wake_kind=WakeKind.HARNESS,
-    recipient_uuid="019e916c-7f45-700e-afc0-f45557b237b7",
-    wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+    recipient_uuid="01a161c5-8102-71e0-82f0-2d53fa00c27b",
+    wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
 )
-JT_KEY = "bc_isk_fakejtintegrationsigningkey00001"
+ORION_KEY = "bc_isk_fakeorionintegrationsigningkey01"
 
 
 def _env_with_harness_agent(tmp_path) -> dict[str, str]:
@@ -233,12 +233,12 @@ def _env_with_harness_agent(tmp_path) -> dict[str, str]:
                     "clone_path": NOVA.clone_path,
                     "bot_slug": NOVA.bot_slug,
                 },
-                JT.key: {
+                ORION.key: {
                     "kind": "harness",
-                    "os_user": JT.os_user,
-                    "clone_path": JT.clone_path,
-                    "recipient_uuid": JT.recipient_uuid,
-                    "wake_bin": JT.wake_bin,
+                    "os_user": ORION.os_user,
+                    "clone_path": ORION.clone_path,
+                    "recipient_uuid": ORION.recipient_uuid,
+                    "wake_bin": ORION.wake_bin,
                 },
             }
         )
@@ -255,17 +255,17 @@ def _env_with_harness_agent(tmp_path) -> dict[str, str]:
 def test_create_app_wires_the_per_recipient_keyring(tmp_path) -> None:
     # The wiring proof: a key provisioned in the environment must reach the route, or
     # the whole feature is inert on the box while every unit test still passes.
-    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY}
+    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}ORION": ORION_KEY}
     route = build_registry(load_config(env), env).get("basecradle")
 
-    assert dict(route.keyring.by_recipient) == {JT.recipient_uuid: Secret(JT_KEY)}
+    assert dict(route.keyring.by_recipient) == {ORION.recipient_uuid: Secret(ORION_KEY)}
     assert route.keyring.shared_fallback is True
 
 
 def test_a_misprovisioned_key_stops_the_daemon_at_boot(tmp_path) -> None:
     # Loud at boot, not as one agent's deliveries quietly failing to verify. The
     # daemon refusing to start is what the NOC's converge and the box's alarms see.
-    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
+    env = _env_with_harness_agent(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}ORIONN": ORION_KEY}
     with pytest.raises(ConfigError, match="names no registered agent"):
         create_app(env, waker=_RecordingWaker())
 
@@ -273,7 +273,7 @@ def test_a_misprovisioned_key_stops_the_daemon_at_boot(tmp_path) -> None:
 def test_the_keyring_is_not_built_when_the_basecradle_route_is_disabled(tmp_path) -> None:
     # Each route's own config is demanded only when that route is in use — so a box
     # running github only is never asked for keys it has no route to verify with.
-    env = _env(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}JTT": JT_KEY}
+    env = _env(tmp_path) | {f"{RECIPIENT_SECRET_PREFIX}ORIONN": ORION_KEY}
     create_app(env, waker=_RecordingWaker())
 
 
@@ -281,7 +281,7 @@ def test_the_keyring_is_not_built_when_the_basecradle_route_is_disabled(tmp_path
 
 SHARED_FALLBACK = "BASECRADLE_ROUTER_BASECRADLE_SHARED_SECRET_FALLBACK"
 SHARED_SECRET = "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET"
-UNREGISTERED_UUID = "019e916c-7f45-700e-afc0-000000000000"
+UNREGISTERED_UUID = "01a161c5-ddcf-7e4b-95b3-9366453193b0"
 
 
 def _signed_basecradle(recipient_uuid: str, key: str) -> tuple[bytes, dict[str, str]]:
@@ -290,18 +290,18 @@ def _signed_basecradle(recipient_uuid: str, key: str) -> tuple[bytes, dict[str, 
     body = json.dumps(
         {
             "event": "timeline.locked",
-            "event_id": "019e916c-7f45-700e-afc0-00000000beef",
+            "event_id": "01a161c5-fcbe-7528-a672-4053f306856c",
             "occurred_at": "2026-01-01T00:00:00Z",
             "actor_uuid": None,
             "recipient_uuid": recipient_uuid,
-            "timeline_uuid": "019e916c-7f45-700e-afc0-0000000000aa",
-            "resource": {"type": "timeline", "uuid": "019e916c-7f45-700e-afc0-0000000000aa"},
+            "timeline_uuid": "01a161c6-1bad-74a3-8dc1-ce01f48ee0c5",
+            "resource": {"type": "timeline", "uuid": "01a161c6-1bad-74a3-8dc1-ce01f48ee0c5"},
         }
     ).encode("utf-8")
     digest = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
     return body, {
         "X-BaseCradle-Event": "timeline.locked",
-        "X-BaseCradle-Delivery": "019e916c-7f45-700e-afc0-00000000beef",
+        "X-BaseCradle-Delivery": "01a161c5-fcbe-7528-a672-4053f306856c",
         "X-BaseCradle-Signature": f"sha256={digest}",
         "Content-Type": "application/json",
     }
@@ -310,7 +310,7 @@ def _signed_basecradle(recipient_uuid: str, key: str) -> tuple[bytes, dict[str, 
 def _retired_env_without_the_shared_secret(tmp_path) -> dict[str, str]:
     """A new host's router.env: per-recipient keys, the fallback off, no shared value."""
     env = _env_with_harness_agent(tmp_path) | {
-        f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY,
+        f"{RECIPIENT_SECRET_PREFIX}ORION": ORION_KEY,
         SHARED_FALLBACK: "0",
     }
     del env[SHARED_SECRET]
@@ -355,11 +355,12 @@ def test_a_retired_fallback_boots_without_the_shared_secret(tmp_path) -> None:
 
     server = create_app(env, waker=_RecordingWaker())
     assert _post(
-        server, "/webhooks/basecradle", *_signed_basecradle(JT.recipient_uuid, JT_KEY)
+        server, "/webhooks/basecradle", *_signed_basecradle(ORION.recipient_uuid, ORION_KEY)
     ) == (200)
     # A recipient with no key of its own is refused — there is nothing to fall back to.
     assert (
-        _post(server, "/webhooks/basecradle", *_signed_basecradle(UNREGISTERED_UUID, JT_KEY)) == 401
+        _post(server, "/webhooks/basecradle", *_signed_basecradle(UNREGISTERED_UUID, ORION_KEY))
+        == 401
     )
 
 
@@ -367,12 +368,12 @@ def test_a_retired_fallback_boots_unchanged_with_the_shared_secret_still_set(tmp
     # `ai`'s router.env still carries the shared value: it boots exactly as before, and
     # the value is never consulted — signing an unregistered recipient with it is refused.
     env = _env_with_harness_agent(tmp_path) | {
-        f"{RECIPIENT_SECRET_PREFIX}JT": JT_KEY,
+        f"{RECIPIENT_SECRET_PREFIX}ORION": ORION_KEY,
         SHARED_FALLBACK: "0",
     }
     server = create_app(env, waker=_RecordingWaker())
     assert _post(
-        server, "/webhooks/basecradle", *_signed_basecradle(JT.recipient_uuid, JT_KEY)
+        server, "/webhooks/basecradle", *_signed_basecradle(ORION.recipient_uuid, ORION_KEY)
     ) == (200)
     assert (
         _post(server, "/webhooks/basecradle", *_signed_basecradle(UNREGISTERED_UUID, SECRET)) == 401

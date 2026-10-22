@@ -42,7 +42,7 @@ PROBE_SECRET = "fake-probe-route-secret-" + "3" * 32
 NOVA_KEY = "bc_isk_fakenovaintegrationsigningkey9001"
 PLAINTEXTS = (GITHUB_SECRET, BASECRADLE_SECRET, PROBE_SECRET, NOVA_KEY)
 
-NOVA_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"
+NOVA_UUID = "01a161c5-9ff1-76f8-a04c-c476e36c30b7"
 
 
 def _assert_clean(text: str) -> None:

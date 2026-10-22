@@ -391,7 +391,7 @@ def test_a_drained_scheduler_keeps_no_per_agent_notification_state() -> None:
     # invisible from the public surface until the box has been up for months.
     sched = WakeScheduler(lambda *_a: None, lanes=2, on_queue_change=lambda *_a: None)
     try:
-        for n, slug in enumerate(("nova", "john", "nova", "pinky"), start=1):
+        for n, slug in enumerate(("nova", "john", "nova", "orion"), start=1):
             sched.submit(_agent(slug), _event(slug, "go", n), PipelineResult())
         assert sched.wait_idle(timeout=5)
         assert sched._notify_seq == {}

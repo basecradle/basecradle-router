@@ -41,13 +41,13 @@ REGISTRY = {
         "bot_slug": "basecradle-python-ai",
     }
 }
-JT_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"
+ORION_UUID = "01a161c5-8102-71e0-82f0-2d53fa00c27b"
 HARNESS_ENTRY = {
-    "os_user": "jt",
-    "clone_path": "/home/jt/harness",
+    "os_user": "orion",
+    "clone_path": "/home/orion/harness",
     "kind": "harness",
-    "recipient_uuid": JT_UUID,
-    "wake_bin": "/home/jt/venv/bin/basecradle-harness-wake",
+    "recipient_uuid": ORION_UUID,
+    "wake_bin": "/home/orion/venv/bin/basecradle-harness-wake",
 }
 FAKE_SECRET = "fake-github-webhook-secret-" + "0" * 32  # correctly-shaped fake
 
@@ -136,29 +136,29 @@ def test_agent_for_unknown_repo_fails(tmp_path) -> None:
 def test_harness_entry_parses_and_indexes_by_recipient_uuid(tmp_path) -> None:
     from basecradle_router.models import Recipient, WakeKind
 
-    registry = {**REGISTRY, "jt": HARNESS_ENTRY}
+    registry = {**REGISTRY, "orion": HARNESS_ENTRY}
     config = load_config(
         _env(tmp_path, BASECRADLE_ROUTER_AGENTS=_write_registry(tmp_path, registry, name="r.json"))
     )
     # Keyed by its bare slug, with the harness wake shape and no bot_slug.
-    jt = config.agent_for("jt")
-    assert jt.wake_kind is WakeKind.HARNESS
-    assert jt.wake_bin == "/home/jt/venv/bin/basecradle-harness-wake"
-    assert jt.bot_slug is None
+    orion = config.agent_for("orion")
+    assert orion.wake_kind is WakeKind.HARNESS
+    assert orion.wake_bin == "/home/orion/venv/bin/basecradle-harness-wake"
+    assert orion.bot_slug is None
     # A basecradle event resolves to it by recipient_uuid; github builders are untouched.
-    assert config.agent_for_recipient(Recipient(by="recipient_uuid", value=JT_UUID)) is jt
+    assert config.agent_for_recipient(Recipient(by="recipient_uuid", value=ORION_UUID)) is orion
     assert config.agent_for("basecradle/basecradle-python").wake_kind is WakeKind.CLAUDE
 
 
 def test_harness_entry_missing_field_fails(tmp_path) -> None:
-    bad = {"jt": {k: v for k, v in HARNESS_ENTRY.items() if k != "wake_bin"}}
+    bad = {"orion": {k: v for k, v in HARNESS_ENTRY.items() if k != "wake_bin"}}
     bad_path = _write_registry(tmp_path, bad, name="bad.json")
     with pytest.raises(ConfigError, match="missing 'wake_bin'"):
         load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
 
 
 def test_unknown_kind_fails(tmp_path) -> None:
-    bad = {"jt": {**HARNESS_ENTRY, "kind": "robot"}}
+    bad = {"orion": {**HARNESS_ENTRY, "kind": "robot"}}
     bad_path = _write_registry(tmp_path, bad, name="bad.json")
     with pytest.raises(ConfigError, match="unknown kind 'robot'"):
         load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
@@ -168,7 +168,7 @@ def test_duplicate_recipient_uuid_fails_loudly(tmp_path) -> None:
     # Two harness agents claiming the same uuid would silently misroute one's events to
     # the other; the recipient index is a bijection, so this must fail at load.
     second = {**HARNESS_ENTRY, "os_user": "kim", "clone_path": "/home/kim/harness"}
-    bad = {"jt": HARNESS_ENTRY, "kim": second}
+    bad = {"orion": HARNESS_ENTRY, "kim": second}
     bad_path = _write_registry(tmp_path, bad, name="bad.json")
     with pytest.raises(ConfigError, match="reuses recipient_uuid"):
         load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))
@@ -177,7 +177,7 @@ def test_duplicate_recipient_uuid_fails_loudly(tmp_path) -> None:
 def test_harness_key_shaped_like_a_repo_fails(tmp_path) -> None:
     # A harness key must be a bare slug — never owner/name — so it stays out of the
     # github key-space and a Recipient(by="repo") lookup can never hit it.
-    bad = {"basecradle/jt": HARNESS_ENTRY}
+    bad = {"basecradle/orion": HARNESS_ENTRY}
     bad_path = _write_registry(tmp_path, bad, name="bad.json")
     with pytest.raises(ConfigError, match="bare slug"):
         load_config(_env(tmp_path, BASECRADLE_ROUTER_AGENTS=bad_path))

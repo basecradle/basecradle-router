@@ -51,7 +51,7 @@
 #
 # PRESENTATION (basecradle-router#170) — the `ai_scrub` transform also PREFIXES each shipped message
 # with its journald `SYSLOG_IDENTIFIER`, so a Better Stack Live Tail line reads `[basecradle-router] …`
-# or `[basecradle-wake-jt] …` and says which program on the box emitted it. Doing it HERE, once, is what
+# or `[basecradle-wake-nova] …` and says which program on the box emitted it. Doing it HERE, once, is what
 # makes it uniform: every program on the box gets the prefix for free, whereas hand-prefixing `[Router]`
 # into the daemon's own log strings would cover only the daemon (never sshd, Caddy, or a wake) and would
 # bake a presentation concern into application code. The identifier is journald's, so it is only as good

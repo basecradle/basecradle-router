@@ -63,7 +63,7 @@
 # Two agent kinds are wakeable, selected by the registry entry's `kind`:
 #   - a builder ("github", the default): only the trusted, system-installed
 #     `claude` may be launched, resolved off a root-owned PATH;
-#   - a harness agent ("harness", e.g. @jt): only the exact `wake_bin` the
+#   - a harness agent ("harness", e.g. @nova): only the exact `wake_bin` the
 #     registry pins for that agent may be launched (its own wake CLI in its venv).
 # Either way the binary is decided by the ROOT-OWNED registry, never by the
 # caller's argv, so a compromised router cannot substitute a different command.

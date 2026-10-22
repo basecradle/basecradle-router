@@ -123,7 +123,7 @@ def _statement_indent(source: str, statement: str) -> int:
 
 def test_every_shipped_line_is_prefixed_with_the_emitting_programs_identifier() -> None:
     # The presentation half: a Live Tail line reads `[basecradle-router] …` or
-    # `[basecradle-wake-jt] …`, so a human can see which program on the box emitted it.
+    # `[basecradle-wake-nova] …`, so a human can see which program on the box emitted it.
     # Done in Vector, once, so it covers EVERY program (sshd, Caddy, a wake) — never
     # hand-prefixed into the daemon's own log strings, which would cover only the daemon.
     source = _scrub_source()

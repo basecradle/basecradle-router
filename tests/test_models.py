@@ -1,7 +1,7 @@
 """Shape and validation invariants for the core vocabulary.
 
-Test cast: John Doe (``john``, human) and Nova Digital (``nova``, AI); plus the
-harness agent @jt (``jt``, a non-builder agent) for the non-repo shape.
+Test cast: John Doe (``john``, human) and Nova Digital (``nova``, AI); plus Orion
+Digital (``orion``, AI), a harness agent, for the non-repo shape.
 """
 
 from dataclasses import FrozenInstanceError
@@ -18,7 +18,7 @@ from basecradle_router.models import (
 )
 
 DELIVERY_ID = "0192f3a4-5b6c-7d8e-9f01-23456789abcd"  # well-formed UUIDv7
-JT_UUID = "019e916c-7f45-700e-afc0-f45557b237b7"  # @jt's BaseCradle user uuid
+ORION_UUID = "01a161c5-8102-71e0-82f0-2d53fa00c27b"  # @orion's BaseCradle user uuid
 
 
 def _issue() -> IssueRef:
@@ -55,7 +55,7 @@ def test_event_origin_is_optional_for_sources_without_one() -> None:
     event = Event(
         source="basecradle",
         kind=EventKind.PLATFORM_EVENT,
-        recipient=Recipient(by="recipient_uuid", value=JT_UUID),
+        recipient=Recipient(by="recipient_uuid", value=ORION_UUID),
         wake_arg="0192f3a4-5b6c-7d8e-9f01-23456789abcd",
         delivery_id=DELIVERY_ID,
     )
@@ -63,7 +63,7 @@ def test_event_origin_is_optional_for_sources_without_one() -> None:
     assert event.recipient.by == "recipient_uuid"
 
 
-def _platform_event(recipient_uuid: str = JT_UUID) -> Event:
+def _platform_event(recipient_uuid: str = ORION_UUID) -> Event:
     return Event(
         source="basecradle",
         kind=EventKind.PLATFORM_EVENT,
@@ -79,16 +79,16 @@ def test_dedup_key_joins_the_source_the_recipient_and_the_delivery_id() -> None:
     assert _event().dedup_key == f"github:basecradle/basecradle-python:{DELIVERY_ID}"
     assert _event().dedup_key == _event().dedup_key
     # Same delivery_id, different source → distinct keys (no cross-source collision).
-    assert _platform_event().dedup_key == f"basecradle:{JT_UUID}:{DELIVERY_ID}"
+    assert _platform_event().dedup_key == f"basecradle:{ORION_UUID}:{DELIVERY_ID}"
     assert _platform_event().dedup_key != _event().dedup_key
 
 
 def test_dedup_key_tells_two_recipients_of_one_platform_event_apart() -> None:
     # The platform shares one event_id across every recipient of an event (#312), so
-    # @jt's and Nova's deliveries of one message carry the same delivery id. They are
+    # @orion's and Nova's deliveries of one message carry the same delivery id. They are
     # two deliveries, and a key that named them as one suppressed the second agent's.
-    nova_uuid = "019e916c-7f45-7aaa-8bbb-0123456789ab"
-    assert _platform_event(JT_UUID).dedup_key != _platform_event(nova_uuid).dedup_key
+    nova_uuid = "01a161c5-9ff1-76f8-a04c-c476e36c30b7"
+    assert _platform_event(ORION_UUID).dedup_key != _platform_event(nova_uuid).dedup_key
 
 
 def test_builder_agent_round_trips() -> None:
@@ -106,15 +106,15 @@ def test_harness_agent_round_trips() -> None:
     # A non-builder harness agent: no repo, no bot_slug — a slug key, a wake_bin, and a
     # recipient_uuid its basecradle events resolve by.
     agent = Agent(
-        key="jt",
-        os_user="jt",
-        clone_path="/home/jt/harness",
+        key="orion",
+        os_user="orion",
+        clone_path="/home/orion/harness",
         wake_kind=WakeKind.HARNESS,
-        recipient_uuid=JT_UUID,
-        wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+        recipient_uuid=ORION_UUID,
+        wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
     )
-    assert agent.harness_key == "jt"
-    assert agent.recipient_uuid == JT_UUID
+    assert agent.harness_key == "orion"
+    assert agent.recipient_uuid == ORION_UUID
     assert agent.wake_bin.endswith("basecradle-harness-wake")
 
 
@@ -142,19 +142,19 @@ def test_builder_requires_a_bot_slug() -> None:
 def test_harness_requires_wake_bin_and_recipient_uuid() -> None:
     with pytest.raises(ValueError, match="wake_bin"):
         Agent(
-            key="jt",
-            os_user="jt",
-            clone_path="/home/jt/harness",
+            key="orion",
+            os_user="orion",
+            clone_path="/home/orion/harness",
             wake_kind=WakeKind.HARNESS,
-            recipient_uuid=JT_UUID,
+            recipient_uuid=ORION_UUID,
         )
     with pytest.raises(ValueError, match="recipient_uuid"):
         Agent(
-            key="jt",
-            os_user="jt",
-            clone_path="/home/jt/harness",
+            key="orion",
+            os_user="orion",
+            clone_path="/home/orion/harness",
             wake_kind=WakeKind.HARNESS,
-            wake_bin="/home/jt/venv/bin/basecradle-harness-wake",
+            wake_bin="/home/orion/venv/bin/basecradle-harness-wake",
         )
 
 
