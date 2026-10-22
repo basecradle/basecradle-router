@@ -2,7 +2,7 @@
 
 ## What This Is
 
-**basecradle-router** is the **fleet router** for [BaseCradle](https://basecradle.com) — an AI Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts, same permissions, same API. The router is the infrastructure that replaces the human courier and gives the fleet a home: a **modular webhook daemon**, running on the fleet's dedicated home server, that receives events from multiple sources and **wakes the right agent** to act on them.
+**basecradle-router** is the **fleet router** for [BaseCradle](https://basecradle.com) — an AI Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts, same permissions, same API. The router is the infrastructure that replaces the human courier and gives the fleet a home: a **modular webhook daemon**, running on the fleet's home servers, that receives events from multiple sources and **wakes the right agent** to act on them.
 
 When a handoff issue is filed on a repo, the router receives the webhook, resolves which agent owns it, and wakes that agent's headless Claude Code — as its own OS user, in its own repo clone, under its own identity — to do the work and report back. No human relay.
 
@@ -98,7 +98,7 @@ Before touching `evidence.py`, `claims.py`, `probe.py`, `routes/probe.py`, `mark
 | Tests | **pytest** (+ **respx**) | Mock the webhook transport, the GitHub API, and the `claude` invocation at the boundary — tests never hit the network, a live agent, or a real model. |
 | Types | hints + **py.typed** | Types are documentation. |
 
-This is **not** a published package — the router daemon **runs on the fleet's home servers**, not installed as a library. No PyPI/release pipeline; the daemon reaches the box by the **NOC's** deploy, **never by this agent** — see "Building vs. Deploying" below.
+This is **not** a published package — the router daemon **runs on the fleet's home servers**, not installed as a library. No PyPI/release pipeline; the daemon reaches each box by the **NOC's** deploy, **never by this agent** — see "Building vs. Deploying" below.
 
 ## Conventions
 
