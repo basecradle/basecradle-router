@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -26,6 +27,11 @@ _AGENTS_VAR = f"{ENV_PREFIX}AGENTS"
 _ENABLED_ROUTES_VAR = f"{ENV_PREFIX}ENABLED_ROUTES"
 _DEFAULT_ENABLED_ROUTES = ("github",)
 _GITHUB_TRUSTED_ACTORS_VAR = f"{ENV_PREFIX}GITHUB_TRUSTED_ACTORS"
+#: A captain's GitHub App bot login, refused on the trust allow-list at boot (#369). An
+#: agent's slug is its repo's name plus ``-ai``, and every fleet repo is ``basecradle-<name>``,
+#: so a captain's bot is ``basecradle-<name>-ai[bot]``; the capital's repo is the bare
+#: ``basecradle``, so its bot (``basecradle-ai[bot]``) never has this shape.
+_CAPTAIN_BOT_LOGIN = re.compile(r"basecradle-.+-ai\[bot\]", re.IGNORECASE)
 
 _BREAKER_PREFIX = f"{ENV_PREFIX}WAKE_BREAKER_"
 _BREAKER_MAX_VAR = f"{_BREAKER_PREFIX}MAX"
@@ -503,9 +509,17 @@ def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozense
     captain's bot, which the github route trusts only as the sender of its own merge
     (``deploy/README.md`` carries the box's value). It is **required** and must be
     non-empty: this is a security control, so a deployment that forgets it fails
-    loudly at startup rather than silently disabling the gate. Source-specific
-    config, so it lives on the github route (via the composition root), not on the
-    source-agnostic core :class:`Config`.
+    loudly at startup rather than silently disabling the gate.
+
+    It also **refuses a captain's bot** (#369). The star — no captain's label or comment
+    wakes another — rests on this list alone, so a captain bot listed here would let
+    every captain's comment wake every other, and no delivery would say so. A captain's
+    bot is known by its shape (:data:`_CAPTAIN_BOT_LOGIN`), not by this box's registry,
+    so a laptop builder's bot, which no box registers, is refused too. Matched
+    case-insensitively, as the route reads the list.
+
+    Source-specific config, so it lives on the github route (via the composition root),
+    not on the source-agnostic core :class:`Config`.
     """
     env = os.environ if env is None else env
     raw = env.get(_GITHUB_TRUSTED_ACTORS_VAR)
@@ -517,4 +531,11 @@ def load_github_trusted_actors(env: Mapping[str, str] | None = None) -> frozense
     actors = _split_csv(raw)
     if not actors:
         raise ConfigError(f"{_GITHUB_TRUSTED_ACTORS_VAR} is set but lists no actors")
+    captains = sorted(actor for actor in actors if _CAPTAIN_BOT_LOGIN.fullmatch(actor))
+    if captains:
+        raise ConfigError(
+            f"{_GITHUB_TRUSTED_ACTORS_VAR} lists a captain's bot ({', '.join(captains)}), "
+            "which would let any captain's comment wake another; the github route trusts a "
+            "captain's bot only as the sender of its own merge"
+        )
     return actors
