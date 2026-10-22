@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Session cleanup guard for a laptop builder agent — ported from basecradle-noc
-# (the incident is basecradle-noc#790; the port is basecradle-router#354).
+# Session cleanup guard for a laptop builder agent (basecradle-noc#790).
 #
 # WHY THIS EXISTS
 # ---------------
@@ -42,12 +41,40 @@
 # LAPTOP-ONLY. Removed on migration to the fleet server along with
 # .claude/self-exit.sh — a server wake has no Docker Desktop and no browser.
 # On a box with no docker CLI every Docker check is inert by construction.
+#
+# ONE SCRIPT, EVERY LAPTOP BUILDER (basecradle-noc#1110). This file, self-exit.sh
+# and the SessionStart hook are carried byte for byte by every laptop builder and
+# anchored in basecradle-noc, whose shared-block drift guard diffs them. Hand-synced
+# copies bounced defects between three repos for three rounds before that. The one
+# thing that differs per repo, its name, is read from .claude/session-guard.env
+# beside this file, and the label, the builder prefix and the state root are
+# derived from it. Change this file in basecradle-noc and re-sync; never edit a copy.
 
 set -uo pipefail
 
-LABEL_KEY="basecradle-router-builder"
+GUARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD_CONFIG="$GUARD_DIR/session-guard.env"
+
+# Read, never sourced: one `SESSION_GUARD_REPO=<repo>` line, and nothing else that
+# is not a comment or blank. A missing or malformed config refuses every command, so
+# a carrier that forgot it has no baseline and `check` says so; it never runs under
+# some other repo's label.
+read_repo() {
+  local lines value
+  [ -r "$GUARD_CONFIG" ] || { echo "session-guard: $GUARD_CONFIG is missing — it names this repo (SESSION_GUARD_REPO=<repo>)." >&2; return 1; }
+  lines="$(grep -v -E '^[[:space:]]*(#|$)' "$GUARD_CONFIG")"
+  value="$(sed -n 's/^SESSION_GUARD_REPO=\([a-z0-9][a-z0-9.-]*\)$/\1/p' <<< "$lines")"
+  if [ -z "$value" ] || [ "$lines" != "SESSION_GUARD_REPO=$value" ]; then
+    echo "session-guard: $GUARD_CONFIG must hold exactly one line SESSION_GUARD_REPO=<repo> (lowercase letters, digits, '.', '-')." >&2
+    return 1
+  fi
+  echo "$value"
+}
+REPO_NAME="$(read_repo)" || exit 78
+
+LABEL_KEY="${REPO_NAME}-builder"
 LABEL="${LABEL_KEY}=1"
-BUILDER_PREFIX="basecradle-router-builder-"
+BUILDER_PREFIX="${REPO_NAME}-builder-"
 
 # Docker Desktop's own processes all live under this bundle path. Matching the
 # PATH (not a pattern typed into a command line) is what keeps the probe from
@@ -55,16 +82,16 @@ BUILDER_PREFIX="basecradle-router-builder-"
 # finished job as in-flight for a day (basecradle-noc#694). /Library/Privileged-
 # HelperTools/com.docker.vmnetd is a LaunchDaemon that stays up regardless and
 # is excluded by construction, since it is not under the bundle.
-DOCKER_APP_PREFIX="${BASECRADLE_ROUTER_DOCKER_APP_PREFIX:-/Applications/Docker.app/}"
+DOCKER_APP_PREFIX="${SESSION_GUARD_DOCKER_APP_PREFIX:-/Applications/Docker.app/}"
 
 # Whatever creates, cleans up — turned on this guard's own state.
 STALE_STATE_DAYS=7
 
 # How long a stop/start is given before it is reported as not having happened.
 # The stop bound is what turns "we asked it to quit" into "it is gone".
-STOP_WAIT_SECONDS="${BASECRADLE_ROUTER_GUARD_STOP_WAIT:-90}"
-START_WAIT_SECONDS="${BASECRADLE_ROUTER_GUARD_START_WAIT:-180}"
-POLL_SECONDS="${BASECRADLE_ROUTER_GUARD_POLL:-3}"
+STOP_WAIT_SECONDS="${SESSION_GUARD_STOP_WAIT:-90}"
+START_WAIT_SECONDS="${SESSION_GUARD_START_WAIT:-180}"
+POLL_SECONDS="${SESSION_GUARD_POLL:-3}"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -129,11 +156,19 @@ proc_identity() {
 # session started then sat in the new baseline as pre-existing and was never quit — #790 itself.
 # Claude Code sets CLAUDE_PID, its own pid, in every hook and Bash command it spawns, so the hook
 # and every later call agree on this key by construction. A session id is the fallback, for a
-# Claude Code that predates CLAUDE_PID.
-session_key() {
+# Claude Code that predates CLAUDE_PID — never for a CLAUDE_PID whose start time could not be read
+# (basecradle#710 item 1). One failed `ps` used to drop that run onto the session-id key, so its
+# writes (a Docker Desktop it started) landed in a directory no later call reads, and its lsof
+# stderr redirect into that missing directory read as "no listeners". So the key is computed ONCE
+# per run, and a CLAUDE_PID that cannot be read refuses the run instead of moving it.
+compute_session_key() {
   local pid ident
-  if [ -n "${CLAUDE_PID:-}" ] && ident="$(proc_identity "$CLAUDE_PID")"; then
-    echo "claude-$ident"; return
+  if [ -n "${CLAUDE_PID:-}" ]; then
+    if ident="$(proc_identity "$CLAUDE_PID")"; then
+      echo "claude-$ident"; return 0
+    fi
+    echo "session-guard: CLAUDE_PID=$CLAUDE_PID is set but its start time cannot be read, so this session's key cannot be computed — refusing rather than running under another key. Re-run it." >&2
+    return 1
   fi
   if [ -n "$SESSION_ID_OVERRIDE" ]; then echo "$SESSION_ID_OVERRIDE"; return; fi
   if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID"; return; fi
@@ -141,8 +176,11 @@ session_key() {
   echo "no-session"
 }
 
+SESSION_KEY=""
+session_key() { echo "$SESSION_KEY"; }
+
 state_root() {
-  echo "${BASECRADLE_ROUTER_SESSION_STATE_ROOT:-$HOME/.cache/basecradle-router/builder-sessions}"
+  echo "${SESSION_GUARD_STATE_ROOT:-$HOME/.cache/$REPO_NAME/builder-sessions}"
 }
 
 state_dir() {
@@ -220,15 +258,84 @@ docker_census() {  # docker_census begin|started|late
   list_images     > "$d/images.base"
   list_volumes    > "$d/volumes.base"
   list_builders   > "$d/builders.base"
-  s_put build_cache.base "$(build_cache_size)"
+  # One re-read (basecradle#710 item 2): the `started` census runs the moment `docker version` first
+  # answers, while the engine may still be settling, and a single failed `docker system df` stored
+  # an unreadable baseline for the whole session. One that stays unreadable is `docker-up`'s to re-take.
+  local cache; cache="$(build_cache_size)"
+  size_bytes "$cache" >/dev/null || { sleep "$POLL_SECONDS"; cache="$(build_cache_size)"; }
+  s_put build_cache.base "$cache"
+  s_put docker_census_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   s_put docker_census "$1"
+}
+
+# Which Docker Desktop this session started: the identity (pid + start time) of every process under
+# the bundle once its engine answers. A later session can then prove that a Docker Desktop still
+# running is that same one, and not one somebody started since (basecradle#709 item 4).
+record_desktop_procs() {
+  local pid ident out=""
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    ident="$(proc_identity "$pid")" && out+="$ident"$'\n'
+  done <<< "$(docker_desktop_pids)"
+  printf '%s' "$out" > "$(state_dir)/docker_desktop_procs"
+}
+
+# A RESUME IS A NEW PROCESS, so it takes a new key and a new baseline (basecradle#709 item 4). A
+# session killed after its `docker-up` left the record that it started Docker Desktop under its own
+# dead key, the new baseline saw Desktop running and called it pre-existing, and nothing ever quit
+# it: the basecradle-noc#790 leftover, on the resume path. So `begin` reads every OTHER process key
+# under this repo's state root whose `claude` is gone and which started Docker Desktop. If a process
+# it recorded is still alive, that is provably the same Docker Desktop, and this session ADOPTS it:
+# the record moves here and this session's sweep quits it, as the dead one would have. If none is
+# alive, the record is stale and is cleared. A record with no processes (written before they were
+# recorded, or a Desktop found only through `docker desktop status`) proves nothing: reported, kept.
+adopt_orphaned_desktop() {
+  local root dir key rest ident line live
+  root="$(state_root)"
+  [ -d "$root" ] || return 0
+  for dir in "$root"/claude-*; do
+    [ -d "$dir" ] || continue
+    key="${dir##*/}"
+    [ "$key" != "$(session_key)" ] || continue
+    [ "$(cat "$dir/docker_started_by_session" 2>/dev/null)" = "1" ] || continue
+    rest="${key#claude-}"
+    if ident="$(proc_identity "${rest%%-*}")" && [ "$ident" = "$rest" ]; then
+      continue  # its claude is still running: not an orphan
+    fi
+    if [ ! -s "$dir/docker_desktop_procs" ]; then
+      echo "  WARNING: session $key ended without quitting the Docker Desktop it started, and recorded no process that proves a running one is that one — not adopted. Check Docker Desktop by hand."
+      continue
+    fi
+    live=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      if ident="$(proc_identity "${line%%-*}")" && [ "$ident" = "$line" ]; then live=1; fi
+    done < "$dir/docker_desktop_procs"
+    if [ "$live" = "1" ]; then
+      cp "$dir/docker_desktop_procs" "$(state_dir)/docker_desktop_procs"
+      s_put docker_started_by_session 1
+      s_put desktop_running 0
+      s_put adopted_from "$key"
+      rm -rf "$dir"
+      echo "  ADOPTED: session $key ended without quitting the Docker Desktop it started, and that same Docker Desktop is still running — this session quits it at sweep."
+    else
+      rm -rf "$dir"
+      echo "  cleared session $key's record: the Docker Desktop it started is no longer running."
+    fi
+  done
 }
 
 # Whether the engine must still answer: this session took a baseline from an engine that was
 # already running (at `begin`, or one that came up from outside before `docker-up`), or it started
 # Docker Desktop and has not quit it. An engine this session started and its own sweep then quit
-# is down because the session is done with it, not because something died.
+# is down because the session is done with it, not because something died. An ADOPTED Docker
+# Desktop is one this session started, by inheritance: its engine was up at `begin` only because
+# the dead session had not quit it yet.
 engine_must_answer() {
+  if [ -n "$(s_get adopted_from)" ]; then
+    [ "$(s_get docker_started_by_session 0)" = "1" ]
+    return
+  fi
   case "$(s_get docker_census)" in begin|late) return 0 ;; esac
   [ "$(s_get docker_started_by_session 0)" = "1" ]
 }
@@ -255,7 +362,9 @@ has_lsof() { command -v lsof >/dev/null 2>&1; }
 list_listeners() {
   local err raw rc
   err="$(mktemp "${TMPDIR:-/tmp}/session-guard-lsof.XXXXXX")" || return 1
-  raw="$(lsof -w -nP -a -u "$(id -un)" -iTCP -sTCP:LISTEN -Fpcn 2>"$err")"; rc=$?
+  # A redirect that fails never runs lsof and returns 1 with nothing printed: the "no listeners"
+  # shape exactly (basecradle#710 item 1). So the redirect is its own step, and its failure is 125.
+  raw="$(if exec 2>"$err"; then lsof -w -nP -a -u "$(id -un)" -iTCP -sTCP:LISTEN -Fpcn; else exit 125; fi)"; rc=$?
   if [ -s "$err" ] || { [ "$rc" -ne 0 ] && { [ "$rc" -ne 1 ] || [ -n "$raw" ]; }; }; then
     rm -f "$err"
     return 1
@@ -321,11 +430,6 @@ cmd_begin() {
   rm -rf "$d"
   mkdir -p "$d" || { echo "session-guard: cannot create $d" >&2; return 1; }
 
-  # This guard's own leftovers have a stated end too.
-  if [ -d "$root" ]; then
-    find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$STALE_STATE_DAYS" -exec rm -rf {} + 2>/dev/null || true
-  fi
-
   # `began_at` is what `check` reads as "a baseline exists", so it is written LAST:
   # a census cut off part-way (the hook's timeout, a wedged engine) leaves no
   # baseline, never one that reads complete with its .base files missing.
@@ -335,6 +439,14 @@ cmd_begin() {
   if has_docker; then s_put docker_present 1; else s_put docker_present 0; fi
   if engine_up; then s_put engine_up 1; else s_put engine_up 0; fi
   if docker_desktop_running; then s_put desktop_running 1; else s_put desktop_running 0; fi
+  # After the Desktop reading, which an adoption overrides; before the stale sweep, which would
+  # otherwise delete a week-old orphan's record while its Docker Desktop still runs.
+  adopt_orphaned_desktop
+
+  # This guard's own leftovers have a stated end too.
+  if [ -d "$root" ]; then
+    find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$STALE_STATE_DAYS" -exec rm -rf {} + 2>/dev/null || true
+  fi
 
   [ "$(s_get engine_up)" = "1" ] && docker_census begin
   if has_lsof; then
@@ -375,7 +487,18 @@ cmd_docker_up() {
     echo "session-guard: Docker engine is already up; not recording a session start."
     if [ -z "$(s_get docker_census)" ]; then
       docker_census late
-      echo "session-guard: it came up after this session began, so the Docker baseline is taken now, before the session uses it."
+      echo "session-guard: it came up after this session began, so the Docker baseline is taken now (LATE) — anything this session made on the engine before now is attested by hand, not measured."
+    elif ! size_bytes "$(s_get build_cache.base)" >/dev/null; then
+      # The one lever for an unreadable cache baseline (basecradle#709 item 6). Without it, the
+      # finding `check` raises could never clear, and self-exit has no override.
+      local cache; cache="$(build_cache_size)"
+      if ! size_bytes "$cache" >/dev/null; then
+        echo "session-guard: the build cache's size still cannot be read ('$cache'); no cache baseline recorded." >&2
+        return 1
+      fi
+      s_put build_cache.base "$cache"
+      s_put build_cache_late "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "session-guard: the build cache's size could not be read when the Docker baseline was taken; it is read now ($cache, LATE) — a build before now is attested by hand, not measured."
     fi
     return 0
   fi
@@ -396,6 +519,7 @@ cmd_docker_up() {
   while [ "$waited" -lt "$START_WAIT_SECONDS" ]; do
     if engine_up; then
       echo "session-guard: engine up after ${waited}s."
+      record_desktop_procs
       [ -n "$(s_get docker_census)" ] || docker_census started
       return 0
     fi
@@ -591,11 +715,15 @@ cmd_check() {
     #
     # Only against a census. With none, the engine was down at `begin` and came up
     # from outside this session without a `docker-up`, so there is nothing to
-    # compare against: every artefact on the laptop would read as new. The labelled
-    # checks above still ran, and the gap is named rather than reported as findings
-    # whose repair is `docker rmi` of someone else's image (basecradle#707 (b)).
+    # compare against: every artefact on the laptop would read as new, with `docker
+    # rmi` of someone else's image as the repair (basecradle#707 (b)). The labelled
+    # checks above still ran. The gap itself is a finding (basecradle#709 item 3):
+    # "we could not look" is never clean, and a session that used the engine out of
+    # protocol would otherwise exit clean. Its one lever is a LATE census, taken
+    # after checking by hand, which every later `check` names as late.
     if [ -z "$base_census" ]; then
-      echo "session-guard: NOT CHECKED: unlabelled Docker artefacts — the engine came up after this session began and the session never ran docker-up, so there is no Docker baseline to compare against."
+      finding "no Docker baseline — the engine came up after this session began and the session never ran docker-up, so nothing here can say what it made on the engine." \
+              "check by hand (docker ps -a; docker image ls; docker volume ls), remove anything this session made, then .claude/session-guard.sh docker-up — it takes the Docker baseline now, which check names as LATE"
     else
       extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
       if [ -n "$extra" ]; then
@@ -630,8 +758,13 @@ cmd_check() {
       # too — so it is reported like every other unlabelled artefact, never pruned.
       local cache_now cache_base now_bytes base_bytes
       cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
-      if ! now_bytes="$(size_bytes "$cache_now")" || ! base_bytes="$(size_bytes "$cache_base")"; then
-        finding "the shared build cache's size could not be read (at session start: '${cache_base}', now: '${cache_now}'), so a build on a shared builder cannot be ruled out." \
+      # An unreadable BASELINE never becomes readable by re-running `check`, so it gets its own
+      # finding with its own lever (basecradle#709 item 6); an unreadable reading NOW may be a blip.
+      if ! base_bytes="$(size_bytes "$cache_base")"; then
+        finding "the shared build cache's size could not be read when the Docker baseline was taken ('${cache_base}'), so a build on a shared builder cannot be ruled out." \
+                "compare docker system df by hand, then .claude/session-guard.sh docker-up — it re-reads the cache baseline, which check names as LATE"
+      elif ! now_bytes="$(size_bytes "$cache_now")"; then
+        finding "the shared build cache's size could not be read now ('${cache_now}'; at the baseline: '${cache_base}'), so a build on a shared builder cannot be ruled out." \
                 "re-run .claude/session-guard.sh check; if it persists, compare docker system df by hand and say what you found in the completion comment"
       elif [ "$now_bytes" -gt "$base_bytes" ]; then
         finding "shared build cache grew during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
@@ -647,7 +780,9 @@ cmd_check() {
   local now_desktop=0
   docker_desktop_running && now_desktop=1
   if [ "$base_desktop" = "0" ] && [ "$now_desktop" = "1" ]; then
-    if [ "$(s_get docker_started_by_session 0)" = "1" ]; then
+    if [ -n "$(s_get adopted_from)" ] && [ "$(s_get docker_started_by_session 0)" = "1" ]; then
+      finding "this session adopted the Docker Desktop that session $(s_get adopted_from) started and never quit, and it is still running." ".claude/session-guard.sh sweep"
+    elif [ "$(s_get docker_started_by_session 0)" = "1" ]; then
       finding "this session started Docker Desktop and it is still running." ".claude/session-guard.sh sweep"
     else
       finding "Docker Desktop is running and was not at session start, and this session did not record starting it." \
@@ -715,6 +850,19 @@ cmd_check() {
             "re-check the browser, then .claude/session-guard.sh tabs-checked"
   fi
 
+  # A LATE baseline is an attestation, not a measurement (basecradle#709 item 5): what the session
+  # made before it was taken is in it with no trace. It is the designed path where the engine came
+  # up from outside, so it never blocks, but every check says it, so a clean verdict never hides it.
+  if [ "$(s_get docker_census)" = "late" ]; then
+    echo "session-guard: LATE: the Docker baseline was taken at $(s_get docker_census_at '(unrecorded)'), not at session start — anything this session made on the engine before then is attested by hand, not measured."
+  fi
+  if [ -n "$(s_get build_cache_late)" ]; then
+    echo "session-guard: LATE: the build cache's baseline was read at $(s_get build_cache_late) — a build before then is attested by hand, not measured."
+  fi
+  if [ -n "$(s_get listeners_baseline_late)" ]; then
+    echo "session-guard: LATE: the listening-port baseline was taken at $(s_get listeners_baseline_late) — attested by hand, not measured from session start."
+  fi
+
   if [ "$FINDINGS" -eq 0 ]; then
     echo "session-guard: clean — this session left nothing behind (baseline $(s_get began_at))."
     return 0
@@ -740,6 +888,8 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+SESSION_KEY="$(compute_session_key)" || exit 75
 
 case "$command" in
   begin)        cmd_begin ;;
