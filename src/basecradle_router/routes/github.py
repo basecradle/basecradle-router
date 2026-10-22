@@ -8,8 +8,8 @@ malformed, or tampered gets past it into the core pipeline.
 
 :meth:`GithubRoute.normalize` is the other half. It turns a verified webhook
 into a core :class:`~basecradle_router.models.Event`, gating so only a handoff
-wakes an agent — everything else is a well-formed *ignore*, not an error. Two
-event types are consumed:
+wakes an agent — everything else is a well-formed *ignore*, not an error. Four
+event types are consumed, two of them borne by the handoff issue itself:
 
 * ``issues`` (action ``opened``/``labeled``) — a handoff issue is filed or
   labeled, the initial wake.
@@ -27,8 +27,9 @@ wake (basecradle-router#146). The skip is logged with the issue URL, never silen
 
 As defense-in-depth both paths gate on the webhook ``sender``: a wake only fires
 if a **trusted fleet actor** triggered it (the label applier, or the commenter) —
-the founders' accounts and the capital bot, never a captain's bot. (The merge path
-below admits one more sender, and only there: the repo's own captain bot.)
+the founders' accounts and the capital bot, never a captain's bot. (The two paths
+below that wake a captain on its own PR, its merge and its failed CI, admit one more
+actor, and only there: the repo's own captain bot.)
 Because that check runs *after* :meth:`verify`, the ``sender`` is GitHub-attested
 and not attacker-spoofable. The comment path adds one more gate the issue path
 does not need — the **self-comment guard**: a comment authored by the recipient
@@ -83,6 +84,18 @@ handoff issue the PR names by number, or — when it names none — the repo's o
 handoff issue; with none, or more than one and no name to choose between them, the merge
 is a visible skip. Its trigger is the issues path's, verbatim, plus one line naming the
 merged PR.
+
+**So does CI failing on that PR** (basecradle-router#371). A PR that never merges strands
+its handoff just as silently: CI goes red after the captain's turn ended, and nothing woke
+anyone (basecradle-python#286). A fourth event type, ``workflow_run`` (action ``completed``
+with ``conclusion: failure``), wakes the captain the same way, through the same gates. A
+run carries no author, title or body for the PRs it lists, only their numbers, so the
+route keeps a :class:`PullLedger` of the repo's PRs as the ``pull_request`` deliveries
+(and the warm-up) report them. A run on a PR the ledger has no record of is a visible
+skip. GitHub does not document what a run's ``sender`` is, so the sender scope reads the
+run's own ``triggering_actor`` instead: the captain bot for its own push, a trusted actor
+for a re-run by hand. Each failed run or re-run attempt is its own delivery, and a run
+that passes wakes no one, because the merge will.
 """
 
 from __future__ import annotations
@@ -124,6 +137,7 @@ DELIVERY_HEADER = "X-GitHub-Delivery"
 ISSUES_EVENT = "issues"
 ISSUE_COMMENT_EVENT = "issue_comment"
 PULL_REQUEST_EVENT = "pull_request"
+WORKFLOW_RUN_EVENT = "workflow_run"
 
 HANDOFF_LABEL = "handoff"
 # The fleet-wide do-not-pick-this-up signal (basecradle#376; constitution.md →
@@ -142,11 +156,23 @@ _ACTIONABLE_COMMENT_ACTION = "created"
 # A pull request's merge arrives as `closed` with `merged: true`; a PR closed unmerged
 # finished nothing, so it wakes no one (#365).
 _ACTIONABLE_PULL_REQUEST_ACTION = "closed"
+# A workflow run wakes only once it has finished, and only as a failure: `cancelled` is
+# usually a newer push superseding it, and a pass wakes no one, because the merge will
+# (#371).
+_ACTIONABLE_WORKFLOW_RUN_ACTION = "completed"
+_FAILED_CONCLUSION = "failure"
 
-# Why a merge of the captain's own PR woke no one — the ``reason=`` on its
-# ``event=merge_wake_skip`` line (#365).
+# Why the captain's own merge (#365) or failed CI (#371) woke no one: the ``reason=`` on
+# the ``event=merge_wake_skip`` and ``event=ci_wake_skip`` lines.
 NO_OPEN_HANDOFF = "no_open_handoff"
 AMBIGUOUS_HANDOFF = "ambiguous_handoff"
+# Only a failed run can carry these three. It lists a PR the pull ledger has no record of
+# (lost to a restart the warm-up could not repair) — which may be the captain's, so it is
+# never guessed past; or the captain's PR it lists has closed; or it lists more than one
+# open PR of the captain's, and a guess between two is never made.
+UNKNOWN_PULL_REQUEST = "unknown_pull_request"
+CLOSED_PULL_REQUEST = "closed_pull_request"
+AMBIGUOUS_PULL_REQUEST = "ambiguous_pull_request"
 
 # How a PR names an issue in its own repo: a bare `#N`, an `owner/name#N`, or the
 # issue's URL. The lookbehind keeps `basecradle-router#129` — another repo, named
@@ -240,6 +266,10 @@ _HANDOFF_TRIGGER = (
 # in the words #365 ordered — it adds no instruction of its own. Both values are
 # GitHub's own — the PR's number and URL, never its author-written text.
 _MERGE_NOTE = "\nWake reason: your pull request #{number} ({url}) merged; finish the issue."
+# The same, for a failed CI run on that PR (#371), in the words #371 ordered.
+_CI_FAILURE_NOTE = (
+    "\nWake reason: CI on your pull request #{number} ({url}) failed; finish the issue."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +428,86 @@ class IssueLedger:
         ]
 
 
+@dataclass(frozen=True, slots=True)
+class _PullState:
+    """One pull request as deliveries reported it: who wrote it, where, what it names."""
+
+    updated_at: datetime
+    open: bool
+    author: str
+    number: int
+    url: str
+    named: frozenset[int]
+
+
+class PullLedger:
+    """The newest state of each pull request, as GitHub's own deliveries reported it (#371).
+
+    A ``workflow_run`` lists the PRs its run belongs to by number alone, with no author,
+    title or body. The failed-CI wake needs all three: the author to know it is the
+    captain's own PR, the title and body to know which handoff issue it names. So every
+    verified ``pull_request`` delivery, whatever its action, is recorded here, along with
+    the warm-up's listing of the open ones (:meth:`GithubRoute.warm`). Every author is
+    recorded, so a PR known not to be the captain's is a quiet ignore, not a skip.
+
+    Ordered by the payload's own ``updated_at``, like :class:`IssueLedger`. In a tie, a
+    report of a closed PR is never overridden by one of an open PR: the only safe error is
+    a missed wake on a PR that reopened in the same second as it closed. An LRU of
+    :data:`LEDGER_CAPACITY` PRs, keyed case-insensitively on the repo, as GitHub matches
+    repo names. Thread-safe in the same way as :class:`IssueLedger`.
+    """
+
+    def __init__(self, capacity: int = LEDGER_CAPACITY) -> None:
+        if capacity < 1:
+            raise ValueError(f"capacity must be >= 1, got {capacity}")
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._pulls: OrderedDict[tuple[str, int], _PullState] = OrderedDict()
+
+    def observe(self, repo: str, pull: object) -> None:
+        """Record the state a verified ``pull_request`` object reports. Never raises.
+
+        Best-effort, for the reason :meth:`IssueLedger.observe` gives: a malformed object
+        is simply not recorded.
+        """
+        if not isinstance(pull, dict):
+            return
+        number = pull.get("number")
+        url = pull.get("html_url")
+        state = pull.get("state")
+        login = _author_login(pull)
+        updated_at = parse_timestamp(pull.get("updated_at"))
+        if (
+            not _is_int(number)
+            or not isinstance(url, str)
+            or not url
+            or state not in ("open", "closed")
+            or login is None
+            or updated_at is None
+        ):
+            return
+        report = _PullState(
+            updated_at, state == "open", login, number, url, _named_issues(pull, repo)
+        )
+        key = (repo.lower(), number)
+        with self._lock:
+            known = self._pulls.get(key)
+            if known is not None and (
+                updated_at < known.updated_at
+                or (updated_at == known.updated_at and not known.open and report.open)
+            ):
+                return  # older, or a same-second report that would reopen a closed PR
+            self._pulls[key] = report
+            self._pulls.move_to_end(key)
+            while len(self._pulls) > self._capacity:
+                self._pulls.popitem(last=False)
+
+    def get(self, repo: str, number: int) -> _PullState | None:
+        """The PR ``number`` in ``repo`` as last reported, or ``None`` if never seen."""
+        with self._lock:
+            return self._pulls.get((repo.lower(), number))
+
+
 def _repo_full_name(data: dict[str, Any]) -> str | None:
     """The payload's ``repository.full_name``, or ``None`` if it is absent or not a name."""
     repository = data.get("repository")
@@ -449,8 +559,9 @@ class GithubRoute:
     wake — the founders' accounts and the capital bot, and never a captain's
     bot (the star: a sibling captain's label or comment wakes no one). A handoff whose
     ``sender`` is not on it is rejected (defense-in-depth behind GitHub's own
-    permission model); the one exception is a captain's own merge, whose ``sender`` is
-    admitted as the repo's registered captain bot (:meth:`_normalize_pull_request`).
+    permission model); the one exception is an event on a captain's own PR — its merge,
+    or a failed CI run on it — whose actor is admitted as the repo's registered captain
+    bot (:meth:`_wake_on_own_pull`).
     GitHub logins are case-insensitive, so the list is matched case-insensitively.
     """
 
@@ -468,14 +579,16 @@ class GithubRoute:
         bot_login_for_repo: Callable[[str], str | None] | None = None,
         repos: Iterable[str] = (),
         read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
+        read_open_pulls: Callable[[str, float], list[dict[str, Any]]] | None = None,
         warm_deadline: float = WARM_DEADLINE,
     ) -> None:
         self._trusted_actors = frozenset(actor.lower() for actor in trusted_actors)
-        # The registered repos the warm-up reads, and how (#370). Production reads GitHub's
-        # public API; a test injects the reader (and tests/conftest.py fails any test that
-        # reaches the real one).
+        # The registered repos the warm-up reads, and how (#370, #371). Production reads
+        # GitHub's public API; a test injects the readers (and tests/conftest.py fails any
+        # test that reaches a real one).
         self._repos = tuple(sorted(set(repos)))
         self._read_open_handoffs = read_open_handoffs or read_open_handoffs_from_github
+        self._read_open_pulls = read_open_pulls or read_open_pulls_from_github
         self._warm_deadline = warm_deadline
         # Resolves a repo's captain bot login (e.g. ``basecradle-ruby-ai[bot]``)
         # for the self-comment guard, or ``None`` for an unregistered repo. The
@@ -487,29 +600,27 @@ class GithubRoute:
         # What each handoff issue looks like now, per GitHub's own deliveries — read at
         # dispatch by `recheck` (#272). One per route instance, so each test is isolated.
         self._ledger = IssueLedger()
+        # The PRs a failed workflow run names by number alone (#371).
+        self._pulls = PullLedger()
 
     def warm(self) -> None:
-        """Fill the ledger from GitHub before the first delivery, so a restart drops no merge.
+        """Fill the ledgers from GitHub before the first delivery, so a restart drops no wake.
 
         Called once at startup (:func:`~basecradle_router.routes.base.route_warm`), before
         the daemon accepts a delivery (#370). The registered repos are read **one at a
         time** — never a concurrent burst from the box's shared IP (CLAUDE.md → Polling
         GitHub) — under one :data:`WARM_DEADLINE` for them all: each read is handed what is
-        left of it, and a repo reached with nothing left is not read at all. Each repo's
-        count is logged; a repo that failed or ran out of time is logged loudly and left
-        cold, the ledger as it was before the warm-up existed. Never raises: a warm-up that
-        cannot reach GitHub must not stop the daemon.
+        left of it, and a read reached with nothing left is not made at all. Every repo's
+        open handoff issues are read first, then the open PRs (#371) of each repo that has
+        an open handoff, so the later read can never starve the one a merge depends on.
+        Each count is logged; a read that failed or ran out of time is logged loudly and
+        its ledger left cold for that repo, as it was before the warm-up existed. Never
+        raises: a warm-up that cannot reach GitHub must not stop the daemon.
         """
         deadline = monotonic() + self._warm_deadline
         for repo in self._repos:
-            budget = deadline - monotonic()
-            if budget <= 0:
-                _log_cold(repo, f"no time left of the {self._warm_deadline:g}s warm-up")
-                continue
-            try:
-                issues = self._read_open_handoffs(repo, budget)
-            except Exception as exc:  # noqa: BLE001 — any failure leaves this repo cold
-                _log_cold(repo, _describe_failure(exc))
+            issues = self._warm_read(self._read_open_handoffs, repo, deadline)
+            if issues is None:
                 continue
             for issue in issues:
                 self._ledger.observe(
@@ -520,6 +631,52 @@ class GithubRoute:
                 "event=ledger_warm %s",
                 log_fields(repo=repo, open_handoffs=len(self._ledger.open_handoffs(repo))),
             )
+        # A failed run wakes no one in a repo with no open handoff, so only the repos that
+        # have one are read: the unauthenticated quota is the box's IP's, shared by every
+        # restart in the hour (#371).
+        for repo in self._repos:
+            if not self._ledger.open_handoffs(repo):
+                continue
+            pulls = self._warm_read(self._read_open_pulls, repo, deadline, listing="pulls")
+            if pulls is None:
+                continue
+            for pull in pulls:
+                self._pulls.observe(repo, pull)
+            recorded = [
+                known
+                for pull in pulls
+                if isinstance(pull, dict)
+                and _is_int(pull.get("number"))
+                and (known := self._pulls.get(repo, pull["number"])) is not None
+            ]
+            own = sum(1 for known in recorded if self._is_captain_bot(repo, known.author))
+            logger.info(
+                "event=pull_ledger_warm %s",
+                log_fields(repo=repo, open_pull_requests=len(recorded), captain_pull_requests=own),
+            )
+
+    def _warm_read(
+        self,
+        read: Callable[[str, float], list[dict[str, Any]]],
+        repo: str,
+        deadline: float,
+        *,
+        listing: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """One warm-up read with what is left of ``deadline``, or ``None`` if it was not had.
+
+        ``listing`` names a read other than the handoff issues on its cold line; the handoff
+        read's line stays as #370 wrote it.
+        """
+        budget = deadline - monotonic()
+        if budget <= 0:
+            _log_cold(repo, f"no time left of the {self._warm_deadline:g}s warm-up", listing)
+            return None
+        try:
+            return read(repo, budget)
+        except Exception as exc:  # noqa: BLE001 — any failure leaves this repo cold
+            _log_cold(repo, _describe_failure(exc), listing)
+            return None
 
     def recheck(self, event: Event) -> str | None:
         """Why a queued handoff wake should no longer run, or ``None`` to run it.
@@ -549,13 +706,13 @@ class GithubRoute:
         """Turn a verified webhook into an :class:`Event`, or ignore it.
 
         Dispatches on the event type: an ``issues`` handoff (opened/labeled), an
-        ``issue_comment`` reply on a handoff issue, and a ``pull_request`` merge of the
-        captain's own PR all normalize to the same handoff :class:`Event`; every other
-        event is a well-formed *ignore*.
+        ``issue_comment`` reply on a handoff issue, a ``pull_request`` merge of the
+        captain's own PR, and a ``workflow_run`` failing on it all normalize to the same
+        handoff :class:`Event`; every other event is a well-formed *ignore*.
         Raises :class:`PayloadError` when an actionable payload is structurally
         malformed and :class:`UntrustedSenderError` when a wake was triggered by
-        an actor who is not on the trusted-actor allow-list (on a merge, nor the repo's
-        own captain bot). Emits a structured decision
+        an actor who is not on the trusted-actor allow-list (on the captain's own PR, nor
+        the repo's own captain bot). Emits a structured decision
         line for each quiet outcome (basecradle-router#91) so a deliberate ignore
         is visible in observability, never indistinguishable from a silent drop.
         """
@@ -571,6 +728,8 @@ class GithubRoute:
             return self._normalize_comment(request, event_type, delivery)
         if event_type == PULL_REQUEST_EVENT:
             return self._normalize_pull_request(request, event_type, delivery)
+        if event_type == WORKFLOW_RUN_EVENT:
+            return self._normalize_workflow_run(request, event_type, delivery)
         return self._ignore(event_type, delivery)
 
     def _normalize_issues(
@@ -684,44 +843,130 @@ class GithubRoute:
         """
         data = parse_json_object(request.body)
         pull = data.get("pull_request")
+        # Every verified PR delivery reports who wrote the PR and what it names, which a
+        # failed run on it will need (#371), so it is observed ahead of every gate.
+        repo = _repo_full_name(data)
+        if repo is not None:
+            self._pulls.observe(repo, pull)
         if data.get("action") != _ACTIONABLE_PULL_REQUEST_ACTION or not isinstance(pull, dict):
             return self._ignore(event_type, delivery)
         if pull.get("merged") is not True:
             return self._ignore(event_type, delivery)
 
-        repo = _repo_full_name(data)
         if repo is None:
             raise PayloadError("event payload is missing 'repository.full_name'")
-        author = pull.get("user")
-        login = author.get("login") if isinstance(author, dict) else None
-        if not isinstance(login, str) or not self._is_captain_bot(repo, login):
+        login = _author_login(pull)
+        if login is None or not self._is_captain_bot(repo, login):
             return self._ignore(event_type, delivery)
 
         number = _int(pull, "number", "pull_request.number")
         pull_url = _text(pull, "html_url", "pull_request.html_url")
-        target, reason = _merge_target(self._ledger.open_handoffs(repo), _named_issues(pull, repo))
-        if target is None:
-            logger.info(
-                "event=merge_wake_skip pull_request=%s delivery=%s reason=%s",
-                pull_url,
-                delivery or "<unknown>",
-                reason,
-            )
+        return self._wake_on_own_pull(
+            repo,
+            _named_issues(pull, repo),
+            actor=_sender_login(data),
+            note=_MERGE_NOTE.format(number=number, url=pull_url),
+            skip_line=f"event=merge_wake_skip pull_request={pull_url}",
+            event_type=event_type,
+            delivery=delivery,
+            occurred_at=parse_timestamp(pull.get("merged_at")),
+        )
+
+    def _normalize_workflow_run(
+        self, request: InboundRequest, event_type: str, delivery: str | None
+    ) -> Event | None:
+        """A ``workflow_run`` webhook: CI failing on the captain's own PR wakes it (#371).
+
+        The mirror of the merge path, for a PR that will never merge: only a **completed**
+        run whose conclusion is **failure**, on exactly one open PR into this repo that the
+        :class:`PullLedger` knows the **repo's registered captain bot** wrote, with an
+        **open handoff issue** to wake it on (the one the PR names, else the repo's only
+        one) that is not parked under ``Do Not Work``. The run's ``triggering_actor``
+        (who pushed the commit, or re-ran the run) must be that captain bot or a trusted
+        actor, as the merge path's sender must. That field is read rather than ``sender``
+        because it is the run's own record of who caused it, while GitHub documents no
+        mapping from a run to a delivery's ``sender`` — the gap #367 fell into. Waking
+        cannot loop: the wake's own pushes start new runs, and each failure is a further
+        delivery capped, like any stream, by the breaker.
+        """
+        data = parse_json_object(request.body)
+        run = data.get("workflow_run")
+        if data.get("action") != _ACTIONABLE_WORKFLOW_RUN_ACTION or not isinstance(run, dict):
             return self._ignore(event_type, delivery)
+        if run.get("conclusion") != _FAILED_CONCLUSION:
+            return self._ignore(event_type, delivery)
+
+        repo = _repo_full_name(data)
+        if repo is None:
+            raise PayloadError("event payload is missing 'repository.full_name'")
+        numbers = _run_pull_numbers(run, repo)
+        if not numbers:
+            return self._ignore(event_type, delivery)  # a run on no PR into this repo
+
+        run_url = run.get("html_url") if isinstance(run.get("html_url"), str) else "<unknown>"
+        skip_line = f"event=ci_wake_skip workflow_run={run_url}"
+        known = [self._pulls.get(repo, number) for number in numbers]
+        # Never a guess: a PR the ledger has not seen may be the captain's too.
+        if None in known:
+            return self._skip_pull_wake(skip_line, UNKNOWN_PULL_REQUEST, event_type, delivery)
+        own = [pull for pull in known if pull and self._is_captain_bot(repo, pull.author)]
+        if not own:
+            return self._ignore(event_type, delivery)  # PRs known to be someone else's
+        open_own = [pull for pull in own if pull.open]
+        if not open_own:
+            return self._skip_pull_wake(skip_line, CLOSED_PULL_REQUEST, event_type, delivery)
+        if len(open_own) > 1:
+            return self._skip_pull_wake(skip_line, AMBIGUOUS_PULL_REQUEST, event_type, delivery)
+
+        (pull,) = open_own
+        return self._wake_on_own_pull(
+            repo,
+            pull.named,
+            actor=_author_login(run, "triggering_actor"),
+            note=_CI_FAILURE_NOTE.format(number=pull.number, url=pull.url),
+            skip_line=skip_line,
+            event_type=event_type,
+            delivery=delivery,
+            occurred_at=parse_timestamp(run.get("updated_at")),
+        )
+
+    def _wake_on_own_pull(
+        self,
+        repo: str,
+        named: frozenset[int],
+        *,
+        actor: str | None,
+        note: str,
+        skip_line: str,
+        event_type: str,
+        delivery: str | None,
+        occurred_at: datetime | None,
+    ) -> Event | None:
+        """The tail the merge (#365) and failed-CI (#371) wakes share, from the captain's PR.
+
+        Finds the open handoff issue the PR is about, takes the ``Do Not Work`` brake, and
+        holds ``actor`` (who caused the event) to the sender scope: the captain's own bot is
+        the one case a captain bot is trusted, because a captain bot is never on the
+        allow-list (#367). Anyone else — a human by hand, a peer bot — is held to the
+        allow-list, the other paths' gate. ``skip_line`` opens the line a target-less event
+        logs; ``note`` follows the verbatim trigger.
+        """
+        target, reason = _merge_target(self._ledger.open_handoffs(repo), named)
+        if target is None:
+            return self._skip_pull_wake(skip_line, reason, event_type, delivery)
         if self._ledger.reason_to_drop(target.url) == DO_NOT_WORK:
             return self._skip_do_not_work(target.url, event_type, delivery)
+        if actor is None or not self._is_captain_bot(repo, actor):
+            self._require_trusted_login(actor)
+        wake_arg = _HANDOFF_TRIGGER.format(url=target.url) + note
+        return self._build_event(target, wake_arg, event_type, delivery, occurred_at)
 
-        # Sender scope: the captain's own merge is the one case a captain bot is trusted,
-        # because a captain bot is never on the allow-list (#367). Anyone else — a human
-        # merging by hand, a peer bot — is held to the allow-list, the other paths' gate.
-        if not self._sender_is_captain_bot(data):
-            self._require_trusted_sender(data)
-        wake_arg = _HANDOFF_TRIGGER.format(url=target.url) + _MERGE_NOTE.format(
-            number=number, url=pull_url
-        )
-        return self._build_event(
-            target, wake_arg, event_type, delivery, parse_timestamp(pull.get("merged_at"))
-        )
+    def _skip_pull_wake(
+        self, skip_line: str, reason: str | None, event_type: str, delivery: str | None
+    ) -> None:
+        """Log why the captain's own PR woke no one, then the usual ``IGNORED`` decision."""
+        logger.info("%s delivery=%s reason=%s", skip_line, delivery or "<unknown>", reason)
+        return self._ignore(event_type, delivery)
 
     def _wake_event(
         self,
@@ -822,14 +1067,13 @@ class GithubRoute:
     def _sender_is_captain_bot(self, data: dict[str, Any]) -> bool:
         """Whether the delivery's sender is the recipient agent's own bot.
 
-        The recipient is the captain of the repo the delivery is on. Read by two
-        gates: the self-comment guard (re-waking a captain on its own comment loops)
-        and the merge path's sender scope (its own auto-merge is the one case a
-        captain bot is trusted). We compare the GitHub-attested ``sender`` against
-        the recipient's *registered* bot login (not a name derived by convention —
-        the registry is the authority). If the repo is unregistered the bot is
-        unknown and this returns ``False``; that is safe, because resolution will
-        then find no agent and run no wake, so there is no loop to break.
+        The recipient is the captain of the repo the delivery is on. Read by the
+        self-comment guard (re-waking a captain on its own comment loops). We compare
+        the GitHub-attested ``sender`` against the recipient's *registered* bot login
+        (not a name derived by convention — the registry is the authority). If the
+        repo is unregistered the bot is unknown and this returns ``False``; that is
+        safe, because resolution will then find no agent and run no wake, so there is
+        no loop to break.
         """
         repo = _repo_full_name(data)
         if repo is None:
@@ -853,7 +1097,13 @@ class GithubRoute:
         actor from a missing or malformed ``sender``, so that fails closed (an
         untrusted sender), the same as a known-but-not-allowed login.
         """
-        login = _sender_login(data)
+        self._require_trusted_login(_sender_login(data))
+
+    def _require_trusted_login(self, login: str | None) -> None:
+        """Raise :class:`UntrustedSenderError` unless ``login`` is on the allow-list.
+
+        ``None`` is an actor the payload did not identify, and fails closed.
+        """
         if login is None:
             raise UntrustedSenderError("handoff webhook has no identifiable sender")
         if login.lower() not in self._trusted_actors:
@@ -877,11 +1127,34 @@ def read_open_handoffs_from_github(
     API, too many pages — and the caller leaves the repo cold. ``urlopen`` is looked up
     when called, never bound at import, so the test suite's network guard always holds.
     """
+    query = urllib.parse.urlencode({"state": "open", "labels": HANDOFF_LABEL, "per_page": 100})
+    return _read_listing(
+        repo, f"issues?{query}", "open handoff issues", timeout, urlopen=urlopen, clock=clock
+    )
+
+
+def read_open_pulls_from_github(
+    repo: str, timeout: float = WARM_DEADLINE, *, urlopen=None, clock=monotonic
+) -> list[dict[str, Any]]:
+    """``repo``'s open pull requests, as GitHub's public REST API lists them (#371).
+
+    The same tokenless read as :func:`read_open_handoffs_from_github`, under the same
+    rules. Each item is the same pull request object a ``pull_request`` webhook carries.
+    """
+    query = urllib.parse.urlencode({"state": "open", "per_page": 100})
+    return _read_listing(
+        repo, f"pulls?{query}", "open pull requests", timeout, urlopen=urlopen, clock=clock
+    )
+
+
+def _read_listing(
+    repo: str, path: str, what: str, timeout: float, *, urlopen, clock
+) -> list[dict[str, Any]]:
+    """Every page of one of ``repo``'s REST listings, ``path`` below the repo (#370)."""
     urlopen = urlopen or urllib.request.urlopen
     deadline = clock() + timeout
-    query = urllib.parse.urlencode({"state": "open", "labels": HANDOFF_LABEL, "per_page": 100})
-    url: str | None = f"{GITHUB_API}/repos/{urllib.parse.quote(repo, safe='/')}/issues?{query}"
-    issues: list[dict[str, Any]] = []
+    url: str | None = f"{GITHUB_API}/repos/{urllib.parse.quote(repo, safe='/')}/{path}"
+    items: list[dict[str, Any]] = []
     for _ in range(_WARM_MAX_PAGES):
         remaining = deadline - clock()
         if remaining <= 0:
@@ -898,12 +1171,12 @@ def read_open_handoffs_from_github(
             page = json.load(response)
             link = response.headers.get("Link")
         if not isinstance(page, list):
-            raise ValueError("the issues listing is not a JSON array")
-        issues.extend(item for item in page if isinstance(item, dict))
+            raise ValueError(f"the listing of {what} is not a JSON array")
+        items.extend(item for item in page if isinstance(item, dict))
         url = _next_page(link)
         if url is None:
-            return issues
-    raise ValueError(f"more than {_WARM_MAX_PAGES} pages of open handoff issues")
+            return items
+    raise ValueError(f"more than {_WARM_MAX_PAGES} pages of {what}")
 
 
 def _issue_repo(issue: dict[str, Any], registered: str) -> str:
@@ -942,9 +1215,12 @@ def _describe_failure(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _log_cold(repo: str, reason: str) -> None:
-    """The one loud line for a repo the warm-up left cold (#370)."""
-    logger.warning("event=ledger_warm_failed %s", log_fields(repo=repo, reason=reason))
+def _log_cold(repo: str, reason: str, listing: str | None = None) -> None:
+    """The one loud line for a read the warm-up left cold (#370); ``listing`` names a
+    read other than the handoff issues (#371)."""
+    logger.warning(
+        "event=ledger_warm_failed %s", log_fields(repo=repo, listing=listing, reason=reason)
+    )
 
 
 def _named_issues(pull: dict[str, Any], repo: str) -> frozenset[int]:
@@ -960,10 +1236,36 @@ def _named_issues(pull: dict[str, Any], repo: str) -> frozenset[int]:
     return frozenset(named)
 
 
+def _run_pull_numbers(run: dict[str, Any], repo: str) -> list[int]:
+    """The PRs into ``repo`` a workflow run belongs to, by number (#371).
+
+    A run lists them in ``pull_requests``, each with its base repo's API URL; one into any
+    other repo is not this repo's PR, whatever its number. GitHub lists none for a run on
+    a fork's PR, or for a push with no open PR.
+    """
+    pulls = run.get("pull_requests")
+    if not isinstance(pulls, list):
+        return []
+    here = f"{GITHUB_API}/repos/{repo}".lower()
+    numbers: list[int] = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            continue
+        number = pull.get("number")
+        base = pull.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_url = base_repo.get("url") if isinstance(base_repo, dict) else None
+        if _is_int(number) and isinstance(base_url, str) and base_url.lower() == here:
+            numbers.append(number)
+    return numbers
+
+
 def _merge_target(
     candidates: list[IssueRef], named: frozenset[int]
 ) -> tuple[IssueRef | None, str | None]:
-    """The one open handoff issue a merge wakes its captain on, or why there is none.
+    """The one open handoff issue the captain's PR wakes it on, or why there is none.
+
+    Shared by a merge (#365) and a failed CI run (#371): both are about the same PR.
 
     A PR that names issues in its repo is about those: the candidates among them, and
     never a candidate it did not name — a passed-by fix that names its own issue says
@@ -989,6 +1291,21 @@ def _require_issue(data: dict[str, Any]) -> dict[str, Any]:
     return issue
 
 
+def _is_int(value: object) -> bool:
+    """Whether ``value`` is a JSON integer; ``bool`` is an int subclass, and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _author_login(obj: object, key: str = "user") -> str | None:
+    """The login of the user object at ``obj[key]``, or ``None`` if there is none.
+
+    A PR's author is its ``user``; a workflow run's actor is its ``triggering_actor``.
+    """
+    user = obj.get(key) if isinstance(obj, dict) else None
+    login = user.get("login") if isinstance(user, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
 def _sender_login(data: dict[str, Any]) -> str | None:
     """The GitHub-attested actor login on a webhook, or ``None`` if unidentifiable.
 
@@ -997,9 +1314,7 @@ def _sender_login(data: dict[str, Any]) -> str | None:
     never disagree on what the sender is. A missing or malformed ``sender``, or an
     empty login, is ``None`` (the callers fail closed on it).
     """
-    sender = data.get("sender")
-    login = sender.get("login") if isinstance(sender, dict) else None
-    return login if isinstance(login, str) and login else None
+    return _author_login(data, "sender")
 
 
 def _is_handoff(action: str, issue: dict[str, Any], data: dict[str, Any]) -> bool:
