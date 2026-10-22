@@ -48,8 +48,19 @@ the front of the queue the core asks this route whether the work still stands
 newest state of each handoff issue as GitHub itself reported it, in the ``issues`` and
 ``issue_comment`` deliveries the App subscription already sends — ``closed``,
 ``reopened`` and ``unlabeled`` included, which reached the router all along and were
-ignored. It is not a fetch: the router holds no GitHub credential by design, and needs
-none for this, because every change of state that matters arrives as a delivery.
+ignored. The recheck itself is not a fetch: every change of state that matters arrives as
+a delivery, so answering it needs no read of GitHub, and the router holds no GitHub
+credential by design.
+
+**A restart does not empty it** (basecradle-router#370). The ledger is memory, and the
+NOC redeploys on every move of ``main``, so a restart between a handoff's pickup and its
+merge is the ordinary case. So the router's one outbound read of GitHub happens here:
+before the daemon accepts its first delivery, :meth:`GithubRoute.warm` reads each
+registered repo's open ``handoff`` issues from GitHub's public API, **tokenlessly** (a
+public repo needs no credential, as the box already pulls this repo without one), and
+records each one as a delivery would have. A repo it cannot read in time — a private
+one, a rate limit, GitHub down — logs one loud line and starts cold, the behaviour before
+the warm-up: an outage at GitHub never takes the router down.
 
 Each handoff :class:`~basecradle_router.models.Event` is also stamped with **when its
 event happened** — the issue's creation for ``opened``, its last update for ``labeled``,
@@ -76,15 +87,21 @@ merged PR.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from time import monotonic
 from typing import Any
 
+from basecradle_router.logfmt import log_fields
 from basecradle_router.models import Event, EventKind, IssueRef, Recipient
 from basecradle_router.routes.base import (
     DeliveryDecision,
@@ -156,6 +173,19 @@ _LABEL_ACTIONS = frozenset({"opened", "labeled", "unlabeled"})
 #: behind a running wake, so this is generous by orders of magnitude; an evicted issue
 #: is answered "no information", which wakes exactly as the router always did.
 LEDGER_CAPACITY = 1024
+
+#: The public API the warm-up reads, without a credential (#370). A pagination link that
+#: points anywhere else is refused, never followed.
+GITHUB_API = "https://api.github.com"
+#: How long the warm-up may hold back the listener, for every repo together: GitHub
+#: answers in well under a second, and a hung GitHub must not stall a deploy's restart.
+WARM_DEADLINE = 3.0
+# Ten pages of a hundred, about the ledger's capacity; a repo with more is not warmed.
+_WARM_MAX_PAGES = LEDGER_CAPACITY // 100
+# What the warm-up's observations are recorded as: never an `issues` action, so it never
+# claims to have heard a change first-hand (see IssueLedger.observe).
+_WARM_UP = "warm_up"
+_NEXT_LINK = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 # The standing trust-boundary envelope wrapped around every handoff trigger
 # (basecradle-router#60, workstream 1).
@@ -256,8 +286,9 @@ class IssueLedger:
     is kept; and the whole ledger is an LRU of :data:`LEDGER_CAPACITY` issues.
 
     **It fails towards waking.** An issue it has no record of — never seen, evicted, or
-    lost to a restart (the ledger is memory, like the queue it serves) — is answered
-    ``None``, which is the router's behaviour before the ledger existed.
+    lost to a restart the warm-up could not repair (the ledger is memory, like the queue
+    it serves; :meth:`GithubRoute.warm`) — is answered ``None``, which is the router's
+    behaviour before the ledger existed.
 
     **It is also where a merge finds its issue** (#365, :meth:`open_handoffs`). A
     ``pull_request`` payload names no issue, so the open handoff issues the ledger holds
@@ -435,8 +466,17 @@ class GithubRoute:
         trusted_actors: Iterable[str],
         *,
         bot_login_for_repo: Callable[[str], str | None] | None = None,
+        repos: Iterable[str] = (),
+        read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
+        warm_deadline: float = WARM_DEADLINE,
     ) -> None:
         self._trusted_actors = frozenset(actor.lower() for actor in trusted_actors)
+        # The registered repos the warm-up reads, and how (#370). Production reads GitHub's
+        # public API; a test injects the reader (and tests/conftest.py fails any test that
+        # reaches the real one).
+        self._repos = tuple(sorted(set(repos)))
+        self._read_open_handoffs = read_open_handoffs or read_open_handoffs_from_github
+        self._warm_deadline = warm_deadline
         # Resolves a repo's captain bot login (e.g. ``basecradle-ruby-ai[bot]``)
         # for the self-comment guard, or ``None`` for an unregistered repo. The
         # composition root (:mod:`basecradle_router.app`) wires it from the agent
@@ -447,6 +487,39 @@ class GithubRoute:
         # What each handoff issue looks like now, per GitHub's own deliveries — read at
         # dispatch by `recheck` (#272). One per route instance, so each test is isolated.
         self._ledger = IssueLedger()
+
+    def warm(self) -> None:
+        """Fill the ledger from GitHub before the first delivery, so a restart drops no merge.
+
+        Called once at startup (:func:`~basecradle_router.routes.base.route_warm`), before
+        the daemon accepts a delivery (#370). The registered repos are read **one at a
+        time** — never a concurrent burst from the box's shared IP (CLAUDE.md → Polling
+        GitHub) — under one :data:`WARM_DEADLINE` for them all: each read is handed what is
+        left of it, and a repo reached with nothing left is not read at all. Each repo's
+        count is logged; a repo that failed or ran out of time is logged loudly and left
+        cold, the ledger as it was before the warm-up existed. Never raises: a warm-up that
+        cannot reach GitHub must not stop the daemon.
+        """
+        deadline = monotonic() + self._warm_deadline
+        for repo in self._repos:
+            budget = deadline - monotonic()
+            if budget <= 0:
+                _log_cold(repo, f"no time left of the {self._warm_deadline:g}s warm-up")
+                continue
+            try:
+                issues = self._read_open_handoffs(repo, budget)
+            except Exception as exc:  # noqa: BLE001 — any failure leaves this repo cold
+                _log_cold(repo, _describe_failure(exc))
+                continue
+            for issue in issues:
+                self._ledger.observe(
+                    {"issue": issue, "repository": {"full_name": _issue_repo(issue, repo)}},
+                    event_type=_WARM_UP,
+                )
+            logger.info(
+                "event=ledger_warm %s",
+                log_fields(repo=repo, open_handoffs=len(self._ledger.open_handoffs(repo))),
+            )
 
     def recheck(self, event: Event) -> str | None:
         """Why a queued handoff wake should no longer run, or ``None`` to run it.
@@ -787,6 +860,91 @@ class GithubRoute:
             raise UntrustedSenderError(
                 f"wake triggered by untrusted actor {login!r}; not on the trusted-actor allow-list"
             )
+
+
+def read_open_handoffs_from_github(
+    repo: str, timeout: float = WARM_DEADLINE, *, urlopen=None, clock=monotonic
+) -> list[dict[str, Any]]:
+    """``repo``'s open issues labeled ``handoff``, as GitHub's public REST API lists them.
+
+    Tokenless by design — the router holds no GitHub credential, and a public repo needs
+    none to be read (#370). Each item is the same issue object a webhook carries, so the
+    ledger records it exactly as a delivery. ``timeout`` is the whole read's budget, every
+    page included: each request is given what is left of it, and a page that would start
+    with none left raises instead. Follows ``Link: rel="next"`` within :data:`GITHUB_API`
+    only, for at most ``_WARM_MAX_PAGES`` pages. Raises on anything else — an HTTP error (a
+    private repo's 404, a rate limit's 403), a body that is not a list, a link off the
+    API, too many pages — and the caller leaves the repo cold. ``urlopen`` is looked up
+    when called, never bound at import, so the test suite's network guard always holds.
+    """
+    urlopen = urlopen or urllib.request.urlopen
+    deadline = clock() + timeout
+    query = urllib.parse.urlencode({"state": "open", "labels": HANDOFF_LABEL, "per_page": 100})
+    url: str | None = f"{GITHUB_API}/repos/{urllib.parse.quote(repo, safe='/')}/issues?{query}"
+    issues: list[dict[str, Any]] = []
+    for _ in range(_WARM_MAX_PAGES):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError(f"no time left of the {timeout:g}s budget")
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "basecradle-router",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urlopen(request, timeout=remaining) as response:
+            page = json.load(response)
+            link = response.headers.get("Link")
+        if not isinstance(page, list):
+            raise ValueError("the issues listing is not a JSON array")
+        issues.extend(item for item in page if isinstance(item, dict))
+        url = _next_page(link)
+        if url is None:
+            return issues
+    raise ValueError(f"more than {_WARM_MAX_PAGES} pages of open handoff issues")
+
+
+def _issue_repo(issue: dict[str, Any], registered: str) -> str:
+    """The repo a listed issue belongs to, as GitHub spells it, else the registry's spelling.
+
+    A webhook carries ``repository.full_name`` in GitHub's own case; a listed issue carries
+    the same name at the end of its ``repository_url``, so the warm-up records the issue
+    exactly as a delivery would, whatever case the registry key was written in.
+    """
+    url = issue.get("repository_url")
+    prefix = f"{GITHUB_API}/repos/"
+    if isinstance(url, str) and url.startswith(prefix):
+        name = url[len(prefix) :]
+        if name.lower() == registered.lower():
+            return name
+    return registered
+
+
+def _next_page(link: str | None) -> str | None:
+    """The ``rel="next"`` URL of a ``Link`` header, or ``None`` on the last page."""
+    match = _NEXT_LINK.search(link or "")
+    if match is None:
+        return None
+    url = match.group(1)
+    if not url.startswith(f"{GITHUB_API}/"):
+        raise ValueError(f"refusing a pagination link off {GITHUB_API}: {url}")
+    return url
+
+
+def _describe_failure(exc: Exception) -> str:
+    """A one-line reason for a failed warm-up read: the HTTP status, else the error."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        return f"unreachable: {exc.reason}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _log_cold(repo: str, reason: str) -> None:
+    """The one loud line for a repo the warm-up left cold (#370)."""
+    logger.warning("event=ledger_warm_failed %s", log_fields(repo=repo, reason=reason))
 
 
 def _named_issues(pull: dict[str, Any], repo: str) -> frozenset[int]:

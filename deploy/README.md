@@ -464,10 +464,18 @@ the router's side can tell):
   usual skip. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
   number and URL (never its author-written text): `Wake reason: your pull request #N (<url>) merged;
   finish the issue.` A merge stamps the event with `merged_at`, so it coalesces like any delivery: a
-  successful wake on the issue that started after the merge already covers it. The record is memory: a handoff issue the daemon has not
-  seen a delivery for since it last started (a deploy restarts it) is one no merge can wake until an
-  `issues` or `issue_comment` delivery shows it again — the behaviour before #365, never a wrong wake. Any
-  such delivery teaches it, the ones the route ignores included, so it can be taught without a wake: the
+  successful wake on the issue that started after the merge already covers it. The record is memory, so
+  **the daemon warms it on start** (#370): before it accepts a delivery, it reads every registered github
+  repo's open `handoff` issues from GitHub's public API — **tokenlessly**, as the box pulls this repo, so
+  the router still holds no GitHub credential — and records each as a delivery would have. The journal
+  states the result per repo, `event=ledger_warm repo=<owner/name> open_handoffs=<n>`. The repos are read
+  one at a time, about one unauthenticated request each per restart, under one 3 s budget for them all, so
+  a hung GitHub holds the listener back by 3 s at most. A repo it cannot read in that time (a private
+  repo's `404`, a rate limit's `403`, GitHub down) gets one `WARNING` line,
+  `event=ledger_warm_failed repo=<owner/name> reason=<why>`, and the daemon
+  starts anyway with that repo cold: a handoff issue there is one no merge can wake until an `issues` or
+  `issue_comment` delivery shows it again — the behaviour before #365, never a wrong wake. Any such
+  delivery teaches it, the ones the route ignores included, so it can be taught without a wake: the
   captain's **own** comment on the issue (the self-comment guard ignores it), a label other than `handoff`
   added or removed, or an edit of the issue. A comment from a trusted actor, or `handoff` re-applied by
   one, teaches it too, but wakes the captain.

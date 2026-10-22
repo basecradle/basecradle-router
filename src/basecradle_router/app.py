@@ -19,6 +19,7 @@ no merge stage to wire here (see issue #38 for the decision).
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from typing import Any
 
 from basecradle_router.breaker import WakeRateBreaker
 from basecradle_router.config import (
@@ -46,18 +47,22 @@ from basecradle_router.wakelock import WakeLockGuard
 
 
 def create_app(
-    env: Mapping[str, str] | None = None, *, waker: Waker | None = None
+    env: Mapping[str, str] | None = None,
+    *,
+    waker: Waker | None = None,
+    read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
 ) -> WebhookServer:
     """Build the daemon's ASGI app from ``env`` (defaults to the process environment).
 
     Raises :class:`~basecradle_router.config.ConfigError` (naming the missing
     variable) if required configuration is absent. ``waker`` is injectable so tests
     never reach the real wake boundary; production uses the default
-    :class:`~basecradle_router.wake.HomeServerWaker`.
+    :class:`~basecradle_router.wake.HomeServerWaker`. ``read_open_handoffs`` is
+    injectable for the same reason (see :func:`build_registry`).
     """
     config = load_config(env)
     pipeline = Pipeline(
-        registry=build_registry(config, env),
+        registry=build_registry(config, env, read_open_handoffs=read_open_handoffs),
         config=config,
         waker=waker or HomeServerWaker(),
         breaker=WakeRateBreaker(load_breaker_config(env)),
@@ -68,7 +73,12 @@ def create_app(
     return WebhookServer(pipeline, lanes=load_wake_lanes(env))
 
 
-def build_registry(config: Config, env: Mapping[str, str] | None = None) -> RouteRegistry:
+def build_registry(
+    config: Config,
+    env: Mapping[str, str] | None = None,
+    *,
+    read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
+) -> RouteRegistry:
     """The enabled routes, wired with their own source-specific config.
 
     Split out of :func:`create_app` because the claims emitter needs the same
@@ -83,6 +93,9 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
     keyring — is demanded only when in use. The route-wide signing secret is demanded
     here too, last, because only a built route can say whether it needs one (see
     :func:`_require_route_secrets`).
+
+    ``read_open_handoffs`` is the github route's startup reader (#370), injectable like
+    the waker so a test never reaches GitHub; ``None`` is the real, tokenless one.
     """
     registry = RouteRegistry()
     if "github" in config.enabled_routes:
@@ -90,6 +103,9 @@ def build_registry(config: Config, env: Mapping[str, str] | None = None) -> Rout
             GithubRoute(
                 load_github_trusted_actors(env),
                 bot_login_for_repo=_bot_login_for_repo(config),
+                # Every repo a github builder captains, warmed at startup (#370).
+                repos=[agent.key for agent in config.agents.values() if agent.bot_slug],
+                read_open_handoffs=read_open_handoffs,
             )
         )
     if "basecradle" in config.enabled_routes:

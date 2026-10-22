@@ -289,6 +289,10 @@ class Route(Protocol):
     # it asked for still stands — ``None`` to wake, or a short reason to drop it (see
     # :func:`route_recheck`). Optional for the same reason.
     #
+    # A route MAY likewise define ``warm() -> None``: run once at startup, before the
+    # daemon accepts a delivery, to rebuild whatever per-source memory a restart emptied
+    # (see :func:`route_warm`). Optional for the same reason.
+    #
     # A route MAY likewise define ``requires_route_secret: bool``: whether, as configured,
     # it verifies anything with the route-wide secret the core holds for it. Absent means
     # yes — every route but one needs it — so only a route whose own config can retire
@@ -354,3 +358,27 @@ def route_recheck(route: object, event: Event) -> str | None:
         return None
     reason = recheck(event)
     return reason if isinstance(reason, str) and reason.strip() else None
+
+
+def route_warm(route: object) -> None:
+    """Run ``route``'s startup warm-up, if it has one. Never raises.
+
+    A route whose memory a restart empties — the github route's ledger of open handoff
+    issues (basecradle-router#370) — rebuilds it here, before the first delivery, because
+    nothing would otherwise refill it until that source happened to deliver again. The
+    core owns *when* (the lifespan startup) and never learns what is warmed; the route
+    owns *what*.
+
+    Read by duck-typing, like :func:`route_boot_summary`, so a route with nothing to warm
+    implements nothing. A warm-up is a convenience, never a precondition: one that raises
+    is logged with its traceback and the daemon starts anyway.
+    """
+    warm = getattr(route, "warm", None)
+    if not callable(warm):
+        return
+    try:
+        warm()
+    except Exception:  # noqa: BLE001 — a warm-up must never stop the daemon
+        logger.error(
+            "event=route_warm status=error source=%s", getattr(route, "name", "?"), exc_info=True
+        )

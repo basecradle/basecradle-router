@@ -7,6 +7,9 @@ Test cast: John Doe (``john``, human) / Nova Digital (``nova``, AI).
 import hashlib
 import hmac
 import json
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 import pytest
@@ -26,6 +29,7 @@ from basecradle_router.routes.github import (
     EVENT_HEADER,
     SIGNATURE_HEADER,
     IssueLedger,
+    read_open_handoffs_from_github,
 )
 from basecradle_router.secret import Secret
 
@@ -1217,3 +1221,265 @@ def test_the_ledger_names_an_issue_only_when_the_payload_does() -> None:
     )
     assert ledger.reason_to_drop(ISSUE_URL) is None
     assert ledger.open_handoffs(TARGET_REPO) == []
+
+
+# --- the ledger is warmed on start, so a deploy never drops a merge-wake (#370) -----
+#
+# The ledger is memory and every move of `main` restarts the daemon, so a merge delivered
+# after a restart found no open handoff. The warm-up reads each registered repo's open
+# handoff issues before the first delivery. The reader is injected: no test reaches
+# GitHub (tests/conftest.py fails one that tries). Fabricated: Nova Digital's repo has one
+# open handoff, #42.
+
+OTHER_REPO = "basecradle/basecradle-example"
+
+
+def _listed_issue(number: int = ISSUE_NUMBER, repo: str = TARGET_REPO, **extra) -> dict:
+    """One item of GitHub's REST issues listing — the same object a webhook carries."""
+    return {
+        "number": number,
+        "title": "Mirror the wire-shape change",
+        "html_url": f"https://github.com/{repo}/issues/{number}",
+        "repository_url": f"https://api.github.com/repos/{repo}",
+        "state": "open",
+        "labels": [{"name": "handoff"}],
+        "created_at": CREATED,
+        "updated_at": UPDATED,
+        **extra,
+    }
+
+
+def _reader(listings: dict[str, list[dict]], asked: list | None = None):
+    """A reader answering from ``listings``, recording each (repo, budget) it is handed."""
+
+    def read(repo: str, timeout: float) -> list[dict]:
+        if asked is not None:
+            asked.append((repo, timeout))
+        return listings[repo]
+
+    return read
+
+
+def _warm_route(reader, repos=(TARGET_REPO,), **kwargs) -> GithubRoute:
+    return GithubRoute(
+        TRUSTED,
+        bot_login_for_repo={TARGET_REPO: RECIPIENT_BOT}.get,
+        repos=repos,
+        read_open_handoffs=reader,
+        **kwargs,
+    )
+
+
+def test_a_merge_right_after_start_wakes_the_captain_on_a_warmed_handoff() -> None:
+    # The incident: a restart between pickup and merge. No delivery has taught this
+    # route anything; the warm-up alone finds the issue the merge must wake on.
+    route = _warm_route(_reader({TARGET_REPO: [_listed_issue()]}))
+    route.warm()
+    event = route.normalize(_merge_request(_merge_payload()))
+    assert event is not None
+    assert event.origin.url == ISSUE_URL
+    assert event.origin.title == "Mirror the wire-shape change"
+
+
+def test_without_the_warm_up_the_same_merge_is_a_skip() -> None:
+    # The control: the very route above, never warmed, is the router before #370.
+    route = _warm_route(_reader({TARGET_REPO: [_listed_issue()]}))
+    assert route.normalize(_merge_request(_merge_payload())) is None
+
+
+def test_the_warm_up_logs_each_repos_count(caplog) -> None:
+    reader = _reader({TARGET_REPO: [_listed_issue(), _listed_issue(43)], OTHER_REPO: []})
+    with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
+        _warm_route(reader, repos=(TARGET_REPO, OTHER_REPO)).warm()
+    lines = [r.getMessage() for r in caplog.records if "event=ledger_warm " in r.getMessage()]
+    assert lines == [
+        f"event=ledger_warm repo={OTHER_REPO} open_handoffs=0",
+        f"event=ledger_warm repo={TARGET_REPO} open_handoffs=2",
+    ]
+
+
+def test_a_repo_the_warm_up_cannot_read_starts_cold_and_says_so(caplog) -> None:
+    # The cold fallback: one loud line, the other repo still warmed, nothing raised.
+    def reader(repo: str, timeout: float) -> list[dict]:
+        if repo == OTHER_REPO:
+            raise urllib.error.HTTPError(f"https://api.github.com/repos/{repo}", 404, "", {}, None)
+        return [_listed_issue()]
+
+    route = _warm_route(reader, repos=(TARGET_REPO, OTHER_REPO))
+    with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
+        route.warm()
+    cold = [r for r in caplog.records if "event=ledger_warm_failed" in r.getMessage()]
+    assert [(r.levelname, r.getMessage()) for r in cold] == [
+        ("WARNING", f'event=ledger_warm_failed repo={OTHER_REPO} reason="HTTP 404"')
+    ]
+    assert route.normalize(_merge_request(_merge_payload())) is not None  # still warmed
+
+
+def test_the_repos_are_read_one_at_a_time_under_one_shared_budget() -> None:
+    # Never a concurrent burst from the box's shared IP: each read is handed what is left
+    # of the one deadline, so the second repo gets less than the first.
+    asked: list = []
+    reader = _reader({OTHER_REPO: [], TARGET_REPO: []}, asked)
+    _warm_route(reader, repos=(TARGET_REPO, OTHER_REPO), warm_deadline=2.0).warm()
+    assert [repo for repo, _ in asked] == [OTHER_REPO, TARGET_REPO]
+    (_, first), (_, second) = asked
+    assert 2.0 >= first >= second > 0
+
+
+def test_a_slow_github_leaves_the_rest_cold_unread(caplog) -> None:
+    # A read that spends the whole budget leaves nothing for the next repo, which is
+    # logged cold without being read at all — the start is held no longer than that.
+    asked: list[str] = []
+
+    def reader(repo: str, timeout: float) -> list[dict]:
+        asked.append(repo)
+        time.sleep(timeout + 0.01)
+        raise TimeoutError("timed out")
+
+    with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
+        _warm_route(reader, repos=(TARGET_REPO, OTHER_REPO), warm_deadline=0.05).warm()
+    assert asked == [OTHER_REPO]
+    assert f'repo={TARGET_REPO} reason="no time left of the 0.05s warm-up"' in caplog.text
+
+
+def test_the_warm_up_records_only_what_a_delivery_would(caplog) -> None:
+    # A pull request in the listing, or an issue no longer labeled handoff, is not a
+    # handoff — exactly as the ledger treats the same object in a webhook.
+    reader = _reader(
+        {
+            TARGET_REPO: [
+                _listed_issue(7, pull_request={"url": "https://api.github.com/x"}),
+                _listed_issue(8, labels=[{"name": "bug"}]),
+                _listed_issue(),
+            ]
+        }
+    )
+    with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
+        _warm_route(reader).warm()
+    assert f"event=ledger_warm repo={TARGET_REPO} open_handoffs=1" in caplog.text
+
+
+def test_a_warmed_issue_carries_githubs_spelling_of_the_repo() -> None:
+    # The registry key may be written in another case; a delivery would carry GitHub's
+    # `full_name`, and so does a warmed issue, taken from its own `repository_url`.
+    registered = TARGET_REPO.upper()
+    route = _warm_route(_reader({registered: [_listed_issue()]}), repos=(registered,))
+    route.warm()
+    event = route.normalize(_merge_request(_merge_payload()))
+    assert event is not None
+    assert event.origin.repo == TARGET_REPO
+
+
+def test_a_newer_delivery_outranks_the_warm_up() -> None:
+    # The warm-up is a snapshot, ordered by `updated_at` like every report: a later close
+    # delivered after it wins, and the merge then finds nothing to finish.
+    route = _warm_route(_reader({TARGET_REPO: [_listed_issue()]}))
+    route.warm()
+    closed = _stamped(_issues_payload(action="closed"), state="closed")
+    closed["issue"]["updated_at"] = COMMENTED
+    route.normalize(_issues_request(closed))
+    assert route.normalize(_merge_request(_merge_payload())) is None
+
+
+def test_a_route_with_no_repos_warms_nothing() -> None:
+    def reader(repo: str, timeout: float) -> list[dict]:
+        raise AssertionError("no repo was registered, so nothing may be read")
+
+    _warm_route(reader, repos=()).warm()
+
+
+# --- the tokenless reader (#370) --------------------------------------------
+
+
+class _Response:
+    def __init__(self, body: object, link: str | None = None) -> None:
+        self._body = json.dumps(body).encode()
+        self.headers = {"Link": link} if link else {}
+
+    def read(self, *args) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+def _opener(*pages: _Response, tick: float = 0.0, clock: list | None = None):
+    """A fake ``urlopen`` serving ``pages``; each request advances ``clock[0]`` by ``tick``."""
+    seen: list[tuple[urllib.request.Request, float]] = []
+    queue = list(pages)
+
+    def urlopen(request, timeout):
+        seen.append((request, timeout))
+        if clock is not None:
+            clock[0] += tick
+        return queue.pop(0)
+
+    return urlopen, seen
+
+
+NEXT = "https://api.github.com/repositories/1/issues?page=2"
+
+
+def test_the_reader_asks_for_open_handoffs_without_a_credential() -> None:
+    urlopen, seen = _opener(_Response([_listed_issue()]))
+    assert read_open_handoffs_from_github(TARGET_REPO, urlopen=urlopen) == [_listed_issue()]
+    ((request, _),) = seen
+    assert request.full_url == (
+        f"https://api.github.com/repos/{TARGET_REPO}/issues?state=open&labels=handoff&per_page=100"
+    )
+    assert request.get_header("Authorization") is None  # the router holds no credential
+
+
+def test_the_reader_follows_the_next_page() -> None:
+    urlopen, seen = _opener(
+        _Response([_listed_issue(1)], link=f'<{NEXT}>; rel="next", <{NEXT}>; rel="last"'),
+        _Response([_listed_issue(2)]),
+    )
+    issues = read_open_handoffs_from_github(TARGET_REPO, urlopen=urlopen)
+    assert [issue["number"] for issue in issues] == [1, 2]
+    assert seen[1][0].full_url == NEXT
+
+
+def test_the_reader_spends_one_budget_across_its_pages() -> None:
+    # Each request is handed what is left; a page that would start with nothing left
+    # raises instead, so no read outlives the warm-up that asked for it.
+    clock = [100.0]
+    urlopen, seen = _opener(
+        *[_Response([_listed_issue()], link=f'<{NEXT}>; rel="next"') for _ in range(3)],
+        tick=1.5,
+        clock=clock,
+    )
+    with pytest.raises(TimeoutError, match="no time left of the 3s budget"):
+        read_open_handoffs_from_github(TARGET_REPO, 3.0, urlopen=urlopen, clock=lambda: clock[0])
+    assert [timeout for _, timeout in seen] == [3.0, 1.5]
+
+
+def test_the_reader_refuses_a_pagination_link_off_the_api() -> None:
+    urlopen, _ = _opener(
+        _Response([_listed_issue()], link='<https://evil.example.com/x>; rel="next"')
+    )
+    with pytest.raises(ValueError, match="off https://api.github.com"):
+        read_open_handoffs_from_github(TARGET_REPO, urlopen=urlopen)
+
+
+def test_the_reader_refuses_a_body_that_is_not_a_listing() -> None:
+    urlopen, _ = _opener(_Response({"message": "Not Found"}))
+    with pytest.raises(ValueError, match="not a JSON array"):
+        read_open_handoffs_from_github(TARGET_REPO, urlopen=urlopen)
+
+
+def test_the_reader_stops_at_its_page_limit() -> None:
+    link = f'<{NEXT}>; rel="next"'
+    urlopen, seen = _opener(*[_Response([_listed_issue()], link=link) for _ in range(20)])
+    with pytest.raises(ValueError, match="pages of open handoff issues"):
+        read_open_handoffs_from_github(TARGET_REPO, urlopen=urlopen)
+    assert len(seen) == 10
+
+
+def test_the_suite_never_reaches_the_real_github() -> None:
+    # The guard in tests/conftest.py: the real reader, uninjected, fails loudly.
+    with pytest.raises(AssertionError, match="inject the github route's reader"):
+        read_open_handoffs_from_github(TARGET_REPO)
