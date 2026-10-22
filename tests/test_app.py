@@ -408,6 +408,58 @@ def test_a_merge_right_after_a_restart_wakes_on_the_issue_the_startup_warmed(
     assert event.origin.url == f"https://github.com/{NOVA.key}/issues/42"
 
 
+def test_ci_failing_right_after_a_restart_wakes_the_captain_through_the_composition_root(
+    tmp_path, monkeypatch
+) -> None:
+    # #371 end to end: the startup warms Nova's open handoff and its own open PR #57, and a
+    # signed `workflow_run` failure on #57 wakes Nova. The allow-list stays the box's shape,
+    # so Nova's own push is admitted by the registry's bot_slug, never by the list.
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+    failed = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pull = {
+        "number": 57,
+        "html_url": f"https://github.com/{NOVA.key}/pull/57",
+        "state": "open",
+        "title": "Mirror the wire-shape change",
+        "body": "Ships #42.",
+        "updated_at": "2026-09-19T03:40:00Z",
+        "user": {"login": NOVA_BOT, "type": "Bot"},
+    }
+    waker = _RecordingWaker()
+    server = create_app(
+        _env(tmp_path),
+        waker=waker,
+        read_open_handoffs=lambda repo, timeout: [_open_issue_42()],
+        read_open_pulls=lambda repo, timeout: [pull],
+    )
+    assert _start(server) == ["lifespan.startup.complete"]
+
+    api = f"https://api.github.com/repos/{NOVA.key}"
+    body, headers = _signed(
+        "workflow_run",
+        "0192f3a4-5b6c-7d8e-9f01-23456789abcf",
+        {
+            "action": "completed",
+            "workflow_run": {
+                "conclusion": "failure",
+                "html_url": f"https://github.com/{NOVA.key}/actions/runs/1",
+                "updated_at": failed,
+                "triggering_actor": {"login": NOVA_BOT, "type": "Bot"},
+                "pull_requests": [
+                    {"number": 57, "url": f"{api}/pulls/57", "base": {"repo": {"url": api}}}
+                ],
+            },
+            "repository": {"full_name": NOVA.key},
+            "sender": {"login": NOVA_BOT, "type": "Bot"},
+        },
+    )
+    assert _post(server, "/webhooks/github", body, headers) == 202
+    ((agent, event),) = waker.calls
+    assert agent == NOVA
+    assert event.origin.url == f"https://github.com/{NOVA.key}/issues/42"
+    assert "CI on your pull request #57" in event.wake_arg
+
+
 def test_a_warm_up_that_cannot_reach_github_never_stops_the_start(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
 

@@ -427,12 +427,14 @@ comment wake any other. So **the daemon refuses to start when the list holds a c
 `basecradle-<name>-ai[bot]` login, the shape every captain's slug takes — the same refusal as an absent or
 empty list (#369). The shape, not the box's registry, decides it, so a laptop builder's bot, which no box
 registers, is refused too; the capital's `basecradle-ai[bot]` never has that shape. A captain bot is trusted in
-exactly one place, decided in code rather than by this list: as the `sender` of its **own** merge on its
-own repo (the `pull_request` path below, issue #367). Matched case-insensitively.
+exactly one place, decided in code rather than by this list: as the actor behind an event on its **own** PR
+on its own repo — the `sender` of its merge (the `pull_request` path below, issue #367), or the
+`triggering_actor` of a failed run on it (the `workflow_run` path, issue #371). Matched case-insensitively.
 
-**The github route consumes three webhook events** (subscribe each agent's App to all three — *Issues*,
-*Issue comment* **and** *Pull request*; an App not subscribed to an event never sends it, and nothing on
-the router's side can tell):
+**The github route consumes four webhook events** (subscribe each agent's App to all four — *Issues*,
+*Issue comment*, *Pull request* **and** *Workflow run*, the last of which needs the App's repository
+permission **Actions: Read-only**, accepted on its installation; an App not subscribed to an event never
+sends it, and nothing on the router's side can tell):
 
 - **`issues`** (action `opened`/`labeled`) — a handoff issue filed or labeled `handoff`: the initial wake.
 - **`issue_comment`** (action `created`) — a **reply on a handoff issue re-wakes its agent** (issue #129).
@@ -470,7 +472,8 @@ the router's side can tell):
   the router still holds no GitHub credential — and records each as a delivery would have. The journal
   states the result per repo, `event=ledger_warm repo=<owner/name> open_handoffs=<n>`. The repos are read
   one at a time, about one unauthenticated request each per restart, under one 3 s budget for them all, so
-  a hung GitHub holds the listener back by 3 s at most. A repo it cannot read in that time (a private
+  a hung GitHub holds the listener back by 3 s at most (the `workflow_run` path below adds a second read
+  for each repo with an open handoff, under the same budget). A repo it cannot read in that time (a private
   repo's `404`, a rate limit's `403`, GitHub down) gets one `WARNING` line,
   `event=ledger_warm_failed repo=<owner/name> reason=<why>`, and the daemon
   starts anyway with that repo cold: a handoff issue there is one no merge can wake until an `issues` or
@@ -479,6 +482,31 @@ the router's side can tell):
   captain's **own** comment on the issue (the self-comment guard ignores it), a label other than `handoff`
   added or removed, or an edit of the issue. A comment from a trusted actor, or `handoff` re-applied by
   one, teaches it too, but wakes the captain.
+- **`workflow_run`** (action `completed` with `conclusion: failure`) — **CI failing on a captain's own PR
+  wakes it while its handoff issue is open** (issue #371): the mirror of the merge-wake, for a PR that will
+  never merge (basecradle-python#286 sat with red CI and no one awake). It passes the same gates as the merge:
+  a PR **authored by the repo's captain bot**, an open handoff issue in the same repo found the same way
+  (the one the PR names, else the repo's only one; otherwise `event=ci_wake_skip
+  workflow_run=<run url> … reason=no_open_handoff`/`ambiguous_handoff`), the `Do Not Work` brake, and an
+  actor that is that captain bot or a trusted actor. The actor is the run's own **`triggering_actor`**
+  (who pushed the commit, or re-ran the run), never the delivery's `sender`, because GitHub documents no
+  mapping from a run to its `sender`. A run lists its PRs by number only, with no author, title or body,
+  so the route keeps a second record, of PRs, fed by every `pull_request` delivery whatever its action
+  (an edit of the PR body re-points it) and by the warm-up, which reads the **open PRs** tokenlessly after
+  every repo's handoff issues, under the same 3 s budget, and only for a repo with an open handoff: a
+  failed run wakes no one anywhere else, and the unauthenticated quota is the box IP's, shared by every
+  restart in the hour. The journal states it per repo read:
+  `event=pull_ledger_warm repo=<owner/name> open_pull_requests=<n> captain_pull_requests=<m>` (what was
+  recorded, not merely listed), and a failed read is
+  `event=ledger_warm_failed repo=<owner/name> listing=pulls reason=<why>`. A failed run listing any PR the
+  record has never seen is `reason=unknown_pull_request` (it may be the captain's, so it is never guessed
+  past); one on the captain's PR the record holds as closed is `reason=closed_pull_request`; one listing two
+  open PRs of the captain's is `reason=ambiguous_pull_request`. All three are skips and wake no one. A run
+  whose PRs are all known to be someone else's (Dependabot's, a human's) is a plain ignore. Each failed run and each failed re-run
+  attempt is its own delivery; a passing run wakes no one, because the merge will; `cancelled`,
+  `timed_out` and `startup_failure` wake no one either. The trigger is the issues path's, verbatim,
+  followed by `Wake reason: CI on your pull request #N (<url>) failed; finish the issue.`, and the event
+  is stamped with the run's `updated_at` (its completion), so it coalesces like any delivery.
 
 **One handoff, one wake — and never for a closed issue** (#272). One handoff once cost five sessions: every
 accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`
@@ -488,7 +516,8 @@ the core and both opt-in per route: the platform route opts into the coalesce bu
 the probe passes both untouched:
 
 - **Coalesce.** The route stamps each event with when it happened (the issue's creation for `opened`, its
-  last update for `labeled`, the comment's creation for `issue_comment`, the merge for `pull_request`). A
+  last update for `labeled`, the comment's creation for `issue_comment`, the merge for `pull_request`,
+  the run's completion for `workflow_run`). A
   delivery whose event happened *before* a **successful** wake on the same issue *started* was read by that
   session, so it collapses into it. That is what makes a labeled create one wake in either arrival order, and it bounds a burst:
   everything that queued behind a running session collapses into the **first** follow-up, never N. A

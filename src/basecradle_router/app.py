@@ -51,18 +51,21 @@ def create_app(
     *,
     waker: Waker | None = None,
     read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
+    read_open_pulls: Callable[[str, float], list[dict[str, Any]]] | None = None,
 ) -> WebhookServer:
     """Build the daemon's ASGI app from ``env`` (defaults to the process environment).
 
     Raises :class:`~basecradle_router.config.ConfigError` (naming the missing
     variable) if required configuration is absent. ``waker`` is injectable so tests
     never reach the real wake boundary; production uses the default
-    :class:`~basecradle_router.wake.HomeServerWaker`. ``read_open_handoffs`` is
-    injectable for the same reason (see :func:`build_registry`).
+    :class:`~basecradle_router.wake.HomeServerWaker`. ``read_open_handoffs`` and
+    ``read_open_pulls`` are injectable for the same reason (see :func:`build_registry`).
     """
     config = load_config(env)
     pipeline = Pipeline(
-        registry=build_registry(config, env, read_open_handoffs=read_open_handoffs),
+        registry=build_registry(
+            config, env, read_open_handoffs=read_open_handoffs, read_open_pulls=read_open_pulls
+        ),
         config=config,
         waker=waker or HomeServerWaker(),
         breaker=WakeRateBreaker(load_breaker_config(env)),
@@ -78,6 +81,7 @@ def build_registry(
     env: Mapping[str, str] | None = None,
     *,
     read_open_handoffs: Callable[[str, float], list[dict[str, Any]]] | None = None,
+    read_open_pulls: Callable[[str, float], list[dict[str, Any]]] | None = None,
 ) -> RouteRegistry:
     """The enabled routes, wired with their own source-specific config.
 
@@ -94,8 +98,9 @@ def build_registry(
     here too, last, because only a built route can say whether it needs one (see
     :func:`_require_route_secrets`).
 
-    ``read_open_handoffs`` is the github route's startup reader (#370), injectable like
-    the waker so a test never reaches GitHub; ``None`` is the real, tokenless one.
+    ``read_open_handoffs`` and ``read_open_pulls`` are the github route's startup readers
+    (#370, #371), injectable like the waker so a test never reaches GitHub; ``None`` is
+    the real, tokenless one.
     """
     registry = RouteRegistry()
     if "github" in config.enabled_routes:
@@ -103,9 +108,10 @@ def build_registry(
             GithubRoute(
                 load_github_trusted_actors(env),
                 bot_login_for_repo=_bot_login_for_repo(config),
-                # Every repo a github builder captains, warmed at startup (#370).
+                # Every repo a github builder captains, warmed at startup (#370, #371).
                 repos=[agent.key for agent in config.agents.values() if agent.bot_slug],
                 read_open_handoffs=read_open_handoffs,
+                read_open_pulls=read_open_pulls,
             )
         )
     if "basecradle" in config.enabled_routes:
