@@ -5,7 +5,7 @@ The **fleet router** for [BaseCradle](https://basecradle.com) — an AI Research
 A modular webhook daemon that wakes the right agent on an event. It receives events from multiple
 sources (**routes**: GitHub webhooks, the BaseCradle platform's **Event Delivery** sent through the
 agent's **integration**, and more later) and dispatches each to the agent that owns it, running on the
-fleet's dedicated home server.
+fleet's home servers.
 
 A small, source-agnostic **core** (verify → normalize → resolve → wake → report) plus **pluggable
 route modules** — adding a source is implementing one route, never forking the daemon.
@@ -14,7 +14,8 @@ Every input path for an agent converges on its **one harness instance** (the con
 unified-identity rule), so the router is a **per-agent serializing multiplexer**: `N inputs → one
 harness instance per agent`. A new source routes to the agent's *existing* instance and its wakes
 serialize behind every other source's — never a second instance, never two parallel sessions over one
-memory. See [`CLAUDE.md`](CLAUDE.md) → "One harness instance per agent."
+memory. See [`CLAUDE.md`](CLAUDE.md) → "One harness instance per agent" for the rules and the
+[`router-wake-pipeline`](.claude/skills/router-wake-pipeline/SKILL.md) skill for the mechanism.
 
 Because the router is the fleet's wake edge, it also has to **prove** its own claims: an agent can be
 registered, healthy, and permanently unreachable while every dashboard stays green. So the daemon
@@ -34,7 +35,8 @@ The synthetic wake is **token-free by construction** — the model binary is nev
 with no probe secret armed is a refusal, never a fallback — and it reports `proven` only because the
 *daemon* recorded the wake, never because the probe itself exited zero.
 
-See [`CLAUDE.md`](CLAUDE.md) → "Proving the router's own claims" and
+See [`CLAUDE.md`](CLAUDE.md) → "Proving the router's own claims" for the rules, the
+[`router-claims-and-probes`](.claude/skills/router-claims-and-probes/SKILL.md) skill for the mechanism, and
 [`deploy/README.md`](deploy/README.md) for the on-box invocation and the probe's exit codes.
 
 - **Charter / conventions:** [`CLAUDE.md`](CLAUDE.md)
