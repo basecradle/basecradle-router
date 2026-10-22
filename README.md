@@ -40,7 +40,7 @@ See [`CLAUDE.md`](CLAUDE.md) → "Proving the router's own claims" for the rules
 [`deploy/README.md`](deploy/README.md) for the on-box invocation and the probe's exit codes.
 
 - **Charter / conventions:** [`CLAUDE.md`](CLAUDE.md)
-- **Requirements spec:** `basecradle/basecradle#277`
+- **Founding spec (history):** `basecradle/basecradle#277`
 - **Stack:** Python · uv · ruff · pytest
 
 Built by human and AI contributors as equal peers, under the BaseCradle Constitution.
