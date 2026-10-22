@@ -171,6 +171,15 @@ a = sys.argv[1:]
 if "-Ao" in a:
     for line in st.get("ps_lines", []):
         print(line)
+elif "lstart=" in a and "-p" in a:
+    # A process's fixed start-time string, the second half of the guard's session key.
+    start = st.get("lstart", {}).get(a[a.index("-p") + 1])
+    if start is None:
+        sys.exit(1)
+    if isinstance(start, int):
+        # An epoch, rendered as the real ps renders it: in the caller's time zone.
+        start = time.strftime("%a %b %e %H:%M:%S %Y", time.localtime(start))
+    print(start)
 elif "etime=" in a and "-p" in a:
     start = st.get("proc_start", {}).get(a[a.index("-p") + 1])
     if start is None:
@@ -210,8 +219,24 @@ def scenario(**over):
 # The lab's `lsof`: prints the listeners the scenario declares, in `lsof -F pcn` form.
 LSOF_STUB = r"""#!/usr/bin/env python3
 import json, os
+import sys
 with open(os.environ["DOCKER_STUB_STATE"]) as fh:
     st = json.load(fh)
+if st.get("lsof_error"):
+    # The real lsof's failure: exit 1, the same status as "nothing matched", with its reason on
+    # stderr (measured on macOS's lsof 4.91).
+    sys.stderr.write("lsof: can't get UID for nosuchuser\n")
+    sys.stderr.flush()
+    if st.get("lsof_err_raced"):
+        # A sibling run under the same key removing the shared stderr file mid-census.
+        root = os.environ["BASECRADLE_ROUTER_SESSION_STATE_ROOT"]
+        for name in os.listdir(root):
+            path = os.path.join(root, name, "lsof.err")
+            if os.path.exists(path):
+                os.remove(path)
+    sys.exit(1)
+if not st.get("listeners"):
+    sys.exit(1)  # nothing matched: exit 1, silent
 for pid, cmd, addr in st.get("listeners", []):
     print("p%s" % pid)
     print("c%s" % cmd)
@@ -244,6 +269,9 @@ class Lab:
     @property
     def env(self) -> dict:
         env = dict(os.environ)
+        # The suite runs inside Claude Code sessions too, whose CLAUDE_PID would key the guard's
+        # state on the real session; a test that wants a process key sets its own.
+        env.pop("CLAUDE_PID", None)
         env.update(
             {
                 "PATH": f"{self.bin}:{env['PATH']}",
@@ -925,3 +953,167 @@ def test_self_exit_keeps_the_state_when_it_cannot_find_its_kill_target(lab):
     assert got.returncode != 0
     assert "no ancestor 'claude' process found" in got.stderr
     assert (lb.state_root / "test-session" / "began_at").is_file()
+
+
+# ------------------------- the open design questions (basecradle#707 a-d; basecradle-noc#1108)
+
+
+def test_a_clear_keeps_the_baseline_because_the_key_is_the_claude_process(lab):
+    """(d): ``/clear`` gives the same ``claude`` process a new session id, in the hook payload and
+    in ``CLAUDE_CODE_SESSION_ID`` alike. Keyed on the session id, the hook then took a fresh
+    baseline and orphaned the record that this session started Docker Desktop, which then sat in
+    the new baseline as pre-existing and was never quit — the ``basecradle-noc#790`` leftover.
+    Keyed on the process (``CLAUDE_PID`` plus its start time), the hook's re-fire finds the
+    baseline and keeps it."""
+    lb = lab(
+        engine_up=False,
+        desktop_status="stopped",
+        ps_lines=[],
+        lstart={"4711": "Thu Oct 22 00:12:56 2026"},
+    )
+    env = lb.env | {"CLAUDE_PID": "4711", "CLAUDE_CODE_SESSION_ID": "before-clear"}
+    run = lambda *a: subprocess.run(  # noqa: E731
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp
+    )
+    assert run("begin", "--session-id", "before-clear").returncode == 0
+    assert run("docker-up").returncode == 0
+
+    env["CLAUDE_CODE_SESSION_ID"] = "after-clear"
+    again = run("begin", "--session-id", "after-clear")
+    assert again.returncode == 0
+    assert "kept" in again.stdout
+    swept = run("sweep")
+    assert swept.returncode == 0, swept.stderr
+    assert ["desktop", "stop"] in lb.calls_log()
+
+
+def test_a_recycled_pid_is_a_different_process_and_takes_its_own_baseline(lab):
+    """The process key carries the start time, so a later process that drew the same pid never
+    inherits (or keeps) a dead session's baseline."""
+    lb = lab(lstart={"4711": "Thu Oct 22 00:12:56 2026"})
+    env = lb.env | {"CLAUDE_PID": "4711"}
+    run = lambda *a: subprocess.run(  # noqa: E731
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp
+    )
+    assert run("begin").returncode == 0
+    lb.mutate(lstart={"4711": "Fri Oct 23 09:00:00 2026"})
+    got = run("begin")
+    assert "kept" not in got.stdout
+    assert sorted(d.name for d in lb.state_root.iterdir()) == [
+        "claude-4711-FriOct230900002026",
+        "claude-4711-ThuOct220012562026",
+    ]
+
+
+def test_a_census_failure_at_check_time_is_never_read_as_no_listeners(lab):
+    """(a): ``lsof`` exits 1 both for "nothing matched" and for a failure, so the pipe the census
+    used to be read a failure as an empty census, and a dev server the session left behind as
+    clean. Its stderr is what tells them apart."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.mutate(lsof_error=True, listeners=[["9001", "node", "127.0.0.1:3000"]])
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "census failed" in got.stdout
+
+
+def test_a_census_failure_at_session_start_leaves_no_listener_baseline(lab):
+    """(a), at ``begin``: a failed census must not be recorded as a baseline of nothing."""
+    lb = lab(lsof_error=True)
+    assert lb.run("begin").returncode == 0
+    assert not (lb.state_root / "test-session" / "listeners.base").exists()
+    lb.mutate(lsof_error=False)
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "no listening-port baseline" in got.stdout
+
+
+def test_an_engine_down_at_session_start_is_censused_by_docker_up(lab):
+    """(b): with the engine down at ``begin`` there is nothing to list, and comparing against that
+    empty list read every image already on the laptop as this session's — with ``docker rmi`` of
+    someone else's image as the repair — the moment ``docker-up`` brought the engine up."""
+    lb = lab(
+        engine_up=False,
+        desktop_status="stopped",
+        ps_lines=[],
+        images=[FOREIGN_IMAGE],
+        containers=[FOREIGN_CONTAINER],
+    )
+    assert lb.run("begin").returncode == 0
+    assert lb.run("docker-up").returncode == 0
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert FOREIGN_IMAGE["id"] not in got.stdout
+    assert FOREIGN_CONTAINER["id"] not in got.stdout
+    lb.mutate(images=[FOREIGN_IMAGE, {**IMAGE, "labelled": False}])
+    assert IMAGE["id"] in lb.run("check").stdout  # what came after the census still shows
+
+
+def test_an_engine_that_came_up_from_outside_is_named_not_checked_never_blamed(lab):
+    """(b): an engine that came up after ``begin`` without a ``docker-up`` has no baseline to
+    compare against. The labelled checks still run; the unlabelled gap is named, never filed as
+    findings against what was already there."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
+    assert lb.run("begin").returncode == 0
+    lb.mutate(engine_up=True, images=[FOREIGN_IMAGE, IMAGE])
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert "NOT CHECKED: unlabelled Docker artefacts" in got.stdout
+    assert FOREIGN_IMAGE["id"] not in got.stdout
+    assert f"labelled image still present: {IMAGE['id']}" in got.stdout
+
+
+def test_a_build_cache_that_shrank_is_not_a_build(lab):
+    """(c): BuildKit's garbage collection shrinks the cache on its own schedule. Compared as
+    strings, that read as a build this session ran and blocked an exit nothing could clear."""
+    lb = lab(build_cache="1.234GB")
+    assert lb.run("begin").returncode == 0
+    lb.mutate(build_cache="233MB")
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
+
+
+def test_a_build_cache_whose_size_cannot_be_read_is_not_clean(lab):
+    """(c): a size the guard cannot parse is "we could not look", never "it did not grow"."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.mutate(build_cache="garbled")
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "could not be read" in got.stdout
+
+
+# --------------------------------------- this port's review findings on the answers above (#359)
+
+
+def test_a_census_failure_survives_a_sibling_removing_its_error_file(lab):
+    """(a), concurrently: a forked subagent shares ``CLAUDE_PID``, so it shares the state dir. With
+    the census's stderr in a fixed file there, a sibling run's ``rm`` between the write and the
+    read turned the failed census back into an empty one, and a leftover dev server read clean."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.mutate(lsof_error=True, lsof_err_raced=True, listeners=[["9001", "node", "127.0.0.1:3000"]])
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "census failed" in got.stdout
+
+
+def test_the_process_key_does_not_depend_on_the_callers_time_zone(lab):
+    """(d): ``lstart`` is rendered in the caller's time zone, and a Bash call sources the user's
+    profile where the hook may not. Unpinned, the hook and a later call computed two keys for one
+    process, and ``check`` found no baseline."""
+    lb = lab(lstart={"4711": 1792656776})
+    run = lambda tz, *a: subprocess.run(  # noqa: E731
+        [str(GUARD), *a],
+        env=lb.env | {"CLAUDE_PID": "4711", "TZ": tz},
+        capture_output=True,
+        text=True,
+        cwd=lb.tmp,
+    )
+    assert run("America/Chicago", "begin").returncode == 0
+    assert "kept" in run("Asia/Tokyo", "begin").stdout

@@ -109,8 +109,32 @@ ancestor_claude_pid() {
 
 SESSION_ID_OVERRIDE=""
 
+# A process's identity: its pid plus its start time, which a recycled pid cannot share. `lstart`
+# is a fixed string the kernel derives once, so it reads the same on every call (`etime`, read
+# against the clock, could move by a second between two reads and split one session into two).
+# It is RENDERED in the caller's time zone and locale, though, and a Bash call sources the user's
+# profile where the hook may not, so both are pinned: one process, one key, whoever asks.
+proc_identity() {
+  local started
+  started="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -cd 'A-Za-z0-9')"
+  [ -n "$started" ] || return 1
+  echo "$1-$started"
+}
+
+# THE KEY IS THE `claude` PROCESS, not the conversation (basecradle#707 (d)). What this guard
+# certifies is what one `claude` process left on the laptop between its start and its self-exit.
+# `/clear` starts a new session id inside the SAME process (Claude Code updates both the hook's
+# `session_id` and CLAUDE_CODE_SESSION_ID on it), so a session-id key took a fresh baseline after
+# a `/clear` and orphaned `docker_started_by_session` and the tab ledger: a Docker Desktop the
+# session started then sat in the new baseline as pre-existing and was never quit — #790 itself.
+# Claude Code sets CLAUDE_PID, its own pid, in every hook and Bash command it spawns, so the hook
+# and every later call agree on this key by construction. A session id is the fallback, for a
+# Claude Code that predates CLAUDE_PID.
 session_key() {
-  local pid
+  local pid ident
+  if [ -n "${CLAUDE_PID:-}" ] && ident="$(proc_identity "$CLAUDE_PID")"; then
+    echo "claude-$ident"; return
+  fi
   if [ -n "$SESSION_ID_OVERRIDE" ]; then echo "$SESSION_ID_OVERRIDE"; return; fi
   if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID"; return; fi
   if pid=$(ancestor_claude_pid); then echo "pid-$pid"; return; fi
@@ -172,6 +196,43 @@ build_cache_size()     { docker system df --format json 2>/dev/null \
                            | grep '"Type":"Build Cache"' \
                            | sed -n 's/.*"Size":"\([^"]*\)".*/\1/p' | sed -n 1p; }
 
+# Docker prints sizes the way go-units' HumanSize does: decimal units, four significant digits
+# ("0B", "512.5kB", "1.234GB"); its binary form (BytesSize: "KiB", "MiB") is read too. Prints bytes,
+# or fails on a shape it does not know, which the caller reads as "we could not look".
+size_bytes() {
+  awk -v s="$1" 'BEGIN {
+    if (!match(s, /^[0-9]+(\.[0-9]+)?/)) exit 1
+    n = substr(s, 1, RLENGTH); u = substr(s, RLENGTH + 1)
+    m["B"] = 1; m["kB"] = 1e3; m["KB"] = 1e3; m["MB"] = 1e6; m["GB"] = 1e9; m["TB"] = 1e12; m["PB"] = 1e15
+    m["KiB"] = 1024; m["MiB"] = 1024 ^ 2; m["GiB"] = 1024 ^ 3; m["TiB"] = 1024 ^ 4
+    if (!(u in m)) exit 1
+    printf "%.0f\n", n * m[u] }'
+}
+
+# The Docker half of the baseline, taken only from an engine that answers (basecradle#707 (b)). An
+# engine that is down at `begin` has nothing to list, and comparing against that empty list read
+# every container and image already on the laptop as this session's — the moment `docker-up`
+# brought the engine up — with `docker rmi <someone else's image>` as the repair. So `docker-up`,
+# the one sanctioned way to reach Docker, takes the census before the session can use the engine.
+docker_census() {  # docker_census begin|started|late
+  local d; d="$(state_dir)"
+  list_containers > "$d/containers.base"
+  list_images     > "$d/images.base"
+  list_volumes    > "$d/volumes.base"
+  list_builders   > "$d/builders.base"
+  s_put build_cache.base "$(build_cache_size)"
+  s_put docker_census "$1"
+}
+
+# Whether the engine must still answer: this session took a baseline from an engine that was
+# already running (at `begin`, or one that came up from outside before `docker-up`), or it started
+# Docker Desktop and has not quit it. An engine this session started and its own sweep then quit
+# is down because the session is done with it, not because something died.
+engine_must_answer() {
+  case "$(s_get docker_census)" in begin|late) return 0 ;; esac
+  [ "$(s_get docker_started_by_session 0)" = "1" ]
+}
+
 # A DEV SERVER, OR ANYTHING ELSE LISTENING (the capital, on @origin's word, basecradle-noc#899): a
 # process this session started that took a TCP port is as much a leftover as a container. The census
 # is this account's own listeners only — `lsof -u` the running user. A listener is NEW only when two
@@ -183,11 +244,28 @@ build_cache_size()     { docker system df --format json 2>/dev/null \
 # (basecradle-noc#1073). Read off the kernel, like the rest of this guard: nobody has to have written
 # anything down. `lsof` absent means "we could not look", which is never clean.
 has_lsof() { command -v lsof >/dev/null 2>&1; }
+# `lsof` exits 1 both when nothing matches and when it fails, so its status alone cannot tell an
+# empty census from a broken one (basecradle#707 (a)). Measured on macOS's lsof 4.91: "no listeners"
+# is exit 1 with nothing on stderr, a failure is exit 1 with its reason there, and `-w` keeps the
+# warnings it prints on a healthy run off stderr. So anything on stderr, any other status, or a 1
+# that printed rows is a census that FAILED, and the caller reports it rather than reading it clean.
+# The stderr is caught in a file of this run's own: a fixed name in the state dir is shared by every
+# run under the key (a forked subagent shares CLAUDE_PID), and a sibling's `rm` between the write
+# and the read would turn a failed census back into an empty one.
 list_listeners() {
-  lsof -nP -a -u "$(id -un)" -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null | awk '
+  local err raw rc
+  err="$(mktemp "${TMPDIR:-/tmp}/session-guard-lsof.XXXXXX")" || return 1
+  raw="$(lsof -w -nP -a -u "$(id -un)" -iTCP -sTCP:LISTEN -Fpcn 2>"$err")"; rc=$?
+  if [ -s "$err" ] || { [ "$rc" -ne 0 ] && { [ "$rc" -ne 1 ] || [ -n "$raw" ]; }; }; then
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  [ -n "$raw" ] || return 0
+  awk '
     /^p/ { pid = substr($0, 2) }
     /^c/ { cmd = substr($0, 2) }
-    /^n/ { print cmd "\t" substr($0, 2) "\t" pid }' | sort -u
+    /^n/ { print cmd "\t" substr($0, 2) "\t" pid }' <<< "$raw" | sort -u
 }
 listener_keys() { cut -f1,2 | sort -u; }
 
@@ -222,11 +300,12 @@ cmd_begin() {
   local d; d="$(state_dir)"
   local root; root="$(state_root)"
 
-  # The SessionStart hook fires on resume, /clear and compaction too, under the same
-  # session id. Re-taking the baseline then would wipe what the session recorded
-  # (a Docker Desktop it started, its tab ledger) and fold its leftovers into the
-  # new baseline, so a complete baseline under a session id is kept. A pid key can
-  # be recycled by an unrelated session, so that one is still replaced.
+  # The SessionStart hook carries no matcher, on purpose: it fires on startup, resume, /clear,
+  # compaction and fork, and every one of them must leave a baseline in place. A new `claude`
+  # process (startup, resume, a fork) has a new key and takes its own; the same process (/clear,
+  # compaction) keeps the one it has, because re-taking it would wipe what the session recorded
+  # (a Docker Desktop it started, its tab ledger) and fold its leftovers into the new baseline.
+  # A bare pid key can be recycled by an unrelated session, so that one is still replaced.
   case "$(session_key)" in
     pid-*|no-session) ;;
     *)
@@ -257,20 +336,29 @@ cmd_begin() {
   if engine_up; then s_put engine_up 1; else s_put engine_up 0; fi
   if docker_desktop_running; then s_put desktop_running 1; else s_put desktop_running 0; fi
 
-  list_containers > "$d/containers.base"
-  list_images     > "$d/images.base"
-  list_volumes    > "$d/volumes.base"
-  list_builders   > "$d/builders.base"
-  s_put build_cache.base "$(build_cache_size)"
-  if has_lsof; then s_put lsof_present 1; else s_put lsof_present 0; fi
-  list_listeners > "$d/listeners.base"
+  [ "$(s_get engine_up)" = "1" ] && docker_census begin
+  if has_lsof; then
+    s_put lsof_present 1
+    # A census that failed leaves no listener baseline, which `check` reports with its repair.
+    list_listeners > "$d/listeners.base" || {
+      rm -f "$d/listeners.base"
+      echo "  WARNING: the listening-port census failed (lsof reported an error); check will say so." >&2
+    }
+  else
+    s_put lsof_present 0
+    : > "$d/listeners.base"
+  fi
   : > "$d/tabs"
   s_put began_at "$began_at"
 
   echo "session-guard: baseline for $(session_key) at $(s_get began_at)"
   echo "  docker: present=$(s_get docker_present) engine_up=$(s_get engine_up) desktop_running=$(s_get desktop_running)"
-  echo "  containers=$(wc -l < "$d/containers.base" | tr -d ' ') images=$(wc -l < "$d/images.base" | tr -d ' ') volumes=$(wc -l < "$d/volumes.base" | tr -d ' ') build_cache=$(s_get build_cache.base)"
-  echo "  listeners=$(wc -l < "$d/listeners.base" | tr -d ' ') (this account's TCP ports in LISTEN)"
+  if [ -n "$(s_get docker_census)" ]; then
+    echo "  containers=$(wc -l < "$d/containers.base" | tr -d ' ') images=$(wc -l < "$d/images.base" | tr -d ' ') volumes=$(wc -l < "$d/volumes.base" | tr -d ' ') build_cache=$(s_get build_cache.base)"
+  else
+    echo "  docker census: deferred to docker-up (the engine is not answering)"
+  fi
+  [ -f "$d/listeners.base" ] && echo "  listeners=$(wc -l < "$d/listeners.base" | tr -d ' ') (this account's TCP ports in LISTEN)"
 
   # A previous session's leftovers are a finding, not background noise.
   local leftover; leftover="$(labelled_containers)$(labelled_images)"
@@ -285,6 +373,10 @@ cmd_docker_up() {
 
   if engine_up; then
     echo "session-guard: Docker engine is already up; not recording a session start."
+    if [ -z "$(s_get docker_census)" ]; then
+      docker_census late
+      echo "session-guard: it came up after this session began, so the Docker baseline is taken now, before the session uses it."
+    fi
     return 0
   fi
 
@@ -302,7 +394,11 @@ cmd_docker_up() {
 
   local waited=0
   while [ "$waited" -lt "$START_WAIT_SECONDS" ]; do
-    if engine_up; then echo "session-guard: engine up after ${waited}s."; return 0; fi
+    if engine_up; then
+      echo "session-guard: engine up after ${waited}s."
+      [ -n "$(s_get docker_census)" ] || docker_census started
+      return 0
+    fi
     sleep "$POLL_SECONDS"; waited=$((waited + POLL_SECONDS))
   done
   echo "session-guard: engine did not come up within ${START_WAIT_SECONDS}s." >&2
@@ -345,8 +441,8 @@ cmd_sweep() {
   [ -d "$d" ] || { echo "session-guard: no baseline — run 'begin' first." >&2; return 1; }
 
   if ! engine_up; then
-    if [ "$(s_get engine_up 0)" = "1" ]; then
-      echo "session-guard: the Docker engine was reachable at session start and is not now — nothing can be swept or verified." >&2
+    if engine_must_answer; then
+      echo "session-guard: this session used the Docker engine and it is not reachable now — nothing can be swept or verified." >&2
       return 1
     fi
     echo "session-guard: no Docker engine; nothing to sweep."
@@ -441,7 +537,11 @@ cmd_baseline_listeners() {
   has_lsof || { echo "session-guard: lsof is not available; cannot take a listener baseline." >&2; return 1; }
   s_put lsof_present 1
   s_put listeners_baseline_late "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  list_listeners > "$d/listeners.base"
+  list_listeners > "$d/listeners.base" || {
+    rm -f "$d/listeners.base"
+    echo "session-guard: the listening-port census failed (lsof reported an error); no baseline recorded." >&2
+    return 1
+  }
   echo "session-guard: LATE listener baseline recorded ($(wc -l < "$d/listeners.base" | tr -d ' ') listener(s)) — attested by hand, not measured from session start."
 }
 
@@ -455,8 +555,8 @@ cmd_check() {
     return 1
   fi
 
-  local base_engine base_desktop
-  base_engine="$(s_get engine_up 0)"
+  local base_census base_desktop
+  base_census="$(s_get docker_census)"
   base_desktop="$(s_get desktop_running 0)"
 
   if engine_up; then
@@ -488,39 +588,57 @@ cmd_check() {
     # Everything new that the label cannot account for. Reported with the exact
     # command and never removed: an image someone else pulled during this
     # session is theirs, and this guard cannot tell the two apart.
-    extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "container appeared during this session and carries no builder label: $id ($(describe_container "$id"))" \
-                "docker rm -f $id   (only if it is yours — check first)"
-      done <<< "$extra"
-    fi
+    #
+    # Only against a census. With none, the engine was down at `begin` and came up
+    # from outside this session without a `docker-up`, so there is nothing to
+    # compare against: every artefact on the laptop would read as new. The labelled
+    # checks above still ran, and the gap is named rather than reported as findings
+    # whose repair is `docker rmi` of someone else's image (basecradle#707 (b)).
+    if [ -z "$base_census" ]; then
+      echo "session-guard: NOT CHECKED: unlabelled Docker artefacts — the engine came up after this session began and the session never ran docker-up, so there is no Docker baseline to compare against."
+    else
+      extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
+      if [ -n "$extra" ]; then
+        while IFS= read -r id; do
+          [ -n "$id" ] || continue
+          finding "container appeared during this session and carries no builder label: $id ($(describe_container "$id"))" \
+                  "docker rm -f $id   (only if it is yours — check first)"
+        done <<< "$extra"
+      fi
 
-    extra="$(comm -23 <(comm -13 "$d/images.base" <(list_images)) <(labelled_images))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "image appeared during this session and carries no builder label: $id ($(describe_image "$id"))" \
-                "docker rmi $id   (only if it is yours — check first)"
-      done <<< "$extra"
-    fi
+      extra="$(comm -23 <(comm -13 "$d/images.base" <(list_images)) <(labelled_images))"
+      if [ -n "$extra" ]; then
+        while IFS= read -r id; do
+          [ -n "$id" ] || continue
+          finding "image appeared during this session and carries no builder label: $id ($(describe_image "$id"))" \
+                  "docker rmi $id   (only if it is yours — check first)"
+        done <<< "$extra"
+      fi
 
-    extra="$(comm -13 "$d/volumes.base" <(list_volumes))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
-      done <<< "$extra"
-    fi
+      extra="$(comm -13 "$d/volumes.base" <(list_volumes))"
+      if [ -n "$extra" ]; then
+        while IFS= read -r id; do
+          [ -n "$id" ] || continue
+          finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
+        done <<< "$extra"
+      fi
 
-    local cache_now cache_base
-    cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
-    if [ -n "$cache_now" ] && [ "$cache_now" != "0B" ] && [ "$cache_now" != "$cache_base" ]; then
-      finding "shared build cache changed during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
-              "build on your own throwaway builder (${BUILDER_PREFIX}<something>) so 'docker buildx rm' takes its cache with it"
+      # Only GROWTH is a build (basecradle#707 (c)). BuildKit's own garbage collection
+      # shrinks the cache on its schedule, and comparing the printed strings for
+      # inequality read that as a build this session ran, blocking an exit nothing
+      # could clear. Growth is still unattributable — someone else's build grows it
+      # too — so it is reported like every other unlabelled artefact, never pruned.
+      local cache_now cache_base now_bytes base_bytes
+      cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
+      if ! now_bytes="$(size_bytes "$cache_now")" || ! base_bytes="$(size_bytes "$cache_base")"; then
+        finding "the shared build cache's size could not be read (at session start: '${cache_base}', now: '${cache_now}'), so a build on a shared builder cannot be ruled out." \
+                "re-run .claude/session-guard.sh check; if it persists, compare docker system df by hand and say what you found in the completion comment"
+      elif [ "$now_bytes" -gt "$base_bytes" ]; then
+        finding "shared build cache grew during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
+                "build on your own throwaway builder (${BUILDER_PREFIX}<something>) so 'docker buildx rm' takes its cache with it; if the build was not this session's, say whose in the completion comment"
+      fi
     fi
-  elif [ "$base_engine" = "1" ] || [ "$(s_get docker_started_by_session 0)" = "1" ]; then
+  elif engine_must_answer; then
     finding "the Docker engine is not reachable and this session used it — nothing here can certify what it left behind." \
             "bring the engine back (.claude/session-guard.sh docker-up) and re-check, or say so in the completion comment"
   fi
@@ -546,19 +664,23 @@ cmd_check() {
   # @origin opened in the meantime. A process older than the session that merely moved to a new
   # port is not this session's (basecradle-noc#1073) and is named, never reported.
   if [ ! -f "$d/listeners.base" ]; then
-    finding "no listening-port baseline — this session began before the guard censused ports, so nothing here can say which listeners it started." \
+    finding "no listening-port baseline — the census at session start failed, or this session began before the guard censused ports, so nothing here can say which listeners it started." \
             "check by hand (lsof -nP -iTCP -sTCP:LISTEN), stop any this session started, then .claude/session-guard.sh baseline-listeners"
   elif ! has_lsof || [ "$(s_get lsof_present 0)" != "1" ]; then
     finding "lsof was not available, so this session's listening ports could not be censused." \
             "check by hand (lsof -nP -iTCP -sTCP:LISTEN) and say what you found in the completion comment"
   else
-    local new_rows began_epoch cmd addr pid started
+    local now_rows new_rows began_epoch cmd addr pid started
     began_epoch="$(s_get began_epoch)"
+    if ! now_rows="$(list_listeners)"; then
+      finding "the listening-port census failed (lsof reported an error), so this session's listening ports could not be checked." \
+              "re-run .claude/session-guard.sh check; if it persists, check by hand (lsof -nP -iTCP -sTCP:LISTEN) and say what you found in the completion comment"
+    fi
     # Every current row whose command + address the baseline did not hold, one row per pid. Keyed on
     # FILENAME, not NR == FNR, which reads every row as baseline when the baseline file is empty.
-    new_rows="$(list_listeners | awk -F'\t' -v base_file="$d/listeners.base" '
+    new_rows="$(awk -F'\t' -v base_file="$d/listeners.base" '
       FILENAME == base_file { base[$1 "\t" $2] = 1; next }
-      !(($1 "\t" $2) in base)' "$d/listeners.base" -)"
+      !(($1 "\t" $2) in base)' "$d/listeners.base" - <<< "$now_rows")"
     if [ -n "$new_rows" ]; then
       while IFS=$'\t' read -r cmd addr pid; do
         [ -n "${pid:-}" ] || continue

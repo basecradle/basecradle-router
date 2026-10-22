@@ -360,6 +360,21 @@ def test_scanner_catches_head_and_max_count(tmp_path: Path) -> None:
     assert {v.line for v in found} == {2, 3}
 
 
+@pytest.mark.parametrize(
+    "shape",
+    ["x | grep -q y", "x | grep -qE y", "x | grep -Eq y", "x | grep -m1 y", "x | head -1"],
+)
+def test_scanner_sees_a_quiet_flag_in_any_position(shape: str, tmp_path: Path) -> None:
+    """basecradle-noc#1109's control set: the NOC's own ban once put a ``\\b`` after the ``q``,
+    which let ``| grep -qE`` through. The flag letter is found wherever it sits in the bundle."""
+    assert len(_scan_text(f"set -euo pipefail\n{shape}\n", tmp_path)) == 1
+
+
+def test_scanner_reads_an_or_list_into_grep_as_no_pipe(tmp_path: Path) -> None:
+    """basecradle-noc#1109's negative control: ``||`` before ``! grep -qE`` is not a pipe."""
+    assert not _scan_text('set -euo pipefail\n[[ -r f ]] || ! grep -qE "^k=" f\n', tmp_path)
+
+
 def test_scanner_accepts_the_fixed_capture_then_match_shape(tmp_path: Path) -> None:
     """The remedy must pass: a here-string has no live producer to SIGPIPE."""
     assert not _scan_text(
