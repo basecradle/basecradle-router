@@ -46,13 +46,13 @@ The router is a **small, source-agnostic core** plus **pluggable route modules**
 
 - **The core** owns the common pipeline, and knows nothing about any specific event source: **verify → normalize the event → resolve the target agent → wake it → concurrency/queue/retry → report.**
 - **A route module** owns only one event source's specifics: how to receive its webhook, verify its signature, and normalize its payload into the core's vocabulary — a "wake agent X with trigger Y." Adding a source is **implementing one route module**, never forking the daemon; a new route never touches the core.
-- **Routes:** `github` (handoff issues), `basecradle` (the platform's **Event Delivery**, sent through the agent's **Integration**), and `probe` (the router's *own* synthetic wake — see "Proving the router's own claims"; it is a route like any other precisely so a probe traverses the real path rather than a back door into the middle of it). A route declares two things about itself the core reasons over without naming any source: the `recipient_kind` it resolves by, and whether it is `synthetic`.
+- **Routes:** `github` (handoff issues), `basecradle` (the platform's **Event Delivery**, sent through the agent's **Integration**), and `probe` (the router's *own* synthetic wake — see "Proving the router's own claims"; it is a route like any other precisely so a probe traverses the real path rather than a back door into the middle of it). A route declares two things about itself the core reasons over without naming any source: the `recipient_kind` it resolves by, and whether it is `synthetic`. The claims emitter arms an agent's edges by pairing each enabled route's `recipient_kind` with `Config.resolvable_by`, so adding a route never edits the emitter either.
 
 ### The home-server model
 
 The router runs on the fleet's **Ubuntu home servers** — the boxes where the agents live (`ai.basecradle.com` in production; each host's own files under `deploy/hosts/<fqdn>/`). On each box:
 
-- **One OS user per agent**, isolated; each holds only its own credentials, `chmod 600`, unreadable by siblings.
+- **One OS user per agent**, isolated; each holds only its own credentials (its GitHub App key, `ANTHROPIC_API_KEY`, `NOC_PROBE_SECRET`, and any platform credentials), `chmod 600`, unreadable by siblings. **The router holds no agent's secret** and never needs one.
 - The router **wakes an agent by running its headless Claude Code as that agent's OS user**, in that user's repo clone. The woken agent stays an **independent, separately-chartered context** — the router delivers a trigger; it never *becomes* the agent.
 - The router runs as a `systemd` service. The box holds the fleet's crown jewels — **harden it; least privilege everywhere.**
 
@@ -65,24 +65,28 @@ An agent's identity is **singular across every input path** (`constitution.md` �
 - **An ordered stream is not a wake per delivery.** A delivery that a successful wake on the same stream already read collapses into it (`coalesce.WakeCoverage`, keyed per agent), and one whose work ended while it waited is dropped by its route's `recheck`. Both are route opt-ins.
 - **Unified memory, not unified conversation.** The router preserves each event's source/thread context so the harness can map each input to its own session.
 
-**When you add a route module:** resolve the event to its agent and hand it to the same core pipeline. Never give a route its own wake path or its own harness for an agent. The reasoning and the mechanism: the `router-wake-pipeline` skill.
+**When you add a route module:** resolve the event to its agent and hand it to the same core pipeline. Never give a route its own wake path or its own harness for an agent.
 
 ### The wake-rate circuit breaker — the cross-agent runaway backstop
 
-The router is the **single chokepoint for every wake**, so it holds the cross-agent backstop for a runaway loop the harness's own self-breaker cannot catch: `breaker.WakeRateBreaker`, consulted in `pipeline.Pipeline.execute` **inside the per-agent lock and immediately before the wake** — that placement is what makes it count dispatch rate rather than delivery rate, so it stays there. It caps wakes per agent and per (agent, stream) (`Event.stream_key`); a trip is **loud, never silent** (a `BREAKER`/`IGNORED` decision plus an `event=breaker_tripped` `ERROR` the NOC alarms on); it auto-resets after the cooldown; and it shares no protocol with the harness-side layer. Thresholds are tunable in `router.env` (`deploy/README.md`). Why each property holds: the `router-wake-pipeline` skill.
+The router is the **single chokepoint for every wake**, so it holds the cross-agent backstop for a runaway loop the harness's own self-breaker cannot catch: `breaker.WakeRateBreaker`, consulted in `pipeline.Pipeline.execute` **inside the per-agent lock and immediately before the wake** — that placement is what makes it count dispatch rate rather than delivery rate, so it stays there. It caps wakes per agent and per (agent, stream) (`Event.stream_key`); a trip is **loud, never silent** (a `BREAKER`/`IGNORED` decision plus an `event=breaker_tripped` `ERROR` the NOC alarms on); it auto-resets after the cooldown; and it shares no protocol with the harness-side layer. Thresholds are tunable in `router.env` (`deploy/README.md`).
+
+Before changing `pipeline.py`, `scheduler.py`, `concurrency.py`, `coalesce.py`, `breaker.py`, `Event.stream_key`, a route's coalesce/recheck opt-ins, or the breaker or wake-lane settings, or before adding a route module, invoke the `router-wake-pipeline` skill.
 
 ### Proving the router's own claims — the green-while-absent instrument
 
 A capability that is silently **absent** emits no signal, so the router **emits claims and records the evidence behind them** for the NOC's claims-vs-evidence ledger, and proves the one claim that cannot be looked up by running a probe. *The router emits; the NOC judges — a component never grades its own homework.* The guards that bite silently:
 
 - **The instrument must never be able to break the thing it instruments.** The evidence store (`evidence.EvidenceStore`, `/var/lib/basecradle-router/evidence.json`) is written only by the daemon and degrades to memory with one warning if it cannot write; the boot freeze self-test is loud but never aborts startup (fail-closed is the NOC converge's job).
+- **The evidence counters are the classification — no consumer parses reason strings.** A refusal (the converge lock or the breaker working) is never recorded as a failure, and a dedup or coalesce (an outcome only a success can produce) is never recorded as a refusal; a new gate in `Pipeline.execute` records into the counter that matches what it is, or into none when nothing about the edge was tried (a `recheck` drop).
+- **Run the freeze self-test as the daemon's user, never as root:** root bypasses file permissions, so a root run proves nothing.
 - **The admin CLI is strictly read-only** (`python -m basecradle_router …`, wrapped on the box by `deploy/bin/router-admin`): `probe wake` reports `proven` only because the *daemon* recorded a wake carrying the delivery id that run minted — the probe can never manufacture its own pass.
-- **A probe is a lever, never an edge.** It is token-free (no code path builds a model command for a synthetic event; an agent with no `NOC_PROBE_SECRET` armed is a refusal, never a fallback), verified as the agent at the far end, recorded `synthetic` at write time, and excluded from `detail.edges`.
+- **A probe is a lever, never an edge.** It is token-free (no code path builds a model command for a synthetic event; `wake-runner --probe` acks after the privilege drop and never `exec`s the model; an agent with no `NOC_PROBE_SECRET` armed is a refusal, never a fallback); its marker is verified **as the agent**, against a file only that agent can read, while the router verifies nothing; it is recorded `synthetic` at write time; and it is excluded from `detail.edges`.
 - **The system is never widened to make a monitor go green** (`constitution.md` → Operational Baselines): no monitor depends on a consent or trust surface, and the daemon is never granted `systemd-journal` so a check can pass — narrow the claim instead.
 - **A claim's `detail` is the flat projection of the sub-object its own evidence pointer names**, or the NOC reads it `unprovable` and it is never armed; `test_every_declared_evidence_pointer_resolves_from_its_own_detail` pins it.
 - **The `breaker_tripped` line is a NOC alarm's needle**, written only on the failure path; `probe log-grammar` renders a real trip through the daemon's own statement, never a second renderer.
 
-Before touching `evidence.py`, `claims.py`, `probe.py`, `routes/probe.py`, `selftest.py`, `log_grammar.py`, the admin CLI, or any log line a NOC alarm parses, invoke the `router-claims-and-probes` skill.
+Before touching `evidence.py`, `claims.py`, `probe.py`, `routes/probe.py`, `marker.py`, `selftest.py`, `log_grammar.py`, `deploy/bin/wake-runner`'s probe mode, `deploy/bin/probe-ack`, the admin CLI, how a pipeline outcome is recorded as evidence, or any log line a NOC alarm parses, or before running a probe to prove a claim, invoke the `router-claims-and-probes` skill.
 
 ## Stack (omakase — matches harness + cradle)
 

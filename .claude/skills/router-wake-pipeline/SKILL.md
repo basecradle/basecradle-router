@@ -5,13 +5,15 @@ description: The reasoning and the mechanism behind the router's wake-path invar
 
 # The Wake Pipeline
 
-## One harness instance per agent — the per-agent serializing multiplexer
+The rules are CLAUDE.md → Architecture's; this skill is the reasoning and the mechanism behind them. Where the two disagree, the charter wins and this skill is corrected.
+
+## One Harness Instance per Agent — the Per-Agent Serializing Multiplexer
 
 The constitution makes an agent's identity **unified across every input path** (`constitution.md` → "Sovereignty and Governance": *"Each agent acts under its own identity — and that identity is singular"*). Every channel that can address an agent — a GitHub event, a BaseCradle Event Delivery, any future source — converges on **one identity-and-memory locus**: **one harness instance per agent**, running as that agent's own OS user, against its own home and memory. The harness *type* (Claude Code / basecradle-harness / cradle) is shared across agents; the per-agent *instance* is not. The router has **many inputs and one terminus per agent**, so it is a **per-agent serializing multiplexer** — `N inputs → one harness instance per agent`:
 
 - **An input routes to the agent's existing harness instance — never stands up a second.** The `github` route's handoff issues and the `basecradle` route's Event Delivery reach the **same** instance for an agent (same OS user, same home, same memory). Adding an input is wiring a new source onto an existing terminus, never forking the agent.
 - **Inputs serialize into one ordered stream per agent.** A harness instance is a single-session-at-a-time runtime over one memory/transcript store; two live sessions writing it concurrently is corruption / split-brain — the exact failure the unified-identity rule exists to prevent. The router never fans two inputs into two parallel wakes for one agent. Two mechanisms enforce it, both keyed by the agent's `harness_key` (its OS-user slug — the instance's identity):
-  - **The wake scheduler** (`scheduler.WakeScheduler`, #182) holds a FIFO queue per agent and never submits a second wake for an agent while one is running, so no worker thread is ever parked waiting on an agent. Its pool (`BASECRADLE_ROUTER_WAKE_LANES`) caps how many *distinct* agents are mid-wake at once — a busy agent holds exactly one lane — so it is a capacity ceiling, never a per-agent limit, and an idle agent's wake (the probe's included) never queues behind another agent's backlog.
+  - **The wake scheduler** (`scheduler.WakeScheduler`, #182) holds a FIFO queue per agent and never submits a second wake for an agent while one is running, so no worker thread is ever parked waiting on an agent. Its pool (`BASECRADLE_ROUTER_WAKE_LANES`) caps how many *distinct* agents are mid-wake at once — a busy agent holds exactly one lane — so it is a capacity ceiling, never a per-agent limit. An idle agent's wake (the probe's included) waits behind at most the `lanes` currently-running wakes, one per busy agent, never behind a busy agent's queued backlog — so a slow probe while every lane is busy is a reason to raise `BASECRADLE_ROUTER_WAKE_LANES`, not a dead edge.
   - **The per-agent lock** (`concurrency.AgentLocks`), held across the wake in `pipeline.Pipeline.execute`, is the last-line correctness net for the same invariant. Because the scheduler guarantees single-in-flight, the lock is always uncontended.
 
   Both are keyed on the **agent**, deliberately **not** the repo: a repo is a GitHub-shaped notion a non-GitHub input need not carry, whereas every input resolves to an agent.
@@ -19,7 +21,7 @@ The constitution makes an agent's identity **unified across every input path** (
 - **Unified memory, not unified conversation.** A GitHub PR thread and a BaseCradle Timeline are *different conversations sharing one memory + identity*. The router preserves each event's source/thread context so the harness can map each input to its own session while all draw on the one shared memory; that mapping (per-source sessions, cross-session answerability) is the harness's half, owned by `basecradle-harness`.
 - **Bijection.** One agent ↔ one harness instance. The router never points one agent's inputs at two instances, nor one instance at two agents. *Different capability per channel (heavy code work vs. light chat) is one harness with modes/tools — never two harnesses; different capability ≠ different brain.*
 
-## The wake-rate circuit breaker — the cross-agent runaway backstop
+## The Wake-Rate Circuit Breaker — the Cross-Agent Runaway Backstop
 
 Because the router is the **single chokepoint for every wake** — every source's deliveries funnel through one wake path, and it alone has the **cross-agent view** of how often each agent is woken — it is the natural home for the backstop that catches a runaway loop the per-agent harness layer can't: a harness that crashes before it can self-track, a multi-agent ping-pong, a novel loop from a drop-in `tools/` or MCP server. This is the **wake-rate circuit breaker** (`breaker.WakeRateBreaker`), consulted in `pipeline.Pipeline.execute` **inside the per-agent lock and immediately before the wake**.
 
