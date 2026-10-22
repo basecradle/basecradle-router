@@ -3,7 +3,8 @@
 #
 # Two things happen here, in this order, and the order is the point:
 #
-#   1. THE CLEANUP GUARD RUNS FIRST and can refuse. A session that has
+#   1. THE CLEANUP GUARD RUNS FIRST and can refuse (`check`; the state is cleared
+#      by `done` only once the kill target below is found). A session that has
 #      self-exited cannot clean up after itself, so anything it left on the
 #      laptop — a container, an image, a Docker Desktop it started, a browser
 #      tab — outlives it and becomes a founder's problem (basecradle-noc#790:
@@ -30,16 +31,15 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 guard="$here/session-guard.sh"
 
-if [ -x "$guard" ]; then
-  # `done` quoted: bare, it reads to the shell linter as a loop keyword (SC1010).
-  if ! "$guard" "done"; then
-    echo >&2
-    echo "self-exit: REFUSING to exit — this session has not cleaned up after itself (see above)." >&2
-    echo "self-exit: fix it, then run this again. Do not work around this; stay open and say what is blocking." >&2
-    exit 1
-  fi
-else
+if [ ! -x "$guard" ]; then
   echo "self-exit: $guard is missing — refusing to exit without a cleanup check." >&2
+  exit 1
+fi
+
+if ! "$guard" check; then
+  echo >&2
+  echo "self-exit: REFUSING to exit — this session has not cleaned up after itself (see above)." >&2
+  echo "self-exit: fix it, then run this again. Do not work around this; stay open and say what is blocking." >&2
   exit 1
 fi
 
@@ -56,6 +56,15 @@ done
 
 if [ -z "$target" ]; then
   echo "self-exit: no ancestor 'claude' process found — refusing to kill anything." >&2
+  exit 1
+fi
+
+# The session's state is cleared only now, with the kill target in hand: cleared
+# before it, a refused exit would leave a session with no baseline and every later
+# check refusing. `done` re-runs the check, so nothing slips in between.
+# `done` quoted: bare, it reads to the shell linter as a loop keyword (SC1010).
+if ! "$guard" "done"; then
+  echo "self-exit: REFUSING to exit — the final cleanup check failed (see above)." >&2
   exit 1
 fi
 

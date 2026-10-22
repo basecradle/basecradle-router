@@ -134,6 +134,9 @@ s_put() {  # s_put <name> <value>
   local d; d="$(state_dir)"
   mkdir -p "$d" || return 1
   printf '%s\n' "$2" > "$d/$1"
+  # Overwriting a file does not move its directory's mtime, and the stale-state
+  # sweep in `begin` keys on that mtime — so a live session says so on every write.
+  touch "$d"
 }
 
 # ------------------------------------------------------------------ docker io
@@ -219,6 +222,20 @@ cmd_begin() {
   local d; d="$(state_dir)"
   local root; root="$(state_root)"
 
+  # The SessionStart hook fires on resume, /clear and compaction too, under the same
+  # session id. Re-taking the baseline then would wipe what the session recorded
+  # (a Docker Desktop it started, its tab ledger) and fold its leftovers into the
+  # new baseline, so a complete baseline under a session id is kept. A pid key can
+  # be recycled by an unrelated session, so that one is still replaced.
+  case "$(session_key)" in
+    pid-*|no-session) ;;
+    *)
+      if [ -f "$d/began_at" ]; then
+        echo "session-guard: baseline for $(session_key) already taken at $(s_get began_at); kept."
+        return 0
+      fi
+      ;;
+  esac
   if [ -d "$d" ]; then
     echo "session-guard: replacing a state directory that already existed for this session key." >&2
   fi
@@ -230,7 +247,10 @@ cmd_begin() {
     find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$STALE_STATE_DAYS" -exec rm -rf {} + 2>/dev/null || true
   fi
 
-  s_put began_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # `began_at` is what `check` reads as "a baseline exists", so it is written LAST:
+  # a census cut off part-way (the hook's timeout, a wedged engine) leaves no
+  # baseline, never one that reads complete with its .base files missing.
+  local began_at; began_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   s_put began_epoch "$(date +%s)"
 
   if has_docker; then s_put docker_present 1; else s_put docker_present 0; fi
@@ -245,6 +265,7 @@ cmd_begin() {
   if has_lsof; then s_put lsof_present 1; else s_put lsof_present 0; fi
   list_listeners > "$d/listeners.base"
   : > "$d/tabs"
+  s_put began_at "$began_at"
 
   echo "session-guard: baseline for $(session_key) at $(s_get began_at)"
   echo "  docker: present=$(s_get docker_present) engine_up=$(s_get engine_up) desktop_running=$(s_get desktop_running)"
@@ -265,6 +286,14 @@ cmd_docker_up() {
   if engine_up; then
     echo "session-guard: Docker engine is already up; not recording a session start."
     return 0
+  fi
+
+  # Running but not answering (still booting, or the degraded engine of
+  # basecradle-noc#790) is not this session's to start — or, at sweep, to quit.
+  if docker_desktop_running; then
+    echo "session-guard: Docker Desktop is already running but its engine is not answering; not recording a session start." >&2
+    echo "session-guard: wait for it, or find out whose it is — never restart it to make it answer." >&2
+    return 1
   fi
 
   echo "session-guard: starting Docker Desktop (this session will quit it at sweep)."
@@ -312,7 +341,7 @@ cmd_tabs_checked() {
 }
 
 cmd_sweep() {
-  local d; d="$(state_dir)"
+  local d failed=0; d="$(state_dir)"
   [ -d "$d" ] || { echo "session-guard: no baseline — run 'begin' first." >&2; return 1; }
 
   if ! engine_up; then
@@ -328,7 +357,7 @@ cmd_sweep() {
       while IFS= read -r id; do
         [ -n "$id" ] || continue
         echo "session-guard: removing container $id ($(describe_container "$id"))"
-        docker rm -f "$id" >/dev/null 2>&1 || echo "session-guard: could not remove container $id" >&2
+        docker rm -f "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove container $id" >&2; failed=1; }
       done <<< "$ids"
     fi
 
@@ -337,7 +366,7 @@ cmd_sweep() {
       while IFS= read -r id; do
         [ -n "$id" ] || continue
         echo "session-guard: removing image $id ($(describe_image "$id"))"
-        docker rmi -f "$id" >/dev/null 2>&1 || echo "session-guard: could not remove image $id" >&2
+        docker rmi -f "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove image $id" >&2; failed=1; }
       done <<< "$ids"
     fi
 
@@ -349,15 +378,23 @@ cmd_sweep() {
       while IFS= read -r id; do
         [ -n "$id" ] || continue
         echo "session-guard: removing buildx builder $id"
-        docker buildx rm "$id" >/dev/null 2>&1 || echo "session-guard: could not remove builder $id" >&2
+        docker buildx rm "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove builder $id" >&2; failed=1; }
       done <<< "$ids"
     fi
   fi
 
+  # A removal that failed is a sweep that failed: say so, and never quit the
+  # engine out from under it — with the engine down, `check` could no longer see
+  # what was left.
+  if [ "$failed" = "1" ]; then
+    echo "session-guard: sweep INCOMPLETE — a removal above failed; not quitting Docker Desktop." >&2
+    return 1
+  fi
+
   if [ "$(s_get docker_started_by_session 0)" = "1" ]; then
-    local left; left="$(labelled_containers)"
+    local left; left="$(labelled_containers)$(labelled_images)$(session_builders)"
     if [ -n "$left" ]; then
-      echo "session-guard: labelled containers remain; not quitting Docker Desktop." >&2
+      echo "session-guard: labelled artefacts remain; not quitting Docker Desktop." >&2
       return 1
     fi
     stop_docker_desktop || return 1

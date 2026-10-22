@@ -37,6 +37,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,10 @@ elif a[:2] == ["desktop", "stop"]:
 elif a[:1] == ["ps"]:
     if not st["engine_up"]:
         sys.exit(1)
+    if st.get("ps_kills_group") and "-a" in a:
+        # The hook's timeout, simulated: the whole census is killed mid-run.
+        import signal
+        os.killpg(os.getpgrp(), signal.SIGKILL)
     ident = next((x.split("=", 1)[1] for x in a if x.startswith("id=")), None)
     for c in st["containers"]:
         if ident is not None:
@@ -137,6 +142,9 @@ elif a[:1] == ["rm"]:
     st["containers"] = [c for c in st["containers"] if c["id"] not in a]
     save()
 elif a[:1] == ["rmi"]:
+    if st.get("rmi_fails"):
+        sys.stderr.write("conflict: image is being used by a container\n")
+        sys.exit(1)
     st["images"] = [i for i in st["images"] if i["id"] not in a]
     save()
 elif a[:2] == ["buildx", "rm"]:
@@ -508,6 +516,18 @@ def test_docker_desktop_that_was_running_at_session_start_is_left_running(lab):
     assert lb.docker_state()["desktop_status"] == "running"
 
 
+def test_a_running_desktop_whose_engine_is_not_answering_is_never_claimed(lab):
+    """Running but not answering is the incident's own state (basecradle-noc#790). Claiming that
+    start would let ``sweep`` quit an app that was there before the session."""
+    lb = lab(engine_up=False)
+    assert lb.run("begin").returncode == 0
+    got = lb.run("docker-up")
+    assert got.returncode != 0
+    assert "already running" in got.stderr
+    assert not (lb.state_root / "test-session" / "docker_started_by_session").exists()
+    assert ["desktop", "start"] not in lb.calls_log()
+
+
 def test_docker_desktop_status_is_read_when_no_process_sits_under_the_bundle(lab):
     """The second probe, ``docker desktop status``, is the one this port rewrote: captured, then
     matched, instead of piped into ``grep -q``, which under pipefail can fail exactly when it
@@ -829,3 +849,79 @@ def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
     assert run("begin").returncode == 0
     assert run("tabs-checked").returncode == 0
     assert "could not be censused" in run("check").stdout
+
+
+# ------------------------------------------------------------------ review hardening (#354)
+
+
+def test_a_second_session_start_keeps_the_baseline_and_what_the_session_recorded(lab):
+    """The hook fires on resume, ``/clear`` and compaction too. Re-taking the baseline would erase
+    the record that this session started Docker Desktop, and the sweep would leave it running."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
+    assert lb.run("begin").returncode == 0
+    assert lb.run("docker-up").returncode == 0
+    again = lb.run("begin")
+    assert again.returncode == 0
+    assert "kept" in again.stdout
+    assert (lb.state_root / "test-session" / "docker_started_by_session").read_text() == "1\n"
+
+
+def test_a_census_cut_off_part_way_leaves_no_baseline(lab):
+    """``began_at`` is the "a baseline exists" marker, so it is written last. A census that dies
+    mid-run must leave ``check`` refusing, never a baseline that reads complete without its
+    ``.base`` files (which would make every new container invisible)."""
+    lb = lab(ps_kills_group=True)
+    got = subprocess.run(
+        [str(GUARD), "begin"], env=lb.env, capture_output=True, text=True, start_new_session=True
+    )
+    assert got.returncode < 0, "the stub was meant to kill the census"
+    lb.mutate(ps_kills_group=False)
+    check = lb.run("check")
+    assert check.returncode != 0
+    assert "no session baseline" in check.stdout
+
+
+def test_a_live_session_is_not_swept_as_stale_by_another_sessions_start(lab):
+    """The stale sweep keys on the state directory's mtime, which an overwrite does not move — so
+    every write touches it, and a long session that only overwrites stays alive."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.clean_tabs()
+    live = lb.state_root / "test-session"
+    old = time.time() - 30 * 86400
+    os.utime(live, (old, old))
+    lb.clean_tabs()  # an overwrite of tabs_checked, not a new entry
+    env = lb.env | {"CLAUDE_CODE_SESSION_ID": "another-session"}
+    other = subprocess.run([str(GUARD), "begin"], env=env, capture_output=True, text=True)
+    assert other.returncode == 0, other.stderr
+    assert live.is_dir()
+
+
+def test_a_failed_removal_fails_the_sweep_and_keeps_the_engine_up(lab):
+    """A sweep that could not remove something is not complete, and quitting the engine under it
+    would hide the leftover from the ``check`` that follows."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], images=[IMAGE], rmi_fails=True)
+    assert lb.run("begin").returncode == 0
+    assert lb.run("docker-up").returncode == 0
+    got = lb.run("sweep")
+    assert got.returncode != 0
+    assert "INCOMPLETE" in got.stderr
+    assert ["desktop", "stop"] not in lb.calls_log()
+
+
+def test_self_exit_keeps_the_state_when_it_cannot_find_its_kill_target(lab):
+    """``done`` clears the state, so it runs only once the kill target is in hand; a refused exit
+    must leave the baseline for the next attempt."""
+    lb = lab()
+    # Safety precondition: under the lab's stub ``ps`` the ancestry walk sees nothing, so this
+    # test can never find, let alone signal, a real ``claude`` process.
+    walk = subprocess.run(
+        ["ps", "-o", "command=", "-p", str(os.getpid())], env=lb.env, capture_output=True, text=True
+    )
+    assert walk.stdout.strip() == ""
+    assert lb.run("begin").returncode == 0
+    lb.clean_tabs()
+    got = lb.run(script=SELF_EXIT)
+    assert got.returncode != 0
+    assert "no ancestor 'claude' process found" in got.stderr
+    assert (lb.state_root / "test-session" / "began_at").is_file()
