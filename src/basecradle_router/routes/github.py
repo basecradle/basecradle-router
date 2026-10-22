@@ -51,15 +51,28 @@ none for this, because every change of state that matters arrives as a delivery.
 
 Each handoff :class:`~basecradle_router.models.Event` is also stamped with **when its
 event happened** — the issue's creation for ``opened``, its last update for ``labeled``,
-the comment's creation for ``issue_comment`` — which opts this route's streams into the
-core's collapse of a delivery into a wake that already read it
-(:mod:`basecradle_router.coalesce`). That collapse is what turns the ``opened`` and
+the comment's creation for ``issue_comment``, the merge for ``pull_request`` — which opts
+this route's streams into the core's collapse of a delivery into a wake that already read
+it (:mod:`basecradle_router.coalesce`). That collapse is what turns the ``opened`` and
 ``labeled`` of one labeled create into one wake, whichever arrives first.
+
+**A captain's own merge re-wakes it** (basecradle-router#365). A third event type,
+``pull_request`` (action ``closed`` with ``merged: true``), closes the hole the comment
+path leaves: a fleet-server captain arms auto-merge on its PR and ends its turn, and the
+merge itself reached no one — so the completion report and the by-hand close waited on a
+capital nudge, three times on 2026-10-22. A merged PR **authored by the repo's own captain
+bot** now wakes that captain on its open handoff issue in the same repo; a PR by anyone
+else (Dependabot, a human, a peer bot) wakes no one. A PR payload carries no issue, so
+the issue comes from the :class:`IssueLedger`: the open handoff issue the PR names by
+number, or — when it names none — the repo's only open handoff issue; with none, or more
+than one and no name to choose between them, the merge is a visible skip. Its trigger is the issues
+path's, verbatim, plus one line naming the merged PR.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
@@ -88,6 +101,7 @@ DELIVERY_HEADER = "X-GitHub-Delivery"
 
 ISSUES_EVENT = "issues"
 ISSUE_COMMENT_EVENT = "issue_comment"
+PULL_REQUEST_EVENT = "pull_request"
 
 HANDOFF_LABEL = "handoff"
 # The fleet-wide do-not-pick-this-up signal (basecradle#376; constitution.md →
@@ -103,6 +117,22 @@ _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 # Only a newly *created* comment re-wakes; an ``edited``/``deleted`` comment does
 # not (the re-wake re-reads the whole thread anyway, so an edit adds nothing).
 _ACTIONABLE_COMMENT_ACTION = "created"
+# A pull request's merge arrives as `closed` with `merged: true`; a PR closed unmerged
+# finished nothing, so it wakes no one (#365).
+_ACTIONABLE_PULL_REQUEST_ACTION = "closed"
+
+# Why a merge of the captain's own PR woke no one — the ``reason=`` on its
+# ``event=merge_wake_skip`` line (#365).
+NO_OPEN_HANDOFF = "no_open_handoff"
+AMBIGUOUS_HANDOFF = "ambiguous_handoff"
+
+# How a PR names an issue in its own repo: a bare `#N`, an `owner/name#N`, or the
+# issue's URL. The lookbehind keeps `basecradle-router#129` — another repo, named
+# without its owner — from reading as this repo's #129.
+_ISSUE_REFERENCE = re.compile(
+    r"(?<![\w/.-])(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<number>\d+)\b"
+    r"|github\.com/(?P<url_repo>[\w.-]+/[\w.-]+)/issues/(?P<url_number>\d+)\b"
+)
 
 # Why a queued github wake is dropped at dispatch — the ``reason=`` the core logs on
 # the ``decision=dropped`` line (basecradle-router#272). Most decisive first: a closed
@@ -170,13 +200,21 @@ _HANDOFF_TRIGGER = (
     "silently ignore it."
 )
 
+# Appended after the verbatim trigger above on a merge re-wake (#365), never woven into
+# it: the guard's wording is the founder's, and this line only says why the agent woke,
+# in the words #365 ordered — it adds no instruction of its own. Both values are
+# GitHub's own — the PR's number and URL, never its author-written text.
+_MERGE_NOTE = "\nWake reason: your pull request #{number} ({url}) merged; finish the issue."
+
 
 @dataclass(frozen=True, slots=True)
 class _IssueState:
     """One handoff issue as deliveries reported it: when, whether open, which labels.
 
     ``state_first_hand``/``labels_first_hand`` record whether that field came from the
-    delivery whose action made the change — see :meth:`IssueLedger.observe`.
+    delivery whose action made the change — see :meth:`IssueLedger.observe`. ``ref`` is
+    the issue itself, for a merge that has to find it by repo (#365) — ``None`` when the
+    payload did not carry enough to name it, which leaves the recheck unaffected.
     """
 
     updated_at: datetime
@@ -184,6 +222,7 @@ class _IssueState:
     labels: frozenset[str]
     state_first_hand: bool
     labels_first_hand: bool
+    ref: IssueRef | None = None
 
 
 class IssueLedger:
@@ -214,6 +253,11 @@ class IssueLedger:
     **It fails towards waking.** An issue it has no record of — never seen, evicted, or
     lost to a restart (the ledger is memory, like the queue it serves) — is answered
     ``None``, which is the router's behaviour before the ledger existed.
+
+    **It is also where a merge finds its issue** (#365, :meth:`open_handoffs`). A
+    ``pull_request`` payload names no issue, so the open handoff issues the ledger holds
+    for the PR's repo are the candidates. There the same blind spots fail the other way,
+    to the behaviour before #365: an issue it has no record of is one no merge can wake.
 
     Thread-safe: observed on the event loop (``normalize`` runs on the accept half) and
     read from the wake threads, under one lock held for a dictionary operation.
@@ -263,6 +307,7 @@ class IssueLedger:
             names,
             state_first_hand=action in _STATE_ACTIONS,
             labels_first_hand=action in _LABEL_ACTIONS,
+            ref=_issue_ref(data, issue, url),
         )
         with self._lock:
             known = self._issues.get(url)
@@ -297,6 +342,50 @@ class IssueLedger:
             return HANDOFF_REMOVED
         return None
 
+    def open_handoffs(self, repo: str) -> list[IssueRef]:
+        """The issues in ``repo`` the ledger holds as open and still labeled ``handoff``.
+
+        ``Do Not Work`` is not filtered here: a parked issue is still the merge's
+        target, and the caller refuses it as the visible brake skip it is. Matched
+        case-insensitively, as GitHub matches repo names.
+        """
+        wanted = repo.lower()
+        with self._lock:
+            known = list(self._issues.values())
+        return [
+            state.ref
+            for state in known
+            if state.ref is not None
+            and state.ref.repo.lower() == wanted
+            and state.open
+            and HANDOFF_LABEL in state.labels
+        ]
+
+
+def _repo_full_name(data: dict[str, Any]) -> str | None:
+    """The payload's ``repository.full_name``, or ``None`` if it is absent or not a name."""
+    repository = data.get("repository")
+    repo = repository.get("full_name") if isinstance(repository, dict) else None
+    return repo if isinstance(repo, str) and repo else None
+
+
+def _issue_ref(data: dict[str, Any], issue: dict[str, Any], url: str) -> IssueRef | None:
+    """The issue a payload reports on, or ``None`` if it does not carry enough to say."""
+    repo = _repo_full_name(data)
+    number = issue.get("number")
+    title = issue.get("title")
+    if (
+        repo is None
+        or not isinstance(title, str)
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+    ):
+        return None
+    try:
+        return IssueRef(repo=repo, number=number, url=url, title=title)
+    except ValueError:
+        return None
+
 
 def _settle_tie(known: _IssueState, report: _IssueState) -> _IssueState:
     """Merge two reports stamped with the same second, field by field.
@@ -313,6 +402,7 @@ def _settle_tie(known: _IssueState, report: _IssueState) -> _IssueState:
         known.labels if keep_labels else report.labels,
         state_first_hand=known.state_first_hand or report.state_first_hand,
         labels_first_hand=known.labels_first_hand or report.labels_first_hand,
+        ref=report.ref or known.ref,
     )
 
 
@@ -377,9 +467,10 @@ class GithubRoute:
     def normalize(self, request: InboundRequest) -> Event | None:
         """Turn a verified webhook into an :class:`Event`, or ignore it.
 
-        Dispatches on the event type: an ``issues`` handoff (opened/labeled) or an
-        ``issue_comment`` reply on a handoff issue both normalize to the same
-        handoff :class:`Event`; every other event is a well-formed *ignore*.
+        Dispatches on the event type: an ``issues`` handoff (opened/labeled), an
+        ``issue_comment`` reply on a handoff issue, and a ``pull_request`` merge of the
+        captain's own PR all normalize to the same handoff :class:`Event`; every other
+        event is a well-formed *ignore*.
         Raises :class:`PayloadError` when an actionable payload is structurally
         malformed and :class:`UntrustedSenderError` when a wake was triggered by
         an actor who is not a trusted fleet member. Emits a structured decision
@@ -396,6 +487,8 @@ class GithubRoute:
             return self._normalize_issues(request, event_type, delivery)
         if event_type == ISSUE_COMMENT_EVENT:
             return self._normalize_comment(request, event_type, delivery)
+        if event_type == PULL_REQUEST_EVENT:
+            return self._normalize_pull_request(request, event_type, delivery)
         return self._ignore(event_type, delivery)
 
     def _normalize_issues(
@@ -419,7 +512,7 @@ class GithubRoute:
         # even with a (stale or accidental) handoff label. Checked before the
         # trust gate so a parked issue is a clean *skip*, not a sender rejection.
         if _has_do_not_work_label(issue):
-            return self._skip_do_not_work(issue, event_type, delivery)
+            return self._skip_do_not_work(issue.get("html_url"), event_type, delivery)
 
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
         # actor may actually trigger a wake. This runs after verify(), so the
@@ -468,7 +561,7 @@ class GithubRoute:
         # `Do Not Work` wins over `handoff` on the re-wake path too: a reply on a
         # parked handoff issue re-wakes no one while the brake label remains.
         if _has_do_not_work_label(issue):
-            return self._skip_do_not_work(issue, event_type, delivery)
+            return self._skip_do_not_work(issue.get("html_url"), event_type, delivery)
 
         # Infinite-loop guard, *before* the trust gate: the agent commenting on its
         # own handoff issue (a progress note, the completion report) fires
@@ -486,6 +579,60 @@ class GithubRoute:
         stamp = comment.get("created_at") if isinstance(comment, dict) else None
         return self._wake_event(data, issue, event_type, delivery, parse_timestamp(stamp))
 
+    def _normalize_pull_request(
+        self, request: InboundRequest, event_type: str, delivery: str | None
+    ) -> Event | None:
+        """A ``pull_request`` webhook: the captain's own merged PR re-wakes it (#365).
+
+        Gates that narrow the surface to exactly "this captain's own work just landed
+        while its handoff is still open": only a **merge** (``closed`` with ``merged:
+        true``), of a PR **authored by the repo's registered captain bot** (so a
+        Dependabot, human or peer PR stays silent), with an **open handoff issue** in
+        the ledger to wake it on, that is not parked under ``Do Not Work``, delivered with
+        a **trusted** ``sender`` (the actor GitHub attributes the merge to — for
+        auto-merge, the one that armed it, so a captain's own auto-merge is its own bot).
+        Waking the captain on its own merge cannot loop: the wake's comments and its
+        close are ``issues``/``issue_comment`` deliveries the existing guards already
+        stop, and a further merge is a further PR — capped, like any stream, by the
+        breaker.
+        """
+        data = parse_json_object(request.body)
+        pull = data.get("pull_request")
+        if data.get("action") != _ACTIONABLE_PULL_REQUEST_ACTION or not isinstance(pull, dict):
+            return self._ignore(event_type, delivery)
+        if pull.get("merged") is not True:
+            return self._ignore(event_type, delivery)
+
+        repo = _repo_full_name(data)
+        if repo is None:
+            raise PayloadError("event payload is missing 'repository.full_name'")
+        author = pull.get("user")
+        login = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(login, str) or not self._is_captain_bot(repo, login):
+            return self._ignore(event_type, delivery)
+
+        number = _int(pull, "number", "pull_request.number")
+        pull_url = _text(pull, "html_url", "pull_request.html_url")
+        target, reason = _merge_target(self._ledger.open_handoffs(repo), _named_issues(pull, repo))
+        if target is None:
+            logger.info(
+                "event=merge_wake_skip pull_request=%s delivery=%s reason=%s",
+                pull_url,
+                delivery or "<unknown>",
+                reason,
+            )
+            return self._ignore(event_type, delivery)
+        if self._ledger.reason_to_drop(target.url) == DO_NOT_WORK:
+            return self._skip_do_not_work(target.url, event_type, delivery)
+
+        self._require_trusted_sender(data)
+        wake_arg = _HANDOFF_TRIGGER.format(url=target.url) + _MERGE_NOTE.format(
+            number=number, url=pull_url
+        )
+        return self._build_event(
+            target, wake_arg, event_type, delivery, parse_timestamp(pull.get("merged_at"))
+        )
+
     def _wake_event(
         self,
         data: dict[str, Any],
@@ -494,7 +641,7 @@ class GithubRoute:
         delivery: str | None,
         occurred_at: datetime | None,
     ) -> Event:
-        """Build the handoff :class:`Event` shared by both wake paths.
+        """Build the handoff :class:`Event` shared by the two issue-borne wake paths.
 
         Identical for an ``issues`` handoff and an ``issue_comment`` re-wake: the
         wake points at the issue URL so the agent re-reads the full thread,
@@ -511,9 +658,6 @@ class GithubRoute:
         if not isinstance(repository, dict):
             raise PayloadError("event payload is missing a 'repository' object")
 
-        if not delivery:
-            raise PayloadError(f"missing {DELIVERY_HEADER} header")
-
         try:
             origin = IssueRef(
                 repo=_text(repository, "full_name", "repository.full_name"),
@@ -521,11 +665,30 @@ class GithubRoute:
                 url=_text(issue, "html_url", "issue.html_url"),
                 title=_text(issue, "title", "issue.title"),
             )
+        except ValueError as exc:
+            raise PayloadError(f"malformed {event_type} payload: {exc}") from exc
+        return self._build_event(
+            origin, _HANDOFF_TRIGGER.format(url=origin.url), event_type, delivery, occurred_at
+        )
+
+    def _build_event(
+        self,
+        origin: IssueRef,
+        wake_arg: str,
+        event_type: str,
+        delivery: str | None,
+        occurred_at: datetime | None,
+    ) -> Event:
+        """The handoff :class:`Event` every wake path ends in, and its ``WOKE`` line."""
+        if not delivery:
+            raise PayloadError(f"missing {DELIVERY_HEADER} header")
+
+        try:
             event = Event(
                 source=self.name,
                 kind=EventKind.HANDOFF,
                 recipient=Recipient(by="repo", value=origin.repo),
-                wake_arg=_HANDOFF_TRIGGER.format(url=origin.url),
+                wake_arg=wake_arg,
                 delivery_id=delivery,
                 origin=origin,
                 occurred_at=occurred_at,
@@ -547,9 +710,7 @@ class GithubRoute:
         log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED, delivery=delivery)
         return None
 
-    def _skip_do_not_work(
-        self, issue: dict[str, Any], event_type: str | None, delivery: str | None
-    ) -> None:
+    def _skip_do_not_work(self, url: object, event_type: str | None, delivery: str | None) -> None:
         """Refuse a wake on a ``Do Not Work`` issue — the parked-issue brake (#146).
 
         Logged loudly with the issue URL and the reason *before* the structured
@@ -557,8 +718,8 @@ class GithubRoute:
         can see exactly which parked issue the brake caught and why. The wake is
         then recorded as the same ``IGNORED`` decision every other quiet outcome
         emits — a parked issue is deliberately-not-actionable, not an error.
+        ``url`` is the payload's ``html_url`` as delivered, so it may be anything.
         """
-        url = issue.get("html_url")
         logger.info(
             'event=do_not_work_skip issue=%s delivery=%s reason="%s wins over %s"',
             url if isinstance(url, str) and url else "<unknown>",
@@ -578,15 +739,19 @@ class GithubRoute:
         unknown and this returns ``False``; that is safe, because resolution will
         then find no agent and run no wake, so there is no loop to break.
         """
-        repository = data.get("repository")
-        repo = repository.get("full_name") if isinstance(repository, dict) else None
-        if not isinstance(repo, str) or not repo:
+        repo = _repo_full_name(data)
+        if repo is None:
             return False  # malformed repo: _wake_event raises on it, consistently
-        bot_login = self._bot_login_for_repo(repo)
-        if not bot_login:
-            return False
         login = _sender_login(data)
-        return login is not None and login.lower() == bot_login.lower()
+        return login is not None and self._is_captain_bot(repo, login)
+
+    def _is_captain_bot(self, repo: str, login: str) -> bool:
+        """Whether ``login`` is ``repo``'s registered captain bot — never a guessed name.
+
+        An unregistered repo has no known bot, so this is ``False`` for every login.
+        """
+        bot_login = self._bot_login_for_repo(repo)
+        return bool(bot_login) and login.lower() == bot_login.lower()
 
     def _require_trusted_sender(self, data: dict[str, Any]) -> None:
         """Raise :class:`UntrustedSenderError` unless the webhook's actor is trusted.
@@ -603,6 +768,40 @@ class GithubRoute:
             raise UntrustedSenderError(
                 f"wake triggered by untrusted actor {login!r}; not a fleet member"
             )
+
+
+def _named_issues(pull: dict[str, Any], repo: str) -> frozenset[int]:
+    """The issue numbers in ``repo`` a PR's title and body name (see ``_ISSUE_REFERENCE``)."""
+    text = " ".join(
+        value for value in (pull.get("title"), pull.get("body")) if isinstance(value, str)
+    )
+    named: set[int] = set()
+    for match in _ISSUE_REFERENCE.finditer(text):
+        where = match.group("repo") or match.group("url_repo")
+        if where is None or where.lower() == repo.lower():
+            named.add(int(match.group("number") or match.group("url_number")))
+    return frozenset(named)
+
+
+def _merge_target(
+    candidates: list[IssueRef], named: frozenset[int]
+) -> tuple[IssueRef | None, str | None]:
+    """The one open handoff issue a merge wakes its captain on, or why there is none.
+
+    A PR that names issues in its repo is about those: the candidates among them, and
+    never a candidate it did not name — a passed-by fix that names its own issue says
+    nothing about the handoff beside it, and a named handoff the ledger lost (a restart)
+    must not be swapped for another. A PR that names none is about the repo's handoff,
+    so every candidate. Exactly one is a target. More than one is never guessed between —
+    a wake on the wrong issue is a session spent on work that did not change — and none
+    is nothing to finish.
+    """
+    chosen = [ref for ref in candidates if ref.number in named] if named else candidates
+    if not chosen:
+        return None, NO_OPEN_HANDOFF
+    if len(chosen) > 1:
+        return None, AMBIGUOUS_HANDOFF
+    return chosen[0], None
 
 
 def _require_issue(data: dict[str, Any]) -> dict[str, Any]:
