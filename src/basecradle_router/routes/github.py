@@ -1,4 +1,4 @@
-"""The ``github`` route — v0's only event source.
+"""The ``github`` route — GitHub's webhooks, the handoff issue's event source.
 
 GitHub signs each webhook with HMAC-SHA256 over the raw request body, keyed by
 the per-route shared secret, and delivers the digest in the
