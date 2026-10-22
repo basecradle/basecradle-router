@@ -424,8 +424,9 @@ non-empty**; the daemon refuses to start without it, so the check can never be s
 org members by their GitHub login and each fleet captain's bot as `<slug>[bot]`. Matched
 case-insensitively.
 
-**The github route consumes two webhook events** (subscribe each agent's App to both — *Issues* **and**
-*Issue comment*):
+**The github route consumes three webhook events** (subscribe each agent's App to all three — *Issues*,
+*Issue comment* **and** *Pull request*; an App not subscribed to an event never sends it, and nothing on
+the router's side can tell):
 
 - **`issues`** (action `opened`/`labeled`) — a handoff issue filed or labeled `handoff`: the initial wake.
 - **`issue_comment`** (action `created`) — a **reply on a handoff issue re-wakes its agent** (issue #129).
@@ -441,6 +442,22 @@ case-insensitively.
   actor on the list, but the trigger's SECURITY preamble (`routes/github.py`) tells the woken agent that
   only a comment by a founder's account or the capital bot is instruction — every other comment is data,
   whoever's it is (basecradle#546).
+- **`pull_request`** (action `closed` with `merged: true`) — **a captain's own merge re-wakes it while its
+  handoff issue is open** (issue #365). A fleet-server captain arms auto-merge and ends its turn, and the
+  merge used to wake no one, so the completion report and the by-hand close waited for a capital nudge.
+  Only a PR **authored by the repo's captain bot** (resolved from `agents.json`, like the self-comment
+  guard) counts — a Dependabot, human or peer PR wakes no one — and the delivery's `sender` must be a
+  trusted actor (for auto-merge, GitHub attributes the merge to the bot that armed it). A PR payload names no issue, so the target is
+  found in the route's record of handoff issues (the recheck ledger below): the open handoff issue in that
+  repo the PR's title or body names (`#N`, `owner/name#N`, or the issue's URL) — never another, when it
+  names any issue in its repo — or, when it names none, the repo's **only** open handoff issue. None, or several with none named, is an `event=merge_wake_skip` line with
+  `reason=no_open_handoff`/`ambiguous_handoff` and no wake; a target under `Do Not Work` is the brake's
+  usual skip. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
+  number and URL (never its author-written text): `Wake reason: your pull request #N (<url>) merged;
+  finish the issue.` A merge stamps the event with `merged_at`, so it coalesces like any delivery: a
+  successful wake on the issue that started after the merge already covers it. The record is memory: a handoff issue the daemon has not
+  seen a delivery for since it last started (a deploy restarts it) is one no merge can wake until a comment
+  or label delivery shows it again — the behaviour before #365, never a wrong wake.
 
 **One handoff, one wake — and never for a closed issue** (#272). One handoff once cost five sessions: every
 accepted delivery was its own queued wake, launched the moment the previous one exited — the `opened`
@@ -450,9 +467,9 @@ the core and both opt-in per route: the platform route opts into the coalesce bu
 the probe passes both untouched:
 
 - **Coalesce.** The route stamps each event with when it happened (the issue's creation for `opened`, its
-  last update for `labeled`, the comment's creation for `issue_comment`). A delivery whose event happened
-  *before* a **successful** wake on the same issue *started* was read by that session, so it collapses
-  into it. That is what makes a labeled create one wake in either arrival order, and it bounds a burst:
+  last update for `labeled`, the comment's creation for `issue_comment`, the merge for `pull_request`). A
+  delivery whose event happened *before* a **successful** wake on the same issue *started* was read by that
+  session, so it collapses into it. That is what makes a labeled create one wake in either arrival order, and it bounds a burst:
   everything that queued behind a running session collapses into the **first** follow-up, never N. A
   failed wake covers nothing, so the delivery behind it keeps its own chance. GitHub timestamps are whole
   seconds and never later than the truth, so every clock error errs towards an extra wake, never a lost one.

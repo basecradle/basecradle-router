@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -206,6 +207,89 @@ def test_create_app_wires_the_self_comment_guard(tmp_path) -> None:
 
     assert _post(server, "/webhooks/github", body, headers) == 200  # accepted, ignored
     assert waker.calls == []  # no wake — the self-comment guard held
+
+
+# --- a captain's own merge re-wakes it, the author gate wired from the registry (#365)
+
+
+def _signed(event: str, delivery: str, payload: dict) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload).encode("utf-8")
+    digest = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+    headers = {
+        "X-GitHub-Event": event,
+        "X-GitHub-Delivery": delivery,
+        "X-Hub-Signature-256": f"sha256={digest}",
+        "Content-Type": "application/json",
+    }
+    return body, headers
+
+
+def _signed_merge(author: str) -> tuple[bytes, dict[str, str]]:
+    # Merged after the handoff's own wake started, so no coalesce can claim it was read.
+    merged_at = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _signed(
+        "pull_request",
+        "0192f3a4-5b6c-7d8e-9f01-23456789abce",
+        {
+            "action": "closed",
+            "pull_request": {
+                "number": 57,
+                "html_url": f"https://github.com/{NOVA.key}/pull/57",
+                "title": "Mirror the wire-shape change",
+                "body": "Ships #42.",
+                "merged": True,
+                "merged_at": merged_at,
+                "user": {"login": author, "type": "Bot"},
+            },
+            "repository": {"full_name": NOVA.key},
+            "sender": {"login": author, "type": "Bot"},
+        },
+    )
+
+
+def _merge_server(tmp_path, waker: _RecordingWaker):
+    env = _env(tmp_path)
+    env["BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS"] = f"{HANDOFF_SENDER},{NOVA_BOT}"
+    server = create_app(env, waker=waker)
+    opened = {
+        "action": "opened",
+        "issue": {
+            "number": 42,
+            "title": "Mirror the wire-shape change",
+            "html_url": f"https://github.com/{NOVA.key}/issues/42",
+            "labels": [{"name": "handoff"}],
+            "state": "open",
+            "created_at": "2026-09-19T03:14:07Z",
+            "updated_at": "2026-09-19T03:14:07Z",
+        },
+        "repository": {"full_name": NOVA.key},
+        "sender": {"login": HANDOFF_SENDER, "type": "User"},
+    }
+    body, headers = _signed("issues", "0192f3a4-5b6c-7d8e-9f01-23456789abcd", opened)
+    assert _post(server, "/webhooks/github", body, headers) == 202
+    return server
+
+
+def test_create_app_rewakes_a_captain_on_its_own_merge(tmp_path) -> None:
+    waker = _RecordingWaker()
+    server = _merge_server(tmp_path, waker)
+    body, headers = _signed_merge(author=NOVA_BOT)
+
+    assert _post(server, "/webhooks/github", body, headers) == 202
+    assert len(waker.calls) == 2  # the handoff, then the merge
+    agent, event = waker.calls[1]
+    assert agent == NOVA
+    assert event.origin.url == f"https://github.com/{NOVA.key}/issues/42"
+    assert "pull request #57" in event.wake_arg
+
+
+def test_create_app_keeps_a_dependabot_merge_silent(tmp_path) -> None:
+    waker = _RecordingWaker()
+    server = _merge_server(tmp_path, waker)
+    body, headers = _signed_merge(author="dependabot[bot]")
+
+    assert _post(server, "/webhooks/github", body, headers) == 200  # accepted, ignored
+    assert len(waker.calls) == 1  # the handoff alone
 
 
 # --- the basecradle route's per-recipient keyring is wired here (#497) --------
