@@ -13,9 +13,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history: the commit-trailer guard walks base..head, and both ends
+          # must be in the clone. The repo is small, so every event pays it.
+          fetch-depth: 0
 
       - name: Injection-marker guard
         run: .github/scripts/injection-guard.sh
+
+      # Fleet Bot Identity: a commit authored by this repo's bot carries no
+      # Co-Authored-By trailer (#354). A STEP in this job, like Shell lint below, so
+      # the required context stays the single `CI`. Gated on the event because only
+      # a PR's own commits can still be rewritten; main's squash commits never can.
+      - name: Commit trailers
+        if: github.event_name == 'pull_request'
+        env:
+          BOT: basecradle-router-ai[bot]
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/commit-trailers.sh
 
       # Shell was the unlinted half of this repo (#299): the root-run wake path and
       # the reboot helper had no gate while Python had two. `shellcheck` is
