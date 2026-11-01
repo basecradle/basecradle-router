@@ -1629,7 +1629,7 @@ mirrors the proven, scrubbed config `basecradle-noc` already runs (basecradle-no
 of truth** (for example [`deploy/hosts/ai.basecradle.com/vector.yaml`](hosts/ai.basecradle.com/vector.yaml)),
 not Better Stack's generated kitchen-sink. Every host's copy is the same config with only its two sink
 URIs differing (Part 2, *One router, many hosts*). It is tailored to a router box (a webhook daemon +
-Caddy, no database) and has three load-bearing properties:
+Caddy, no database) and has four load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
    (the argv leak path) and from Vector itself (the self-logged-token path), **deletes the
@@ -1675,6 +1675,25 @@ Caddy, no database) and has three load-bearing properties:
    the chmod-640 `/etc/vector/betterstack.env`, supplied to `vector.service` by the systemd drop-in
    [`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`](systemd/vector.service.d/10-ai-betterstack-env.conf).
    The secret lives in exactly one place; a rotation is a one-line swap of that file + a restart.
+4. **`opentelemetry` (`ai_otel`) → `ai_otel_llm` → `ai_scrub` → logs sink** (basecradle-router#380).
+   The Claude Code builders on the box export one OpenTelemetry log event per model call (the NOC's
+   managed-settings file turns it on and names each builder, basecradle-noc#1179). The source
+   listens on **`127.0.0.1:4318`** (OTLP http; the required gRPC listener is `127.0.0.1:4317` and
+   has no sender), localhost only. `ai_otel_llm` renders a `claude_code.api_request` event as the
+   fleet's own `llm` line, the harness telemetry contract's head and fields, so every existing
+   Better Stack column reads a builder's model calls with no change. It **rebuilds the event from
+   scratch**: the slug, the model id, the request id and every number are checked first, and nothing
+   else Claude Code attaches (session, user and account ids, the prompt id) survives; a render that
+   fails is dropped, never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like
+   a journald record, which redacts it and adds the `[basecradle-wake-<slug>]` prefix. Every other
+   Claude Code event is dropped, `claude_code.api_error` included: the contract writes no `llm` line
+   for a brain call that raised, so a builder's final model-call failure is not on the board, and
+   every call is `purpose=main`, auxiliary ones included, since a `helper` line needs a `kind` and
+   an `outcome` Claude Code does not state (both the capital's rulings on #380; the contract
+   questions they leave are in basecradle/basecradle#726). The port is **not authenticated**: any
+   local account can send to it under any agent's name, and nothing records who did.
+   `tests/vector/ai_otel_llm.yaml` asserts the exact shipped bytes, run by `vector test` on the
+   boxes' Vector release in CI.
 
 **Never pass a secret as a command-line argument** (to `sudo`, `bash -s`, anything) — sudo/PAM logs
 the whole command line to the journal, and on a telemetry box that ships it. Pass secrets via

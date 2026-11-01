@@ -30,6 +30,9 @@
 #   * internal_metrics — Vector's OWN health counters (basecradle-noc#215), exposed on a localhost-only
 #                        prometheus endpoint and PULLED out-of-band by the NOC. Never shipped to Better
 #                        Stack: a broken transport cannot ship the metric that says it is broken.
+#   * opentelemetry    — the Claude Code builders' model calls (basecradle-router#380), received on
+#                        localhost and rendered by `ai_otel_llm` as the fleet's own `llm` line, so the
+#                        builders land on the same board as every harness agent.
 #
 # SECURITY — never ship raw journald to an external store (basecradle-noc#33 / basecradle#338).
 # The `ai_scrub` transform runs before the logs sink and:
@@ -97,11 +100,32 @@ sources:
     type: "internal_metrics"
     scrape_interval_secs: 30
 
+  # Claude Code's OpenTelemetry export (basecradle-router#380). The two Claude Code builders on this
+  # box send one log event per model call over OTLP http/protobuf, to the endpoint the NOC's
+  # managed-settings file names (basecradle-noc#1179). Only the `logs` output is consumed: the NOC
+  # turns metrics export off, and anything arriving on `metrics` or `traces` is discarded here.
+  #
+  # BOUND TO 127.0.0.1 — the senders are local processes, and nothing off-box may write lines into
+  # this box's log store. The gRPC listener is required by the source's schema and has no sender.
+  # It is NOT an authenticated channel: any local account can reach the port and name any agent
+  # in `basecradle.agent`, and OTLP over TCP carries no sender credential, so a line from here has
+  # no kernel-attested sender the way a journald record has `_UID`. What this path ships is what
+  # the box's local accounts choose to send, attributed as the sender claims.
+  ai_otel:
+    type: "opentelemetry"
+    grpc:
+      address: "127.0.0.1:4317"
+    http:
+      address: "127.0.0.1:4318"
+
 transforms:
   ai_scrub:
     type: "remap"
     inputs:
       - "ai_journald"
+      # The Claude Code builders' rendered `llm` line, so that it gets the same redaction and the
+      # same `[identifier]` prefix as every journald line, from the one place that applies them.
+      - "ai_otel_llm"
     drop_on_abort: true
     reroute_dropped: false
     source: |
@@ -175,6 +199,152 @@ transforms:
       # Better Stack reads the event timestamp from `dt` (mirrors the generated log parser).
       del(.source_type)
       .dt = del(.timestamp)
+
+  # A Claude Code model call, rendered as the fleet's `llm` line (basecradle-router#380). The grammar
+  # is the harness's telemetry contract (basecradle-harness docs/telemetry.md, Model Calls), and
+  # this transform writes the contract's line and NOTHING else: contract heads, contract fields,
+  # contract meanings, in the harness's field order, so every Better Stack column and chart that
+  # reads a harness agent's `llm` line reads a builder's with no change.
+  #
+  # NOTHING FROM THE INPUT EVENT SHIPS AS-IS. The event is rebuilt from scratch, out of values
+  # checked here: the slug and the model id against a fixed charset, the request id against
+  # another, every count as a non-negative integer, the cost as a finite non-negative number. A
+  # Claude Code event also carries the session, user and account identifiers, the prompt id and
+  # the terminal type; none of them is a contract field, so none of them reaches the sink. The
+  # rebuilt line then passes through `ai_scrub` like every journald line: a charset admits a
+  # key-shaped value, so the redaction still applies, and `ai_scrub` adds the
+  # `[basecradle-wake-<slug>]` prefix from the identifier set here.
+  #
+  # `drop_on_error` as well as `drop_on_abort`: on a runtime error a remap otherwise forwards the
+  # ORIGINAL event, every identifier above included. A failure here drops the event, never ships it.
+  #
+  # ONLY `claude_code.api_request` IS RENDERED. Every other Claude Code event (a prompt, a tool
+  # result, a plugin load) is dropped whole.
+  #
+  # A KNOWN MISFIT: `claude_code.api_error` IS DROPPED (the capital's ruling, basecradle-router#380).
+  # Claude Code sends it once, after its own retries are exhausted, with `model`, `error`,
+  # `status_code`, `duration_ms`, `attempt`, `request_id` and `query_source`. The contract has no
+  # line for it: `llm` writes none for a brain call that raised ("the wake's failure lines carry
+  # it"), `llm retry` is only for an attempt about to be retried, `outcome=fallback` only for a
+  # non-brain caller, and the wake-failure heads need a timeline a builder session does not have.
+  # So a builder's final model-call failure is not on the board today. The head it needs is a
+  # contract question in the fleet's telemetry audit (basecradle/basecradle#726), never invented
+  # here.
+  #
+  # The numbers mirror the harness's own formatting (`_observability` and `_anthropic` there):
+  #   * tokens_in is the whole prompt, input + cache read + cache write, because Claude Code's
+  #     `input_tokens` excludes both cache parts; tokens_total is exactly tokens_in + tokens_out;
+  #   * cached_tokens is written whenever the cache read is reported, zero included, and
+  #     cache_write_tokens only when it is non-zero, as the Anthropic adapter writes them;
+  #   * a usage block of nothing but zeros is not usage: no token field is written, and no cost
+  #     unless a non-zero one was stated;
+  #   * duration is seconds to two decimals, and cost is fixed-point dollars to at most eight
+  #     decimals with trailing zeros trimmed. Both are built with integer arithmetic, because VRL's
+  #     format_number truncates instead of rounding (1.508 renders 1.50).
+  # `cost_basis=computed` because Claude Code's figure is arithmetic over a published rate, which is
+  # what that value means (the capital's call).
+  #
+  # EVERY CALL IS `purpose=main`, `auxiliary` included (the capital's ruling, basecradle-router#380).
+  # `helper` would be closer, but the contract leaves `kind` and `outcome` out only on `main`, and
+  # Claude Code states neither: no `kind` in the contract's vocabulary, and no usable-or-fallback
+  # judgment. A `helper` line without them would be outside the contract. The cost is one series: a
+  # builder's auxiliary spend folds into its main spend. A `kind` for Claude Code's auxiliary calls
+  # is a contract question in the same audit (basecradle/basecradle#726).
+  #
+  # Every regex below ends on the end-of-text anchor `\z`, never the usual end-of-line one: that one
+  # is the dollar sign, which Vector would interpolate (see the header).
+  ai_otel_llm:
+    type: "remap"
+    inputs:
+      - "ai_otel.logs"
+    drop_on_abort: true
+    drop_on_error: true
+    reroute_dropped: false
+    source: |
+      if .message != "claude_code.api_request" { abort }
+      attrs = object(.attributes) ?? {}
+      resources = object(.resources) ?? {}
+      # The agent is named by the NOC's per-builder resource attribute and nothing else, and it
+      # becomes part of a journald identifier: a slug, or no line at all.
+      slug = string(resources."basecradle.agent") ?? ""
+      if !match(slug, r'^[a-z0-9-]{1,64}\z') { abort }
+      # The contract never omits `model`, and the value is written bare: a model id, or no line.
+      model = string(attrs.model) ?? ""
+      if !match(model, r'^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\z') { abort }
+      # Claude Code may send a counter as a string; either way it is a non-negative integer below
+      # 10^18 or it was not stated. The bound keeps every sum below the integer ceiling, where VRL
+      # arithmetic would wrap negative.
+      n = map_values({
+        "uncached": attrs.input_tokens,
+        "output": attrs.output_tokens,
+        "read": attrs.cache_read_tokens,
+        "written": attrs.cache_creation_tokens,
+        "ms": attrs.duration_ms,
+      }) -> |value| {
+        if is_integer(value) && int!(value) >= 0 && int!(value) < 1000000000000000000 {
+          value
+        } else if is_string(value) && match(string!(value), r'^[0-9]{1,18}\z') {
+          to_int!(value)
+        } else {
+          null
+        }
+      }
+      line = "llm provider=anthropic purpose=main model=" + model
+      if n.ms != null {
+        centis = to_int(round(int!(n.ms) / 10))
+        line = line + " duration=" + to_string(to_int((centis - mod(centis, 100)) / 100))
+        line = line + "." + slice!(to_string(mod(centis, 100) + 100), 1) + "s"
+      }
+      usage_stated = n.uncached != null || n.output != null
+      usage_reported = false
+      if usage_stated {
+        written = 0
+        if n.written != null { written = int!(n.written) }
+        read = 0
+        if n.read != null { read = int!(n.read) }
+        tokens_in = written + read
+        if n.uncached != null { tokens_in = tokens_in + int!(n.uncached) }
+        tokens_out = 0
+        if n.output != null { tokens_out = int!(n.output) }
+        usage_reported = tokens_in != 0 || tokens_out != 0
+        if usage_reported {
+          line = line + " tokens_in=" + to_string(tokens_in) + " tokens_out=" + to_string(tokens_out)
+          line = line + " tokens_total=" + to_string(tokens_in + tokens_out)
+          if n.read != null { line = line + " cached_tokens=" + to_string(read) }
+          if written != 0 { line = line + " cache_write_tokens=" + to_string(written) }
+        }
+      }
+      cost = attrs.cost_usd
+      if is_string(cost) && match(string!(cost), r'^[0-9]{1,9}(\.[0-9]{1,20})?\z') {
+        cost = to_float!(cost)
+      }
+      # The upper bound is the guard against a non-finite figure: NaN and infinity both fail it.
+      if (is_float(cost) || is_integer(cost)) && to_float!(cost) >= 0 && to_float!(cost) < 1000000000 {
+        # In hundred-millionths of a dollar: the harness renders cost to eight decimals.
+        units = to_int(round(to_float!(cost) * 100000000))
+        if units != 0 || !usage_stated || usage_reported {
+          fraction = slice!(to_string(mod(units, 100000000) + 100000000), 1)
+          fraction = replace(fraction, r'0+\z', "")
+          money = to_string(to_int((units - mod(units, 100000000)) / 100000000))
+          if fraction != "" { money = money + "." + fraction }
+          line = line + " cost=" + money + " cost_basis=computed"
+        }
+      }
+      request_id = string(attrs.request_id) ?? ""
+      if match(request_id, r'^[A-Za-z0-9_-]{1,128}\z') {
+        line = line + " generation_id=" + request_id
+      }
+      at = .timestamp
+      if at == null { at = .observed_timestamp }
+      if at == null { at = now() }
+      # The shape of a journald record, as `ai_scrub` reads one: it prefixes the message with
+      # SYSLOG_IDENTIFIER and moves `timestamp` to Better Stack's `dt`.
+      . = {
+        "message": "INFO " + line,
+        "SYSLOG_IDENTIFIER": "basecradle-wake-" + slug,
+        "host": get_hostname!(),
+        "timestamp": at,
+      }
 
 sinks:
   better_stack_logs:
