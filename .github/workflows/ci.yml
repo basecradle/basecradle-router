@@ -72,5 +72,21 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
+      # THE BOXES' VECTOR (#380). tests/test_vector_otel_llm.py runs the shipped vector.yaml's
+      # VRL through `vector test`, so it must run on the release the boxes install
+      # (deploy/README → VECTOR_VERSION, which that test holds this pin to). The same .deb the
+      # boxes install, checksum-verified, and only unpacked: no service, no root, nothing on
+      # PATH but this job's own copy.
+      - name: Install Vector
+        env:
+          VECTOR_VERSION: "0.56.0"
+          VECTOR_DEB_SHA256: "15978ce37ea17e8228bfd7ce28810237c06b77fdeb6943d8aa3de834cb19d4b1"
+        run: |
+          deb="$RUNNER_TEMP/vector.deb"
+          curl -fsSL -o "$deb" "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb"
+          echo "${VECTOR_DEB_SHA256}  $deb" | sha256sum -c -
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/vector"
+          echo "VECTOR_BIN=$RUNNER_TEMP/vector/usr/bin/vector" >> "$GITHUB_ENV"
+
       - name: Test
         run: uv run pytest
