@@ -219,10 +219,17 @@ transforms:
   # ORIGINAL event, every identifier above included. A failure here drops the event, never ships it.
   #
   # ONLY `claude_code.api_request` IS RENDERED. Every other Claude Code event (a prompt, a tool
-  # result, a plugin load) is dropped whole. `claude_code.api_error` is dropped too, for now: the
-  # contract writes no `llm` line for a brain call that raised, and its wake-failure heads need a
-  # timeline that a builder session does not have. The capital's ruling on that misfit is on
-  # basecradle-router#380.
+  # result, a plugin load) is dropped whole.
+  #
+  # A KNOWN MISFIT: `claude_code.api_error` IS DROPPED (the capital's ruling, basecradle-router#380).
+  # Claude Code sends it once, after its own retries are exhausted, with `model`, `error`,
+  # `status_code`, `duration_ms`, `attempt`, `request_id` and `query_source`. The contract has no
+  # line for it: `llm` writes none for a brain call that raised ("the wake's failure lines carry
+  # it"), `llm retry` is only for an attempt about to be retried, `outcome=fallback` only for a
+  # non-brain caller, and the wake-failure heads need a timeline a builder session does not have.
+  # So a builder's final model-call failure is not on the board today. The head it needs is a
+  # contract question in the fleet's telemetry audit (basecradle/basecradle#726), never invented
+  # here.
   #
   # The numbers mirror the harness's own formatting (`_observability` and `_anthropic` there):
   #   * tokens_in is the whole prompt, input + cache read + cache write, because Claude Code's
@@ -235,8 +242,14 @@ transforms:
   #     decimals with trailing zeros trimmed. Both are built with integer arithmetic, because VRL's
   #     format_number truncates instead of rounding (1.508 renders 1.50).
   # `cost_basis=computed` because Claude Code's figure is arithmetic over a published rate, which is
-  # what that value means (the capital's call). A `query_source` of `auxiliary` is `purpose=helper`;
-  # every other value (`main`, `subagent`, `sdk`) is the builder's own work, `purpose=main`.
+  # what that value means (the capital's call).
+  #
+  # EVERY CALL IS `purpose=main`, `auxiliary` included (the capital's ruling, basecradle-router#380).
+  # `helper` would be closer, but the contract leaves `kind` and `outcome` out only on `main`, and
+  # Claude Code states neither: no `kind` in the contract's vocabulary, and no usable-or-fallback
+  # judgment. A `helper` line without them would be outside the contract. The cost is one series: a
+  # builder's auxiliary spend folds into its main spend. A `kind` for Claude Code's auxiliary calls
+  # is a contract question in the same audit (basecradle/basecradle#726).
   #
   # Every regex below ends on the end-of-text anchor `\z`, never the usual end-of-line one: that one
   # is the dollar sign, which Vector would interpolate (see the header).
@@ -276,9 +289,7 @@ transforms:
           null
         }
       }
-      purpose = "main"
-      if attrs.query_source == "auxiliary" { purpose = "helper" }
-      line = "llm provider=anthropic purpose=" + purpose + " model=" + model
+      line = "llm provider=anthropic purpose=main model=" + model
       if n.ms != null {
         centis = to_int(round(int!(n.ms) / 10))
         line = line + " duration=" + to_string(to_int((centis - mod(centis, 100)) / 100))

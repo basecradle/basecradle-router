@@ -1686,8 +1686,11 @@ Caddy, no database) and has four load-bearing properties:
    else Claude Code attaches (session, user and account ids, the prompt id) survives; a render that
    fails is dropped, never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like
    a journald record, which redacts it and adds the `[basecradle-wake-<slug>]` prefix. Every other
-   Claude Code event is dropped, `claude_code.api_error` included (the contract writes no `llm` line
-   for a brain call that raised; ruling pending on #380). The port is **not authenticated**: any
+   Claude Code event is dropped, `claude_code.api_error` included: the contract writes no `llm` line
+   for a brain call that raised, so a builder's final model-call failure is not on the board, and
+   every call is `purpose=main`, auxiliary ones included, since a `helper` line needs a `kind` and
+   an `outcome` Claude Code does not state (both the capital's rulings on #380; the contract
+   questions they leave are in basecradle/basecradle#726). The port is **not authenticated**: any
    local account can send to it under any agent's name, and nothing records who did.
    `tests/vector/ai_otel_llm.yaml` asserts the exact shipped bytes, run by `vector test` on the
    boxes' Vector release in CI.

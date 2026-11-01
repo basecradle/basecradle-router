@@ -75,7 +75,7 @@ tests:
               # The whole event is these four fields: no attribute, resource or scope survives.
               assert_eq!(keys(.), ["SYSLOG_IDENTIFIER", "dt", "host", "message"])
 
-  - name: "an auxiliary call is a helper, string counters are read, and a zero cache write is omitted"
+  - name: "an auxiliary call is main, string counters are read, and a zero cache write is omitted"
     inputs:
       - insert_at: "ai_otel_llm"
         type: "vrl"
@@ -101,7 +101,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=helper model=claude-haiku-5-5 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=0 cost=0.0445 cost_basis=computed generation_id=req_011CgcFabricatedNova0002")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-haiku-5-5 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=0 cost=0.0445 cost_basis=computed generation_id=req_011CgcFabricatedNova0002")
 
   - name: "a subagent or sdk call is the builder's own work"
     inputs:
