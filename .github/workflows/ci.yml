@@ -72,7 +72,7 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
-      # THE BOXES' VECTOR (#380). tests/test_vector_otel_llm.py runs the shipped vector.yaml's
+      # THE BOXES' VECTOR (#380). tests/test_vector_unit.py runs the shipped vector.yaml's
       # VRL through `vector test`, so it must run on the release the boxes install
       # (deploy/README → VECTOR_VERSION, which that test holds this pin to). The same .deb the
       # boxes install, checksum-verified, and only unpacked: no service, no root, nothing on
