@@ -246,8 +246,16 @@ transforms:
   #   * `attempt` is a count with no total, and the contract spells it `n/total`, so it is left off;
   #   * the error text rides as `detail`, never `error`, because `detail` is the field that explains
   #     `reason` on an `llm` line.
-  # The slug is read off `status_code`, as ruled on #782: 429 is `rate_limited`, 504 is `timeout`,
-  # any other 5xx is `server_error`, and anything else, a missing code included, is `api_error`.
+  # The slug is the contract's own, row for row from its one Fault Slugs table (basecradle-harness
+  # `docs/telemetry.md`, read at 9c574c4, basecradle-harness#786), so a builder's failure and a
+  # harness agent's count in one series; the table is the reference, never this comment. It is read
+  # off `status_code`, and the key's ABSENCE is the no-HTTP-answer row. Two kinds of call send none
+  # (measured on Claude Code 2.1.317 against loopback): a connection that failed (`Connection
+  # error.`), which is `transport`, and one that ran out of Claude Code's own deadline (`Request
+  # timed out.`), which the contract names `timeout`, never `transport`. That is the one place the
+  # error text is read, and only as an exact match on the SDK's own message, which no vendor wrote
+  # because none answered; a message that changes falls back to `transport`. A status that came
+  # back unreadable is still an answer: `api_error`, the any-other-status row.
   #
   # A FAILED LINE IS WARNING, NEVER ERROR. The NOC's Error on AI Server alert pages on any ERROR
   # line under a `basecradle-wake-` identifier, so ERROR would make a builder's failed call a page,
@@ -331,19 +339,33 @@ transforms:
         }
       }
       line = "llm provider=anthropic purpose=" + purpose + " model=" + model
+      # A status, readable or not, means Anthropic answered; none at all means it never did.
+      answered = attrs.status_code != null
       # A failed call's time is its last attempt's, so it is the call's whole wait only when the
       # call made one attempt and that attempt reached Anthropic (a status came back; see above).
-      if n.ms != null && (!failed || (n.attempt == 1 && n.status != null)) {
+      if n.ms != null && (!failed || (n.attempt == 1 && answered)) {
         centis = to_int(round(int!(n.ms) / 10))
         line = line + " duration=" + to_string(to_int((centis - mod(centis, 100)) / 100))
         line = line + "." + slice!(to_string(mod(centis, 100) + 100), 1) + "s"
       }
       if failed {
         # A decision line: no tokens and no cost.
+        # The contract's Fault Slugs table, row for row (see above).
         reason = "api_error"
-        if n.status != null {
+        if !answered {
+          reason = "transport"
+          if attrs.error == "Request timed out." { reason = "timeout" }
+        } else if n.status != null {
           code = int!(n.status)
-          if code == 429 {
+          if code == 401 || code == 403 {
+            reason = "config:auth"
+          } else if code == 402 {
+            reason = "config:billing"
+          } else if code == 404 {
+            reason = "config:model_not_found"
+          } else if code == 413 {
+            reason = "payload_too_large"
+          } else if code == 429 {
             reason = "rate_limited"
           } else if code == 504 {
             reason = "timeout"

@@ -5,7 +5,8 @@
 #
 # Every input is a fabricated event in the exact shape Vector 0.56.0's `opentelemetry` source emits
 # for a real Claude Code model call (2.1.316, captured 2026-11-01; `api_error` and
-# `api_retries_exhausted` from 2.1.317, captured 2026-11-03): the body is `.message`, the
+# `api_retries_exhausted` from 2.1.317, captured 2026-11-03; the status-less connection failure and
+# deadline from 2.1.317, captured 2026-11-03 against loopback): the body is `.message`, the
 # per-call fields are `.attributes`, and the NOC's `basecradle.agent` rides in `.resources`. The
 # identifiers Claude Code attaches (session, user, account, prompt, terminal) are carried here as
 # fabricated values on purpose, so the tests can prove that none of them ships.
@@ -221,8 +222,9 @@ tests:
           - type: "vrl"
             source: |
               # A decision line: WARNING, no tokens, no cost, no attempt. One attempt that reached
-              # Anthropic, so its time is the whole wait and is written.
-              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.32s outcome=failed reason=api_error detail=\"model: claude-opus-5-5\" generation_id=req_011CgcFabricatedNova0004")
+              # Anthropic, so its time is the whole wait and is written. A 404 is the contract's
+              # `config:model_not_found` (Fault Slugs, basecradle-harness#786).
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.32s outcome=failed reason=config:model_not_found detail=\"model: claude-opus-5-5\" generation_id=req_011CgcFabricatedNova0004")
               assert_eq!(.dt, t'2026-11-01T10:26:00.317Z')
               assert_eq!(keys(.), ["SYSLOG_IDENTIFIER", "dt", "host", "message"])
 
@@ -295,7 +297,7 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=timeout detail=\"Gateway Timeout\"")
 
-  - name: "a connection failure has no status, no request id and no duration, and is api_error"
+  - name: "a connection failure has no status, no request id and no duration, and is transport"
     inputs:
       - insert_at: "ai_otel_llm"
         type: "vrl"
@@ -317,9 +319,9 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-haiku-5-5 outcome=failed reason=api_error detail=\"Connection error.\"")
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-haiku-5-5 outcome=failed reason=transport detail=\"Connection error.\"")
 
-  - name: "a status that is not a number is api_error"
+  - name: "a status that came back unreadable is api_error, never transport"
     inputs:
       - insert_at: "ai_otel_llm"
         type: "vrl"
@@ -356,6 +358,188 @@ tests:
             source: |
               # No error text: no detail, never an empty one.
               assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error")
+
+  - name: "a 404 is config:model_not_found"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Not Found", "status_code": 404, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:56Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=config:model_not_found detail=\"Not Found\"")
+
+  - name: "a call that ran out of Claude Code's own deadline is timeout, never transport, with no duration"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Request timed out.", "duration_ms": 2007, "attempt": 1, "query_source": "sdk"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:57Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # Measured on Claude Code 2.1.317 against a loopback listener that never answered: no
+              # status and no request id. Nothing answered, so its time is not stated as the call's.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=timeout detail=\"Request timed out.\"")
+
+  - name: "a status-less message that is not the SDK's own timeout text is transport"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "request timed out", "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:58Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=transport detail=\"request timed out\"")
+
+  - name: "a status sent as null is no answer: transport"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Connection error.", "status_code": null, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:59Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=transport detail=\"Connection error.\"")
+
+  - name: "an empty status came back unreadable: api_error, never transport"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "status_code": "", "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:00Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error")
+
+  - name: "an unreadable status is still an answer, so a one-attempt call keeps its duration"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "status_code": "5xx", "duration_ms": 1234, "attempt": 1, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:01Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 duration=1.23s outcome=failed reason=api_error")
+
+  - name: "a 401 is config:auth"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "invalid x-api-key", "status_code": 401, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:52Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=config:auth detail=\"invalid x-api-key\"")
+
+  - name: "a 403 is config:auth"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Forbidden request", "status_code": 403, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:53Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=config:auth detail=\"Forbidden request\"")
+
+  - name: "a 402 is config:billing"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Payment Required", "status_code": 402, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:54Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=config:billing detail=\"Payment Required\"")
+
+  - name: "a 413 is payload_too_large"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Request Too Large", "status_code": 413, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:55Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=payload_too_large detail=\"Request Too Large\"")
 
   - name: "foreign error text is flattened, quoted, and redacted, and cannot forge a field"
     inputs:
