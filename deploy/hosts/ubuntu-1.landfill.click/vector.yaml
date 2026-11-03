@@ -153,7 +153,7 @@ transforms:
       #
       # TWO PASSES, IN THIS ORDER, AND ONE WORD RULE (basecradle-router#398). Both are the harness's:
       # the one definition is basecradle-harness docs/telemetry.md → Credential Scrubbing
-      # (`_observability.scrub` and `_is_word`, harness 0.176.0). This copy follows it and never
+      # (`_observability.scrub` and `_is_word`, harness 0.177.0). This copy follows it and never
       # varies it. What differs here is only the box's rule set (a subset of the harness's shapes:
       # the harness is the superset by design), its minimums and its labels.
       #   1. The rules anchored on a literal of their own: a heartbeat URL, an `api_key=` assignment
@@ -175,6 +175,14 @@ transforms:
       #     the host before `/heartbeat/` stays, as it does in the harness, since it is not the
       #     secret. First, because the bearer rule's token class takes a scheme's `https`, which
       #     would leave the rest of the URL, userinfo included, to the scheme-less arm alone.
+      #     The match runs to the end of the space-free run, and a bearer scheme word ending that
+      #     run is put back for the bearer rule (basecradle-router#402, the harness's
+      #     `_TRAILING_BEARER`): taken with the URL, the word left its token in the next run, which
+      #     no rule matched, so compact JSON (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query
+      #     value (`…&access_token=Bearer eyJ…`) shipped the token. Only a word not glued to a
+      #     letter or digit is put back, so a secret whose last letters merely spell it
+      #     (`…/heartbeat/K9xbearer`) is redacted whole. The word is put back as captured, so what
+      #     ships is only ever the word the pattern matched.
       #   * The assignment rule before the bearer rule. The bearer rule's token class takes an
       #     assignment's name and its `=`, so with bearer first, `Bearer api_key=SECRET` lost
       #     `api_key=` into a bearer value and the secret shipped. The assignment rule takes every
@@ -183,7 +191,10 @@ transforms:
       #   * The bearer rule takes EVERY scheme word before the token, as the harness's does: a token
       #     stored with its scheme and sent with another reads `Bearer Bearer eyJ…`, and one scheme
       #     word taken alone is the value, leaving the token.
-      msg = replace(msg, r'(?:https?://\S*)?/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
+      msg = replace_with(msg, r'(?:https?://\S*)?/heartbeat/\S+') -> |url| {
+          kept = parse_regex(url.string, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}
+          "[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "")
+      }
       # Any `apiKey=` value, whatever it looks like. A Steel (steel.dev) launcher, the browser backend
       # behind Playwright MCP (basecradle/basecradle#582, basecradle-noc#797), puts its key in the
       # `apiKey=` query parameter of its wss://connect.steel.dev URL, and this catches that shape
@@ -192,9 +203,10 @@ transforms:
       # `NAME_apiKey=[REDACTED]`: the name is normalised, the value never ships. The launcher already
       # redacts the exact key from what it forwards to the harness; this is the journald layer.
       #
-      # Every replacement is a fixed string on purpose: a capture-group back-reference needs a dollar
-      # sign, which Vector interpolates (see the header), and no pattern carries a single quote,
-      # which would close the raw string.
+      # Every replacement is built from fixed strings on purpose, and the two closures put back only
+      # what they captured: a capture-group back-reference needs a dollar sign, which Vector
+      # interpolates (see the header), and no pattern carries a single quote, which would close the
+      # raw string.
       msg = replace(msg, r'(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+', "apiKey=[REDACTED]")
       msg = replace(msg, r'(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is

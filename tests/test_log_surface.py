@@ -162,13 +162,27 @@ def test_provider_api_keys_are_redacted() -> None:
     assert r"r8_(?P<r8>[A-Za-z0-9]{20,})" in source
 
 
-# One `msg = replace(msg, r'…', "…")` statement, in the only shape this file may carry: a raw
+# One `msg = replace(msg, r'…', "…")` statement, the shape every fixed rule carries (the two
+# closures, the heartbeat rule and the prefix pass, are pinned on their own): a raw
 # string with no single quote inside it (one would close it early), and a fixed replacement
 # with no dollar sign (a capture-group back-reference needs one, and Vector interpolates every
 # dollar sign in the file before parsing it — basecradle-router#305).
 _REPLACE = re.compile(
     r"""^ *msg = replace\(msg, r'(?P<pattern>[^']*)', "(?P<replacement>[^"$]*)"\)$"""
 )
+
+
+_HEARTBEAT_PASS = r"msg = replace_with(msg, r'(?:https?://\S*)?/heartbeat/\S+') -> |url| {"
+
+# The heartbeat rule's whole closure (basecradle-router#402), pinned offline because the `vector
+# test` suite that asserts its bytes runs only on the boxes' Vector release. It returns fixed
+# strings and nothing of the match but the one captured bearer word, so no part of the URL can ship.
+_HEARTBEAT_CLOSURE = [
+    _HEARTBEAT_PASS,
+    r"kept = parse_regex(url.string, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}",
+    r'"[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "")',
+    "}",
+]
 
 
 def _statements(source: str) -> list[str]:
@@ -197,15 +211,23 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
         line.strip() for line in _scrub_source().splitlines() if re.match(r"^ *msg *=", line)
     ]
     assert assignments[-1].startswith(_PREFIX_PASS), assignments
-    for line in literal:
-        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
-    patterns = [_REPLACE.match(line).group("pattern") for line in literal]
     # The heartbeat URL, then the assignment, then bearer: the bearer rule's token class takes a
     # URL's `https` and an assignment's `api_key=`. After it, a heartbeat URL would keep its
     # userinfo out of the redaction, and an assignment would ship its secret. The assignment takes
     # every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
+    #
+    # The heartbeat rule is the one closure in the pass (basecradle-router#402): it puts back a
+    # bearer word ending its run, so the bearer rule still takes the word and its token. Its
+    # pattern is pinned here; what it returns is pinned by the `vector test` suite, which asserts
+    # the shipped bytes. The other two are fixed `replace`s in the one safe shape.
+    assert literal[0] == _HEARTBEAT_PASS, f"pass 1 must open with the heartbeat rule: {literal!r}"
+    lines = [line.strip() for line in _scrub_source().splitlines()]
+    start = lines.index(_HEARTBEAT_PASS)
+    assert lines[start : start + len(_HEARTBEAT_CLOSURE)] == _HEARTBEAT_CLOSURE
+    for line in literal[1:]:
+        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
+    patterns = [_REPLACE.match(line).group("pattern") for line in literal[1:]]
     assert patterns == [
-        r"(?:https?://\S*)?/heartbeat/\S+",
         r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""",
         r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
     ]
