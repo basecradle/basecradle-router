@@ -121,9 +121,9 @@ def _render_value(value: object) -> str:
 
     1. **Flatten.** Every run of whitespace becomes one space, trimmed at both ends, so
        a record stays one line. A control character that is not whitespace (an escape,
-       a NUL) becomes a space first, as the remap's ``\\p{Cc}`` does — the one place
-       both router renderers go past the harness's ``_value``, which leaves it in, and
-       what keeps a value from painting the line outside :func:`paint`.
+       a NUL) becomes a space first, as the remap's ``\\p{Cc}`` and the harness's
+       ``_flatten`` do (harness 0.177.0, so the fleet's three renderers flatten the
+       same bytes) — what keeps a value from painting the line outside :func:`paint`.
     2. **Quote** a value holding a space, an ``=`` or a double quote, so it reads as
        *one* value rather than as extra fields — and turn its own ``"`` into ``'``.
 

@@ -1735,7 +1735,7 @@ Caddy, no database) and has four load-bearing properties:
    redaction shape are NOC's `noc_scrub` plus these additions; do not weaken them.
    **The redaction runs in two passes, in this order, with one word rule** (basecradle-router#398).
    The one definition of both is the harness's: basecradle-harness `docs/telemetry.md` → Credential
-   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.176.0). `ai_scrub` follows it and
+   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.177.0). `ai_scrub` follows it and
    never varies it; only the box's rules (a subset of the harness's shapes), minimum lengths and labels differ.
    - **Pass 1, the literal rules** — the heartbeat URL, then `api[-_]?key=`, then bearer — each
      redacted wherever it matches. They go first because a prefix rule's run is made of the
@@ -1745,7 +1745,12 @@ Caddy, no database) and has four load-bearing properties:
      (`curl uptime.betterstack.com/api/v1/heartbeat/SECRET`) is redacted too, its host left in place
      since it is not the secret. A URL with a scheme is still taken from the scheme on, so userinfo
      (`https://john:…@host/…`) never ships, and the rule runs first because the bearer rule's token
-     class takes a scheme's `https`. Inside the pass the rules run one after another (the harness's
+     class takes a scheme's `https`. Its match runs to the end of the space-free run, and a bearer
+     scheme word ending that run, not glued to a letter or digit, is put back for the bearer rule
+     (basecradle-router#402, the harness's `_TRAILING_BEARER`): taken with the URL, the word left
+     its token in the next run, which no rule matched, so compact JSON
+     (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query value (`…&access_token=Bearer eyJ…`)
+     shipped the token. Inside the pass the rules run one after another (the harness's
      are one alternation), so their order is load-bearing: the bearer rule's token class takes an
      assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`
      ships its secret. The assignment rule takes every bearer scheme in its value, as the harness's

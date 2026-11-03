@@ -5,7 +5,7 @@
 #
 # The rule under test is the harness's: two passes, literal rules then prefix rules, and a prefixed
 # match kept only when `_is_word` reads it as a word (basecradle-harness docs/telemetry.md →
-# Credential Scrubbing, harness 0.176.0). The samples are the harness's own (its
+# Credential Scrubbing, harness 0.177.0). The samples are the harness's own (its
 # tests/test_log_value_cut.py), lengthened to the box's minimums where the harness's are shorter:
 # the box's `sk-` run needs 16 characters where the harness's needs 8, so `task-specification`, whose
 # run is 13, never met the box's rule at all, and the long forms below are the ones that did.
@@ -134,6 +134,106 @@ tests:
           # Anchored on `/heartbeat/` alone, the rule would keep everything before it, the password
           # in the userinfo included. A URL with a scheme is taken from the scheme on.
           . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://john:hunter2Secret@uptime.example.com/api/v1/heartbeat/SECRETabc123 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
+
+  # --- a bearer word ending a heartbeat run is kept for the bearer rule (basecradle-router#402) ---
+
+  - name: "a bearer word ending a heartbeat run in compact json redacts its token"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The heartbeat match runs to the end of the space-free run, which ends in `Bearer`. Taken
+          # with the URL, the word left its token in the next run, which no rule matched.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": s'{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}'}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, s'[basecradle-router] {"url":"[REDACTED_HEARTBEAT_URL]Bearer [REDACTED]"}')
+
+  - name: "a bearer word ending a heartbeat run in a query value redacts its token"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/x?token=abc/heartbeat/K9&access_token=Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+
+  - name: "a bearer word ending a heartbeat run is kept in any case"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping uptime.example.com/heartbeat/K9&auth=BEARER eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping uptime.example.com[REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+
+  - name: "a heartbeat secret glued to a bearer word is redacted whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Glued to a letter or digit, the word is the secret's own tail, never a scheme word, so
+          # it is never kept: a secret whose last letters merely spell it is redacted whole.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9xbearer failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
+
+  - name: "a doubled bearer scheme after a heartbeat run redacts the token after both"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+
+  - name: "a bearer word ending a heartbeat run at the end of the line ships as the word alone"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Nothing follows the word for the bearer rule to take, so the word is all that ships.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer")
+
+  - name: "a bearer word inside a heartbeat run, not ending it, is redacted with the url"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Only a word that ENDS the run is put back. The run's last six characters here are a
+          # secret, and a bearer word earlier in the run must never put them back.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9?auth=bearer&sig=Zq7Sec failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
