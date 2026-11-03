@@ -866,7 +866,7 @@ class GithubRoute:
             _named_issues(pull, repo),
             actor=_sender_login(data),
             note=_MERGE_NOTE.format(number=number, url=pull_url),
-            skip_line=f"event=merge_wake_skip pull_request={pull_url}",
+            skip_line=f"event=merge_wake_skip {log_fields(pull_request=pull_url)}",
             event_type=event_type,
             delivery=delivery,
             occurred_at=parse_timestamp(pull.get("merged_at")),
@@ -904,7 +904,7 @@ class GithubRoute:
             return self._ignore(event_type, delivery)  # a run on no PR into this repo
 
         run_url = run.get("html_url") if isinstance(run.get("html_url"), str) else "<unknown>"
-        skip_line = f"event=ci_wake_skip workflow_run={run_url}"
+        skip_line = f"event=ci_wake_skip {log_fields(workflow_run=run_url)}"
         known = [self._pulls.get(repo, number) for number in numbers]
         # Never a guess: a PR the ledger has not seen may be the captain's too.
         if None in known:
@@ -965,7 +965,7 @@ class GithubRoute:
         self, skip_line: str, reason: str | None, event_type: str, delivery: str | None
     ) -> None:
         """Log why the captain's own PR woke no one, then the usual ``IGNORED`` decision."""
-        logger.info("%s delivery=%s reason=%s", skip_line, delivery or "<unknown>", reason)
+        logger.info("%s %s", skip_line, log_fields(delivery=delivery or "<unknown>", reason=reason))
         return self._ignore(event_type, delivery)
 
     def _wake_event(
@@ -1056,11 +1056,12 @@ class GithubRoute:
         ``url`` is the payload's ``html_url`` as delivered, so it may be anything.
         """
         logger.info(
-            'event=do_not_work_skip issue=%s delivery=%s reason="%s wins over %s"',
-            url if isinstance(url, str) and url else "<unknown>",
-            delivery or "<unknown>",
-            DO_NOT_WORK_LABEL,
-            HANDOFF_LABEL,
+            "event=do_not_work_skip %s",
+            log_fields(
+                issue=url if isinstance(url, str) and url else "<unknown>",
+                delivery=delivery or "<unknown>",
+                reason=f"{DO_NOT_WORK_LABEL} wins over {HANDOFF_LABEL}",
+            ),
         )
         return self._ignore(event_type, delivery)
 

@@ -12,7 +12,9 @@ No model, agent, or network — this is pure string rendering.
 
 from __future__ import annotations
 
+import logging
 import re
+from pathlib import Path
 
 from basecradle_router.logfmt import (
     BLUE,
@@ -24,6 +26,7 @@ from basecradle_router.logfmt import (
     log_fields,
     paint,
 )
+from basecradle_router.routes.base import DeliveryDecision, log_delivery_decision
 
 #: Any ANSI SGR sequence — used to read a painted line the way a colour-blind
 #: consumer (a grep, an extraction regex) reads it.
@@ -65,6 +68,101 @@ def test_log_fields_renders_key_value_dropping_empties_and_quoting_spaces() -> N
     assert log_fields(error="wake of x exited 1: boom") == 'error="wake of x exited 1: boom"'
     # A newline in a value cannot break the line into two.
     assert "\n" not in log_fields(error="line one\nline two")
+
+
+#: The value the NOC's colour corpus pins as `router.stage_error_with_an_inner_quote_RESIDUAL`
+#: (basecradle-noc `tests/fixtures/colour-corpus-2026-08-18.json`): an upstream body quoting
+#: a `"`, followed by text shaped like the line's own tokens.
+_RESIDUAL_ERROR = 'upstream said " stage=wake outcome=failed duration=99999.0s'
+
+#: A fabricated, well-formed UUIDv7 delivery id.
+_DELIVERY = "019a4b3c-5d6e-7f80-9a1b-2c3d4e5f6a7b"
+
+
+def _outside_quotes(line: str) -> list[str]:
+    """The tokens a fleet consumer reads as the line's own: those preceded by an even
+    number of ``"`` — the NOC's anchoring rule (basecradle-noc#1217), applied literally."""
+    return [
+        match.group()
+        for match in re.finditer(r"\S+", line)
+        if line[: match.start()].count('"') % 2 == 0
+    ]
+
+
+def test_an_inner_double_quote_becomes_an_apostrophe_so_no_value_can_forge_a_token() -> None:
+    # #396: `json.dumps` wrote `\"`, which is still a `"` to the quote count, so the
+    # count flipped inside the value and `outcome=failed duration=99999.0s` read as the
+    # line's own. The fleet's one value rule never escapes a quote: it swaps it.
+    rendered = log_fields(delivery=_DELIVERY, error=_RESIDUAL_ERROR)
+    assert rendered == (
+        f'delivery={_DELIVERY} error="upstream said \' stage=wake outcome=failed duration=99999.0s"'
+    )
+    assert "\\" not in rendered
+    assert rendered.count('"') == 2
+    line = f"stage=verify outcome=failed {rendered}"
+    # The line's own tokens, and nothing the value carried.
+    assert _outside_quotes(line) == [
+        "stage=verify",
+        "outcome=failed",
+        f"delivery={_DELIVERY}",
+        'error="upstream',
+    ]
+
+
+def test_the_value_rule_treats_apostrophes_newlines_and_backslashes_as_the_harness_does() -> None:
+    # basecradle-harness `_observability._value`: flatten whitespace to single spaces,
+    # quote on a space, an `=` or a `"`, swap an inner `"` for `'`, and leave the rest
+    # alone — an apostrophe and a backslash are ordinary characters, never escaped.
+    assert log_fields(error="it's done") == 'error="it\'s done"'
+    assert log_fields(error="it's") == "error=it's"
+    assert log_fields(error="line one\nline two\r\n\tthree ") == 'error="line one line two three"'
+    assert log_fields(path="C:\\tmp\\x") == "path=C:\\tmp\\x"
+    assert log_fields(error="C:\\tmp\\x failed") == 'error="C:\\tmp\\x failed"'
+    assert log_fields(error='a "quoted" word') == "error=\"a 'quoted' word\""
+    assert log_fields(error='"') == 'error="\'"'
+    # An `=` alone quotes the value too, or `a=b` would read as a second field.
+    assert log_fields(error="a=b") == 'error="a=b"'
+    # A value that flattens to nothing is dropped like `""`, never logged as `key=`.
+    assert log_fields(agent="nova", error=" \n\t") == "agent=nova"
+
+
+def test_a_control_character_in_a_value_is_a_space_never_a_raw_escape() -> None:
+    # The router's `detail=` remap turns every `\p{Cc}` into a space, so this renderer
+    # does too: an escape inside a value would paint a stretch of the line, and the
+    # token-integrity rule says colour reaches a line only through `paint`.
+    assert log_fields(error="upstream\x1b[31m red\x00\x7f") == 'error="upstream [31m red"'
+    assert "\x1b" not in log_fields(error="\x1b[32moutcome=ok\x1b[0m")
+
+
+def _vrl_string(literal: str) -> str:
+    """A VRL double-quoted string literal's text, its escapes resolved (``\\u{1b}`` included)."""
+
+    def resolve(match: re.Match[str]) -> str:
+        if match[1]:
+            return chr(int(match[1], 16))
+        return {"n": "\n", "t": "\t", "r": "\r"}.get(match[2], match[2])
+
+    return re.sub(r"\\(?:u\{([0-9A-Fa-f]+)\}|(.))", resolve, literal)
+
+
+def test_log_fields_and_the_detail_remap_render_the_same_bytes() -> None:
+    # Two renderers of one rule drift unless one test reads both. The remap's case runs
+    # through the shipped VRL in tests/test_vector_otel_llm.py; this reads that case's
+    # input and expected `detail=` back out of the fixture and renders the input here.
+    fixture = (Path(__file__).parent / "vector" / "ai_otel_llm.yaml").read_text()
+    name = (
+        "a detail renders by the fleet's one value rule, byte for byte with the router's log_fields"
+    )
+    case = fixture.split(f'  - name: "{name}"', 1)[1].split("\n  - name: ", 1)[0]
+    error = re.search(r'"error": "((?:[^"\\]|\\.)*)"', case)
+    expected = re.search(r'assert_eq!\(\.message, "((?:[^"\\]|\\.)*)"\)', case)
+    assert error and expected, "the shared value-rule case is missing from the Vector fixture"
+    value = _vrl_string(error.group(1))
+    # Every class the rule treats specially is in the one shared input.
+    for char in ('"', "\\", "'", "\n", "\x1b", "\x85"):
+        assert char in value, repr(char)
+    detail = _vrl_string(expected.group(1)).split(" detail=", 1)[1]
+    assert log_fields(detail=value) == f"detail={detail}"
 
 
 def test_log_fields_renders_a_bool_lowercase_and_never_drops_false() -> None:
@@ -151,3 +249,41 @@ def test_every_painted_token_is_a_whole_key_value_pair() -> None:
         key, sep, value = token.partition("=")
         assert sep == "=" and key and value, f"{token!r} is not a key=value token"
         assert " " not in token
+
+
+# --- every value reaches a line through the renderer -------------------------
+
+
+def test_no_log_format_interpolates_a_value_after_a_key() -> None:
+    # The value rule holds only for a value that goes through `log_fields`. A format
+    # string such as `"delivery=%s"` drops a value in raw, so a `"` in it flips the
+    # fleet's quote count, and a space in it splits it into tokens (#396: the decision
+    # line's `delivery=` and `event_type=` come from unsigned request headers). A key
+    # is followed by a rendered value, never by a placeholder.
+    source = Path(__file__).resolve().parents[1] / "src" / "basecradle_router"
+    raw = re.compile(r"""[A-Za-z_]=(?:%[-#0-9.]*[sdrfi]|["']%)""")
+    offenders = [
+        f"{path.relative_to(source)}:{number}: {line.strip()}"
+        for path in sorted(source.rglob("*.py"))
+        for number, line in enumerate(path.read_text().splitlines(), start=1)
+        if raw.search(line)
+    ]
+    assert offenders == []
+
+
+def test_a_hostile_delivery_header_cannot_forge_the_decision_line(caplog) -> None:
+    # A delivery id is read from a header no signature covers, so it is a stranger's
+    # text until proven otherwise: it renders as one quoted value like any other.
+    with caplog.at_level(logging.INFO, logger="basecradle_router"):
+        log_delivery_decision(
+            "github",
+            "issues",
+            DeliveryDecision.IGNORED,
+            delivery='x" outcome=failed stage=wake',
+        )
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert line == (
+        "event=delivery_decision source=github event_type=issues decision=ignored "
+        'recipient=<unknown> delivery="x\' outcome=failed stage=wake"'
+    )
+    assert "outcome=failed" not in _outside_quotes(line)

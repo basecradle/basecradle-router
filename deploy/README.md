@@ -185,7 +185,20 @@ journalctl -t basecradle-router -n 100 --no-pager    # the daemon (as -t basecra
 journalctl -u basecradle-router -f                   # by unit — also fine; the unit and identifier agree
 ```
 
-**Every line is `key=value`.** The vocabulary, in the order one delivery produces it:
+**Every line is `key=value`**, and every value is rendered by the fleet's one value rule, defined once
+in basecradle-harness `docs/telemetry.md` → The Grammar: runs of whitespace become one space, so a
+record stays one line; a value holding a space, an `=` or a `"` is double-quoted, and its own `"`
+becomes `'` — never `\"`. A backslash is an ordinary character. The fleet's consumers anchor a token
+outside every quoted value by counting the `"` before it, so an escaped quote would flip that count and
+let a value forge a line's own fields (#396). `logfmt.log_fields` renders it, and a value reaches a
+router line only through it: `tests/test_logfmt.py` fails on any log format that drops one in after a
+key (`key=%s`). The `detail=` of `ai_otel_llm` (below) renders the same bytes, and the same file holds
+the two together. Two differences from the harness's `kv`, both deliberate: the router also turns every
+other control character (an escape, a NUL) into a space, as `ai_otel_llm` does, so no value can paint
+the line; and it does not bound a value's length, which the harness does at 240 characters (that is a
+separate job from quoting, and the router has never done it).
+
+The vocabulary, in the order one delivery produces it:
 
 | Line | Carries |
 |---|---|
@@ -1773,7 +1786,8 @@ Caddy, no database) and has four load-bearing properties:
    whether a builder's failed call pages is basecradle/basecradle#726's open question. An auxiliary
    call is `purpose=helper` with no `kind`; every other call is `purpose=main`. It **rebuilds the
    event from scratch**: the slug, the model id, the request id and every number are checked first,
-   the error text is flattened, quoted and bounded without ever cutting a credential-shaped run
+   the error text is flattened and quoted by the fleet's value rule (above), and bounded without
+   ever cutting a credential-shaped run
    short of its redaction, and nothing else Claude Code
    attaches (session, user and account ids, the prompt id) survives; a render that fails is dropped,
    never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like a journald

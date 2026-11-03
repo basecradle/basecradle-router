@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
+from basecradle_router.logfmt import log_fields
 from basecradle_router.marker import is_marker
 from basecradle_router.models import Agent, Event, WakeKind
 
@@ -93,10 +94,9 @@ def _correlation_id(event: Event) -> str | None:
     if _SAFE_DELIVERY_ID.match(event.delivery_id):
         return event.delivery_id
     logger.warning(
-        "event=unsafe_delivery_id source=%s delivery=%r; omitting %s from the wake "
+        "event=unsafe_delivery_id %s; omitting %s from the wake "
         "environment — correlation is lost for this wake, which still runs",
-        event.source,
-        event.delivery_id,
+        log_fields(source=event.source, delivery=event.delivery_id),
         DELIVERY_ID_ENV,
     )
     return None

@@ -61,7 +61,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-from basecradle_router.logfmt import paint
+from basecradle_router.logfmt import log_fields, paint
 
 logger = logging.getLogger("basecradle_router.wakelock")
 
@@ -194,32 +194,32 @@ class WakeLockGuard:
         # :mod:`basecradle_router.logfmt`.
         if state is WakeLockState.UNREADABLE:
             logger.error(
-                "%s agent=%s detail=%s",
+                "%s %s",
                 paint("event=wake_lock_unreadable"),
-                slug,
-                decision.reason,
+                log_fields(agent=slug, detail=decision.reason),
             )
         elif state is WakeLockState.HELD:
             logger.warning(
-                "%s reason=wake_lock_held agent=%s lock_reason=%s expires_at=%s",
+                "%s %s",
                 paint("event=wake_refused"),
-                slug,
-                decision.lock_reason,
-                decision.expires_at,
+                log_fields(
+                    reason="wake_lock_held",
+                    agent=slug,
+                    lock_reason=decision.lock_reason,
+                    expires_at=decision.expires_at,
+                ),
             )
         elif state is WakeLockState.STALE:
             logger.warning(
-                "%s agent=%s expires_at=%s",
+                "%s %s",
                 paint("event=wake_lock_stale"),
-                slug,
-                decision.expires_at,
+                log_fields(agent=slug, expires_at=decision.expires_at),
             )
         elif state is WakeLockState.UNPARSEABLE:
             logger.warning(
-                "%s reason=wake_lock_unparseable agent=%s detail=%s",
+                "%s %s",
                 paint("event=wake_refused"),
-                slug,
-                decision.reason,
+                log_fields(reason="wake_lock_unparseable", agent=slug, detail=decision.reason),
             )
         return decision
 
