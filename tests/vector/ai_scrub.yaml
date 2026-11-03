@@ -111,6 +111,36 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] token bearer [REDACTED_HEARTBEAT_URL] done")
 
+  - name: "a heartbeat url logged without its scheme redacts its secret"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The harness anchors on the literal `/heartbeat/`; anchored on `https?://`, a URL logged
+          # without its scheme matched nothing and shipped its secret. The host is not the secret.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "curl uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] curl uptime.betterstack.com/api/v1[REDACTED_HEARTBEAT_URL] failed")
+
+  - name: "a heartbeat url with userinfo redacts the credential before the host"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Anchored on `/heartbeat/` alone, the rule would keep everything before it, the password
+          # in the userinfo included. A URL with a scheme is taken from the scheme on.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://john:hunter2Secret@uptime.example.com/api/v1/heartbeat/SECRETabc123 failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
+
   - name: "a bearer whose value is an assignment redacts the secret after it"
     inputs:
       - insert_at: "ai_scrub"
@@ -277,6 +307,20 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] laughs_happilyeverafterandafter abc_uat_unknown")
 
+  - name: "a word under the wide basecradle rule survives whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # `bc_def_` with a run of eight or more lowercase letters, glued to a letter, is a word.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "the abc_def_ghijklmnop table"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] the abc_def_ghijklmnop table")
+
   - name: "a word glued by a digit, a combining mark or any script is kept"
     inputs:
       - insert_at: "ai_scrub"
@@ -359,6 +403,21 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] push failed with [REDACTED_GH_TOKEN] rejected")
 
+  - name: "a basecradle key glued onto another is redacted whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The harness's wide `bc_???_` run takes `_` and `-`, so the second key cannot be cut out
+          # of the first: a narrower run stopped at `_isk_` and shipped `DEF123`.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "keys bc_uat_ABCbc_isk_DEF123 and bc_isk_Ab3Cd5Ef7Gh9_x-y bc_tok_Ab3Cd5Ef7Gh9 loaded"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] keys [REDACTED_BC_TOKEN] and [REDACTED_BC_INTEGRATION_SECRET] [REDACTED_BC_TOKEN] loaded")
+
   - name: "a key at the start of the text is redacted"
     inputs:
       - insert_at: "ai_scrub"
@@ -385,6 +444,8 @@ tests:
             ["github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv", "[REDACTED_GH_TOKEN]"],
             ["bc_uat_K", "[REDACTED_BC_TOKEN]"],
             ["bc_isk_K", "[REDACTED_BC_INTEGRATION_SECRET]"],
+            ["bc_isk_Ab3Cd5Ef7Gh9", "[REDACTED_BC_INTEGRATION_SECRET]"],
+            ["bc_tok_Ab3Cd5Ef7Gh9", "[REDACTED_BC_TOKEN]"],
             ["sk-ant-api03-Ab3Cd5Ef7Gh9", "[REDACTED_API_KEY]"],
             ["sk-or-v1-0f3a9c2b7d4e6f8a", "[REDACTED_API_KEY]"],
             ["xai-Ab3Cd5Ef7Gh9Ij1K", "[REDACTED_API_KEY]"],
@@ -425,6 +486,6 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              # Every key and every neighbour was sent: 12 keys after 24 neighbours.
-              assert_eq!(.count, 288)
+              # Every key and every neighbour was sent: 14 keys after 24 neighbours.
+              assert_eq!(.count, 336)
               assert_eq!(.message, .expected)
