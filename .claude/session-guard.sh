@@ -120,13 +120,20 @@ USAGE
 
 # ---------------------------------------------------------------- session key
 
+# What a `claude` process looks like on a process list: the one spelling, shared by the session key
+# below and by the listener attribution (basecradle-noc#1230). self-exit.sh carries the same case.
+is_claude_command() {
+  case "$1" in
+    claude|claude\ *|*/claude|*/claude\ *) return 0 ;;
+  esac
+  return 1
+}
+
 ancestor_claude_pid() {
   local pid=$$ cmd ppid
   while [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "1" ]; do
     cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
-    case "$cmd" in
-      claude|claude\ *|*/claude|*/claude\ *) echo "$pid"; return 0 ;;
-    esac
+    if is_claude_command "$cmd"; then echo "$pid"; return 0; fi
     ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     [ "$ppid" = "$pid" ] && break
     pid=$ppid
@@ -178,6 +185,16 @@ compute_session_key() {
 
 SESSION_KEY=""
 session_key() { echo "$SESSION_KEY"; }
+
+# This session's own `claude` process, the anchor every listener is attributed against
+# (basecradle-noc#1230): CLAUDE_PID when Claude Code set it (the key above already proved it
+# readable), else the nearest `claude` above this script. Empty when neither is found, and then no
+# listener is excused by ancestry: a session that cannot name itself cannot say what is a sibling's.
+own_claude_pid() {
+  if [ -n "${CLAUDE_PID:-}" ]; then echo "$CLAUDE_PID"; return 0; fi
+  ancestor_claude_pid || true
+}
+OWN_CLAUDE_PID=""
 
 state_root() {
   echo "${SESSION_GUARD_STATE_ROOT:-$HOME/.cache/$REPO_NAME/builder-sessions}"
@@ -400,8 +417,74 @@ proc_started_epoch() {
 # process counts as pre-existing only when it started at least this long before the baseline.
 PROC_START_SLACK_SECONDS=2
 
+# WHOSE A LISTENER IS, read off its parent chain (basecradle-noc#1230). Every laptop builder runs as
+# the same macOS account, so "this account's listeners" holds every concurrent sibling's test run and
+# dev server too, and each one blocked the exit of whichever builder left first. The chain is the
+# kernel's own record of who started a process, so it is read, never trusted from a report:
+#
+#   mine       the chain passes through this session's own `claude` (a nested `claude` under it too)
+#   sibling    it passes through another `claude` and never this one: a concurrent session's
+#   outside    no `claude` at all, and the chain is whole: its top, the child of launchd, leads its
+#              own process group, which is how launchd starts everything it starts (a Terminal the
+#              operator typed into, a GUI app, a daemon)
+#   cut        no `claude`, and its top does NOT lead its own process group: launchd did not start it,
+#              it adopted it. A process detached from the shell that started it (`&`, nohup) keeps
+#              that shell's group, loses its ancestry, and so says nothing about whose it is. It stays
+#              a finding: it is the shape a dev server this session backgrounded takes, and macOS shows
+#              a non-root reader no process environment, so there is no second record to read it from.
+#
+# Measured on Darwin 24 (2026-11-03): 637 of 640 children of launchd led their own group; the other
+# three were two servers detached on purpose and a Chrome crash handler, a real double-fork orphan.
+# The top's PATH says nothing: `/usr/bin/python3` runs a binary inside `Python.app/Contents/MacOS/`.
+# The residual, named: a server that daemonizes ITSELF (setsid, a `-d` flag) leads its own group and
+# reads `outside`, so a session runs its servers in the foreground, under run_in_background.
+#   unreadable a link in the chain could not be read (the process exited mid-walk)
+#   unknown    this session's own `claude` could not be found, so nothing is excused by ancestry
+#
+# Prints the class, a tab, and its detail (the sibling's `claude` pid, or the chain's top).
+CHAIN_MAX_HOPS=64
+attribute_pid() {
+  local pid="$1" hops=0 cmd ppid sibling="" pgid comm
+  [ -n "$OWN_CLAUDE_PID" ] || { printf 'unknown\t\n'; return 0; }
+  while :; do
+    [ "$pid" = "$OWN_CLAUDE_PID" ] && { printf 'mine\t%s\n' "$pid"; return 0; }
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd=""
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" || ppid=""
+    if [ -z "$cmd" ] || ! [[ "$ppid" =~ ^[0-9]+$ ]]; then printf 'unreadable\t%s\n' "$pid"; return 0; fi
+    # The nearest `claude` is the one that names the sibling; the walk goes on past it, because
+    # this session's own may still be above it (a `claude -p` this session ran).
+    if [ -z "$sibling" ] && is_claude_command "$cmd"; then sibling="$pid"; fi
+    [ "$ppid" -gt 1 ] || break
+    hops=$((hops + 1))
+    [ "$hops" -lt "$CHAIN_MAX_HOPS" ] || { printf 'unreadable\t%s\n' "$pid"; return 0; }
+    pid="$ppid"
+  done
+  if [ -n "$sibling" ]; then printf 'sibling\t%s\n' "$sibling"; return 0; fi
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" || pgid=""
+  [[ "$pgid" =~ ^[0-9]+$ ]] || { printf 'unreadable\t%s\n' "$pid"; return 0; }
+  comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || comm=""
+  if [ "$pgid" = "$pid" ]; then
+    printf 'outside\t%s\n' "${comm:-pid $pid}"
+  else
+    printf 'cut\t%s\n' "${comm:-pid $pid}"
+  fi
+}
+
 describe_container() { docker ps -a --no-trunc --filter "id=$1" --format '{{.Image}} ({{.Status}})' 2>/dev/null | sed -n 1p; }
 describe_image()     { docker image ls -a --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | awk -v i="$1" '$1==i && !seen++ {print $2}'; }
+
+# Another laptop builder's label on an artefact, which is that sibling's attribution exactly as this
+# session's own label is its own (basecradle-noc#1230): every carrier labels `<repo>-builder=1`.
+# Prints the sibling's label key, or nothing and fails, which the caller reads as unattributed — an
+# inspect that could not answer included, so "we could not look" stays a finding.
+sibling_label() {  # sibling_label container|image|volume <id>
+  local labels
+  case "$1" in
+    volume) labels="$(docker volume inspect --format '{{json .Labels}}' "$2" 2>/dev/null)" ;;
+    *)      labels="$(docker inspect --type "$1" --format '{{json .Config.Labels}}' "$2" 2>/dev/null)" ;;
+  esac
+  grep -oE '"[a-z0-9][a-z0-9.-]*-builder":"1"' <<< "$labels" | cut -d'"' -f2 | grep -vxF "$LABEL_KEY" | sed -n 1p | grep .
+}
 
 # ------------------------------------------------------------------- commands
 
@@ -684,7 +767,7 @@ cmd_check() {
   base_desktop="$(s_get desktop_running 0)"
 
   if engine_up; then
-    local ids id extra
+    local ids id extra sib
     ids="$(labelled_containers)"
     if [ -n "$ids" ]; then
       while IFS= read -r id; do
@@ -729,7 +812,11 @@ cmd_check() {
       if [ -n "$extra" ]; then
         while IFS= read -r id; do
           [ -n "$id" ] || continue
-          finding "container appeared during this session and carries no builder label: $id ($(describe_container "$id"))" \
+          if sib="$(sibling_label container "$id")"; then
+            echo "session-guard: not this session's: container $id ($(describe_container "$id")) carries $sib=1, a sibling builder's label."
+            continue
+          fi
+          finding "container appeared during this session and carries no builder label of this session's: $id ($(describe_container "$id"))" \
                   "docker rm -f $id   (only if it is yours — check first)"
         done <<< "$extra"
       fi
@@ -738,7 +825,11 @@ cmd_check() {
       if [ -n "$extra" ]; then
         while IFS= read -r id; do
           [ -n "$id" ] || continue
-          finding "image appeared during this session and carries no builder label: $id ($(describe_image "$id"))" \
+          if sib="$(sibling_label image "$id")"; then
+            echo "session-guard: not this session's: image $id ($(describe_image "$id")) carries $sib=1, a sibling builder's label."
+            continue
+          fi
+          finding "image appeared during this session and carries no builder label of this session's: $id ($(describe_image "$id"))" \
                   "docker rmi $id   (only if it is yours — check first)"
         done <<< "$extra"
       fi
@@ -747,6 +838,10 @@ cmd_check() {
       if [ -n "$extra" ]; then
         while IFS= read -r id; do
           [ -n "$id" ] || continue
+          if sib="$(sibling_label volume "$id")"; then
+            echo "session-guard: not this session's: volume $id carries $sib=1, a sibling builder's label."
+            continue
+          fi
           finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
         done <<< "$extra"
       fi
@@ -805,9 +900,10 @@ cmd_check() {
     finding "lsof was not available, so this session's listening ports could not be censused." \
             "check by hand (lsof -nP -iTCP -sTCP:LISTEN) and say what you found in the completion comment"
   else
-    local now_rows new_rows began_epoch cmd addr pid started
+    local now_rows new_rows began_epoch cmd addr pid started census_ok=1
     began_epoch="$(s_get began_epoch)"
     if ! now_rows="$(list_listeners)"; then
+      census_ok=0
       finding "the listening-port census failed (lsof reported an error), so this session's listening ports could not be checked." \
               "re-run .claude/session-guard.sh check; if it persists, check by hand (lsof -nP -iTCP -sTCP:LISTEN) and say what you found in the completion comment"
     fi
@@ -816,20 +912,52 @@ cmd_check() {
     new_rows="$(awk -F'\t' -v base_file="$d/listeners.base" '
       FILENAME == base_file { base[$1 "\t" $2] = 1; next }
       !(($1 "\t" $2) in base)' "$d/listeners.base" - <<< "$now_rows")"
+    # The account-wide census is information; only what the parent chain attributes to this
+    # session refuses the exit (basecradle-noc#1230).
+    local n_all=0 n_new=0 n_mine=0 n_sibling=0 n_outside=0 class detail
+    [ -n "$now_rows" ] && n_all="$(cut -f3 <<< "$now_rows" | sort -u | wc -l | tr -d ' ')"
     if [ -n "$new_rows" ]; then
       while IFS=$'\t' read -r cmd addr pid; do
         [ -n "${pid:-}" ] || continue
         if ! started="$(proc_started_epoch "$pid")"; then
           finding "a new listener's process start time could not be read: $cmd (pid $pid) on $addr — so nothing here can say whether this session started it." \
                   "re-run .claude/session-guard.sh check; if it persists, check by hand (ps -o lstart= -p $pid) and stop it only if this session started it"
+          continue
         elif [[ "$began_epoch" =~ ^[0-9]+$ ]] && [ $((started + PROC_START_SLACK_SECONDS)) -le "$began_epoch" ]; then
           echo "session-guard: not this session's: $cmd (pid $pid) is listening on a new address $addr, but its process started before the session baseline."
-        else
-          finding "a process started listening during this session: $cmd (pid $pid) on $addr" \
-                  "kill $pid   (only if this session started it — a dev server you are done with is yours to stop; if it is not yours, confirm whose before exiting)"
+          continue
         fi
+        n_new=$((n_new + 1))
+        IFS=$'\t' read -r class detail <<< "$(attribute_pid "$pid")"
+        case "$class" in
+          sibling)
+            n_sibling=$((n_sibling + 1))
+            echo "session-guard: not this session's: $cmd (pid $pid) on $addr belongs to a sibling session — its parent chain reaches claude pid $detail, never this session's (pid $OWN_CLAUDE_PID)."
+            ;;
+          outside)
+            n_outside=$((n_outside + 1))
+            echo "session-guard: not this session's: $cmd (pid $pid) on $addr was started outside any Claude session — its parent chain is whole and reaches no claude (top: $detail)."
+            ;;
+          cut)
+            finding "a process started listening during this session and its parent chain was cut, so nothing here can say whose it is: $cmd (pid $pid) on $addr (adopted by launchd at $detail)" \
+                    "kill $pid   (only if this session started it — a server this session detaches loses its ancestry, so run it with run_in_background instead; if it is not yours, confirm whose before exiting)"
+            ;;
+          unreadable)
+            finding "a new listener's parent chain could not be read: $cmd (pid $pid) on $addr (at pid $detail) — so nothing here can say whether this session started it." \
+                    "re-run .claude/session-guard.sh check; if it persists, check by hand (ps -o ppid=,command= -p $detail) and stop it only if this session started it"
+            ;;
+          *)
+            # mine, and unknown: a session that cannot name its own claude excuses nothing.
+            n_mine=$((n_mine + 1))
+            finding "a process started listening during this session: $cmd (pid $pid) on $addr" \
+                    "kill $pid   (only if this session started it — a dev server you are done with is yours to stop; if it is not yours, confirm whose before exiting)"
+            ;;
+        esac
       done <<< "$new_rows"
     fi
+    # A census that failed has no count to print: its finding above says so, and a 0 here would not.
+    [ "$census_ok" = "1" ] && echo "session-guard: listening-port census: $n_all process(es) listening on this account; $n_new started since the baseline — $n_mine attributed to this session, $n_sibling to a sibling session, $n_outside outside any Claude session."
+    [ -n "$OWN_CLAUDE_PID" ] || echo "session-guard: this session's own claude process could not be found, so no listener is excused by its parent chain."
   fi
 
   # Browser tabs: a record, plus the attestation that makes an empty record mean
@@ -890,6 +1018,7 @@ while [ $# -gt 0 ]; do
 done
 
 SESSION_KEY="$(compute_session_key)" || exit 75
+OWN_CLAUDE_PID="$(own_claude_pid)"
 
 case "$command" in
   begin)        cmd_begin ;;

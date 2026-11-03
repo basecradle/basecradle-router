@@ -152,7 +152,20 @@ elif a[:2] == ["volume", "ls"]:
     if not st["engine_up"]:
         sys.exit(1)
     for v in st["volumes"]:
-        print(v)
+        print(v if isinstance(v, str) else v["name"])
+elif a[:2] == ["volume", "inspect"]:
+    # `{{json .Labels}}`, as Go renders it: compact JSON, `null` for none.
+    v = next((v for v in st["volumes"] if not isinstance(v, str) and v["name"] == a[-1]), None)
+    if not st["engine_up"] or (v is None and a[-1] not in st["volumes"]):
+        sys.exit(1)
+    print(json.dumps((v or {}).get("labels"), separators=(",", ":")))
+elif a[:1] == ["inspect"]:
+    # `{{json .Config.Labels}}` of a container or an image, by the `--type` asked for.
+    pool = st["containers"] if a[a.index("--type") + 1] == "container" else st["images"]
+    obj = next((o for o in pool if o["id"] == a[-1]), None)
+    if not st["engine_up"] or obj is None:
+        sys.exit(1)
+    print(json.dumps(obj.get("labels"), separators=(",", ":")))
 elif a[:2] == ["buildx", "ls"]:
     if not st["engine_up"]:
         sys.exit(1)
@@ -214,6 +227,16 @@ elif "lstart=" in a and "-p" in a:
         time.tzset()
         start = time.strftime("%a %b %e %H:%M:%S %Y", time.localtime(start))
     print(start)
+elif any(f in a for f in ("ppid=", "pgid=", "command=", "comm=")) and "-p" in a:
+    # The parent chain, from the scenario's `procs` (pid -> ppid, pgid, command, comm; comm defaults
+    # to command). A pid the scenario does not know, or a field it does not declare, prints nothing
+    # and exits 1, which is what a process that has exited looks like.
+    proc = st.get("procs", {}).get(a[a.index("-p") + 1])
+    field = next(f for f in ("ppid=", "pgid=", "command=", "comm=") if f in a)[:-1]
+    value = None if proc is None else proc.get(field, proc["command"] if field == "comm" else None)
+    if value is None:
+        sys.exit(1)
+    print(value)
 elif "etime=" in a and "-p" in a:
     start = st.get("proc_start", {}).get(a[a.index("-p") + 1])
     if start is None:
@@ -315,6 +338,8 @@ class Lab:
         self.calls = tmp_path / "docker-calls.log"
         self.calls.write_text("")
         self.state_root = tmp_path / "sessions"
+        # What a test adds on top of the lab's own environment (a CLAUDE_PID, say).
+        self.extra_env: dict[str, str] = {}
 
     @property
     def env(self) -> dict:
@@ -336,6 +361,7 @@ class Lab:
                 "SESSION_GUARD_POLL": "1",
             }
         )
+        env.update(self.extra_env)
         return env
 
     def run(self, *args: str, script: Path = GUARD) -> subprocess.CompletedProcess:
@@ -870,6 +896,214 @@ def test_a_session_with_no_listener_baseline_is_not_clean_until_it_attests_one(l
     assert late.returncode == 0 and "LATE" in late.stdout
     after = lab_obj.run("check")
     assert after.returncode == 0 and "not-clean" not in after.stdout, after.stdout
+
+
+# ------------------------------------- whose a listener is, by its parent chain (#1230)
+
+# Every laptop builder runs as one macOS account, so the account's listeners hold every concurrent
+# sibling's test run too: the router captain's exit was refused twice by a noc session's pytest. A
+# listener is this session's only when its parent chain says so. The chains below are one laptop:
+# this session's claude and a sibling's, both in one Terminal the operator also types into.
+OWN = "4711"
+SIBLING = "4800"
+TERMINAL = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+PYTHON_APP = (
+    "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/"
+    "Resources/Python.app/Contents/MacOS/Python"
+)
+PROCS = {
+    OWN: {"ppid": "4700", "command": "claude --effort high"},
+    "4700": {"ppid": "4690", "command": "-zsh"},
+    "4690": {"ppid": "1", "pgid": "4690", "command": TERMINAL, "comm": TERMINAL},
+    SIBLING: {"ppid": "4790", "command": "/opt/homebrew/bin/claude --model claude-fable-5-1"},
+    "4790": {"ppid": "4690", "command": "-zsh"},
+    # this session's dev server, under its Bash tool's shell
+    "5150": {"ppid": "5140", "command": "node server.js"},
+    "5140": {"ppid": OWN, "command": "/bin/zsh -c node server.js"},
+    # the sibling's pytest, the shape that refused basecradle-router#389's exit
+    "6150": {"ppid": "6140", "command": ".venv/bin/python -m pytest"},
+    "6140": {"ppid": SIBLING, "command": "/bin/zsh -c uv run pytest"},
+    # the operator's own server, typed into the Terminal
+    "7150": {"ppid": "7140", "command": "bin/rails server"},
+    "7140": {"ppid": "4690", "command": "-zsh"},
+    # a server detached from the shell that started it: launchd adopted it, and it still carries the
+    # dead shell's process group. Its binary is inside an app bundle, as `/usr/bin/python3`'s is.
+    "8150": {"ppid": "1", "pgid": "8100", "command": "python3 -m http.server", "comm": PYTHON_APP},
+    # a `claude -p` this session ran, and the server it started
+    "9150": {"ppid": "9140", "command": "python3 -m http.server"},
+    "9140": {"ppid": OWN, "command": "claude -p 'serve it'"},
+}
+LISTENERS = {
+    "5150": ["5150", "node", "127.0.0.1:3000"],
+    "6150": ["6150", "python3.1", "127.0.0.1:52811"],
+    "7150": ["7150", "ruby", "127.0.0.1:3001"],
+    "8150": ["8150", "python3.1", "127.0.0.1:8000"],
+    "9150": ["9150", "python3.1", "127.0.0.1:8001"],
+}
+
+
+def _attributed_check(lab, *pids, claude_pid=OWN, procs=None):
+    """``begin`` in a session that knows its own claude, then ``check`` with ``pids`` listening,
+    every one of them started after the baseline."""
+    lab_obj = lab(lstart={OWN: 1792656776}, procs=PROCS if procs is None else procs)
+    if claude_pid is not None:
+        lab_obj.extra_env["CLAUDE_PID"] = claude_pid
+    assert lab_obj.run("begin").returncode == 0
+    lab_obj.clean_tabs()
+    (began,) = (int(f.read_text()) for f in lab_obj.state_root.glob("*/began_epoch"))
+    lab_obj.mutate(listeners=[LISTENERS[p] for p in pids], proc_start={p: began + 5 for p in pids})
+    return lab_obj, lab_obj.run("check")
+
+
+def _findings(out: str) -> str:
+    return "\n".join(ln for ln in out.splitlines() if ln.startswith("not-clean:"))
+
+
+def test_a_listener_this_sessions_claude_started_blocks_the_exit(lab):
+    _, got = _attributed_check(lab, "5150")
+    assert got.returncode == 1
+    assert "node (pid 5150) on 127.0.0.1:3000" in _findings(got.stdout)
+    assert "kill 5150" in got.stdout
+
+
+def test_a_sibling_sessions_listener_is_named_and_never_blocks_the_exit(lab):
+    """The DoD's case: a sibling's pytest listening while this builder exits."""
+    lab_obj, got = _attributed_check(lab, "6150")
+    assert got.returncode == 0, got.stdout
+    assert "not-clean" not in got.stdout
+    assert (
+        f"belongs to a sibling session — its parent chain reaches claude pid {SIBLING}"
+        in got.stdout
+    )
+    assert "kill 6150" not in got.stdout
+    # ...and the exit path itself gets past the guard: it stops only at the kill-target walk,
+    # which finds no `claude` above it in the lab.
+    exited = lab_obj.run(script=SELF_EXIT)
+    assert "has not cleaned up" not in exited.stderr
+    assert "no ancestor 'claude' process found" in exited.stderr
+
+
+def test_a_listener_started_outside_any_claude_session_never_blocks_the_exit(lab):
+    _, got = _attributed_check(lab, "7150")
+    assert got.returncode == 0, got.stdout
+    assert (
+        "started outside any Claude session — its parent chain is whole and reaches no claude "
+        f"(top: {TERMINAL})" in got.stdout
+    )
+
+
+def test_a_detached_listener_whose_chain_was_cut_still_blocks_the_exit(lab):
+    """A server this session backgrounded and whose shell then exited is adopted by launchd, and
+    its chain names nobody. Excusing it would reopen #899 for the commonest leftover there is."""
+    _, got = _attributed_check(lab, "8150")
+    assert got.returncode == 1
+    assert "parent chain was cut" in _findings(got.stdout)
+    assert f"adopted by launchd at {PYTHON_APP}" in got.stdout
+    assert "kill 8150" in got.stdout
+    assert "run_in_background" in got.stdout
+
+
+def test_a_claude_this_session_ran_is_still_this_session(lab):
+    """The walk goes on past the nearest ``claude``: a ``claude -p`` this session ran is its own."""
+    _, got = _attributed_check(lab, "9150")
+    assert got.returncode == 1
+    assert "python3.1 (pid 9150) on 127.0.0.1:8001" in _findings(got.stdout)
+    assert "sibling" not in got.stdout.replace("to a sibling session,", "")
+
+
+def test_a_chain_that_cannot_be_read_is_never_read_as_a_siblings(lab):
+    """The sibling's shell exited mid-walk: "we could not look" is not "it is someone else's"."""
+    procs = {k: v for k, v in PROCS.items() if k != "6140"}
+    _, got = _attributed_check(lab, "6150", procs=procs)
+    assert got.returncode == 1
+    assert "parent chain could not be read: python3.1 (pid 6150)" in _findings(got.stdout)
+
+
+def test_a_top_whose_process_group_cannot_be_read_is_never_read_as_outside(lab):
+    procs = PROCS | {"4690": {k: v for k, v in PROCS["4690"].items() if k != "pgid"}}
+    _, got = _attributed_check(lab, "7150", procs=procs)
+    assert got.returncode == 1
+    assert "parent chain could not be read: ruby (pid 7150)" in _findings(got.stdout)
+
+
+def test_a_session_that_cannot_name_its_own_claude_excuses_nothing(lab):
+    """No CLAUDE_PID and no ``claude`` above the guard: a sibling-shaped chain still refuses."""
+    _, got = _attributed_check(lab, "6150", claude_pid=None)
+    assert got.returncode == 1
+    assert "python3.1 (pid 6150) on 127.0.0.1:52811" in _findings(got.stdout)
+    assert "own claude process could not be found" in got.stdout
+
+
+def test_the_census_is_printed_and_only_this_sessions_share_refuses(lab):
+    _, got = _attributed_check(lab, "5150", "6150", "7150")
+    assert got.returncode == 1
+    findings = _findings(got.stdout)
+    assert "pid 5150" in findings
+    assert "pid 6150" not in findings and "pid 7150" not in findings
+    assert (
+        "listening-port census: 3 process(es) listening on this account; 3 started since the "
+        "baseline — 1 attributed to this session, 1 to a sibling session, 1 outside any Claude "
+        "session." in got.stdout
+    )
+
+
+# Another carrier's label, distinct from this checkout's by construction.
+SIBLING_KEY = f"{REPO_NAME}-sibling-builder"
+
+
+def test_an_artefact_carrying_a_sibling_builders_label_is_named_and_never_blocks(lab):
+    """Docker's attribution is the label, and every carrier writes its own ``<repo>-builder=1``:
+    a sibling's artefact is provably that sibling's. An unlabelled one beside it is still found."""
+    labels = {SIBLING_KEY: "1", "org.opencontainers.image.title": "replica"}
+    sib_container = {
+        "id": "d" * 64,
+        "image": "sib",
+        "status": "Up",
+        "labelled": False,
+        "labels": labels,
+    }
+    sib_image = {
+        "id": "sha256:" + "d" * 64,
+        "tag": "sib:latest",
+        "labelled": False,
+        "labels": labels,
+    }
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.clean_tabs()
+    lb.mutate(
+        containers=[sib_container],
+        images=[sib_image],
+        volumes=[{"name": "sib-volume", "labels": labels}],
+    )
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
+    for name in (sib_container["id"], sib_image["id"], "volume sib-volume"):
+        assert f"{name}" in got.stdout
+    assert got.stdout.count(f"carries {SIBLING_KEY}=1, a sibling builder's label") == 3
+
+    lb.mutate(containers=[sib_container, FOREIGN_CONTAINER])
+    got = lb.run("check")
+    assert got.returncode == 1
+    assert FOREIGN_CONTAINER["id"] in _findings(got.stdout)
+    assert sib_container["id"] not in _findings(got.stdout)
+    # Reported, never removed: a sibling's artefact is not this session's to sweep.
+    assert lb.run("sweep").returncode == 0
+    assert {c["id"] for c in lb.docker_state()["containers"]} == {
+        sib_container["id"],
+        FOREIGN_CONTAINER["id"],
+    }
+
+
+def test_a_builder_label_that_is_not_set_to_one_attributes_nothing(lab):
+    """The convention is ``=1`` exactly; anything else is an unattributed artefact."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.clean_tabs()
+    lb.mutate(volumes=[{"name": "odd-volume", "labels": {SIBLING_KEY: "true"}}])
+    got = lb.run("check")
+    assert got.returncode == 1
+    assert "volume appeared during this session: odd-volume" in got.stdout
 
 
 def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
@@ -1519,6 +1753,7 @@ def test_an_lsof_stderr_redirect_that_fails_is_a_failed_census(lab, tmp_path):
     )
     assert got.returncode != 0
     assert "census failed" in got.stdout
+    assert "listening-port census:" not in got.stdout  # no count from a census that failed
 
 
 def test_one_failed_cache_read_at_the_census_is_read_again_before_it_is_stored(lab):
