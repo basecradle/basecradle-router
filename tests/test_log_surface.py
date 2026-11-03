@@ -200,12 +200,14 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
     for line in literal:
         assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
     patterns = [_REPLACE.match(line).group("pattern") for line in literal]
-    # Bearer before the assignment rule: `AUTH_API_KEY=Bearer eyJ…` would otherwise lose
-    # `Bearer` into the assignment's value and leave the token after the space unmatched.
+    # The heartbeat URL, then the assignment, then bearer: the bearer rule's token class takes a
+    # URL's `https` and an assignment's `api_key=`, so either one after it would lose its literal
+    # into a bearer value and ship its secret. The assignment takes every bearer scheme in its
+    # value, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
     assert patterns == [
-        r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
         r"https?://\S*/heartbeat/\S+",
-        r"""(?i)api[-_]?key=[^&\s"]+""",
+        r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""",
+        r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
     ]
 
 
@@ -216,7 +218,7 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     # rule catches `apiKey=` whatever its value, so a future key format in a URL is covered.
     source = _scrub_source()
     assert r"ste-(?P<ste>[A-Za-z0-9]{20,})" in source
-    assert r"""(?i)api[-_]?key=[^&\s"]+""" in source
+    assert r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""" in source
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
     for rule in (_PREFIX_PASS, "msg = replace(msg, r'(?i)api[-_]?key="):
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
@@ -294,6 +296,8 @@ def test_the_pre_existing_scrub_rules_survive() -> None:
     source = _scrub_source()
     for pattern in ("REDACTED_GH_TOKEN", "REDACTED_HEARTBEAT_URL", "REDACTED_BC_TOKEN"):
         assert pattern in source
+    # GitHub fine-grained personal access tokens (#398), a rule of the prefix pass.
+    assert r"github_pat_(?P<pat>[A-Za-z0-9_]{20,})" in source
     assert 'SYSLOG_IDENTIFIER == "sudo"' in source  # the whole-event drop for argv leaks
 
 

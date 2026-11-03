@@ -1724,41 +1724,47 @@ Caddy, no database) and has four load-bearing properties:
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
    (the argv leak path) and from Vector itself (the self-logged-token path), **deletes the
    `_CMDLINE` field from every event** (below), and **redacts**
-   secret-shaped patterns (`gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`, `bc_isk_…`, and
-   **provider API keys** — `sk-…` covering the whole `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus
-   `xai-…`, `AIza…`, `hf_…`, `r8_…`; and Steel's `ste-…` keys plus any `apiKey=` query value, since a
-   Steel launcher puts its key on the `wss://connect.steel.dev` URL — basecradle-noc#797) as defense
-   in depth. The provider-key rules are the belt for the braces
-   (basecradle-router#170): agents run with those keys in their env, and a wake's stdout+stderr now
-   flows into journald (#168) and therefore through here — nothing is *known* to print one, and a
-   traceback that did would otherwise ship it. The drop rules and every redaction shape are NOC's
-   `noc_scrub` plus these additions; do not weaken them.
+   secret-shaped patterns (`github_pat_…`, `gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`,
+   `bc_isk_…`, and **provider API keys** — `sk-…` covering the whole
+   `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`, `hf_…`, `r8_…`; and Steel's
+   `ste-…` keys plus any `apiKey=` query value, since a Steel launcher puts its key on the
+   `wss://connect.steel.dev` URL — basecradle-noc#797) as defense in depth. The provider-key rules
+   are the belt for the braces (basecradle-router#170): agents run with those keys in their env, and
+   a wake's stdout+stderr now flows into journald (#168) and therefore through here — nothing is
+   *known* to print one, and a traceback that did would otherwise ship it. The drop rules and every
+   redaction shape are NOC's `noc_scrub` plus these additions; do not weaken them.
    **The redaction runs in two passes, in this order, with one word rule** (basecradle-router#398).
    The one definition of both is the harness's: basecradle-harness `docs/telemetry.md` → Credential
    Scrubbing (`_observability.scrub` and `_is_word`, harness 0.176.0). `ai_scrub` follows it and
    never varies it; only the box's rules (a subset of the harness's shapes), minimum lengths and labels differ.
-   - **Pass 1, the literal rules** — bearer, the heartbeat URL, then `api[-_]?key=` — each redacted
-     wherever it matches. They go first because a prefix rule's run is made of the characters their
-     literals are: with `sk-` first, `task-runner-pipeline-api-key=abc123secret` lost `api-key` into
-     the run, and the secret after `=` shipped. Bearer goes before the assignment rule, or
-     `AUTH_API_KEY=Bearer eyJ…` would lose `Bearer` into the assignment's value and ship the token.
-     The bearer rule takes every scheme word before the token, as the harness's does, so a doubled
-     `Bearer Bearer eyJ…` is redacted whole rather than taking the second `Bearer` as its value.
-   - **Pass 2, the prefix rules** (`gh?_`, `bc_uat_`, `bc_isk_`, `sk-`, `xai-`, `AIza`, `hf_`, `r8_`,
-     `ste-`), as **one** alternation, so a word one rule kept is never cut by the next. A match is
-     **kept as a word** only when **both** hold: a letter, digit or combining mark, in any script,
-     comes right before it, **and** its run after the prefix holds no digit and no uppercase letter.
-     So `risk-assessment-pending-review` survives, and `密钥sk-ant-api03-…`, `ESC[33msk-…` and
-     `Bearer%20sk-…` are still redacted. Never a left boundary: a serialization glues a key to a
-     letter or digit, and a random key holds a digit or a capital with overwhelming certainty. VRL's
-     regex has no lookbehind, so the pass is a `replace_with` closure that captures the one character
-     before the match and applies both tests.
+   - **Pass 1, the literal rules** — the heartbeat URL, then `api[-_]?key=`, then bearer — each
+     redacted wherever it matches. They go first because a prefix rule's run is made of the
+     characters their literals are: with `sk-` first, `task-runner-pipeline-api-key=abc123secret`
+     lost `api-key` into the run, and the secret after `=` shipped. Inside the pass the rules run
+     one after another (the harness's are one alternation), so their order is load-bearing too. The
+     bearer rule's token class takes a URL's `https` and an assignment's `api_key=`, so both go
+     before it: otherwise `token bearer https://…/heartbeat/SECRET` and `Bearer api_key=SECRET`
+     ship their secrets. The assignment rule takes every bearer scheme in its value, as the
+     harness's does, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole, and the bearer rule takes
+     every scheme word before its token, so a doubled `Bearer Bearer eyJ…` is too.
+   - **Pass 2, the prefix rules** (`github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `sk-`, `xai-`,
+     `AIza`, `hf_`, `r8_`, `ste-`), as **one** alternation, so a word one rule kept is never cut by
+     the next. A match is **kept as a word** only when **both** hold: a letter, digit or combining
+     mark, in any script, comes right before it, **and** its run after the prefix holds no digit and
+     no uppercase letter. So `risk-assessment-pending-review` survives, and `密钥sk-ant-api03-…`,
+     `ESC[33msk-…` and `Bearer%20sk-…` are still redacted. Never a left boundary: a serialization
+     glues a key to a letter or digit, and a random key holds a digit or a capital with overwhelming
+     certainty. VRL's regex has no lookbehind, so the pass is a `replace_with` closure that captures
+     the one character before the match and applies both tests.
    The stated residuals, as the harness's: a glued word whose run holds a digit or a capital is
    redacted (the scrub errs toward redaction), and a glued key made only of lowercase letters, `_`
    and `-` is kept. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
    `Bearer`), so a long word glued to a pass-1 match is cut by the word rule
    (`task-runner-pipeline-api-key=…` ships as `ta[REDACTED_API_KEY]=[REDACTED]`). That errs toward
-   redaction, and the secret never ships.
+   redaction, and the secret never ships. A second residual is also the box's: a key glued straight
+   onto another key's run, with no separator, is cut where the first run's charset ends.
+   `bc_uat_ABCbc_isk_DEF123` ships as `[REDACTED_BC_TOKEN]_isk_DEF123`: the `bc_uat_` run takes
+   `ABCbc`, which consumes the second prefix's `bc`, so the `DEF123` after it ships.
    `tests/vector/ai_scrub.yaml` asserts the exact shipped bytes, run by `vector test` on the boxes'
    Vector release in CI.
    **It also PREFIXES each shipped message with the emitting program's journald identifier**, so a
