@@ -167,9 +167,14 @@ transforms:
       msg = to_string(.message) ?? ""
       # Pass 1, in its own order, because these rules run one after another where the harness's are
       # one alternation, so an earlier rule can take a later one's literal.
-      #   * The heartbeat URL first. The bearer rule's token class takes a URL's scheme, so with
-      #     bearer first, `token bearer https://…/heartbeat/SECRET` lost `https` into a bearer
-      #     value, the heartbeat rule no longer matched, and the secret shipped.
+      #   * The heartbeat URL first, anchored on the literal `/heartbeat/` as the harness's is, so a
+      #     URL logged without its scheme is redacted too: anchored on `https?://`,
+      #     `curl uptime.betterstack.com/api/v1/heartbeat/SECRET` matched nothing and shipped its
+      #     secret. Where the URL has a scheme the rule still takes it from the scheme on, so
+      #     userinfo before the host (`https://john:…@host/…/heartbeat/…`) never ships; without one,
+      #     the host before `/heartbeat/` stays, as it does in the harness, since it is not the
+      #     secret. First, because the bearer rule's token class takes a scheme's `https`, which
+      #     would leave the rest of the URL, userinfo included, to the scheme-less arm alone.
       #   * The assignment rule before the bearer rule. The bearer rule's token class takes an
       #     assignment's name and its `=`, so with bearer first, `Bearer api_key=SECRET` lost
       #     `api_key=` into a bearer value and the secret shipped. The assignment rule takes every
@@ -178,7 +183,7 @@ transforms:
       #   * The bearer rule takes EVERY scheme word before the token, as the harness's does: a token
       #     stored with its scheme and sent with another reads `Bearer Bearer eyJ…`, and one scheme
       #     word taken alone is the value, leaving the token.
-      msg = replace(msg, r'https?://\S*/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
+      msg = replace(msg, r'(?:https?://\S*)?/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
       # Any `apiKey=` value, whatever it looks like. A Steel (steel.dev) launcher, the browser backend
       # behind Playwright MCP (basecradle/basecradle#582, basecradle-noc#797), puts its key in the
       # `apiKey=` query parameter of its wss://connect.steel.dev URL, and this catches that shape
@@ -194,15 +199,19 @@ transforms:
       msg = replace(msg, r'(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is
       # never read again by another rule, where a pass per rule would let `hf_…` inside a kept word be
-      # cut by the next one. No two prefixes can match at one position, so the order of the
-      # alternatives decides nothing. The rules:
+      # cut by the next one. The order of the alternatives is the harness's, and it decides only
+      # between the two `bc_` rules, the one place two can match at one position: the wide run is
+      # tried first, as in `_PREFIXED`. The rules:
       #   * `github_pat_`, `gh?_`: GitHub tokens, fine-grained personal access tokens and the rest.
-      #   * `bc_uat_`: BaseCradle user access tokens.
-      #   * `bc_isk_`: BaseCradle integration signing keys. THIS box is where they live: the router
-      #     verifies each platform delivery's HMAC with the recipient agent's own key, so every one
-      #     of them sits in /etc/basecradle-router/router.env and is read into the daemon's
-      #     environment (basecradle/basecradle#497). `bc_uat_` never matched these: a distinct
-      #     prefix is a distinct rule, carried on the box that actually holds the secrets.
+      #   * `bc_???_`, `bc_uat_`, `bc_isk_`: BaseCradle credentials, in the harness's two rules. First
+      #     any `bc_` + three lowercase letters + `_` with a run of eight or more that takes `_` and `-`, so a
+      #     second key glued onto the first (`bc_uat_ABCbc_isk_DEF123`) is taken whole rather than
+      #     cut where a narrower run ends; then `bc_uat_` and `bc_isk_` with a run of any length, for
+      #     what is shorter. A user access token (`uat`) and an integration signing key (`isk`) each
+      #     keep their own label. THIS box is where the signing keys live: the router verifies each
+      #     platform delivery's HMAC with the recipient agent's own key, so every one of them sits in
+      #     /etc/basecradle-router/router.env and is read into the daemon's environment
+      #     (basecradle/basecradle#497).
       #   * `sk-`, `xai-`, `AIza`, `hf_`, `r8_`: provider API keys. Harness agents and builder agents
       #     run with these in their env (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, …), and a wake's
       #     stdout+stderr (a traceback, a curl echo, a misconfigured debug print) flows into journald
@@ -219,10 +228,7 @@ transforms:
       # (`Bearer%20sk-…`, `ESC[33msk-…`, `密钥sk-…`), and a random key of a vendor's length holds a
       # digit or a capital with overwhelming certainty. The stated residuals, as the harness's: a
       # glued word whose run holds a digit or a capital is redacted (the scrub errs toward
-      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept. One
-      # residual is the box's own: a key glued straight onto another key's run is cut where the
-      # first run's charset ends, so `bc_uat_ABCbc_isk_DEF123` ships its `DEF123`
-      # (deploy/README.md → Part 5).
+      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept.
       #
       # VRL's regex has no lookbehind and the closure is not given the match's offset, so the
       # pattern captures the one character before the key as `before` (empty at the start of the
@@ -238,6 +244,7 @@ transforms:
           (?:
               github_pat_(?P<pat>[A-Za-z0-9_]{20,})
             | gh[a-z]_(?P<gh>[A-Za-z0-9]{20,})
+            | bc_(?P<bc_kind>[a-z]{3})_(?P<bc>[A-Za-z0-9_-]{8,})
             | bc_uat_(?P<bc_uat>[A-Za-z0-9]+)
             | bc_isk_(?P<bc_isk>[A-Za-z0-9]+)
             | sk-(?P<sk>[A-Za-z0-9_-]{16,})
@@ -248,15 +255,15 @@ transforms:
             | ste-(?P<ste>[A-Za-z0-9]{20,})
           )') -> |key| {
           before = string(key.before) ?? ""
-          run = string(key.pat) ?? string(key.gh) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? ""
+          run = string(key.pat) ?? string(key.gh) ?? string(key.bc) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? ""
           if run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
               key.string
           } else if key.pat != null || key.gh != null {
               before + "[REDACTED_GH_TOKEN]"
-          } else if key.bc_uat != null {
-              before + "[REDACTED_BC_TOKEN]"
-          } else if key.bc_isk != null {
+          } else if key.bc_isk != null || key.bc_kind == "isk" {
               before + "[REDACTED_BC_INTEGRATION_SECRET]"
+          } else if key.bc_uat != null || key.bc != null {
+              before + "[REDACTED_BC_TOKEN]"
           } else {
               before + "[REDACTED_API_KEY]"
           }

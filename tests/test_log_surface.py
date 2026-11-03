@@ -201,11 +201,11 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
         assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
     patterns = [_REPLACE.match(line).group("pattern") for line in literal]
     # The heartbeat URL, then the assignment, then bearer: the bearer rule's token class takes a
-    # URL's `https` and an assignment's `api_key=`, so either one after it would lose its literal
-    # into a bearer value and ship its secret. The assignment takes every bearer scheme in its
-    # value, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
+    # URL's `https` and an assignment's `api_key=`. After it, a heartbeat URL would keep its
+    # userinfo out of the redaction, and an assignment would ship its secret. The assignment takes
+    # every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
     assert patterns == [
-        r"https?://\S*/heartbeat/\S+",
+        r"(?:https?://\S*)?/heartbeat/\S+",
         r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""",
         r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
     ]
@@ -273,11 +273,14 @@ def test_basecradle_integration_signing_keys_are_redacted() -> None:
     # THIS box is where `bc_isk_…` values live: the router verifies each platform
     # delivery's HMAC with the recipient agent's own Integration Signing Key, so all of
     # them sit in router.env and are read into the daemon's environment
-    # (basecradle/basecradle#497). The pre-existing `bc_uat_` rule covers *user access
-    # tokens* and never matched these — a distinct prefix needs its own rule, and the
-    # box that holds the secrets is the one that must carry it.
+    # (basecradle/basecradle#497). The box that holds the secrets is the one that must carry
+    # the rule: the harness's wide `bc_???_` rule takes a key of eight or more, and the short
+    # `bc_isk_` rule takes a shorter one, under its own label.
     source = _scrub_source()
     assert r"bc_isk_(?P<bc_isk>[A-Za-z0-9]+)" in source
+    # The harness's wide rule, ahead of the two short ones, so a glued second key is taken whole.
+    wide = r"bc_(?P<bc_kind>[a-z]{3})_(?P<bc>[A-Za-z0-9_-]{8,})"
+    assert source.index(wide) < source.index(r"bc_uat_(?P<bc_uat>")
     assert r"bc_uat_(?P<bc_uat>[A-Za-z0-9]+)" in source
 
 
