@@ -91,10 +91,11 @@ RestartSec=2s
 #     not just that the directive is set. The systemd default (control-group) SIGTERMs
 #     every process in the cgroup at t=0 — severing the very wakes the drain exists to
 #     protect. SIGKILL still sweeps the whole cgroup at the stop timeout as the backstop.
-#   TimeoutStopSec=30min — wakes are deliberately UNBOUNDED (HomeServerWaker timeout=None)
+#   TimeoutStopSec=30min — wakes are deliberately UNBOUNDED (the router sets no wake deadline, #389)
 #     and real agent turns run up to ~15 min, so the drain must tolerate a full-length
 #     wake rather than SIGKILL it. Sized >=2x that worst case; a genuinely hung wake is
-#     still cut at 30 min so a stop/reboot can never stall unbounded. Any consumer that
+#     still cut at 30 min of a stop so a stop/reboot can never stall unbounded (outside a
+#     stop nothing cuts a wake; stop-wake is the tool). Any consumer that
 #     waits on `systemctl stop` (the reboot orchestrator's TimeoutStartSec) must stay
 #     above this bound.
 KillMode=mixed

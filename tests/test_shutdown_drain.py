@@ -71,7 +71,7 @@ def test_the_drain_kills_only_the_main_process_first() -> None:
 
 
 def test_the_drain_tolerates_a_full_length_wake() -> None:
-    # Wakes are deliberately UNBOUNDED (HomeServerWaker timeout=None) and real agent
+    # Wakes are deliberately UNBOUNDED (the router sets no wake deadline, #389) and real agent
     # turns run up to ~15 min, so the drain window must comfortably exceed that or a
     # legitimate in-flight wake is SIGKILLed on stop/restart/reboot (#180).
     drain = _to_seconds(_directive(ROUTER_UNIT, "TimeoutStopSec"))

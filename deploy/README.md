@@ -798,6 +798,14 @@ util-linux `runuser`:
 The daemon is granted nothing: no sudoers rule names `stop-wake`, so the account that dispatches every wake
 cannot kill one; both of its callers — @origin over SSH and the NOC — already hold root.
 
+**There is no wake timeout, and this op is why** (#389). A deadline the router enforced could reach
+the `sudo` it spawned at most: everything below runs as root or as the agent, which the daemon cannot
+signal. SIGKILL to `sudo` is the worst stop above, and the expiry would have read as a crash, so
+the retry would start a second session on the same memory store while the first ran on, orphaned.
+So the router takes no deadline at all: `WakeInvocation`, `SubprocessWaker`, and `HomeServerWaker`
+have no `timeout` field, and a test pins it. A wake that has to end early is ended by this op; the
+only other bound on one is the unit's `TimeoutStopSec`, and that bites only during a drain.
+
 **What reads as a stop is exit `-15`/`-9` and nothing else:** `sudo` died by the signal, which happens only
 when a signal from outside the wake reached `sudo` or `runuser` — this op, or a `pkill -f`. A signal death
 *inside* the wake (the harness's own watchdog, the kernel's OOM killer, a hand `kill <pid>` of the binary)
