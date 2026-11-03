@@ -1753,8 +1753,12 @@ Caddy, no database) and has four load-bearing properties:
    `claude_code.api_error` (sent once per call, after Claude Code's own retries are spent) is a
    decision line, `WARNING … outcome=failed reason=<slug> detail=…`, with no tokens or cost, and a
    `duration` only for a call that made one attempt and reached Anthropic (the event's time is the
-   last attempt's, so for any other call it is not the whole wait). The slug is read off the HTTP status: `429` is `rate_limited`, `504` is `timeout`, any
-   other `5xx` is `server_error`, and anything else, a connection failure included, is `api_error`.
+   last attempt's, so for any other call it is not the whole wait). The slug is the contract's own,
+   read off the HTTP status by its one *Fault Slugs* table (basecradle-harness `docs/telemetry.md`,
+   basecradle-harness#786), which is the reference: this page does not copy it. Claude Code sends
+   no status for a call Anthropic never answered, and the remap tells the two such calls apart by
+   Claude Code's own message: a connection that failed is `transport`, and one that ran out of
+   Claude Code's deadline (`Request timed out.`) is `timeout`.
    It is WARNING rather than ERROR because the NOC's *Error on AI Server* alert pages on ERROR, and
    whether a builder's failed call pages is basecradle/basecradle#726's open question. An auxiliary
    call is `purpose=helper` with no `kind`; every other call is `purpose=main`. It **rebuilds the
