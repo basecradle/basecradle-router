@@ -134,7 +134,7 @@ from basecradle_router.routes import (
     route_requires_secret,
 )
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeError, Waker, WakeResult
+from basecradle_router.wake import WakeError, Waker, WakeResult, WakeStopped
 from basecradle_router.wakelock import WakeLockGuard
 
 logger = logging.getLogger("basecradle_router.pipeline")
@@ -219,6 +219,7 @@ class Outcome(Enum):
     IGNORED = "ignored"  # well-formed but not actionable (not a handoff)
     REJECTED = "rejected"  # bad signature or malformed payload
     FAILED = "failed"  # the stage errored
+    STOPPED = "stopped"  # the wake was stopped by a signal — an operator's act, not a fault
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,9 +510,10 @@ class Pipeline:
                     )
                     return
                 if self._wake(agent, event, result):
-                    # Remember the delivery *only* once a wake actually succeeded, so
-                    # the duplicate serialised behind us collapses — but a failed wake
-                    # leaves the duplicate free to retry the work (see dedup module).
+                    # Remember the delivery *only* once it is done — woken, or stopped by
+                    # an operator — so the duplicate serialised behind us collapses; a
+                    # failed wake leaves the duplicate free to retry the work (see dedup
+                    # module). A stop is a stop: its delivery is never re-dispatched (#386).
                     self.deduper.mark(event.dedup_key)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, **who, error=f"unexpected: {exc}")
@@ -603,10 +605,27 @@ class Pipeline:
         return agent, event
 
     def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> bool:
-        """Dispatch the wake (with retry); return ``True`` iff it succeeded.
+        """Dispatch the wake (with retry); return ``True`` iff its delivery is done.
 
-        The boolean drives delivery dedup: the caller marks the delivery as woken
-        only on success, so a failed wake never suppresses the duplicate.
+        Done means woken or stopped. The boolean drives delivery dedup: the caller marks
+        the delivery only when it is done, so a failed wake never suppresses the
+        duplicate.
+
+        **A wake stopped by a signal is a stop, never a crash** (basecradle-router#386).
+        Killing a runaway wake (SIGTERM, or SIGKILL) is the one tool an operator has
+        against it, and the router used to read the kill as a transient failure: it
+        re-woke the agent on the same delivery, and after the last retry wrote the
+        ``stage=wake outcome=failed`` line the NOC's *Wake Failed* alert pages on —
+        paging the operator who had just used the tool. The waker raises
+        :class:`~basecradle_router.wake.WakeStopped` instead, which is not a
+        ``WakeError`` and so never enters the retry; it ends the wake on the spot with
+        one ``event=wake_stopped`` WARNING, a ``stage=wake outcome=stopped`` record, and
+        a ``wake_end outcome=stopped``. The delivery is marked done, and the stopped
+        session covers its stream exactly as a successful one does, because it began
+        reading everything before its start: re-dispatching those deliveries would
+        re-run the work the operator stopped. It records **no** wake evidence — a stop
+        is neither the edge failing nor a gate refusing, and it never learned whether
+        the wake would have succeeded, so it is no ``ok`` either.
 
         Each attempt is timed, and ``duration`` is always *the last attempt's*
         wall-clock — the wake subprocess's own, never the retry backoff's — so the
@@ -686,6 +705,18 @@ class Pipeline:
         try:
             try:
                 woke = with_retry(attempt, attempts=attempts, sleep=self.sleep, on_retry=on_retry)
+            except WakeStopped as exc:
+                stop = {
+                    "signal": exc.signal,
+                    "exit": exc.exit_code,
+                    "duration": _seconds(last_duration),
+                }
+                logger.warning("%s %s", paint("event=wake_stopped"), log_fields(**who, **stop))
+                if last_started_at is not None:
+                    self.coverage.record(agent.harness_key, event, last_started_at)
+                self._record(result, Stage.WAKE, Outcome.STOPPED, **who, **stop)
+                verdict = {"outcome": Outcome.STOPPED.value, **stop}
+                return True
             except RetryExhausted as exc:
                 error = str(exc.__cause__ or exc)
                 self.evidence.record_wake_failed(

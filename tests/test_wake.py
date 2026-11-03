@@ -20,6 +20,7 @@ from basecradle_router.wake import (
     WakeInvocation,
     Waker,
     WakeResult,
+    WakeStopped,
 )
 
 NOVA = Agent(
@@ -353,3 +354,43 @@ def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
 
 def test_home_server_waker_default_runner_is_the_subprocess_one() -> None:
     assert HomeServerWaker().runner is wake_module._run_subprocess
+
+
+# --- a signal death is a stop, never a crash (basecradle-router#386) --------
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "signal"),
+    [
+        (-15, "TERM"),  # the signal reached sudo, which re-raised it (the 2026-11-03 pkill)
+        (-9, "KILL"),
+    ],
+)
+@pytest.mark.parametrize("waker_kind", [SubprocessWaker, HomeServerWaker])
+def test_a_stop_signal_exit_raises_wake_stopped_not_wake_error(
+    waker_kind, exit_code: int, signal: str
+) -> None:
+    waker = waker_kind(runner=_FakeRunner(WakeResult(exit_code=exit_code)))
+    with pytest.raises(WakeStopped) as excinfo:
+        waker.wake(NOVA, EVENT)
+    assert excinfo.value.signal == signal
+    assert excinfo.value.exit_code == exit_code
+    assert f"SIG{signal}" in str(excinfo.value)
+
+
+def test_a_stop_is_not_a_wake_error_so_no_failure_handler_can_swallow_it() -> None:
+    # The retry converts WakeError into a transient; a stop must never reach it.
+    assert not issubclass(WakeStopped, WakeError)
+
+
+@pytest.mark.parametrize(
+    "exit_code",
+    # Crashes, aborts, SIGINT, SIGHUP — and 143/137, a signal death INSIDE the wake (the
+    # harness's watchdog, the OOM killer), which the router cannot tell from a crash.
+    [1, 2, 75, -11, -6, -2, 134, 139, 130, 129, -1, 143, 137],
+)
+def test_every_other_non_zero_exit_is_still_a_crash_with_its_retry(exit_code: int) -> None:
+    runner = _FakeRunner(WakeResult(exit_code=exit_code))
+    with pytest.raises(WakeError) as excinfo:
+        HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+    assert excinfo.value.exit_code == exit_code

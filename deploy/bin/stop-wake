@@ -1,0 +1,473 @@
+#!/usr/bin/python3 -I
+"""stop-wake — stop one agent's running wake, the sanctioned way an operator ends it.
+
+Installed ROOT-OWNED at /opt/basecradle-router/bin/stop-wake (root:root, 0755) by the
+NOC's deploy, like every `deploy/bin/*` helper, and run AS ROOT by whoever is stopping
+the wake — @origin over SSH, or the NOC under its own account:
+
+    sudo /opt/basecradle-router/bin/stop-wake --agent <slug> [--delivery <id>] [--grace <s>]
+
+WHY IT EXISTS (basecradle-router#386). Killing a runaway wake is an operator's one tool
+against it, and until now that meant a hand-typed `pkill`. Two things were wrong with
+that. The router read the kill as a crash and re-woke the agent on the same delivery —
+fixed in the router, which now reads a stop signal's exit as a stop (`STOP_SIGNALS` in
+`basecradle_router.wake`). And a `pkill` is imprecise in both directions: `pkill -f
+<binary>` reaches every process whose argv names it, while the session's own children (a
+model's tool subprocesses) outlive the kill as orphans. This finds exactly the wake the
+daemon launched, stops everything it is running, and records who stopped it.
+
+WHAT IT SIGNALS, AND WHY NOT A PROCESS GROUP. A wake runs as
+`router daemon -> sudo -> wake-runner -> systemd-cat -> runuser -> <binary> -> …`, and
+none of those links starts a process group: proven on Ubuntu 24.04, the whole wake shares
+the DAEMON'S group, so `kill -- -<pgid>` would stop the router itself. So a wake's
+members are found two ways, and every member gets SIGTERM:
+
+  * its TREE — the `sudo` the daemon spawned for this agent (its argv is the wake-runner
+    invocation, and its parent is the daemon's account), and every descendant by pid;
+  * its MARK — every process of the agent's own account whose environment carries this
+    wake's `BASECRADLE_DELIVERY_ID`, which wake-runner exports after the privilege drop
+    and every descendant inherits. The tree alone misses a process that was already
+    reparented — a tool's `nohup job &`, a `setsid` server, a child whose parent exited —
+    and the mark survives reparenting and a new session alike. Only a process that
+    scrubbed its own environment escapes both. A wake whose delivery id was too odd to
+    carry has no mark, and is stopped by its tree alone.
+
+Both are re-read while the wake drains, so a member born in the window is caught too;
+whatever outlives the grace period gets SIGKILL. Signalling `sudo` alone would not do: it
+relays to `runuser`, which signals only its own child, so the session's grandchildren
+survive — the same orphans `pkill` leaves.
+
+WHAT THE ROUTER THEN SEES. `sudo` dies by the signal it was sent, so the daemon reads
+exit -15, logs `event=wake_stopped`, never retries, never writes `wake failed`, and marks
+the delivery done. That holds even when the binary traps SIGTERM and exits 0, because
+`runuser` re-raises a signal it caught, and even when a process ignores SIGTERM and needs
+the SIGKILL, because `sudo` has already died of the TERM by then.
+
+WHO STOPPED IT is `SUDO_USER` — asserted by sudo, not by the caller — or the account
+running this when it was not reached through sudo. It rides on both lines this writes per
+wake, under the journal identifier `basecradle-router-stop-wake`, beside the wake's own
+`delivery=` and `agent=`, so one `delivery=<id>` grep reads the stop request, the
+router's `event=wake_stopped`, and the agent's own journal together.
+
+ROOT ONLY, AND NOTHING GRANTED. The router daemon is not given this power: no sudoers
+rule names this file, so the account that dispatches every wake cannot also kill one.
+Root needs no grant, and both callers already hold it.
+
+A PROBE IS NEVER A TARGET: a `--probe` invocation acks and exits without launching
+anything, so there is nothing to stop, and it is not matched.
+
+EXIT CODES
+
+    0   stopped     every member of the wake is gone
+    1   survived    some process outlived SIGKILL (uninterruptible sleep); named on stdout
+    3   no wake     no running wake matched --agent (and --delivery, when given)
+    77  not root    EX_NOPERM: it cannot see or signal the wake as anyone else
+    2   usage       (argparse)
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import pwd
+import re
+import signal
+import sys
+import syslog
+import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+
+WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
+ROUTER_USER = "router"
+#: The variable wake-runner exports to the agent — `basecradle_router.wake.DELIVERY_ID_ENV`,
+#: spelled again because this program runs standalone, and pinned equal by a test.
+DELIVERY_ENV = "BASECRADLE_DELIVERY_ID"
+IDENT = "basecradle-router-stop-wake"
+DEFAULT_GRACE = 10.0
+#: After SIGKILL: long enough for the kernel to tear the tree down, short enough that an
+#: operator is never left waiting on a process in uninterruptible sleep.
+KILL_WAIT = 3.0
+POLL = 0.2
+
+EXIT_STOPPED = 0
+EXIT_SURVIVED = 1
+EXIT_NO_WAKE = 3
+EXIT_NOT_ROOT = 77
+
+# The same inert shapes the router and wake-runner pin, so a value that could never
+# have been a real wake's is refused rather than silently matching nothing.
+_SLUG = re.compile(r"\A[a-z_][a-z0-9_-]{0,63}\Z")
+_DELIVERY = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
+_MARK = f"{DELIVERY_ENV}=".encode()
+
+
+@dataclass(frozen=True, slots=True)
+class Proc:
+    """One process, as /proc describes it. ``start`` pins identity across PID reuse."""
+
+    pid: int
+    ppid: int
+    uid: int
+    start: int
+    state: str
+    argv: tuple[str, ...]
+    #: The process's own ``BASECRADLE_DELIVERY_ID``, if its environment carries one.
+    delivery: str | None = None
+    #: False when its environment could not be read, so whether it carries a mark is unknown.
+    marked_known: bool = True
+
+    @property
+    def alive(self) -> bool:
+        # A zombie has already exited; it is only waiting for its parent to reap it.
+        return self.state not in ("Z", "X")
+
+
+@dataclass(frozen=True, slots=True)
+class Wake:
+    """A running wake: the ``sudo`` the daemon spawned, and who and what it is for."""
+
+    root: Proc
+    agent: str
+    agent_uid: int
+    delivery: str | None
+
+
+def read_proc(proc_root: str, pid: int) -> Proc | None:
+    """``pid`` as a :class:`Proc`, or ``None`` if it vanished or cannot be read."""
+    base = f"{proc_root}/{pid}"
+    try:
+        with open(f"{base}/stat", encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+        with open(f"{base}/status", encoding="utf-8", errors="replace") as fh:
+            status = fh.read()
+        with open(f"{base}/cmdline", "rb") as fh:
+            cmdline = fh.read()
+    except OSError:
+        return None
+    marked_known = True
+    try:
+        with open(f"{base}/environ", "rb") as fh:
+            environ = fh.read()
+    except PermissionError:
+        # Reading another account's environment takes CAP_SYS_PTRACE, which a real root
+        # holds and a capability-trimmed one (a container, a narrowed unit) may not.
+        environ, marked_known = b"", False
+    except OSError:
+        environ = b""  # gone since the stat read: it carries no mark either way
+    # comm sits in parentheses and may itself contain spaces or ')', so the fields are
+    # read after the LAST ')': state is field 3, ppid 4, starttime 22 (proc(5)).
+    tail = stat[stat.rfind(")") + 2 :].split()
+    uid = next(
+        (int(line.split()[1]) for line in status.splitlines() if line.startswith("Uid:")), -1
+    )
+    delivery = next(
+        (
+            var[len(_MARK) :].decode("utf-8", "replace")
+            for var in environ.split(b"\0")
+            if var.startswith(_MARK)
+        ),
+        None,
+    )
+    try:
+        return Proc(
+            pid=pid,
+            ppid=int(tail[1]),
+            uid=uid,
+            start=int(tail[19]),
+            state=tail[0],
+            argv=tuple(a.decode("utf-8", "replace") for a in cmdline.split(b"\0") if a),
+            delivery=delivery,
+            marked_known=marked_known,
+        )
+    except (IndexError, ValueError):
+        return None
+
+
+def read_procs(proc_root: str = "/proc") -> dict[int, Proc]:
+    """Every readable process. Run as root, so the host's ``hidepid`` hides nothing."""
+    procs: dict[int, Proc] = {}
+    for name in os.listdir(proc_root):
+        if name.isdigit():
+            proc = read_proc(proc_root, int(name))
+            if proc is not None:
+                procs[proc.pid] = proc
+    return procs
+
+
+def parse_wake(argv: tuple[str, ...]) -> tuple[str, str | None] | None:
+    """``(agent, delivery)`` if ``argv`` is the daemon's real-wake ``sudo`` call, else ``None``.
+
+    The exact argv :class:`~basecradle_router.wake.HomeServerWaker` assembles:
+    ``sudo <WAKE_RUNNER> --user <slug> --cwd <clone> [--delivery <id>] -- <command>``.
+    A probe (``--probe``) and anything unrecognised before the ``--`` are not wakes.
+    """
+    if len(argv) < 2 or os.path.basename(argv[0]) != "sudo" or argv[1] != WAKE_RUNNER:
+        return None
+    user: str | None = None
+    delivery: str | None = None
+    rest = list(argv[2:])
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--":
+            return (user, delivery) if user else None
+        if flag not in ("--user", "--cwd", "--delivery") or not rest:
+            return None
+        value = rest.pop(0)
+        if flag == "--user":
+            user = value
+        elif flag == "--delivery":
+            delivery = value
+    return None
+
+
+def find_wakes(
+    procs: Mapping[int, Proc],
+    agent: str,
+    agent_uid: int,
+    delivery: str | None,
+    router_uid: int,
+) -> list[Wake]:
+    """The running wakes of ``agent`` (for ``delivery``, when given) the daemon launched."""
+    wakes = []
+    for proc in procs.values():
+        parsed = parse_wake(proc.argv)
+        if parsed is None or not proc.alive:
+            continue
+        who, carried = parsed
+        parent = procs.get(proc.ppid)
+        if who != agent or parent is None or parent.uid != router_uid:
+            continue
+        if delivery is not None and carried != delivery:
+            continue
+        wakes.append(Wake(root=proc, agent=who, agent_uid=agent_uid, delivery=carried))
+    return sorted(wakes, key=lambda w: w.root.pid)
+
+
+def tree(procs: Mapping[int, Proc], roots: Iterable[int]) -> set[int]:
+    """``roots`` and every live descendant of them, by parent pid."""
+    children: dict[int, list[int]] = {}
+    for proc in procs.values():
+        children.setdefault(proc.ppid, []).append(proc.pid)
+    seen: set[int] = set()
+    stack = [pid for pid in roots if pid in procs]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, ()))
+    return {pid for pid in seen if procs[pid].alive}
+
+
+def members(procs: Mapping[int, Proc], wake: Wake) -> set[int]:
+    """Every live process of ``wake``: its tree, and its marked processes with theirs.
+
+    The mark is honoured only on the agent's own account, so nothing another account
+    runs can be pulled in by naming a delivery id in its environment.
+    """
+    marked = (
+        [
+            p.pid
+            for p in procs.values()
+            if p.alive and p.uid == wake.agent_uid and p.delivery == wake.delivery
+        ]
+        if wake.delivery is not None
+        else []
+    )
+    return tree(procs, [wake.root.pid, *marked])
+
+
+def fields(**pairs: object) -> str:
+    """A ``key=value`` run, dropping empty values — the router's own line grammar."""
+    out = []
+    for key, value in pairs.items():
+        if value is None or value == "":
+            continue
+        text = str(value)
+        if any(c.isspace() for c in text) or '"' in text:
+            text = json.dumps(text)
+        out.append(f"{key}={text}")
+    return " ".join(out)
+
+
+@dataclass(slots=True)
+class _Tracked:
+    start: int
+    wake: int  # index into the wakes being stopped, so each wake reports its own result
+
+
+@dataclass(slots=True)
+class Stopper:
+    """Stop the matched wakes — every collaborator injectable, so it is testable offline."""
+
+    read: Callable[[], dict[int, Proc]]
+    kill: Callable[[int, int], None]
+    log: Callable[[str], None]
+    sleep: Callable[[float], None] = time.sleep
+    now: Callable[[], float] = time.monotonic
+    _tracked: dict[int, _Tracked] = field(default_factory=dict)
+
+    def stop(self, wakes: list[Wake], *, by: str, grace: float) -> list[int]:
+        """Signal every member of every wake; return the pids that survived SIGKILL."""
+        started = self.now()
+        procs = self.read()
+        for wake in wakes:
+            self.log(
+                fields(
+                    event="wake_stop_requested",
+                    delivery=wake.delivery,
+                    agent=wake.agent,
+                    by=by,
+                    signal="TERM",
+                    pids=len(members(procs, wake)),
+                )
+            )
+        self._sweep(procs, wakes, signal.SIGTERM)
+
+        while self.now() - started < grace:
+            self.sleep(POLL)
+            procs = self.read()
+            if not self._sweep(procs, wakes, signal.SIGTERM) and not self._live(procs):
+                break
+
+        # Escalate: anything still standing, and any member born since the last sweep.
+        procs = self.read()
+        killed = self._live(procs)
+        for pid in killed:
+            self._send(pid, signal.SIGKILL)
+        killed += self._sweep(procs, wakes, signal.SIGKILL)
+        survivors = killed
+        waited = 0.0
+        while survivors and waited < KILL_WAIT:
+            self.sleep(POLL)
+            waited += POLL
+            survivors = self._live(self.read())
+
+        elapsed = f"{self.now() - started:.1f}s"
+        for index, wake in enumerate(wakes):
+            own = {pid for pid, t in self._tracked.items() if t.wake == index}
+            own_killed = sorted(own.intersection(killed))
+            own_survivors = sorted(own.intersection(survivors))
+            outcome = "survived" if own_survivors else ("killed" if own_killed else "stopped")
+            self.log(
+                fields(
+                    event="wake_stop_done",
+                    delivery=wake.delivery,
+                    agent=wake.agent,
+                    by=by,
+                    outcome=outcome,
+                    signalled=len(own),
+                    killed=len(own_killed),
+                    survivors=" ".join(map(str, own_survivors)) or None,
+                    duration=elapsed,
+                )
+            )
+        return survivors
+
+    def _live(self, procs: Mapping[int, Proc]) -> list[int]:
+        """The tracked processes still running — the same process, never a reused pid."""
+        return sorted(
+            pid
+            for pid, t in self._tracked.items()
+            if pid in procs and procs[pid].start == t.start and procs[pid].alive
+        )
+
+    def _sweep(self, procs: Mapping[int, Proc], wakes: list[Wake], sig: int) -> list[int]:
+        """Signal every member not yet tracked, recording which wake it belongs to."""
+        fresh = []
+        for index, wake in enumerate(wakes):
+            for pid in sorted(members(procs, wake)):
+                if pid not in self._tracked:
+                    self._tracked[pid] = _Tracked(start=procs[pid].start, wake=index)
+                    self._send(pid, sig)
+                    fresh.append(pid)
+        return fresh
+
+    def _send(self, pid: int, sig: int) -> None:
+        # A process that exited between the read and the signal is the outcome we wanted.
+        with contextlib.suppress(ProcessLookupError):
+            self.kill(pid, sig)
+
+
+def _operator() -> str:
+    """Who is stopping the wake: sudo's own record of the caller, else this account."""
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if _SLUG.match(sudo_user):
+        return sudo_user
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return str(os.getuid())
+
+
+def _journal(line: str) -> None:
+    """The line on stdout for the operator, and in the journal under :data:`IDENT`.
+
+    ``syslog`` reports no failure, so stdout is the record the operator can always see;
+    the journal copy is what joins it to the router's and the agent's lines.
+    """
+    print(line, flush=True)
+    syslog.syslog(syslog.LOG_WARNING, line)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="stop-wake", description="Stop an agent's running wake (an operator's stop)."
+    )
+    parser.add_argument("--agent", required=True, help="the agent's OS-user slug")
+    parser.add_argument("--delivery", help="stop only the wake for this delivery id")
+    parser.add_argument(
+        "--grace",
+        type=float,
+        default=DEFAULT_GRACE,
+        help=f"seconds to wait after SIGTERM before SIGKILL (default {DEFAULT_GRACE:g})",
+    )
+    args = parser.parse_args(argv)
+    if not _SLUG.match(args.agent):
+        parser.error(f"--agent is not an agent slug: {args.agent!r}")
+    if args.delivery is not None and not _DELIVERY.match(args.delivery):
+        parser.error(f"--delivery must match [A-Za-z0-9_.:-]{{1,128}}: {args.delivery!r}")
+    if args.grace < 0:
+        parser.error("--grace must be >= 0")
+
+    if os.geteuid() != 0:
+        print(
+            "stop-wake: must run as root (sudo); it cannot see or signal a wake otherwise",
+            file=sys.stderr,
+        )
+        return EXIT_NOT_ROOT
+    target = f"agent={args.agent}" + (f" delivery={args.delivery}" if args.delivery else "")
+    try:
+        router_uid = pwd.getpwnam(ROUTER_USER).pw_uid
+        agent_uid = pwd.getpwnam(args.agent).pw_uid
+    except KeyError:
+        print(f"stop-wake: no running wake matched {target} (no such account)", file=sys.stderr)
+        return EXIT_NO_WAKE
+
+    procs = read_procs()
+    wakes = find_wakes(procs, args.agent, agent_uid, args.delivery, router_uid)
+    if not wakes:
+        print(f"stop-wake: no running wake matched {target}", file=sys.stderr)
+        return EXIT_NO_WAKE
+
+    unknown = sum(1 for p in procs.values() if p.uid == agent_uid and not p.marked_known)
+    if unknown:
+        # Loud, never silent: the stop still runs, by the tree, but a member already
+        # reparented out of it would be missed, and the operator must know to look.
+        print(
+            f"stop-wake: WARNING: could not read {unknown} of {args.agent}'s process "
+            "environments (no CAP_SYS_PTRACE?): a member already reparented out of the "
+            f"wake's tree will be missed — check `ps -u {args.agent}` afterwards",
+            file=sys.stderr,
+        )
+    syslog.openlog(IDENT, 0, syslog.LOG_DAEMON)
+    stopper = Stopper(read=read_procs, kill=os.kill, log=_journal)
+    survivors = stopper.stop(wakes, by=_operator(), grace=args.grace)
+    return EXIT_SURVIVED if survivors else EXIT_STOPPED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

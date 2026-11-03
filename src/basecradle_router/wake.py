@@ -116,6 +116,48 @@ class WakeError(Exception):
         self.exit_code = exit_code
 
 
+class WakeStopped(Exception):
+    """A wake was stopped by a signal — an operator's stop, never a crash to retry.
+
+    Deliberately **not** a :class:`WakeError`. Retrying a failure is the pipeline's
+    policy for a *crash*; a wake killed by SIGTERM or SIGKILL is the one tool an
+    operator has against a runaway session, and retrying it re-woke the agent the
+    operator had just stopped, then, once the retries ran out, paged that operator
+    with a *Wake Failed* alert (basecradle-router#386). A separate class means no
+    ``except WakeError`` anywhere can mistake a stop for a failure.
+
+    ``signal`` is the signal's short name (``TERM``, ``KILL``); ``exit_code`` is the
+    raw status the router saw, which says *which layer* the signal reached — see
+    :data:`STOP_SIGNALS`.
+    """
+
+    def __init__(self, message: str, *, signal: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.signal = signal
+        self.exit_code = exit_code
+
+
+# The exit statuses that mean "this wake was stopped by a signal", and the signal each
+# names. A wake reaches the router through `sudo -> wake-runner -> runuser -> <binary>`,
+# and the router's direct child is `sudo`. Proven on Ubuntu 24.04's sudo and util-linux
+# runuser (basecradle-router#386):
+#
+#   -15 / -9   `sudo` died by the signal. That happens only when a signal from OUTSIDE the
+#              wake reached `sudo` or `runuser`: each relays it down and then re-raises it
+#              on itself, `runuser` even when the binary trapped SIGTERM and exited 0. The
+#              stop op (`deploy/bin/stop-wake`, which signals the whole wake) always lands
+#              here, as did the 2026-11-03 `pkill -f`.
+#
+# Nothing else is a stop. A signal death *inside* the wake — the binary, or a process it
+# ran, killed by the harness's own watchdog, by the kernel's OOM killer, or by a hand
+# `kill <pid>` — reaches the router only as `runuser`'s exit 128+N (143, 137), the same
+# encoding a wrapper passing a child's status through would produce. The router cannot
+# tell an operator from a crash there, so those stay crashes: they keep their retry and
+# their *Wake Failed* page, and an operator who wants a stop uses the stop op. So does
+# every other status — a plain exit code, a Python traceback, a timeout.
+STOP_SIGNALS: Mapping[int, str] = MappingProxyType({-15: "TERM", -9: "KILL"})
+
+
 @dataclass(frozen=True, slots=True)
 class WakeInvocation:
     """The fully-assembled command for one wake — the runner's sole input.
@@ -163,7 +205,8 @@ class Waker(Protocol):
         """Run ``agent``'s headless ``claude`` for ``event``.
 
         Returns a :class:`WakeResult` on a clean (exit 0) run; raises
-        :class:`WakeError` on a non-zero exit or a launch failure.
+        :class:`WakeStopped` when the wake was killed by a stop signal, and
+        :class:`WakeError` on any other non-zero exit or a launch failure.
         """
         ...
 
@@ -205,13 +248,22 @@ def _run_subprocess(invocation: WakeInvocation) -> WakeResult:
 
 
 def _result_or_raise(result: WakeResult, agent: Agent) -> WakeResult:
-    """Return a clean (exit 0) result, or raise :class:`WakeError` naming the repo.
+    """Return a clean (exit 0) result, or raise naming the agent.
 
-    The shared tail of every waker: a non-zero exit becomes a ``WakeError`` carrying
-    the exit code and the best available detail (stderr, then stdout, then a clear
-    placeholder — never an empty message)."""
+    The shared tail of every waker, so both classify an exit identically: a stop
+    signal's status (:data:`STOP_SIGNALS`) becomes a :class:`WakeStopped`; any other
+    non-zero exit becomes a ``WakeError`` carrying the exit code and the best available
+    detail (stderr, then stdout, then a clear placeholder — never an empty message)."""
     if not result.ok:
         detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        stopped_by = STOP_SIGNALS.get(result.exit_code)
+        if stopped_by is not None:
+            raise WakeStopped(
+                f"wake of {agent.key} stopped by SIG{stopped_by} "
+                f"(exit {result.exit_code}): {detail}",
+                signal=stopped_by,
+                exit_code=result.exit_code,
+            )
         raise WakeError(
             f"wake of {agent.key} exited {result.exit_code}: {detail}",
             exit_code=result.exit_code,
