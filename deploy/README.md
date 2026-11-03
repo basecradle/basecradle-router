@@ -1679,19 +1679,29 @@ Caddy, no database) and has four load-bearing properties:
    The Claude Code builders on the box export one OpenTelemetry log event per model call (the NOC's
    managed-settings file turns it on and names each builder, basecradle-noc#1179). The source
    listens on **`127.0.0.1:4318`** (OTLP http; the required gRPC listener is `127.0.0.1:4317` and
-   has no sender), localhost only. `ai_otel_llm` renders a `claude_code.api_request` event as the
-   fleet's own `llm` line, the harness telemetry contract's head and fields, so every existing
-   Better Stack column reads a builder's model calls with no change. It **rebuilds the event from
-   scratch**: the slug, the model id, the request id and every number are checked first, and nothing
-   else Claude Code attaches (session, user and account ids, the prompt id) survives; a render that
-   fails is dropped, never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like
-   a journald record, which redacts it and adds the `[basecradle-wake-<slug>]` prefix. Every other
-   Claude Code event is dropped, `claude_code.api_error` included: the contract writes no `llm` line
-   for a brain call that raised, so a builder's final model-call failure is not on the board, and
-   every call is `purpose=main`, auxiliary ones included, since a `helper` line needs a `kind` and
-   an `outcome` Claude Code does not state (both the capital's rulings on #380; the contract
-   questions they leave are in basecradle/basecradle#726). The port is **not authenticated**: any
-   local account can send to it under any agent's name, and nothing records who did.
+   has no sender), localhost only. `ai_otel_llm` renders two Claude Code events as the fleet's own
+   `llm` line, the harness telemetry contract's head and fields, so every Better Stack column reads
+   a builder's model calls the way it reads a harness agent's (basecradle-harness#782,
+   basecradle-router#384): a `claude_code.api_request` is a billed line, `INFO … outcome=ok`, and a
+   `claude_code.api_error` (sent once per call, after Claude Code's own retries are spent) is a
+   decision line, `WARNING … outcome=failed reason=<slug> detail=…`, with no tokens or cost, and a
+   `duration` only for a call that made one attempt and reached Anthropic (the event's time is the
+   last attempt's, so for any other call it is not the whole wait). The slug is read off the HTTP status: `429` is `rate_limited`, `504` is `timeout`, any
+   other `5xx` is `server_error`, and anything else, a connection failure included, is `api_error`.
+   It is WARNING rather than ERROR because the NOC's *Error on AI Server* alert pages on ERROR, and
+   whether a builder's failed call pages is basecradle/basecradle#726's open question. An auxiliary
+   call is `purpose=helper` with no `kind`; every other call is `purpose=main`. It **rebuilds the
+   event from scratch**: the slug, the model id, the request id and every number are checked first,
+   the error text is flattened, quoted and bounded without ever cutting a credential-shaped run
+   short of its redaction, and nothing else Claude Code
+   attaches (session, user and account ids, the prompt id) survives; a render that fails is dropped,
+   never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like a journald
+   record, which redacts it and adds the `[basecradle-wake-<slug>]` prefix. Every other Claude Code
+   event is dropped, `claude_code.api_retries_exhausted` included, so a failure is counted once.
+   The port is **not authenticated**: any local account can send to it under any agent's name, and
+   nothing records who did. `detail` is the one value no charset limits, so through it a sender can
+   ship up to 240 characters of its own text; it is quoted, so only a consumer that matches inside
+   quoted values reads it as more than text.
    `tests/vector/ai_otel_llm.yaml` asserts the exact shipped bytes, run by `vector test` on the
    boxes' Vector release in CI.
 
