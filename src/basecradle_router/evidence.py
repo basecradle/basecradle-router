@@ -120,6 +120,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from basecradle_router.dedup import DUPLICATE_DELIVERY
+from basecradle_router.logfmt import log_fields
 
 logger = logging.getLogger("basecradle_router.evidence")
 
@@ -575,11 +576,10 @@ class EvidenceStore:
                 removed.append(name)
         if removed:
             logger.warning(
-                "event=evidence_orphaned_temps_removed dir=%s removed=%s "
+                "event=evidence_orphaned_temps_removed %s "
                 "(a flush was interrupted before its swap; the update it carried never "
                 "reached the document)",
-                directory,
-                ",".join(removed),
+                log_fields(dir=directory, removed=",".join(removed)),
             )
 
     def _discard_stale_queue_depths(self) -> None:
@@ -615,11 +615,10 @@ class EvidenceStore:
             return
         for agent, pending in sorted(stale.items()):
             logger.warning(
-                "event=evidence_stale_queue_cleared agent=%s pending=%s "
+                "event=evidence_stale_queue_cleared %s "
                 "(the previous daemon stopped without draining; no scheduler in this process "
                 "owns that work)",
-                agent,
-                pending,
+                log_fields(agent=agent, pending=pending),
             )
         with self._lock:
             for agent in stale:
@@ -813,10 +812,9 @@ class EvidenceStore:
             if not self._write_failed:
                 self._write_failed = True
                 logger.warning(
-                    "event=evidence_write_failed path=%s detail=%s "
+                    "event=evidence_write_failed %s "
                     "(evidence is now in-memory only for this process)",
-                    self.path,
-                    exc,
+                    log_fields(path=self.path, detail=exc),
                 )
 
 
@@ -866,7 +864,7 @@ def _load(path: str) -> EvidenceDocument:
     except FileNotFoundError:
         return EvidenceDocument()
     except (OSError, ValueError) as exc:
-        logger.warning("event=evidence_unreadable path=%s detail=%s", path, exc)
+        logger.warning("event=evidence_unreadable %s", log_fields(path=path, detail=exc))
         return EvidenceDocument()
 
 

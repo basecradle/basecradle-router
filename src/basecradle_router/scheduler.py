@@ -72,6 +72,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from basecradle_router.logfmt import log_fields
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import PipelineResult
 
@@ -251,9 +252,8 @@ class WakeScheduler:
             self._run(job.agent, job.event, job.result)
         except Exception:  # noqa: BLE001 — pipeline.execute never raises; guard a defect
             logger.exception(
-                "wake run raised for agent=%s delivery=%s (lane freed regardless)",
-                key,
-                job.event.delivery_id,
+                "wake run raised for %s (lane freed regardless)",
+                log_fields(agent=key, delivery=job.event.delivery_id),
             )
         finally:
             with self._cv:
@@ -334,7 +334,9 @@ class WakeScheduler:
         try:
             self._on_queue_change(key, pending)
         except Exception:  # noqa: BLE001 — observability must never break scheduling
-            logger.exception("queue observer raised for agent=%s (scheduling unaffected)", key)
+            logger.exception(
+                "queue observer raised for %s (scheduling unaffected)", log_fields(agent=key)
+            )
 
     def _note_saturation_locked(self) -> None:
         """Log the saturated↔not-saturated transition. Caller holds ``_cv``.

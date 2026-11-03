@@ -219,15 +219,16 @@ def log_delivery_decision(
     decisions say *why* — ``into=`` for a coalesce, ``reason=`` for a drop — while the
     five leading keys stay in the same place on every decision line, whoever emits it.
     """
-    extra = log_fields(**detail)
     logger.info(
-        "event=delivery_decision source=%s event_type=%s decision=%s recipient=%s delivery=%s%s",
-        source,
-        event_type or "<none>",
-        decision.value,
-        recipient or "<unknown>",
-        delivery or "<unknown>",
-        f" {extra}" if extra else "",
+        "event=delivery_decision %s",
+        log_fields(
+            source=source,
+            event_type=event_type or "<none>",
+            decision=decision.value,
+            recipient=recipient or "<unknown>",
+            delivery=delivery or "<unknown>",
+            **detail,
+        ),
     )
 
 
@@ -380,5 +381,7 @@ def route_warm(route: object) -> None:
         warm()
     except Exception:  # noqa: BLE001 — a warm-up must never stop the daemon
         logger.error(
-            "event=route_warm status=error source=%s", getattr(route, "name", "?"), exc_info=True
+            "event=route_warm status=error %s",
+            log_fields(source=getattr(route, "name", "?")),
+            exc_info=True,
         )

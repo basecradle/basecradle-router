@@ -566,6 +566,34 @@ tests:
               # outcome= outside a quoted value is the line's own.
               assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"upstream said: [31m 'outcome=ok' x-api-key: [REDACTED_API_KEY]\"")
 
+  # The router's own `log_fields` renders this same input to these same bytes:
+  # tests/test_logfmt.py reads this case back out of this file and asserts it (#396).
+  - name: "a detail renders by the fleet's one value rule, byte for byte with the router's log_fields"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-opus-5-5",
+              "error": "upstream said \" stage=wake outcome=failed duration=99999.0s\nit's C:\\path\\x\u{1b}[31m red\u{85}end",
+              "status_code": 500,
+              "query_source": "main"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:15Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # The inner double quote is a single quote, so the quote count stays balanced; the
+              # apostrophe and the backslashes pass through untouched; the newline, the escape and
+              # the C1 control character are each one space.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"upstream said ' stage=wake outcome=failed duration=99999.0s it's C:\\path\\x [31m red end\"")
+
   - name: "a long error text is never cut inside a credential, so none ships short of its redaction"
     inputs:
       - insert_at: "ai_otel_llm"

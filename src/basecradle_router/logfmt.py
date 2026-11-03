@@ -39,7 +39,7 @@ Live Tail whichever daemon emitted the line.
 
 from __future__ import annotations
 
-import json
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -105,15 +105,58 @@ def paint(token: str) -> str:
     return f"{colour}{token}{RESET}" if colour else token
 
 
+#: One C0 or C1 control character, or DEL — Unicode's ``Cc`` category exactly, which is
+#: what the ``\\p{Cc}`` of the router's own ``detail=`` remap matches (``vector.yaml``,
+#: ``ai_otel_llm``), so the two renderers flatten the same bytes.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _render_value(value: object) -> str:
+    """One field's value, rendered by the fleet's one value rule — or ``""`` when empty.
+
+    The rule is basecradle-harness ``docs/telemetry.md`` → The Grammar, the one
+    definition (the harness's ``_observability._value``); this is the router's copy of
+    it, and the ``detail=`` remap in ``vector.yaml`` is the other, byte for byte
+    (``tests/test_logfmt.py`` reads the remap's case and holds the two together):
+
+    1. **Flatten.** Every run of whitespace becomes one space, trimmed at both ends, so
+       a record stays one line. A control character that is not whitespace (an escape,
+       a NUL) becomes a space first, as the remap's ``\\p{Cc}`` does — the one place
+       both router renderers go past the harness's ``_value``, which leaves it in, and
+       what keeps a value from painting the line outside :func:`paint`.
+    2. **Quote** a value holding a space, an ``=`` or a double quote, so it reads as
+       *one* value rather than as extra fields — and turn its own ``"`` into ``'``.
+
+    Step 2's swap is the point (basecradle-router#396). Every fleet consumer anchors a
+    token **outside every quoted value** by counting the ``"`` before it, so a quote is
+    never escaped: a ``\\"`` (what ``json.dumps`` wrote here before) is still a ``"`` to
+    that count, flips it, and lets a value such as ``upstream said " stage=wake
+    outcome=failed`` forge a line's verdict. A backslash is an ordinary character and
+    passes through untouched, as in the harness.
+
+    A ``bool`` renders lowercase (see :func:`log_fields`). Two of the harness's ``kv``
+    jobs are not this function's: bounding a value's length (240 characters there),
+    which is a separate job from quoting and one the router has never done, and
+    credential scrubbing, which is the box's ``ai_scrub``, run over every journald line.
+    """
+    text = ("true" if value else "false") if isinstance(value, bool) else str(value)
+    text = " ".join(_CONTROL.sub(" ", text).split())
+    if " " in text or "=" in text or '"' in text:
+        return '"' + text.replace('"', "'") + '"'
+    return text
+
+
 def log_fields(**pairs: object) -> str:
     """Render ``pairs`` as a ``key=value`` run, dropping the empty ones.
 
     The one renderer behind every line the router logs, so a stage line, a retry
-    warning, a breaker trip, and the startup banner cannot drift apart in shape. A
-    value carrying whitespace or a quote — an error message, always — is JSON-quoted,
-    so it stays a *single* field and a grep for the field after it still matches; a
-    ``None`` or ``""`` value is dropped rather than logged as ``key=`` (``0`` is a
-    value, and is kept).
+    warning, a breaker trip, and the startup banner cannot drift apart in shape. Each
+    value is rendered by :func:`_render_value`, the fleet's one value rule: a value
+    carrying whitespace, an ``=`` or a quote — an error message, always — is
+    double-quoted with its own ``"`` turned into ``'``, so it stays a *single* field
+    and a grep for the field after it still matches; a ``None`` value, or one that
+    renders empty (``""``, whitespace only), is dropped rather than logged as ``key=``
+    (``0`` is a value, and is kept).
 
     A ``bool`` renders lowercase — ``key=true``, never Python's ``True`` — and ``False``
     is a value like ``0``, never dropped as empty. No field passes a bool today
@@ -131,10 +174,9 @@ def log_fields(**pairs: object) -> str:
     """
     parts = []
     for key, value in pairs.items():
-        if value is None or value == "":
+        if value is None:
             continue
-        text = ("true" if value else "false") if isinstance(value, bool) else str(value)
-        if any(char.isspace() for char in text) or '"' in text:
-            text = json.dumps(text)
-        parts.append(f"{key}={text}")
+        text = _render_value(value)
+        if text:
+            parts.append(f"{key}={text}")
     return " ".join(parts)

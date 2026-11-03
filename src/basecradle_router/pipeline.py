@@ -854,8 +854,8 @@ class Pipeline:
         level = logging.WARNING if outcome in (Outcome.REJECTED, Outcome.FAILED) else logging.INFO
         logger.log(
             level,
-            "stage=%s %s%s",
-            stage.value,
+            "%s %s%s",
+            log_fields(stage=stage.value),
             # Painted here and nowhere else: `rendered` above is the record's own
             # bytes, so colour reaches the journal without ever reaching the record.
             paint(f"outcome={outcome.value}"),

@@ -326,7 +326,9 @@ class WebhookServer:
         except Exception as exc:  # noqa: BLE001 — a self-test must never stop the daemon
             # exc_info: this branch only fires on a defect in the self-test itself, and
             # the traceback is the whole diagnosis.
-            logger.error("event=freeze_selftest status=error detail=%s", exc, exc_info=True)
+            logger.error(
+                "event=freeze_selftest status=error %s", log_fields(detail=exc), exc_info=True
+            )
 
     def warm_routes(self) -> None:
         """Let each route rebuild what a restart emptied, before the first delivery (#370).

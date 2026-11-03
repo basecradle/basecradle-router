@@ -80,6 +80,7 @@ from basecradle_router.evidence import (
     RouteWakeEvidence,
     read_evidence,
 )
+from basecradle_router.logfmt import log_fields
 from basecradle_router.marker import is_marker, nonce_of
 from basecradle_router.routes.base import HMAC_SHA256_PREFIX
 from basecradle_router.routes.probe import (
@@ -351,12 +352,14 @@ class WakeProbe:
         started = self.clock()
         injection = self._inject(harness_key, marker, delivery_id)
         logger.info(
-            "event=probe_injected agent=%s route=%s delivery=%s status=%d terminal=%s",
-            harness_key,
-            self.route,
-            delivery_id,
-            injection.status,
-            injection.terminal(),
+            "event=probe_injected %s",
+            log_fields(
+                agent=harness_key,
+                route=self.route,
+                delivery=delivery_id,
+                status=injection.status,
+                terminal=injection.terminal(),
+            ),
         )
         status, detail, after = self._await_outcome(harness_key, delivery_id, before, injection)
         return ProbeResult(

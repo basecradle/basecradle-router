@@ -59,6 +59,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from basecradle_router.logfmt import log_fields
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 logger = logging.getLogger("basecradle_router.selftest")
@@ -339,10 +340,12 @@ def log_freeze_selftest(result: FreezeSelfTest) -> None:
     level = {OK: logging.INFO, DEGRADED: logging.WARNING, FAILED: logging.ERROR}[result.status]
     logger.log(
         level,
-        "event=freeze_selftest status=%s lock_dir=%s ran_as=%s checks=%d detail=%s",
-        result.status,
-        result.lock_dir,
-        result.ran_as,
-        len(result.checks),
-        result.summary(),
+        "event=freeze_selftest %s",
+        log_fields(
+            status=result.status,
+            lock_dir=result.lock_dir,
+            ran_as=result.ran_as,
+            checks=len(result.checks),
+            detail=result.summary(),
+        ),
     )
