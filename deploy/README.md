@@ -251,14 +251,16 @@ event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github out
   delivery id is what a human copies to follow one wake through the router and on into the agent's own
   journal.
 
-**The colours** (fleet-wide — the harness's and the NOC's journald surfaces carry the same table, so a
-colour means the same thing whichever daemon emitted the line):
+**The colours** (fleet-wide — defined once in basecradle-harness `docs/telemetry.md` → The Palette, and carried on
+the harness's and the NOC's journald surfaces too, so a colour means the same thing whichever daemon
+emitted the line):
 
 | Colour | Applied to |
 |---|---|
 | **green** `\x1b[32m` | `event=wake_start`, `outcome=ok`, `event=breaker_reset` |
 | **blue** `\x1b[34m` | `event=wake_end` (the bookend's identity — its trailing `outcome=` carries the verdict's colour) |
 | **yellow** `\x1b[33m` | `event=wake_retry`, `event=wake_refused`, `event=wake_lock_stale` — the warning tier, neither success nor failure |
+| **yellow** `\x1b[33m` | `event=wake_stopped`, `outcome=stopped` — the Operator's Choice tier: neither success nor failure, an outcome an operator chose (a stopped wake); never red, because nothing failed (basecradle-harness#799) |
 | **red** `\x1b[31m` | `outcome=failed`, `outcome=rejected`, `event=breaker_tripped`, `event=wake_lock_unreadable` |
 
 Two rules govern them, and both are pinned by tests:

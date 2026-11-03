@@ -1455,6 +1455,32 @@ def test_a_stopped_wake_writes_one_wake_stopped_warning_naming_the_signal(caplog
     )
 
 
+def test_a_stopped_wake_paints_both_stop_lines_in_the_operators_choice_tier(caplog) -> None:
+    # basecradle-harness `docs/telemetry.md` → The Palette: a stop is an outcome an
+    # operator chose — yellow, never red — and the colour wraps the whole verdict token,
+    # so a search for `event=wake_stopped` or `outcome=stopped` still matches the bytes.
+    pipeline, _ = _pipeline(waker=_StoppedWaker(), clock=_FakeClock(step=2524.3))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    stopped = next(r.getMessage() for r in caplog.records if "event=wake_stopped" in r.getMessage())
+    assert stopped == (
+        f"{YELLOW}event=wake_stopped{RESET} delivery={DELIVERY_A} agent={NOVA.harness_key} "
+        "source=github signal=TERM exit=-15 duration=2524.3s"
+    )
+    assert _stage_line(caplog, Stage.WAKE) == (
+        f"stage=wake {YELLOW}outcome=stopped{RESET} delivery={DELIVERY_A} "
+        f"agent={NOVA.harness_key} source=github signal=TERM exit=-15 duration=2524.3s"
+    )
+    # The bookend keeps its own blue identity; its verdict token carries the verdict's
+    # colour, as it does for every other outcome (basecradle-router#230).
+    end = next(
+        r.getMessage() for r in caplog.records if "event=wake_end" in _uncoloured(r.getMessage())
+    )
+    assert end.startswith(f"{BLUE}event=wake_end{RESET} ")
+    assert f" {YELLOW}outcome=stopped{RESET} " in end
+
+
 def test_the_bracket_closes_a_stopped_wake_with_its_own_verdict(caplog) -> None:
     pipeline, _ = _pipeline(waker=_StoppedWaker(signal="KILL", exit_code=-9), clock=_FakeClock())
     with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
