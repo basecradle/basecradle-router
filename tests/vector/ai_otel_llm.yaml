@@ -1,10 +1,11 @@
-# Vector unit tests for `ai_otel_llm` (basecradle-router#380), run by tests/test_vector_otel_llm.py
+# Vector unit tests for `ai_otel_llm` (basecradle-router#380, #384), run by tests/test_vector_otel_llm.py
 # as `vector test <the shipped vector.yaml> <this file>`. Each event goes in at `ai_otel_llm` and is
 # read back out of `ai_scrub`, the last transform before the logs sink, so the tests run the shipped
 # VRL of both and assert the exact bytes Better Stack receives.
 #
 # Every input is a fabricated event in the exact shape Vector 0.56.0's `opentelemetry` source emits
-# for a real Claude Code 2.1.316 model call (captured 2026-11-01): the body is `.message`, the
+# for a real Claude Code model call (2.1.316, captured 2026-11-01; `api_error` and
+# `api_retries_exhausted` from 2.1.317, captured 2026-11-03): the body is `.message`, the
 # per-call fields are `.attributes`, and the NOC's `basecradle.agent` rides in `.resources`. The
 # identifiers Claude Code attaches (session, user, account, prompt, terminal) are carried here as
 # fabricated values on purpose, so the tests can prove that none of them ships.
@@ -68,14 +69,14 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=1.51s tokens_in=29261 tokens_out=4 tokens_total=29265 cached_tokens=11391 cache_write_tokens=17868 cost=0.00368971 cost_basis=computed generation_id=req_011CgcFabricatedNova0001")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=1.51s tokens_in=29261 tokens_out=4 tokens_total=29265 cached_tokens=11391 cache_write_tokens=17868 cost=0.00368971 cost_basis=computed outcome=ok generation_id=req_011CgcFabricatedNova0001")
               assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-wake-nova")
               assert_eq!(.host, get_hostname!())
               assert_eq!(.dt, t'2026-11-01T10:21:11.614Z')
               # The whole event is these four fields: no attribute, resource or scope survives.
               assert_eq!(keys(.), ["SYSLOG_IDENTIFIER", "dt", "host", "message"])
 
-  - name: "an auxiliary call is main, string counters are read, and a zero cache write is omitted"
+  - name: "an auxiliary call is a helper with no kind, string counters are read, and a zero cache write is omitted"
     inputs:
       - insert_at: "ai_otel_llm"
         type: "vrl"
@@ -101,7 +102,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-haiku-5-5 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=0 cost=0.0445 cost_basis=computed generation_id=req_011CgcFabricatedNova0002")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=helper model=claude-haiku-5-5 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=0 cost=0.0445 cost_basis=computed outcome=ok generation_id=req_011CgcFabricatedNova0002")
 
   - name: "a subagent or sdk call is the builder's own work"
     inputs:
@@ -127,7 +128,7 @@ tests:
           - type: "vrl"
             source: |
               # No cache read reported: no cached_tokens. No request id: no generation_id.
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=10 tokens_out=5 tokens_total=15 cost=2 cost_basis=computed")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=10 tokens_out=5 tokens_total=15 cost=2 cost_basis=computed outcome=ok")
 
   - name: "a usage block of nothing but zeros writes no tokens and no zero cost"
     inputs:
@@ -155,7 +156,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=120.00s generation_id=req_011CgcFabricatedNova0003")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=120.00s outcome=ok generation_id=req_011CgcFabricatedNova0003")
 
   - name: "a negative cost, a malformed counter and a malformed request id are omitted, never shipped"
     inputs:
@@ -182,9 +183,181 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 tokens_in=100 tokens_out=20 tokens_total=120")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 tokens_in=100 tokens_out=20 tokens_total=120 outcome=ok")
 
-  - name: "an api_error writes no llm line"
+  - name: "an api_error renders as a failed llm line and nothing else"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "event.name": "api_error",
+              "event.sequence": 6,
+              "event.timestamp": "2026-11-01T10:26:00.317Z",
+              "model": "claude-opus-5-5",
+              "error": "model: claude-opus-5-5",
+              "status_code": 404,
+              "duration_ms": 317,
+              "attempt": 1,
+              "request_id": "req_011CgcFabricatedNova0004",
+              "query_source": "main",
+              "speed": "normal",
+              "effort": "high",
+              "session.id": "0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2c",
+              "prompt.id": "0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2d",
+              "user.account_uuid": "0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2f",
+              "user.email": "john@example.com",
+              "terminal.type": "non-interactive"
+            },
+            "resources": {"basecradle.agent": "nova", "service.name": "claude-code"},
+            "source_type": "opentelemetry",
+            "timestamp": t'2026-11-01T10:26:00.317Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # A decision line: WARNING, no tokens, no cost, no attempt. One attempt that reached
+              # Anthropic, so its time is the whole wait and is written.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.32s outcome=failed reason=api_error detail=\"model: claude-opus-5-5\" generation_id=req_011CgcFabricatedNova0004")
+              assert_eq!(.dt, t'2026-11-01T10:26:00.317Z')
+              assert_eq!(keys(.), ["SYSLOG_IDENTIFIER", "dt", "host", "message"])
+
+  - name: "a 503 after the retries are spent is server_error with no duration, and a bare detail is left unquoted"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-haiku-5-5",
+              "error": "Overloaded",
+              "status_code": 503,
+              "duration_ms": 4,
+              "attempt": 3,
+              "request_id": "req_011CgcFabricatedNova0005",
+              "query_source": "sdk"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:10Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-haiku-5-5 outcome=failed reason=server_error detail=Overloaded generation_id=req_011CgcFabricatedNova0005")
+
+  - name: "a 429 sent as a string is rate_limited, and a failed auxiliary call is a failed helper"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-haiku-5-5",
+              "error": "Rate limited",
+              "status_code": "429",
+              "attempt": "11",
+              "request_id": "req_011CgcFabricatedNova0006",
+              "query_source": "auxiliary"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:20Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=helper model=claude-haiku-5-5 outcome=failed reason=rate_limited detail=\"Rate limited\" generation_id=req_011CgcFabricatedNova0006")
+
+  - name: "a 504 is timeout"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": "Gateway Timeout", "status_code": 504, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:30Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=timeout detail=\"Gateway Timeout\"")
+
+  - name: "a connection failure has no status, no request id and no duration, and is api_error"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-haiku-5-5",
+              "error": "Connection error.",
+              "duration_ms": 3,
+              "attempt": 1,
+              "query_source": "sdk"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:40Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-haiku-5-5 outcome=failed reason=api_error detail=\"Connection error.\"")
+
+  - name: "a status that is not a number is api_error"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "status_code": "5xx", "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:50Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # No error text: no detail, never an empty one.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error")
+
+  - name: "a status past the 5xx range is api_error"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "status_code": 600, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:26:51Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # No error text: no detail, never an empty one.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error")
+
+  - name: "foreign error text is flattened, quoted, and redacted, and cannot forge a field"
     inputs:
       - insert_at: "ai_otel_llm"
         type: "vrl"
@@ -193,15 +366,123 @@ tests:
             "message": "claude_code.api_error",
             "attributes": {
               "model": "claude-opus-5-5",
-              "error": "model: claude-opus-5-5",
-              "status_code": 404,
-              "duration_ms": 317,
-              "attempt": 1,
-              "request_id": "req_011CgcFabricatedNova0004",
+              "error": "upstream said:\n\t" + decode_base64!("Gw==") + "[31m \"outcome=ok\"   x-api-key: sk-ant-api03-FabricatedNovaKey0000000000\r\n",
+              "status_code": 500,
               "query_source": "main"
             },
             "resources": {"basecradle.agent": "nova"},
-            "timestamp": t'2026-11-01T10:26:00Z'
+            "timestamp": t'2026-11-01T10:27:10Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # One record, one line; the double quotes inside are single quotes, so the only
+              # outcome= outside a quoted value is the line's own.
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"upstream said: [31m 'outcome=ok' x-api-key: [REDACTED_API_KEY]\"")
+
+  - name: "a long error text is never cut inside a credential, so none ships short of its redaction"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          # 228 characters of words and `x `, then a full-length GitHub token straddling the
+          # 239-character cut: a cut inside it would leave `ghp_Fabri`, which is too short for the
+          # redaction to match.
+          words = "lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem "
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-opus-5-5",
+              "error": words + "x ghp_FabricatedNovaToken00000000000000000 and the rest of a long upstream body",
+              "status_code": 502,
+              "query_source": "main"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:20Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              words = "lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem lorem "
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"" + words + "x…\"")
+              assert!(!contains(string!(.message), "ghp_"))
+
+  - name: "an error body with no spaces is cut at its last character outside a credential charset"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {
+              "model": "claude-opus-5-5",
+              "error": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt_is_too_long:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}",
+              "status_code": 400,
+              "query_source": "main"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:25Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error detail=\"{'type':'error','error':{'type':'invalid_request_error','message':'prompt_is_too_long:…\"")
+
+  - name: "an error text that is one credential-charset run past the bound is omitted"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          blob = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef"
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5", "error": blob, "status_code": 400, "query_source": "main"},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:30Z'
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=api_error")
+
+  - name: "api_retries_exhausted writes no line, so a failure is counted once"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_retries_exhausted",
+            "attributes": {
+              "model": "claude-haiku-5-5",
+              "error": "Overloaded",
+              "status_code": 503,
+              "total_attempts": 3,
+              "total_retry_duration_ms": 1640,
+              "query_source": "sdk"
+            },
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:40Z'
+          }
+    no_outputs_from: ["ai_otel_llm", "ai_scrub"]
+
+  - name: "an api_error with a model id outside the charset is dropped"
+    inputs:
+      - insert_at: "ai_otel_llm"
+        type: "vrl"
+        source: |
+          . = {
+            "message": "claude_code.api_error",
+            "attributes": {"model": "claude-opus-5-5 outcome=ok", "error": "x", "status_code": 500},
+            "resources": {"basecradle.agent": "nova"},
+            "timestamp": t'2026-11-01T10:27:50Z'
           }
     no_outputs_from: ["ai_otel_llm", "ai_scrub"]
 
@@ -279,7 +560,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=[REDACTED_API_KEY] tokens_in=1 tokens_out=1 tokens_total=2 generation_id=[REDACTED_GH_TOKEN]")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=[REDACTED_API_KEY] tokens_in=1 tokens_out=1 tokens_total=2 outcome=ok generation_id=[REDACTED_GH_TOKEN]")
 
   - name: "a counter at the integer ceiling is not stated, never wrapped negative"
     inputs:
@@ -303,4 +584,4 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 tokens_in=5 tokens_out=1 tokens_total=6 cached_tokens=5")
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 tokens_in=5 tokens_out=1 tokens_total=6 cached_tokens=5 outcome=ok")

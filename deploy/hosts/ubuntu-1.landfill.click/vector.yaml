@@ -208,28 +208,64 @@ transforms:
   #
   # NOTHING FROM THE INPUT EVENT SHIPS AS-IS. The event is rebuilt from scratch, out of values
   # checked here: the slug and the model id against a fixed charset, the request id against
-  # another, every count as a non-negative integer, the cost as a finite non-negative number. A
-  # Claude Code event also carries the session, user and account identifiers, the prompt id and
-  # the terminal type; none of them is a contract field, so none of them reaches the sink. The
-  # rebuilt line then passes through `ai_scrub` like every journald line: a charset admits a
-  # key-shaped value, so the redaction still applies, and `ai_scrub` adds the
-  # `[basecradle-wake-<slug>]` prefix from the identifier set here.
+  # another, every count as a non-negative integer, the cost as a finite non-negative number, and
+  # one free-text value, a failed call's error text, rendered as `detail` (below). A Claude Code
+  # event also carries the session, user and account identifiers, the prompt id and the terminal
+  # type; none of them is a contract field, so none of them reaches the sink. The rebuilt line then
+  # passes through `ai_scrub` like every journald line: a charset admits a key-shaped value, so the
+  # redaction still applies, and `ai_scrub` adds the `[basecradle-wake-<slug>]` prefix from the
+  # identifier set here.
+  #
+  # `detail` is the one value no charset limits, so it is what a sender on the unauthenticated port
+  # (see `ai_otel`) can say most freely: up to 240 characters of its own text on a line under any
+  # builder's identifier. It is quoted, so no consumer that reads only unquoted tokens can be forged
+  # from it, but a consumer that matches anywhere in the message reads it like any other text.
   #
   # `drop_on_error` as well as `drop_on_abort`: on a runtime error a remap otherwise forwards the
   # ORIGINAL event, every identifier above included. A failure here drops the event, never ships it.
   #
-  # ONLY `claude_code.api_request` IS RENDERED. Every other Claude Code event (a prompt, a tool
-  # result, a plugin load) is dropped whole.
+  # TWO EVENTS ARE RENDERED, ONE LINE EACH, and every other Claude Code event (a prompt, a tool
+  # result, a plugin load, `api_retries_exhausted`) is dropped whole. The contract writes one `llm`
+  # line per model-call attempt with a required `outcome` (basecradle-harness#782, ruled
+  # 2026-11-03), and a builder writes the two it has:
+  #   * `claude_code.api_request`, a call that answered: a billed line, `outcome=ok`;
+  #   * `claude_code.api_error`, a call that ended with no answer: a decision line,
+  #     `outcome=failed reason=<slug>`, with no token or cost field (basecradle-router#384).
   #
-  # A KNOWN MISFIT: `claude_code.api_error` IS DROPPED (the capital's ruling, basecradle-router#380).
-  # Claude Code sends it once, after its own retries are exhausted, with `model`, `error`,
-  # `status_code`, `duration_ms`, `attempt`, `request_id` and `query_source`. The contract has no
-  # line for it: `llm` writes none for a brain call that raised ("the wake's failure lines carry
-  # it"), `llm retry` is only for an attempt about to be retried, `outcome=fallback` only for a
-  # non-brain caller, and the wake-failure heads need a timeline a builder session does not have.
-  # So a builder's final model-call failure is not on the board today. The head it needs is a
-  # contract question in the fleet's telemetry audit (basecradle/basecradle#726), never invented
-  # here.
+  # `api_error` IS `failed`, NEVER `retrying`. Claude Code sends it once per call, after its own
+  # retries are spent (measured on Claude Code 2.1.317 against a loopback 503: three requests on the
+  # wire, one `api_error` with `attempt` 3, then an `api_retries_exhausted` naming the same failure,
+  # which is dropped so a failure is counted once). Its fields are `model`, `error`, `status_code`,
+  # `duration_ms`, `attempt`, `request_id` and `query_source`; a connection failure has no
+  # `status_code` and no `request_id`. Two of them are not written as they arrive:
+  #   * `duration_ms` is the LAST attempt's time (4ms in that run, beside a 1640ms total), and the
+  #     contract's `duration` is the caller's whole wait. So it is written only for a call that
+  #     made one attempt and reached Anthropic (a status came back), where the two are the same;
+  #     a retried call's whole wait is not on this event, and a connection failure never reached
+  #     the vendor, which is when the contract leaves `duration` out;
+  #   * `attempt` is a count with no total, and the contract spells it `n/total`, so it is left off;
+  #   * the error text rides as `detail`, never `error`, because `detail` is the field that explains
+  #     `reason` on an `llm` line.
+  # The slug is read off `status_code`, as ruled on #782: 429 is `rate_limited`, 504 is `timeout`,
+  # any other 5xx is `server_error`, and anything else, a missing code included, is `api_error`.
+  #
+  # A FAILED LINE IS WARNING, NEVER ERROR. The NOC's Error on AI Server alert pages on any ERROR
+  # line under a `basecradle-wake-` identifier, so ERROR would make a builder's failed call a page,
+  # and whether builder failures page is an open policy question (basecradle/basecradle#726), not a
+  # rendering one. WARNING puts the line on the NOC's failures column and in the log stream, which
+  # is what the contract asks of it. A call that answered stays INFO.
+  #
+  # `detail` is rendered as the harness renders a value (`_observability._value` there): control
+  # characters and runs of whitespace become one space, so a record stays one line; a value holding
+  # a space, an `=` or a double quote is double-quoted, its own double quotes turned into single
+  # quotes, so the NOC's outcome predicate (which reads only tokens outside quoted values) cannot be
+  # forged from inside it; and it is bounded at 240 characters. The bound differs from the harness's
+  # in one respect. The redaction in `ai_scrub` runs after this transform, and every redaction rule
+  # with a minimum length (`ghp_…`, `sk-…`, `AIza…` and the rest) matches a run of letters, digits,
+  # `_` and `-`, so a credential cut short of its minimum would ship unredacted. The cut therefore
+  # never falls inside such a run: it backs up to the last character outside one (a space, a
+  # quote, a brace, a dot). A value that is one such run past the bound is omitted, never shipped
+  # half-scrubbed. A new redaction rule with a minimum length over a wider charset widens this cut.
   #
   # The numbers mirror the harness's own formatting (`_observability` and `_anthropic` there):
   #   * tokens_in is the whole prompt, input + cache read + cache write, because Claude Code's
@@ -244,12 +280,11 @@ transforms:
   # `cost_basis=computed` because Claude Code's figure is arithmetic over a published rate, which is
   # what that value means (the capital's call).
   #
-  # EVERY CALL IS `purpose=main`, `auxiliary` included (the capital's ruling, basecradle-router#380).
-  # `helper` would be closer, but the contract leaves `kind` and `outcome` out only on `main`, and
-  # Claude Code states neither: no `kind` in the contract's vocabulary, and no usable-or-fallback
-  # judgment. A `helper` line without them would be outside the contract. The cost is one series: a
-  # builder's auxiliary spend folds into its main spend. A `kind` for Claude Code's auxiliary calls
-  # is a contract question in the same audit (basecradle/basecradle#726).
+  # AN AUXILIARY CALL IS `purpose=helper`, WITH NO `kind` (basecradle-harness#782). It is a second
+  # model working for the builder, which is what `helper` means, and the contract leaves `kind` out
+  # for a producer that names no job. Every other `query_source` (`main`, `sdk`, a subagent) is the
+  # builder's own turn: `purpose=main`. The purpose is read the same way on both events, so a failed
+  # auxiliary call is a failed helper call.
   #
   # Every regex below ends on the end-of-text anchor `\z`, never the usual end-of-line one: that one
   # is the dollar sign, which Vector would interpolate (see the header).
@@ -261,7 +296,9 @@ transforms:
     drop_on_error: true
     reroute_dropped: false
     source: |
-      if .message != "claude_code.api_request" { abort }
+      event = .message
+      if event != "claude_code.api_request" && event != "claude_code.api_error" { abort }
+      failed = event == "claude_code.api_error"
       attrs = object(.attributes) ?? {}
       resources = object(.resources) ?? {}
       # The agent is named by the NOC's per-builder resource attribute and nothing else, and it
@@ -271,7 +308,9 @@ transforms:
       # The contract never omits `model`, and the value is written bare: a model id, or no line.
       model = string(attrs.model) ?? ""
       if !match(model, r'^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\z') { abort }
-      # Claude Code may send a counter as a string; either way it is a non-negative integer below
+      purpose = "main"
+      if attrs.query_source == "auxiliary" { purpose = "helper" }
+      # Claude Code may send a number as a string; either way it is a non-negative integer below
       # 10^18 or it was not stated. The bound keeps every sum below the integer ceiling, where VRL
       # arithmetic would wrap negative.
       n = map_values({
@@ -280,6 +319,8 @@ transforms:
         "read": attrs.cache_read_tokens,
         "written": attrs.cache_creation_tokens,
         "ms": attrs.duration_ms,
+        "attempt": attrs.attempt,
+        "status": attrs.status_code,
       }) -> |value| {
         if is_integer(value) && int!(value) >= 0 && int!(value) < 1000000000000000000 {
           value
@@ -289,58 +330,101 @@ transforms:
           null
         }
       }
-      line = "llm provider=anthropic purpose=main model=" + model
-      if n.ms != null {
+      line = "llm provider=anthropic purpose=" + purpose + " model=" + model
+      # A failed call's time is its last attempt's, so it is the call's whole wait only when the
+      # call made one attempt and that attempt reached Anthropic (a status came back; see above).
+      if n.ms != null && (!failed || (n.attempt == 1 && n.status != null)) {
         centis = to_int(round(int!(n.ms) / 10))
         line = line + " duration=" + to_string(to_int((centis - mod(centis, 100)) / 100))
         line = line + "." + slice!(to_string(mod(centis, 100) + 100), 1) + "s"
       }
-      usage_stated = n.uncached != null || n.output != null
-      usage_reported = false
-      if usage_stated {
-        written = 0
-        if n.written != null { written = int!(n.written) }
-        read = 0
-        if n.read != null { read = int!(n.read) }
-        tokens_in = written + read
-        if n.uncached != null { tokens_in = tokens_in + int!(n.uncached) }
-        tokens_out = 0
-        if n.output != null { tokens_out = int!(n.output) }
-        usage_reported = tokens_in != 0 || tokens_out != 0
-        if usage_reported {
-          line = line + " tokens_in=" + to_string(tokens_in) + " tokens_out=" + to_string(tokens_out)
-          line = line + " tokens_total=" + to_string(tokens_in + tokens_out)
-          if n.read != null { line = line + " cached_tokens=" + to_string(read) }
-          if written != 0 { line = line + " cache_write_tokens=" + to_string(written) }
+      if failed {
+        # A decision line: no tokens and no cost.
+        reason = "api_error"
+        if n.status != null {
+          code = int!(n.status)
+          if code == 429 {
+            reason = "rate_limited"
+          } else if code == 504 {
+            reason = "timeout"
+          } else if code >= 500 && code <= 599 {
+            reason = "server_error"
+          }
         }
-      }
-      cost = attrs.cost_usd
-      if is_string(cost) && match(string!(cost), r'^[0-9]{1,9}(\.[0-9]{1,20})?\z') {
-        cost = to_float!(cost)
-      }
-      # The upper bound is the guard against a non-finite figure: NaN and infinity both fail it.
-      if (is_float(cost) || is_integer(cost)) && to_float!(cost) >= 0 && to_float!(cost) < 1000000000 {
-        # In hundred-millionths of a dollar: the harness renders cost to eight decimals.
-        units = to_int(round(to_float!(cost) * 100000000))
-        if units != 0 || !usage_stated || usage_reported {
-          fraction = slice!(to_string(mod(units, 100000000) + 100000000), 1)
-          fraction = replace(fraction, r'0+\z', "")
-          money = to_string(to_int((units - mod(units, 100000000)) / 100000000))
-          if fraction != "" { money = money + "." + fraction }
-          line = line + " cost=" + money + " cost_basis=computed"
+        line = line + " outcome=failed reason=" + reason
+        # Flatten: a control character (newline, tab, escape) or a run of whitespace is one space.
+        detail = string(attrs.error) ?? ""
+        detail = strip_whitespace(replace(replace(detail, r'\p{Cc}', " "), r'\s+', " "))
+        if strlen(detail) > 240 {
+          # Bound: 239 characters and an ellipsis, never cut inside a credential-charset run (see
+          # above).
+          cut = parse_regex(detail, r'\A(?P<head>.{239})(?P<next>.)') ?? {}
+          head = string(cut.head) ?? ""
+          if match(string(cut.next) ?? "", r'\A[A-Za-z0-9_-]\z') {
+            head = replace(head, r'[A-Za-z0-9_-]*\z', "")
+          }
+          head = strip_whitespace(head)
+          detail = ""
+          if head != "" { detail = head + "…" }
         }
+        if detail != "" {
+          if contains(detail, " ") || contains(detail, "=") || contains(detail, "\"") {
+            detail = "\"" + replace(detail, "\"", "'") + "\""
+          }
+          line = line + " detail=" + detail
+        }
+      } else {
+        # A billed line.
+        usage_stated = n.uncached != null || n.output != null
+        usage_reported = false
+        if usage_stated {
+          written = 0
+          if n.written != null { written = int!(n.written) }
+          read = 0
+          if n.read != null { read = int!(n.read) }
+          tokens_in = written + read
+          if n.uncached != null { tokens_in = tokens_in + int!(n.uncached) }
+          tokens_out = 0
+          if n.output != null { tokens_out = int!(n.output) }
+          usage_reported = tokens_in != 0 || tokens_out != 0
+          if usage_reported {
+            line = line + " tokens_in=" + to_string(tokens_in) + " tokens_out=" + to_string(tokens_out)
+            line = line + " tokens_total=" + to_string(tokens_in + tokens_out)
+            if n.read != null { line = line + " cached_tokens=" + to_string(read) }
+            if written != 0 { line = line + " cache_write_tokens=" + to_string(written) }
+          }
+        }
+        cost = attrs.cost_usd
+        if is_string(cost) && match(string!(cost), r'^[0-9]{1,9}(\.[0-9]{1,20})?\z') {
+          cost = to_float!(cost)
+        }
+        # The upper bound is the guard against a non-finite figure: NaN and infinity both fail it.
+        if (is_float(cost) || is_integer(cost)) && to_float!(cost) >= 0 && to_float!(cost) < 1000000000 {
+          # In hundred-millionths of a dollar: the harness renders cost to eight decimals.
+          units = to_int(round(to_float!(cost) * 100000000))
+          if units != 0 || !usage_stated || usage_reported {
+            fraction = slice!(to_string(mod(units, 100000000) + 100000000), 1)
+            fraction = replace(fraction, r'0+\z', "")
+            money = to_string(to_int((units - mod(units, 100000000)) / 100000000))
+            if fraction != "" { money = money + "." + fraction }
+            line = line + " cost=" + money + " cost_basis=computed"
+          }
+        }
+        line = line + " outcome=ok"
       }
       request_id = string(attrs.request_id) ?? ""
       if match(request_id, r'^[A-Za-z0-9_-]{1,128}\z') {
         line = line + " generation_id=" + request_id
       }
+      level = "INFO"
+      if failed { level = "WARNING" }
       at = .timestamp
       if at == null { at = .observed_timestamp }
       if at == null { at = now() }
       # The shape of a journald record, as `ai_scrub` reads one: it prefixes the message with
       # SYSLOG_IDENTIFIER and moves `timestamp` to Better Stack's `dt`.
       . = {
-        "message": "INFO " + line,
+        "message": level + " " + line,
         "SYSLOG_IDENTIFIER": "basecradle-wake-" + slug,
         "host": get_hostname!(),
         "timestamp": at,
