@@ -94,7 +94,37 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] failed: AUTH_apiKey=[REDACTED] [REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: AUTH_apiKey=[REDACTED] rejected")
+
+  - name: "a heartbeat url after a bearer word redacts its secret"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The bearer rule's token class takes a URL's `https`, so with bearer first the heartbeat
+          # rule never matched and the secret shipped.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "token bearer https://uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 done"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] token bearer [REDACTED_HEARTBEAT_URL] done")
+
+  - name: "a bearer whose value is an assignment redacts the secret after it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The bearer rule's token class takes `api_key` and its `=`, so with bearer first the
+          # assignment rule never matched and the secret after `=` shipped.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Authorization: Bearer api_key=Zq7SecretFab1cated rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED][REDACTED] rejected")
 
   - name: "a doubled bearer scheme redacts the token after both"
     inputs:
@@ -108,7 +138,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] | AUTH_apiKey=[REDACTED] [REDACTED] | GET /v1/models?apiKey=[REDACTED] [REDACTED] HTTP/1.1")
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] | AUTH_apiKey=[REDACTED] | GET /v1/models?apiKey=[REDACTED] HTTP/1.1")
 
   - name: "a query key whose value is a bearer header redacts the token after the scheme"
     inputs:
@@ -121,7 +151,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] GET https://example.com/v1?apiKey=[REDACTED] [REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] GET https://example.com/v1?apiKey=[REDACTED] rejected")
 
   # --- the Steel key, the api-key query shape and the env dump (moved from tests/test_log_surface.py) ---
 
@@ -316,6 +346,19 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] [REDACTED_API_KEY] key [REDACTED_API_KEY] x-[REDACTED_API_KEY]")
 
+  - name: "a github fine-grained token is redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "push failed with github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] push failed with [REDACTED_GH_TOKEN] rejected")
+
   - name: "a key at the start of the text is redacted"
     inputs:
       - insert_at: "ai_scrub"
@@ -339,6 +382,7 @@ tests:
           keys = [
             ["ghp_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_GH_TOKEN]"],
             ["ghs_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_GH_TOKEN]"],
+            ["github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv", "[REDACTED_GH_TOKEN]"],
             ["bc_uat_K", "[REDACTED_BC_TOKEN]"],
             ["bc_isk_K", "[REDACTED_BC_INTEGRATION_SECRET]"],
             ["sk-ant-api03-Ab3Cd5Ef7Gh9", "[REDACTED_API_KEY]"],
@@ -381,6 +425,6 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              # Every key and every neighbour was sent: 11 keys after 24 neighbours.
-              assert_eq!(.count, 264)
+              # Every key and every neighbour was sent: 12 keys after 24 neighbours.
+              assert_eq!(.count, 288)
               assert_eq!(.message, .expected)
