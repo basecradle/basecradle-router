@@ -195,6 +195,7 @@ journalctl -u basecradle-router -f                   # by unit — also fine; th
 | `event=verify_key …` | which signing key verified a basecradle delivery (#236): `source=`, `key_path=recipient\|fallback`, `recipient=`, `delivery=`. Emitted only *after* the signature checks out — before that the recipient is an unauthenticated claim. `key_path=` and not `key=`, which `event=breaker_tripped` already spends on its scope. |
 | `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `coalesce`, `recheck`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
+| `event=wake_stopped …` | **WARNING**, once, when a wake was killed by SIGTERM or SIGKILL (#386): `signal=TERM\|KILL`, `exit=` (`-15`/`-9`: `sudo` died by the signal, which only a signal from outside the wake causes), `duration=`. A stop is never retried and never a failure: no `wake_retry`, no `outcome=failed`. See *Stopping a wake*, below. |
 | `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
 | `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. |
 | `event=breaker_tripped …` / `event=breaker_reset …` | the runaway-loop backstop firing (**ERROR**) and self-healing. `scope=`, `key=`, `agent=`, `count=`, `threshold=`, `window=`, `cooldown=`. |
@@ -231,6 +232,7 @@ was never woken at all. A wake is now bracketed:
 event=wake_start delivery=0192f3a4-… agent=basecradle-glm-ai source=github
 event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=ok exit=0 duration=93.4s
 event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=failed attempts=3 duration=4.1s error="…"
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=stopped signal=TERM exit=-15 duration=2524.3s
 ```
 
 - **The pair is the human surface; `stage=…` is the machinery.** Both stay — the same two-surface split
@@ -311,6 +313,7 @@ half that is about a wake, from the moment the agent is known:
 | `event=wake_retry attempt=N/M` | a transient failure a retry followed |
 | `stage=wake outcome=ok` | **the per-wake duration metric line** |
 | `stage=wake outcome=failed` | the wake-failure line |
+| `stage=wake outcome=stopped` | a wake an operator stopped by signal (#386) — neither a duration sample nor a failure |
 
 A refused probe and a failed probe pollute a wake-failure count exactly as a successful one pollutes a
 duration chart, so the key rides on all of them — not only the happy one. It sits beside `agent=` rather
@@ -736,6 +739,70 @@ credentials, its token minter) is the NOC's onboarding job (noc#91), not the dae
 
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
 on the box out-of-band, `chmod 600`, never in git.
+
+### Stopping a wake — `stop-wake` (#386)
+
+An operator stops a runaway wake with the one sanctioned op, as root:
+
+```bash
+sudo /opt/basecradle-router/bin/stop-wake --agent <slug>                    # that agent's running wake
+sudo /opt/basecradle-router/bin/stop-wake --agent <slug> --delivery <id>   # only the wake for one delivery
+sudo /opt/basecradle-router/bin/stop-wake --agent <slug> --grace 30        # seconds before SIGKILL (default 10)
+```
+
+It finds exactly the wake the daemon launched — the `sudo <wake-runner> --user <slug> … --` process whose
+parent is the `router` account — and SIGTERMs **every member of it**: that process and every descendant,
+plus every process of the agent's own account whose environment carries the wake's
+`BASECRADLE_DELIVERY_ID`. The second set is what catches a process already reparented out of the tree — a
+tool's `nohup job &`, a `setsid` server — since the variable survives reparenting and a new session alike;
+only a process that scrubbed its own environment escapes both. Reading another account's environment takes
+`CAP_SYS_PTRACE`, which root over SSH holds; a capability-trimmed caller (a container, a unit with a narrowed
+`CapabilityBoundingSet=`) cannot, and the op then **warns** on stderr and stops by the tree alone, rather
+than degrading silently. Both sets are re-read while the wake drains,
+so a member born in the window is caught too, and whatever outlives the grace period gets SIGKILL. It
+writes two lines under the journal identifier `basecradle-router-stop-wake` (and to stdout), carrying the
+wake's own `delivery=` and `agent=`, so one `delivery=<id>` grep reads the request, the router's verdict, and
+the agent's own journal:
+
+```
+event=wake_stop_requested delivery=0192f3a4-… agent=ping by=ubuntu signal=TERM pids=7
+event=wake_stop_done      delivery=0192f3a4-… agent=ping by=ubuntu outcome=stopped signalled=7 killed=0 duration=2.1s
+```
+
+`by=` is `SUDO_USER` — sudo's record of the caller, never a value the caller supplies. `outcome=` is
+`stopped` (all gone on SIGTERM), `killed` (something needed SIGKILL), or `survived` (a process outlived
+SIGKILL — uninterruptible sleep — named in `survivors=`). Exit `0` stopped, `1` survived, `3` no running
+wake matched, `77` not run as root.
+
+**The router then reads the stop as a stop.** `sudo` dies by the signal it was sent, so the daemon sees exit
+`-15` (or `-9`) and writes `event=wake_stopped` (WARNING), `stage=wake outcome=stopped`, and `event=wake_end
+outcome=stopped` — never a `wake_retry`, never `outcome=failed`, so the NOC's *Wake Failed* alert never pages
+the operator who stopped it. That holds even when the agent's binary traps SIGTERM and exits 0: `runuser`
+re-raises a signal it caught. The delivery is marked done (a duplicate collapses), the stopped session
+covers the deliveries it had already read (they coalesce rather than re-run the stopped work), and no wake
+evidence is recorded — a stop is neither the edge failing nor a gate refusing, and it never learned whether
+the wake would have succeeded.
+
+Why this rather than a `pkill`, and why not a process group — both proven on Ubuntu 24.04's `sudo` and
+util-linux `runuser`:
+
+- **`pkill -f <binary>` is imprecise both ways.** It hits any process whose argv names the binary, wake or
+  not, and the session's own children — a model's tool subprocesses — outlive it as orphans of the agent.
+  Signalling only `sudo` orphans them the same way, since `runuser` signals only its direct child.
+- **The wake has no process group of its own.** No link in `daemon → sudo → wake-runner → systemd-cat →
+  runuser → <binary>` starts one, so the whole wake shares the *daemon's* group: `kill -- -<pgid>` would
+  stop the router.
+- **SIGKILL to `sudo` alone is the worst stop**: `sudo` dies without relaying, and the whole session
+  carries on, orphaned.
+
+The daemon is granted nothing: no sudoers rule names `stop-wake`, so the account that dispatches every wake
+cannot kill one; both of its callers — @origin over SSH and the NOC — already hold root.
+
+**What reads as a stop is exit `-15`/`-9` and nothing else:** `sudo` died by the signal, which happens only
+when a signal from outside the wake reached `sudo` or `runuser` — this op, or a `pkill -f`. A signal death
+*inside* the wake (the harness's own watchdog, the kernel's OOM killer, a hand `kill <pid>` of the binary)
+reaches the router as `runuser`'s `143`/`137`, which it cannot tell from a crash — so those keep their retry
+and their *Wake Failed* page. To stop a wake, use this op.
 
 ### Proving what the router claims — the NOC's ledger interface (#198)
 
@@ -1350,7 +1417,7 @@ never out of the mirrored tree), and they are this repo's to keep stable:
 | Contract | What the op does with it |
 |---|---|
 | `/opt/basecradle-router/app` | the **root-owned** daemon tree the op mirrors into (protecting its `.venv`, the one `router:router` path). Ownership is narrowed **before** the mirror and **read back after** it, and only then is anything root-owned installed (basecradle-noc#777). The op then runs **`uv sync --locked`** as `router`. The sync must land **before** the restart: the unit starts cache-less and `--no-sync`, so it neither rebuilds nor reaches the network — it runs exactly what the sync left (#280, #297). |
-| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
+| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), `stop-wake` (#386), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). **The reboot timer is not here**: it is per host (next row). |
 | `deploy/hosts/<fqdn>/basecradle-router-reboot.timer` | the host's **own** reboot window (#334), installed `0644` to `/etc/systemd/system/` and armed (`enable --now`) like the shared timers. There is deliberately no shared copy: a host whose directory lacks it gets no reboot timer, never another box's window. |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written `0644` — the drift source `drift-check.sh` reads. The file mode is world-readable but its directory is not: `/etc/basecradle-router` is `750 root:router` (it also holds `router.env`), so only root and the `router` group reach the stamp. That is by design — the drift unit runs `User=router` and traverses as a group member; any other reader (an operator account included) needs `sudo`. |

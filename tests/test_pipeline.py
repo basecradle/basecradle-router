@@ -24,7 +24,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeError, WakeResult
+from basecradle_router.wake import WakeError, WakeResult, WakeStopped
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -1393,3 +1393,115 @@ def test_colour_never_reaches_the_records_the_status_surface_is_built_from(caplo
             assert "\x1b" not in record.outcome.value
     # ...while the journal line for that same rejection IS painted.
     assert any(f"{RED}outcome=rejected{RESET}" in line for line in _pipeline_lines(caplog))
+
+
+# --- an operator's stop is a stop, not a crash to retry (basecradle-router#386) ---
+
+
+class _StoppedWaker(_StubWaker):
+    """A wake killed by a signal on attempt ``stop_on`` (1-based), after transient failures."""
+
+    def __init__(self, *, stop_on: int = 1, signal: str = "TERM", exit_code: int = -15) -> None:
+        super().__init__(fail_times=stop_on - 1)
+        self.stop_on = stop_on
+        self.signal = signal
+        self.exit_code = exit_code
+
+    def wake(self, agent: Agent, event: Event) -> WakeResult:
+        if len(self.calls) + 1 == self.stop_on:
+            self.calls.append((agent, event))
+            raise WakeStopped(
+                f"wake of {agent.key} stopped by SIG{self.signal}",
+                signal=self.signal,
+                exit_code=self.exit_code,
+            )
+        return super().wake(agent, event)
+
+
+def test_a_stopped_wake_is_never_retried_and_never_failed(caplog) -> None:
+    waker = _StoppedWaker()
+    evidence = EvidenceStore(None)
+    pipeline, _ = _pipeline(waker=waker, evidence=evidence, clock=_FakeClock(step=2524.3))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    assert len(waker.calls) == 1  # no re-wake on the same delivery
+    assert result.stages[-1] == (Stage.WAKE, Outcome.STOPPED)
+    lines = [_uncoloured(line) for line in _pipeline_lines(caplog)]
+    assert not any("event=wake_retry" in line for line in lines)
+    # The NOC's *Wake Failed* alert extracts `outcome=failed`; a stop never writes it.
+    assert not any("outcome=failed" in line for line in lines)
+    # A stop is neither the edge failing nor a gate refusing — and never an ok — so it
+    # writes nothing about the agent at all: no counter, no timestamp, no reason.
+    assert NOVA.harness_key not in evidence.snapshot().agent_wakes
+    assert evidence.snapshot().agent_wakes == {}
+
+
+def test_a_stopped_wake_writes_one_wake_stopped_warning_naming_the_signal(caplog) -> None:
+    pipeline, _ = _pipeline(waker=_StoppedWaker(), clock=_FakeClock(step=2524.3))
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+
+    stopped = [r for r in caplog.records if "event=wake_stopped" in r.getMessage()]
+    assert len(stopped) == 1
+    assert stopped[0].levelname == "WARNING"
+    assert _uncoloured(stopped[0].getMessage()) == (
+        f"event=wake_stopped delivery={DELIVERY_A} agent={NOVA.harness_key} source=github "
+        "signal=TERM exit=-15 duration=2524.3s"
+    )
+    assert _uncoloured(_stage_line(caplog, Stage.WAKE)) == (
+        f"stage=wake outcome=stopped delivery={DELIVERY_A} agent={NOVA.harness_key} "
+        "source=github signal=TERM exit=-15 duration=2524.3s"
+    )
+
+
+def test_the_bracket_closes_a_stopped_wake_with_its_own_verdict(caplog) -> None:
+    pipeline, _ = _pipeline(waker=_StoppedWaker(signal="KILL", exit_code=-9), clock=_FakeClock())
+    with caplog.at_level("INFO", logger="basecradle_router.pipeline"):
+        pipeline.handle("github", _github_request(delivery=DELIVERY_B))
+
+    record = next(r for r in caplog.records if "event=wake_end" in _uncoloured(r.getMessage()))
+    # INFO, not WARNING: the bookend is not the failure tier. The warning is wake_stopped.
+    assert record.levelname == "INFO"
+    assert _uncoloured(record.getMessage()) == (
+        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github "
+        "outcome=stopped signal=KILL exit=-9 duration=23.1s"
+    )
+
+
+def test_a_stop_after_a_transient_failure_still_ends_the_wake() -> None:
+    # The operator stopped the retry, not the original: the stop wins on any attempt.
+    waker = _StoppedWaker(stop_on=2)
+    pipeline, _ = _pipeline(waker=waker)
+    result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert len(waker.calls) == 2
+    assert result.stages[-1] == (Stage.WAKE, Outcome.STOPPED)
+
+
+def test_a_stopped_delivery_is_done_so_its_duplicate_is_never_re_dispatched() -> None:
+    waker = _StoppedWaker()
+    pipeline, _ = _pipeline(waker=waker)
+    pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    again = pipeline.handle("github", _github_request(delivery=DELIVERY_DUP))
+    assert again.stages[-1] == (Stage.DEDUP, Outcome.IGNORED)
+    assert len(waker.calls) == 1
+
+
+def test_a_stopped_wake_covers_what_it_had_already_read() -> None:
+    # A delivery whose event predates the stopped session's start was read by it;
+    # waking for it again would re-run the work the operator just stopped.
+    waker = _StoppedWaker()
+    pipeline, _ = _pipeline(waker=waker, now=lambda: _WAKE_AT)
+    pipeline.handle("github", _github_request(state="open", updated_at=_EVENT_AT))
+    second = pipeline.handle("github", _github_request(state="open", updated_at=_EVENT_AT))
+    assert second.stages[-1] == (Stage.COALESCE, Outcome.IGNORED)
+    assert len(waker.calls) == 1
+
+
+def test_a_failed_wake_still_retries_and_still_fails_beside_the_stop() -> None:
+    # The stop path is additive: a crash keeps exactly the behaviour it had.
+    waker = _StubWaker(fail_times=99)
+    pipeline, _ = _pipeline(waker=waker)
+    result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert result.terminal is Outcome.FAILED
+    assert len(waker.calls) == 3
