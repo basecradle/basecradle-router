@@ -362,8 +362,8 @@ class WebhookServer:
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 # Let in-flight wakes finish before we go down, so a deploy/restart
-                # never severs an agent mid-task. (A wake's own timeout, plus the
-                # service's stop timeout, bound how long this can take.) uvicorn has
+                # never severs an agent mid-task. (Wakes are unbounded, #389, so the
+                # service's stop timeout is what bounds how long this can take.) uvicorn has
                 # already stopped accepting connections, so no new wake is submitted
                 # between the drain and the pool teardown that follows it.
                 await self.drain()

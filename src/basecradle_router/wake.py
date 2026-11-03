@@ -154,7 +154,7 @@ class WakeStopped(Exception):
 # encoding a wrapper passing a child's status through would produce. The router cannot
 # tell an operator from a crash there, so those stay crashes: they keep their retry and
 # their *Wake Failed* page, and an operator who wants a stop uses the stop op. So does
-# every other status — a plain exit code, a Python traceback, a timeout.
+# every other status — a plain exit code, a Python traceback, a launch failure.
 STOP_SIGNALS: Mapping[int, str] = MappingProxyType({-15: "TERM", -9: "KILL"})
 
 
@@ -162,16 +162,24 @@ STOP_SIGNALS: Mapping[int, str] = MappingProxyType({-15: "TERM", -9: "KILL"})
 class WakeInvocation:
     """The fully-assembled command for one wake — the runner's sole input.
 
-    Bundling the pieces (``argv``, ``cwd``, ``env``, ``run_as_user``, optional
-    ``timeout``) makes the assembly a single testable object and keeps the runner
-    seam narrow.
+    Bundling the pieces (``argv``, ``cwd``, ``env``, ``run_as_user``) makes the
+    assembly a single testable object and keeps the runner seam narrow.
+
+    **It carries no deadline, by design** (basecradle-router#389). A wake is
+    unbounded, because the router holds no means of ending one whole. Every process
+    below the ``sudo`` it spawns runs as root or as the agent, which the daemon cannot
+    signal, so a runner-side expiry reaches ``sudo`` at most. SIGKILL there orphans
+    the live session under the agent's account, and the expiry reads as a crash, so
+    the retry starts a second session on the same memory store — split-brain. The
+    one sanctioned way to end a wake is the root-only ``stop-wake`` op
+    (``deploy/bin/stop-wake``), and the daemon is deliberately granted no sudoers
+    rule for it (#386). So there is no field for a deadline to be set in.
     """
 
     argv: tuple[str, ...]
     cwd: str
     env: Mapping[str, str]
     run_as_user: str
-    timeout: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,12 +240,7 @@ def _run_subprocess(invocation: WakeInvocation) -> WakeResult:
             capture_output=True,
             text=True,
             check=False,
-            timeout=invocation.timeout,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise WakeError(
-            f"wake in {invocation.cwd!r} timed out after {invocation.timeout}s"
-        ) from exc
     except OSError as exc:
         raise WakeError(f"could not launch wake in {invocation.cwd!r}: {exc}") from exc
     return WakeResult(
@@ -277,10 +280,11 @@ class SubprocessWaker:
 
     ``runner`` and ``env_provider`` are injectable seams: the defaults run a real
     subprocess with an empty environment, and tests replace them so no real
-    model, agent, or network is ever reached. ``timeout`` bounds a wake's
-    wall-clock — left ``None`` (unbounded) in v0 so a legitimately long agent is
-    never killed mid-task; production should set a bound so a hung ``claude``
-    cannot pin a worker thread forever.
+    model, agent, or network is ever reached. It is the non-deployable seam, and it
+    takes no timeout either: with no ``sudo`` in the way an expiry would SIGKILL the
+    session itself, but still not the tool processes it started, and it would still
+    read as a crash and retry the work. See :class:`WakeInvocation` for the deployed
+    path's reason.
 
     The child's environment is the provider's, plus :data:`DELIVERY_ID_ENV` — the
     one variable the *router* contributes. It carries no authority and no secret;
@@ -289,7 +293,6 @@ class SubprocessWaker:
 
     runner: Runner = _run_subprocess
     env_provider: EnvProvider = _empty_env
-    timeout: float | None = None
 
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
         """Assemble the command to wake ``agent`` for ``event`` — pure, no I/O."""
@@ -302,7 +305,6 @@ class SubprocessWaker:
             cwd=agent.clone_path,
             env=MappingProxyType(env),
             run_as_user=agent.os_user,
-            timeout=self.timeout,
         )
 
     def wake(self, agent: Agent, event: Event) -> WakeResult:
@@ -356,6 +358,12 @@ class HomeServerWaker:
     shell string, so it is never re-interpreted. ``runner`` is the same injectable
     seam tests replace; ``wrapper`` is overridable for tests.
 
+    **It takes no timeout** (basecradle-router#389): the waker can reach at most the
+    ``sudo`` at the top of the wake it launched, never the wake itself, so a deadline
+    here would orphan the session and retry it into a second one. See
+    :class:`WakeInvocation`. A wake that must end early is stopped with
+    ``stop-wake``, which the router reads as a stop.
+
     ``--delivery`` is how the delivery id reaches the child *given* that the router
     passes no environment: the wrapper exports it as :data:`DELIVERY_ID_ENV` after
     the privilege drop. It sits before the ``--`` because everything after ``--`` is
@@ -375,7 +383,6 @@ class HomeServerWaker:
 
     runner: Runner = _run_subprocess
     wrapper: str = WAKE_RUNNER
-    timeout: float | None = None
 
     def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
         """Assemble the sudo+wrapper command — pure, no I/O."""
@@ -397,7 +404,6 @@ class HomeServerWaker:
             cwd="/",
             env=MappingProxyType({}),
             run_as_user=agent.os_user,
-            timeout=self.timeout,
         )
 
     def wake(self, agent: Agent, event: Event) -> WakeResult:

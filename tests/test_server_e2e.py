@@ -347,7 +347,7 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
         status = next(m["status"] for m in sent if m["type"] == "http.response.start")
         # The wake is still blocked on `release`, so it cannot have completed — the
         # ack provably preceded it. (A blocking-ack server would only reach here
-        # after the wake's own timeout fired and set wake_done.)
+        # after the fake wake's 5 s safety net released it and set wake_done.)
         assert not wake_done.is_set()
         release.set()  # let the backgrounded wake finish, then drain it cleanly
         await server.drain()

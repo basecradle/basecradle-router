@@ -5,6 +5,7 @@ default subprocess runner is exercised via a monkeypatched ``subprocess.run``.
 Test cast: Nova Digital (``nova``, AI) captains basecradle-python.
 """
 
+import dataclasses
 import subprocess
 
 import pytest
@@ -163,18 +164,18 @@ def test_non_zero_exit_falls_back_to_stdout_then_placeholder() -> None:
         SubprocessWaker(runner=silent).wake(NOVA, EVENT)
 
 
-def test_timeout_is_carried_onto_the_invocation() -> None:
-    runner = _FakeRunner(WakeResult(exit_code=0))
-    SubprocessWaker(runner=runner, timeout=1800.0).wake(NOVA, EVENT)
-    assert runner.invocation is not None
-    assert runner.invocation.timeout == 1800.0
-
-
-def test_default_timeout_is_unbounded() -> None:
-    runner = _FakeRunner(WakeResult(exit_code=0))
-    SubprocessWaker(runner=runner).wake(NOVA, EVENT)
-    assert runner.invocation is not None
-    assert runner.invocation.timeout is None
+@pytest.mark.parametrize("cls", [WakeInvocation, SubprocessWaker, HomeServerWaker])
+def test_no_wake_deadline_can_be_set(cls) -> None:
+    # A deadline the router enforced could reach only the `sudo` at the top of the
+    # wake: SIGKILL there orphans the live session under the agent's account, and the
+    # retry then starts a second one on the same memory store (#389). The router holds
+    # no way to end a wake whole (stop-wake is root-only and granted nothing, #386), so
+    # the refusal is structural: there is no field to put a deadline in, and adding one
+    # back is a deliberate act this test makes someone justify.
+    assert "timeout" not in {f.name for f in dataclasses.fields(cls)}
+    if cls is not WakeInvocation:
+        with pytest.raises(TypeError, match="unexpected keyword argument 'timeout'"):
+            cls(timeout=1800.0)
 
 
 # --- the default subprocess runner -----------------------------------------
@@ -208,7 +209,11 @@ def test_default_runner_invokes_subprocess_with_assembled_command(monkeypatch) -
     assert result.ok and result.stdout == "ok"
 
 
-def test_default_runner_passes_timeout_to_subprocess(monkeypatch) -> None:
+@pytest.mark.parametrize("waker", [SubprocessWaker(), HomeServerWaker()])
+def test_default_runner_never_puts_a_deadline_on_the_wake(monkeypatch, waker) -> None:
+    # The runner-side half of the same refusal (#389): `subprocess.run(timeout=…)`
+    # SIGKILLs at most its direct child — `sudo`, on the deployed path — and its expiry
+    # used to become a retryable WakeError, which is the split-brain the issue names.
     captured: dict = {}
 
     class _Completed:
@@ -217,12 +222,12 @@ def test_default_runner_passes_timeout_to_subprocess(monkeypatch) -> None:
         stderr = ""
 
     def fake_run(argv, **kwargs):
-        captured["timeout"] = kwargs.get("timeout")
+        captured.update(kwargs)
         return _Completed()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    SubprocessWaker(timeout=900.0).wake(NOVA, EVENT)
-    assert captured["timeout"] == 900.0
+    waker.wake(NOVA, EVENT)
+    assert "timeout" not in captured
 
 
 def test_default_runner_wraps_launch_failure_in_wake_error(monkeypatch) -> None:
@@ -232,16 +237,6 @@ def test_default_runner_wraps_launch_failure_in_wake_error(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(WakeError, match="could not launch"):
         SubprocessWaker().wake(NOVA, EVENT)
-
-
-def test_default_runner_maps_timeout_to_wake_error(monkeypatch) -> None:
-    def fake_run(argv, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    with pytest.raises(WakeError, match="timed out") as excinfo:
-        SubprocessWaker(timeout=5.0).wake(NOVA, EVENT)
-    assert excinfo.value.exit_code is None  # never produced an exit code
 
 
 def test_default_runner_is_the_module_default() -> None:
@@ -336,12 +331,11 @@ def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> No
     assert runner.invocation.argv.count(nasty) == 1
 
 
-def test_home_server_waker_honours_a_custom_wrapper_path_and_timeout() -> None:
+def test_home_server_waker_honours_a_custom_wrapper_path() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner", timeout=1800.0).wake(NOVA, EVENT)
+    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner").wake(NOVA, EVENT)
     assert runner.invocation is not None
     assert runner.invocation.argv[1] == "/opt/x/wake-runner"
-    assert runner.invocation.timeout == 1800.0
 
 
 def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
