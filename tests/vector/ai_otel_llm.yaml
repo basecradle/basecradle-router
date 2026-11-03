@@ -1,4 +1,4 @@
-# Vector unit tests for `ai_otel_llm` (basecradle-router#380, #384), run by tests/test_vector_otel_llm.py
+# Vector unit tests for `ai_otel_llm` (basecradle-router#380, #384), run by tests/test_vector_unit.py
 # as `vector test <the shipped vector.yaml> <this file>`. Each event goes in at `ai_otel_llm` and is
 # read back out of `ai_scrub`, the last transform before the logs sink, so the tests run the shipped
 # VRL of both and assert the exact bytes Better Stack receives.

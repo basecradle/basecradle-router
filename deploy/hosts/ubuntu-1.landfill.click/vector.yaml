@@ -150,43 +150,105 @@ transforms:
       del(."_CMDLINE")
       # Redact secret-shaped patterns from the message (defense in depth for anything else that
       # logs a secret to stdout — e.g. a heartbeat ping logging its own secret URL on failure).
+      #
+      # TWO PASSES, IN THIS ORDER, AND ONE WORD RULE (basecradle-router#398). Both are the harness's:
+      # the one definition is basecradle-harness docs/telemetry.md → Credential Scrubbing
+      # (`_observability.scrub` and `_is_word`, harness 0.176.0). This copy follows it and never
+      # varies it. What differs here is only the box's rule set (a subset of the harness's shapes:
+      # the harness is the superset by design), its minimums and its labels.
+      #   1. The rules anchored on a literal of their own: a bearer header, a heartbeat URL, an
+      #      `api_key=` assignment or query value. Each is redacted wherever it matches.
+      #   2. The rules anchored on a vendor prefix: `gh?_`, `bc_uat_`, `bc_isk_`, `sk-`, `xai-`,
+      #      `AIza`, `hf_`, `r8_`, `ste-`. A match the word rule reads as a word is kept.
+      # Literal rules first, because a prefix rule's run is made of the characters their literals
+      # are. When the `sk-` rule ran first, `task-runner-pipeline-api-key=abc123secret` lost
+      # `api-key` into the run `sk-runner-pipeline-api-key`, the secret after `=` matched nothing,
+      # and it shipped. A prefix run cannot reach across the `[REDACTED]` the first pass leaves.
       msg = to_string(.message) ?? ""
-      msg = replace(msg, r'gh[a-z]_[A-Za-z0-9]{20,}', "[REDACTED_GH_TOKEN]")
-      msg = replace(msg, r'(?i)bearer\s+[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
+      # Pass 1. The bearer rule stays ahead of the assignment rule: the assignment's value stops at
+      # a space, so taking `AUTH_API_KEY=Bearer eyJ…` with it first would consume `Bearer` and leave
+      # the token after it for no rule to match. The bearer rule takes EVERY scheme word before the
+      # token, as the harness's does: a token stored with its scheme and sent with another reads
+      # `Bearer Bearer eyJ…`, and one scheme word taken alone is the value, leaving the token.
+      msg = replace(msg, r'(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       msg = replace(msg, r'https?://\S*/heartbeat/\S+', "[REDACTED_HEARTBEAT_URL]")
-      msg = replace(msg, r'bc_uat_[A-Za-z0-9]+', "[REDACTED_BC_TOKEN]")
-      # BaseCradle integration signing keys (`bc_isk_…`). THIS box is where they live:
-      # the router verifies each platform delivery's HMAC with the recipient agent's
-      # own key, so every one of them sits in /etc/basecradle-router/router.env and is
-      # read into the daemon's environment (basecradle/basecradle#497). `bc_uat_` above
-      # covers user access tokens and never matched these — a distinct prefix is a
-      # distinct rule, and the one carried on the box that actually holds the secrets.
-      msg = replace(msg, r'bc_isk_[A-Za-z0-9]+', "[REDACTED_BC_INTEGRATION_SECRET]")
-      # Provider API keys. Harness agents and builder agents run with these in their env
-      # (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, …) and a wake's stdout+stderr — a traceback,
-      # a curl echo, a misconfigured debug print — now flows into journald under
-      # basecradle-wake-<slug> (#168), so it flows through here. Nothing is known to print one;
-      # this is the belt for the braces. The `sk-` rule covers the whole family that shares
-      # the prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one pattern.
-      msg = replace(msg, r'sk-[A-Za-z0-9_-]{16,}', "[REDACTED_API_KEY]")
-      msg = replace(msg, r'xai-[A-Za-z0-9]{16,}', "[REDACTED_API_KEY]")
-      msg = replace(msg, r'AIza[A-Za-z0-9_-]{20,}', "[REDACTED_API_KEY]")
-      msg = replace(msg, r'hf_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
-      msg = replace(msg, r'r8_[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
-      # Steel (steel.dev), the browser backend behind Playwright MCP (basecradle/basecradle#582,
-      # basecradle-noc#797). A Steel agent's launcher carries its key two ways: as the
-      # `steel-api-key` header on calls to api.steel.dev, and as the `apiKey=` query parameter
-      # of its wss://connect.steel.dev URL. The first rule catches the key by its own `ste-`
-      # prefix wherever it lands, header or not; the second catches the query shape whatever
-      # the value looks like, so a key of any future format is still covered inside a URL.
-      # Case-insensitive and unanchored, it also catches an env dump's `NAME_API_KEY=value`
-      # and prints `NAME_apiKey=[REDACTED]`: the name is normalised, the value never ships.
-      # The launcher already redacts the exact key from what it forwards to the harness; this
-      # is the journald layer. Both replacements are fixed strings on purpose: a capture-group
-      # back-reference needs a dollar sign, which Vector interpolates (see the header), and the
-      # character class carries no single quote, which would close the raw string.
-      msg = replace(msg, r'ste-[A-Za-z0-9]{20,}', "[REDACTED_API_KEY]")
+      # Any `apiKey=` value, whatever it looks like. A Steel (steel.dev) launcher, the browser backend
+      # behind Playwright MCP (basecradle/basecradle#582, basecradle-noc#797), puts its key in the
+      # `apiKey=` query parameter of its wss://connect.steel.dev URL, and this catches that shape
+      # whatever the key's format, so a future format is still covered inside a URL. Case-insensitive
+      # and unanchored, it also catches an env dump's `NAME_API_KEY=value` and prints
+      # `NAME_apiKey=[REDACTED]`: the name is normalised, the value never ships. The launcher already
+      # redacts the exact key from what it forwards to the harness; this is the journald layer.
+      #
+      # Every replacement is a fixed string on purpose: a capture-group back-reference needs a dollar
+      # sign, which Vector interpolates (see the header), and no pattern carries a single quote,
+      # which would close the raw string.
       msg = replace(msg, r'(?i)api[-_]?key=[^&\s"]+', "apiKey=[REDACTED]")
+      # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is
+      # never read again by another rule, where nine passes would let `hf_…` inside a kept word be
+      # cut by the next one. No two prefixes can match at one position, so the order of the
+      # alternatives decides nothing. The rules:
+      #   * `gh?_`: GitHub tokens.
+      #   * `bc_uat_`: BaseCradle user access tokens.
+      #   * `bc_isk_`: BaseCradle integration signing keys. THIS box is where they live: the router
+      #     verifies each platform delivery's HMAC with the recipient agent's own key, so every one
+      #     of them sits in /etc/basecradle-router/router.env and is read into the daemon's
+      #     environment (basecradle/basecradle#497). `bc_uat_` never matched these: a distinct
+      #     prefix is a distinct rule, carried on the box that actually holds the secrets.
+      #   * `sk-`, `xai-`, `AIza`, `hf_`, `r8_`: provider API keys. Harness agents and builder agents
+      #     run with these in their env (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, …), and a wake's
+      #     stdout+stderr (a traceback, a curl echo, a misconfigured debug print) flows into journald
+      #     under basecradle-wake-<slug> (#168), so it flows through here. Nothing is known to print
+      #     one; this is the belt for the braces. `sk-` covers the whole family that shares the
+      #     prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one rule.
+      #   * `ste-`: Steel keys, wherever they land, the `steel-api-key` header included.
+      #
+      # THE WORD RULE (basecradle-harness#794). A vendor prefix inside a word is a word, not a
+      # credential: `risk-assessment-pending-review` holds `sk-` and is no key. A match is kept only
+      # when BOTH hold: a letter, digit or combining mark, in any script, comes right before it, AND
+      # its run after the prefix holds no digit and no uppercase letter. Never one without the
+      # other, and never a left boundary: a serialization glues a key to a letter or digit
+      # (`Bearer%20sk-…`, `ESC[33msk-…`, `密钥sk-…`), and a random key of a vendor's length holds a
+      # digit or a capital with overwhelming certainty. The stated residuals, as the harness's: a
+      # glued word whose run holds a digit or a capital is redacted (the scrub errs toward
+      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept.
+      #
+      # VRL's regex has no lookbehind and the closure is not given the match's offset, so the
+      # pattern captures the one character before the key as `before` (empty at the start of the
+      # text) and every branch puts it back. Consuming it takes nothing from an earlier match: every
+      # prefix begins with a letter and every run takes letters, so the character before a key is
+      # never the last of the match before it. A run is captured apart from its prefix, so a
+      # prefix's own capital or digit (`AIza`, `r8_`) is never read as evidence about the run. A run
+      # that came back empty is never kept. Every rule's run is at least one character, so this
+      # holds only for a rule added to the pattern without its run in `run` below: that rule is
+      # redacted, never kept as a word.
+      msg = replace_with(msg, r'(?x)
+          (?P<before>^|[\s\S])
+          (?:
+              gh[a-z]_(?P<gh>[A-Za-z0-9]{20,})
+            | bc_uat_(?P<bc_uat>[A-Za-z0-9]+)
+            | bc_isk_(?P<bc_isk>[A-Za-z0-9]+)
+            | sk-(?P<sk>[A-Za-z0-9_-]{16,})
+            | xai-(?P<xai>[A-Za-z0-9]{16,})
+            | AIza(?P<aiza>[A-Za-z0-9_-]{20,})
+            | hf_(?P<hf>[A-Za-z0-9]{20,})
+            | r8_(?P<r8>[A-Za-z0-9]{20,})
+            | ste-(?P<ste>[A-Za-z0-9]{20,})
+          )') -> |key| {
+          before = string(key.before) ?? ""
+          run = string(key.gh) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? ""
+          if run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
+              key.string
+          } else if key.gh != null {
+              before + "[REDACTED_GH_TOKEN]"
+          } else if key.bc_uat != null {
+              before + "[REDACTED_BC_TOKEN]"
+          } else if key.bc_isk != null {
+              before + "[REDACTED_BC_INTEGRATION_SECRET]"
+          } else {
+              before + "[REDACTED_API_KEY]"
+          }
+      }
       # PRESENTATION — prefix the message with the emitting program's journald identifier, so a
       # Live Tail line is self-describing: `[basecradle-router] stage=wake outcome=ok agent=… `.
       # Fall back to the process comm, then to "unknown", so a line with no identifier (a kernel

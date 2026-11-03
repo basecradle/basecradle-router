@@ -147,7 +147,7 @@ def _vrl_string(literal: str) -> str:
 
 def test_log_fields_and_the_detail_remap_render_the_same_bytes() -> None:
     # Two renderers of one rule drift unless one test reads both. The remap's case runs
-    # through the shipped VRL in tests/test_vector_otel_llm.py; this reads that case's
+    # through the shipped VRL in tests/test_vector_unit.py; this reads that case's
     # input and expected `detail=` back out of the fixture and renders the input here.
     fixture = (Path(__file__).parent / "vector" / "ai_otel_llm.yaml").read_text()
     name = (

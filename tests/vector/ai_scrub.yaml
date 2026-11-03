@@ -1,0 +1,386 @@
+# Vector unit tests for `ai_scrub`'s redaction (basecradle-router#398), run by
+# tests/test_vector_unit.py as `vector test <the shipped vector.yaml> <this file>`. Each event goes
+# in at `ai_scrub` as a journald line and is read back out of it, so the tests run the shipped VRL and
+# assert the exact bytes Better Stack receives.
+#
+# The rule under test is the harness's: two passes, literal rules then prefix rules, and a prefixed
+# match kept only when `_is_word` reads it as a word (basecradle-harness docs/telemetry.md →
+# Credential Scrubbing, harness 0.176.0). The samples are the harness's own (its
+# tests/test_log_value_cut.py), lengthened to the box's minimums where the harness's are shorter:
+# the box's `sk-` run needs 16 characters where the harness's needs 8, so `task-specification`, whose
+# run is 13, never met the box's rule at all, and the long forms below are the ones that did.
+#
+# Every key is a fabricated, correctly shaped fake. No dollar sign anywhere in this file: Vector
+# interpolates environment variables across a test file just as it does across a config.
+
+tests:
+  # --- the literal rules run first: a prefix run never swallows a literal's key name -------------
+
+  - name: "an api-key assignment glued to a prefix run redacts its secret"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: task-runner-pipeline-api-key=abc123secret rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # The secret is gone. The word before it is cut as well, because the box's label
+              # `apiKey=` carries a capital that the word rule reads as evidence of a key.
+              assert_eq!(.message, "[basecradle-router] failed: ta[REDACTED_API_KEY]=[REDACTED] rejected")
+
+  - name: "an api-key assignment inside an sk- run redacts its secret"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: sk-runner-pipeline-api-key=abc123secret rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] failed: [REDACTED_API_KEY]=[REDACTED] rejected")
+
+  - name: "an underscored api_key assignment glued to a prefix run redacts its secret"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: risk-model-pipeline_api_key=hunter2xyz rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] failed: ri[REDACTED_API_KEY]=[REDACTED] rejected")
+
+  - name: "a bearer glued to a github-token run redacts its credential"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: weighs_requestauthorizationbearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] failed: wei[REDACTED_GH_TOKEN] [REDACTED] rejected")
+
+  - name: "a bearer glued to a short prefix run redacts its credential"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: task-runner-bearer abcdefgh123 rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] failed: task-runner-Bearer [REDACTED] rejected")
+
+  - name: "an assignment whose value is a bearer header redacts the token after the scheme"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] failed: AUTH_apiKey=[REDACTED] [REDACTED] rejected")
+
+  - name: "a doubled bearer scheme redacts the token after both"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A token stored with its scheme and sent with another reads `Bearer Bearer eyJ…`.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Authorization: Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc | AUTH_API_KEY=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig | GET /v1/models?api_key=Bearer\tbearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] | AUTH_apiKey=[REDACTED] [REDACTED] | GET /v1/models?apiKey=[REDACTED] [REDACTED] HTTP/1.1")
+
+  - name: "a query key whose value is a bearer header redacts the token after the scheme"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "GET https://example.com/v1?api_key=Bearer eyJhbGciOiJIUzI1NiJ9 rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] GET https://example.com/v1?apiKey=[REDACTED] [REDACTED] rejected")
+
+  # --- the Steel key, the api-key query shape and the env dump (moved from tests/test_log_surface.py) ---
+
+  - name: "a steel key in the connect url is redacted and the rest survives"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Fabricated: the real keys are `ste-` + 99 alphanumerics, so this matches their length.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "connecting to wss://connect.steel.dev?sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b&apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] connecting to wss://connect.steel.dev?sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b&apiKey=[REDACTED]")
+
+  - name: "the query rule stops at the next parameter"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "wss://connect.steel.dev?apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated&sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] wss://connect.steel.dev?apiKey=[REDACTED]&sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b")
+
+  - name: "a steel key outside a url is redacted by its prefix"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The header form carries no `apiKey=`, so only the `ste-` rule can catch it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "POST https://api.steel.dev/v1/sessions steel-api-key: ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] POST https://api.steel.dev/v1/sessions steel-api-key: [REDACTED_API_KEY]")
+
+  - name: "the query rule redacts a value of any shape under any spelling of its name"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "GET /v1/tools?apiKey=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?api_key=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?API-KEY=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?apikey=novaOpaqueFabricatedValue0001 \"ok\""}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\"")
+
+  - name: "an env dump api key is redacted whatever its provider"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The name is normalised and the value never ships, even for a provider no prefix rule knows.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "STEEL_API_KEY=novaOpaqueFabricatedValue0001 ANTHROPIC_API_KEY=sk-ant-0000000000000000000000000000000000000000"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] STEEL_apiKey=[REDACTED] ANTHROPIC_apiKey=[REDACTED]")
+
+  # --- a vendor prefix inside a word is a word -------------------------------------------------
+
+  - name: "an sk- word glued to a letter survives whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "the task-specification-for-this-run is invalid: disk-quota-exceeded-for-org, risk-assessment-pending-review"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] the task-specification-for-this-run is invalid: disk-quota-exceeded-for-org, risk-assessment-pending-review")
+
+  - name: "the issue's short words survive whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "task-specification failed: disk-quota-exceeded, risk-assessment"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] task-specification failed: disk-quota-exceeded, risk-assessment")
+
+  - name: "a word in another script keeps its prefix"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Rísk-assessment-pending-review; Gäste-registrierungssystem-voll"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] Rísk-assessment-pending-review; Gäste-registrierungssystem-voll")
+
+  - name: "a github-token and a user-token prefix inside a word survive whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "laughs_happilyeverafterandafter abc_uat_unknown"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] laughs_happilyeverafterandafter abc_uat_unknown")
+
+  - name: "a word glued by a digit, a combining mark or any script is kept"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "7sk-specificationsforall e\u{301}sk-specificationsforall 密sk-specificationsforall"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] 7sk-specificationsforall e\u{301}sk-specificationsforall 密sk-specificationsforall")
+
+  - name: "a prefix that holds a digit or a capital is not read as its run"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "xr8_abcdefghijklmnopqrstuvwx xAIzaabcdefghijklmnopqrstuvwx | r8_abcdefghijklmnopqrstuvwx"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] xr8_abcdefghijklmnopqrstuvwx xAIzaabcdefghijklmnopqrstuvwx | [REDACTED_API_KEY]")
+
+  - name: "a word kept by one prefix rule is never cut by another"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The `sk-` run takes `hf_…` whole and is kept as a word. One rule per pass would read the
+          # `hf_` inside it again, after an underscore, and cut it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "task-queue_hf_abcdefghijklmnopqrstuvwx drained"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] task-queue_hf_abcdefghijklmnopqrstuvwx drained")
+
+  # --- a key is still a key, whatever it is glued to -------------------------------------------
+
+  - name: "a glued run with a digit or a capital is redacted however wordlike"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ask-specifications2026 7sk-specifications2026 ésk-Specificationsforall 密sk-Specificationsforall"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] a[REDACTED_API_KEY] 7[REDACTED_API_KEY] é[REDACTED_API_KEY] 密[REDACTED_API_KEY]")
+
+  - name: "an unglued lowercase run is still redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "sk-abcdefghijklmnopqr key sk-abcdefghijklmnop x-hf_abcdefghijklmnopqrstuvwx"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] [REDACTED_API_KEY] key [REDACTED_API_KEY] x-[REDACTED_API_KEY]")
+
+  - name: "a key at the start of the text is redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ghp_Ab3Cd5Ef7Gh9Ij1Kl3Mn rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] [REDACTED_GH_TOKEN] rejected")
+
+  - name: "every prefixed key after every left neighbour is still redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # One fabricated key per prefix rule, at the box's own minimum, each with the label its
+          # rule writes.
+          keys = [
+            ["ghp_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_GH_TOKEN]"],
+            ["ghs_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_GH_TOKEN]"],
+            ["bc_uat_K", "[REDACTED_BC_TOKEN]"],
+            ["bc_isk_K", "[REDACTED_BC_INTEGRATION_SECRET]"],
+            ["sk-ant-api03-Ab3Cd5Ef7Gh9", "[REDACTED_API_KEY]"],
+            ["sk-or-v1-0f3a9c2b7d4e6f8a", "[REDACTED_API_KEY]"],
+            ["xai-Ab3Cd5Ef7Gh9Ij1K", "[REDACTED_API_KEY]"],
+            ["AIzaAb3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["hf_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["r8_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["ste-Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"]
+          ]
+          # Every left neighbour a credential can follow, the harness's list. The first group is a
+          # separator; the second ends in a letter, digit or mark (a serialization, a colour code, a
+          # script written without spaces, a word glued on by a bug), which is why no left
+          # boundary can be the test. A real newline and tab sit beside the escaped forms: a multi-line
+          # message is a journald fact, and a key after its newline must still match. The start of
+          # the text has its own test above.
+          neighbours = [
+            "key ", "key\n", "key\t", "key=", "key:", "\"", "OPENAI_KEY_", "x-", "/v1/keys/",
+            "Bearer%20", "key%253D", "key=3D",
+            "body\\n", "\\x22", "\\u0022", "\\U0001f600",
+            "invalid key \u{1b}[33m", "API密钥", "APIキー", "Authorization:Bearer",
+            "2026-11-03T10:00:00Z", "a", "é", "e\u{301}"
+          ]
+          sent = []
+          expected = []
+          for_each(keys) -> |_i, key| {
+            for_each(neighbours) -> |_j, neighbour| {
+              sent = push(sent, neighbour + string!(key[0]))
+              expected = push(expected, neighbour + string!(key[1]))
+            }
+          }
+          . = {
+            "SYSLOG_IDENTIFIER": "basecradle-router",
+            "message": join!(sent, " "),
+            "expected": "[basecradle-router] " + join!(expected, " "),
+            "count": length(sent)
+          }
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # Every key and every neighbour was sent: 11 keys after 24 neighbours.
+              assert_eq!(.count, 264)
+              assert_eq!(.message, .expected)

@@ -140,14 +140,26 @@ def test_the_prefix_is_applied_after_redaction_not_before() -> None:
     assert source.index("[REDACTED_API_KEY]") < source.index('.message = "[" + ident + "] " + msg')
 
 
+# What the redaction does to a line is proven by running it: `tests/vector/ai_scrub.yaml`, through
+# `vector test` (tests/test_vector_unit.py). Python's `re` used to stand in for VRL here, and it can
+# no longer: the word rule is a closure and reads `\p{…}` classes `re` does not have (#398). What
+# stays here is what holds offline, with no Vector on the machine: which rules exist, where they
+# sit, and in what order.
+
+#: The statement that opens the prefix pass, the one `replace_with` in `ai_scrub`.
+_PREFIX_PASS = "msg = replace_with(msg, r'(?x)"
+
+
 def test_provider_api_keys_are_redacted() -> None:
     # Harness and builder agents run with provider keys in their env, and a wake's
     # stdout+stderr now flows into journald (#168) and therefore through here. Nothing
     # is known to print one; this is the belt for the braces.
     source = _scrub_source()
-    assert r"sk-[A-Za-z0-9_-]{16,}" in source  # openai / anthropic / openrouter / …
-    assert r"xai-[A-Za-z0-9]{16,}" in source
-    assert r"AIza[A-Za-z0-9_-]{20,}" in source
+    assert r"sk-(?P<sk>[A-Za-z0-9_-]{16,})" in source  # openai / anthropic / openrouter / …
+    assert r"xai-(?P<xai>[A-Za-z0-9]{16,})" in source
+    assert r"AIza(?P<aiza>[A-Za-z0-9_-]{20,})" in source
+    assert r"hf_(?P<hf>[A-Za-z0-9]{20,})" in source
+    assert r"r8_(?P<r8>[A-Za-z0-9]{20,})" in source
 
 
 # One `msg = replace(msg, r'…', "…")` statement, in the only shape this file may carry: a raw
@@ -159,36 +171,42 @@ _REPLACE = re.compile(
 )
 
 
-def _redact(message: str) -> str:
-    """`message` after every `msg = replace(…)` rule in `ai_scrub`, applied in file order.
-
-    Python's `re` stands in for VRL's Rust `regex`: the two agree on everything these
-    patterns use (classes, `\\s`/`\\S`, bounded repeats, a leading `(?i)`). Every replace
-    statement must parse, so a rule written in any other shape fails here by name rather
-    than being skipped — a redaction this helper never ran would pass vacuously.
-    """
-    # Every non-comment line that mentions `replace` — so a `replace!(` or a respaced
-    # statement must match the strict shape too, instead of slipping past the filter.
-    statements = [
-        line
-        for line in _scrub_source().splitlines()
+def _statements(source: str) -> list[str]:
+    """Every non-comment line of `source` that mentions `replace`, in file order."""
+    return [
+        line.strip()
+        for line in source.splitlines()
         if "replace" in line and not line.lstrip().startswith("#")
     ]
-    assert statements, "ai_scrub carries no replace rules"
-    for line in statements:
-        rule = _REPLACE.match(line)
-        assert rule, (
-            f"ai_scrub replace rule is not a closed raw string + fixed replacement: {line!r}"
-        )
-        # A function, not a template: the replacement is literal, as VRL's is with no `$`.
-        literal = rule.group("replacement")
-        message = re.sub(rule.group("pattern"), lambda _, fixed=literal: fixed, message)
-    return message
 
 
-# Fabricated: the real keys are `ste-` + 99 alphanumerics, so this matches their length.
-STEEL_KEY = "ste-" + "Fab1cated" * 11
-SESSION_ID = "0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"
+def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
+    # The order is the fix (basecradle-router#398): a prefix rule's run is made of the characters
+    # a literal rule's key name is, so a prefix rule that runs first swallows `api-key` or
+    # `bearer` and leaves the secret after it for no rule to match. Every literal rule is a fixed
+    # `replace` in the one safe shape, and the prefix rules are ONE `replace_with` after all of
+    # them, never a rule per pass, so a word kept by one prefix rule is never cut by another.
+    statements = _statements(_scrub_source())
+    prefix_passes = [i for i, line in enumerate(statements) if line.startswith(_PREFIX_PASS)]
+    assert len(prefix_passes) == 1, f"ai_scrub must carry one prefix pass: {statements!r}"
+    literal = statements[: prefix_passes[0]]
+    assert statements[prefix_passes[0] + 1 :] == [], "no rule may run after the prefix pass"
+    # Nor anything else that rewrites `msg`: the prefix pass is the last assignment to it, so
+    # nothing after it can undo or bypass the order, whatever function it calls.
+    assignments = [
+        line.strip() for line in _scrub_source().splitlines() if re.match(r"^ *msg *=", line)
+    ]
+    assert assignments[-1].startswith(_PREFIX_PASS), assignments
+    for line in literal:
+        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
+    patterns = [_REPLACE.match(line).group("pattern") for line in literal]
+    # Bearer before the assignment rule: `AUTH_API_KEY=Bearer eyJ…` would otherwise lose
+    # `Bearer` into the assignment's value and leave the token after the space unmatched.
+    assert patterns == [
+        r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
+        r"https?://\S*/heartbeat/\S+",
+        r"""(?i)api[-_]?key=[^&\s"]+""",
+    ]
 
 
 def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
@@ -197,50 +215,11 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     # (basecradle-noc#797). The `ste-` rule catches the key wherever it lands; the query
     # rule catches `apiKey=` whatever its value, so a future key format in a URL is covered.
     source = _scrub_source()
-    assert r"ste-[A-Za-z0-9]{20,}" in source
+    assert r"ste-(?P<ste>[A-Za-z0-9]{20,})" in source
     assert r"""(?i)api[-_]?key=[^&\s"]+""" in source
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    for rule in ("msg = replace(msg, r'ste-", "msg = replace(msg, r'(?i)api[-_]?key="):
+    for rule in (_PREFIX_PASS, "msg = replace(msg, r'(?i)api[-_]?key="):
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
-
-
-def test_a_steel_key_in_the_connect_url_is_redacted_and_the_rest_survives() -> None:
-    redacted = _redact(
-        f"connecting to wss://connect.steel.dev?sessionId={SESSION_ID}&apiKey={STEEL_KEY}"
-    )
-    assert "Fab1cated" not in redacted
-    assert (
-        redacted
-        == f"connecting to wss://connect.steel.dev?sessionId={SESSION_ID}&apiKey=[REDACTED]"
-    )
-
-
-def test_the_query_rule_stops_at_the_next_parameter() -> None:
-    # `&` ends the value: redact the key, never the parameters after it.
-    redacted = _redact(f"wss://connect.steel.dev?apiKey={STEEL_KEY}&sessionId={SESSION_ID}")
-    assert redacted == f"wss://connect.steel.dev?apiKey=[REDACTED]&sessionId={SESSION_ID}"
-
-
-def test_a_steel_key_outside_a_url_is_redacted_by_its_prefix() -> None:
-    # The header form carries no `apiKey=`, so only the `ste-` rule can catch it.
-    redacted = _redact(f"POST https://api.steel.dev/v1/sessions steel-api-key: {STEEL_KEY}")
-    assert redacted == "POST https://api.steel.dev/v1/sessions steel-api-key: [REDACTED_API_KEY]"
-
-
-def test_the_query_rule_redacts_a_value_of_any_shape() -> None:
-    # No known prefix, any spelling of the name: the query rule stands on its own.
-    for name in ("apiKey", "api_key", "API-KEY", "apikey"):
-        redacted = _redact(f'GET /v1/tools?{name}=novaOpaqueFabricatedValue0001 "ok"')
-        assert "novaOpaqueFabricatedValue0001" not in redacted
-        assert redacted == 'GET /v1/tools?apiKey=[REDACTED] "ok"'
-
-
-def test_an_env_dump_api_key_is_redacted_whatever_its_provider() -> None:
-    # Case-insensitive and unanchored, the query rule also catches the `NAME_API_KEY=value`
-    # shape of an env dump — the name is normalised, the value never ships, even for a
-    # provider no prefix rule knows.
-    assert _redact("STEEL_API_KEY=novaOpaqueFabricatedValue0001") == "STEEL_apiKey=[REDACTED]"
-    assert _redact("ANTHROPIC_API_KEY=sk-ant-" + "0" * 40) == "ANTHROPIC_apiKey=[REDACTED]"
 
 
 def test_the_only_dollar_signs_in_vector_yaml_are_the_sink_tokens() -> None:
@@ -296,8 +275,8 @@ def test_basecradle_integration_signing_keys_are_redacted() -> None:
     # tokens* and never matched these — a distinct prefix needs its own rule, and the
     # box that holds the secrets is the one that must carry it.
     source = _scrub_source()
-    assert r"bc_isk_[A-Za-z0-9]+" in source
-    assert r"bc_uat_[A-Za-z0-9]+" in source
+    assert r"bc_isk_(?P<bc_isk>[A-Za-z0-9]+)" in source
+    assert r"bc_uat_(?P<bc_uat>[A-Za-z0-9]+)" in source
 
 
 def test_the_integration_signing_key_redaction_is_unconditional() -> None:
@@ -306,7 +285,7 @@ def test_the_integration_signing_key_redaction_is_unconditional() -> None:
     # off indentation, against the `sudo` drop which is known to sit at the top level.
     source = _scrub_source()
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    assert _statement_indent(source, "msg = replace(msg, r'bc_isk_") == top_level
+    assert _statement_indent(source, _PREFIX_PASS) == top_level
 
 
 def test_the_pre_existing_scrub_rules_survive() -> None:
@@ -442,7 +421,7 @@ def test_the_scrub_never_strips_the_ansi_colour_the_journal_lines_carry() -> Non
 
 # --- 6. the Claude Code builders' OpenTelemetry path (#380) ----------------
 #
-# What the transform renders is proven by running it (tests/test_vector_otel_llm.py). These pin
+# What the transform renders is proven by running it (tests/test_vector_unit.py). These pin
 # the plumbing around it, which `vector test` never exercises: where the listener binds and which
 # sink the rendered line reaches.
 

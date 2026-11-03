@@ -1,11 +1,18 @@
-"""The Claude Code builders' `llm` line, rendered by the shipped Vector config (#380).
+r"""The shipped Vector config's VRL, run by `vector test` (#380, #398).
 
-`ai_otel_llm` is VRL, and its output is the exact line Better Stack receives, so no Python
-reading of the YAML can prove it. This runs the real thing: `vector test` executes the
-transform over the fabricated events in `tests/vector/ai_otel_llm.yaml` and asserts the
-bytes. It runs against every host's shipped `vector.yaml`, on the Vector release the boxes
-run (deploy/README → `VECTOR_VERSION`), so a VRL behaviour that changed between releases
+`ai_otel_llm` and `ai_scrub` are VRL, and their output is the exact line Better Stack receives,
+so no Python reading of the YAML can prove it. This runs the real thing: `vector test` executes
+the transforms over the fabricated events in every suite under `tests/vector/` and asserts the
+bytes. It runs every suite against every host's shipped `vector.yaml`, on the Vector release the
+boxes run (deploy/README → `VECTOR_VERSION`), so a VRL behaviour that changed between releases
 cannot pass here and fail on a box.
+
+The suites:
+
+* `ai_otel_llm.yaml` — a Claude Code model call rendered as the fleet's `llm` line (#380).
+* `ai_scrub.yaml` — the redaction every shipped line passes: the literal rules before the prefix
+  rules, and the harness's word rule (#398). Python's `re` cannot stand in for it: it has no
+  `\p{L}` classes, and the word rule is a closure, so the real engine is the only test.
 
 CI installs that release (ci.yml → "Install Vector"), so there the binary is required. A
 laptop without it, or with a different release, skips: point `VECTOR_BIN` at the pinned
@@ -28,7 +35,7 @@ REPO = Path(__file__).resolve().parents[1]
 README = REPO / "deploy" / "README.md"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 HOSTS_DIR = REPO / "deploy" / "hosts"
-TESTS = REPO / "tests" / "vector" / "ai_otel_llm.yaml"
+SUITES = sorted((REPO / "tests" / "vector").glob("*.yaml"))
 
 
 def _pinned_version() -> str:
@@ -58,8 +65,15 @@ def test_ci_installs_the_release_the_boxes_run() -> None:
     assert f'VECTOR_VERSION: "{pinned}"' in CI_WORKFLOW.read_text()
 
 
+def test_every_suite_is_run() -> None:
+    # The glob below is the whole list: a suite named here and missing from disk, or the scrub's
+    # suite renamed out of the glob, would otherwise leave the redaction untested and green.
+    assert {suite.name for suite in SUITES} >= {"ai_otel_llm.yaml", "ai_scrub.yaml"}
+
+
+@pytest.mark.parametrize("suite", SUITES, ids=lambda suite: suite.stem)
 @pytest.mark.parametrize("host", sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir()))
-def test_the_shipped_transform_renders_the_contract_line(host: str) -> None:
+def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path) -> None:
     vector = _vector()
     # A sink token is interpolated at load; this fake one never leaves the process, because
     # `vector test` builds no sink.
@@ -69,7 +83,7 @@ def test_the_shipped_transform_renders_the_contract_line(host: str) -> None:
         "NO_COLOR": "1",
     }
     got = subprocess.run(
-        [vector, "test", str(HOSTS_DIR / host / "vector.yaml"), str(TESTS)],
+        [vector, "test", str(HOSTS_DIR / host / "vector.yaml"), str(suite)],
         capture_output=True,
         text=True,
         check=False,
@@ -78,7 +92,7 @@ def test_the_shipped_transform_renders_the_contract_line(host: str) -> None:
     report = got.stdout + got.stderr
     assert got.returncode == 0, report
     # Every declared test ran and passed: a test Vector silently skipped would pass vacuously.
-    declared = re.findall(r'^  - name: "(.+)"$', TESTS.read_text(), re.MULTILINE)
-    assert declared, "tests/vector/ai_otel_llm.yaml declares no tests"
+    declared = re.findall(r'^  - name: "(.+)"$', suite.read_text(), re.MULTILINE)
+    assert declared, f"tests/vector/{suite.name} declares no tests"
     for name in declared:
         assert f"test {name} ... passed" in report, f"{name!r} did not pass:\n{report}"
