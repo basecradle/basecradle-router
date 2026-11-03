@@ -62,10 +62,13 @@ RESET = "\x1b[0m"
 
 #: Whole ``key=value`` token → its colour. Keyed by the token rather than by the key
 #: so the colour can depend on the *value* (``outcome=ok`` green, ``outcome=failed``
-#: red) and so the escape can never land inside a token. Four families, decided by
-#: @origin 2026-08-17: success (green), the ``wake_end`` bookend's own identity (blue —
-#: its trailing ``outcome=`` token carries the verdict's colour), the warning tier that
-#: is neither success nor failure (yellow), and failure (red).
+#: red) and so the escape can never land inside a token. The tiers are the fleet's, defined
+#: once in basecradle-harness ``docs/telemetry.md`` → The Palette: success (green), the
+#: ``wake_end`` bookend's own identity (blue — its trailing ``outcome=`` token carries the
+#: verdict's colour), the warning tier that is neither success nor failure (yellow), the
+#: Operator's Choice tier, an outcome an operator chose such as stopping a wake (yellow,
+#: the warning tier's SGR on purpose — never red, because nothing failed;
+#: basecradle-harness#799), and failure (red).
 PALETTE: Mapping[str, str] = MappingProxyType(
     {
         # success
@@ -78,6 +81,9 @@ PALETTE: Mapping[str, str] = MappingProxyType(
         "event=wake_retry": YELLOW,
         "event=wake_refused": YELLOW,
         "event=wake_lock_stale": YELLOW,
+        # Operator's Choice tier — an operator stopped the wake; nothing failed
+        "event=wake_stopped": YELLOW,
+        "outcome=stopped": YELLOW,
         # failure
         "outcome=failed": RED,
         "outcome=rejected": RED,

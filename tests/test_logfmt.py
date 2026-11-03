@@ -29,14 +29,21 @@ from basecradle_router.logfmt import (
 #: consumer (a grep, an extraction regex) reads it.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
+#: The Operator's Choice tier — neither success nor failure, an outcome an operator
+#: chose — as basecradle-harness `docs/telemetry.md` → The Palette names the router's
+#: members of it (basecradle-harness#799). It shares the warning tier's yellow on
+#: purpose, and is never red, because nothing failed.
+_OPERATORS_CHOICE = {"event=wake_stopped", "outcome=stopped"}
+
 #: The palette as @origin decided it on 2026-08-17, transcribed from the decision
 #: rather than from the implementation, so a drift in either direction fails here.
-#: Four families: success, the `wake_end` bookend's own identity, the warning tier
-#: (neither success nor failure), and failure.
+#: The families: success, the `wake_end` bookend's own identity, the warning tier
+#: (neither success nor failure) with the Operator's Choice tier on the same SGR, and
+#: failure.
 _DECIDED = {
     GREEN: {"event=wake_start", "outcome=ok", "event=breaker_reset"},
     BLUE: {"event=wake_end"},
-    YELLOW: {"event=wake_retry", "event=wake_refused", "event=wake_lock_stale"},
+    YELLOW: {"event=wake_retry", "event=wake_refused", "event=wake_lock_stale"} | _OPERATORS_CHOICE,
     RED: {
         "outcome=failed",
         "outcome=rejected",
@@ -94,6 +101,15 @@ def test_the_palette_is_the_decided_table_exactly() -> None:
     for token, colour in PALETTE.items():
         inverted.setdefault(colour, set()).add(token)
     assert inverted == _DECIDED
+
+
+def test_the_operators_choice_tier_is_yellow_and_never_red() -> None:
+    # A stopped wake is an operator's act, not a fault: painting it red would page a
+    # reader's eye exactly as `outcome=failed` does. The contract page sets the tier's
+    # SGR to `\x1b[33m`, the warning tier's, so the two read alike at a glance.
+    for token in _OPERATORS_CHOICE:
+        assert PALETTE[token] == "\x1b[33m", token
+        assert paint(token) == f"\x1b[33m{token}\x1b[0m"
 
 
 def test_the_colours_are_the_decided_sgr_codes() -> None:
