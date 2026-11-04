@@ -1,4 +1,4 @@
-name: Interaction-limit renewal
+name: Interaction-Limit Renewal
 
 # Keep this repo's public write-surface locked to org members, durably
 # (basecradle-router#60, workstream 3). GitHub interaction limits expire after at
@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Renew + audit interaction limits
+      - name: Renew + Audit Interaction Limits
         env:
           GH_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
         run: |

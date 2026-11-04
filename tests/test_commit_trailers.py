@@ -175,7 +175,7 @@ def test_the_charter_states_the_identity_ci_passes_in() -> None:
 
 def test_ci_runs_the_guard_on_pull_requests_only_with_full_history() -> None:
     ci = CI_WORKFLOW.read_text()
-    start = ci.index("      - name: Commit trailers")
+    start = ci.index("      - name: Commit Trailers")
     end = ci.find("\n      - ", start + 1)
     step = ci[start : end if end != -1 else None]
     assert "if: github.event_name == 'pull_request'" in step
