@@ -206,6 +206,7 @@ class _Box:
         self.ignores_term = set(ignores_term)
         self.spawns_on_term = spawns_on_term  # (parent_pid, Proc) — a child born in the window
         self.sent: list[tuple[int, int]] = []
+        self.relayed: list[int] = []  # the children runuser signalled itself
         self.lines: list[str] = []
         self.t = 0.0
 
@@ -216,12 +217,35 @@ class _Box:
         if pid not in self.table:
             raise ProcessLookupError(pid)
         self.sent.append((pid, sig))
+        self._deliver(pid, sig)
+
+    def _deliver(self, pid: int, sig: int) -> None:
         if sig == signal.SIGTERM and self.spawns_on_term and pid == self.spawns_on_term[0]:
             child = self.spawns_on_term[1]
             self.table[child.pid] = child
             self.spawns_on_term = None
+        if sig == signal.SIGTERM and self._named(pid, "runuser"):
+            # runuser relays the TERM to its child — the copy the stop leaves to it.
+            for child in [p.pid for p in self.table.values() if p.ppid == pid]:
+                self.relayed.append(child)
+                self._deliver(child, signal.SIGTERM)
         if sig == signal.SIGKILL or pid not in self.ignores_term:
-            del self.table[pid]
+            self._exit(pid)
+
+    def _named(self, pid: int, name: str) -> bool:
+        # Only the chain's root-owned links relay; a forged name in the session does not.
+        proc = self.table[pid]
+        return proc.uid == 0 and Path(proc.argv[0]).name == name
+
+    def _exit(self, pid: int) -> None:
+        parent = self.table.pop(pid).ppid
+        # sudo exits the way its command did, so it goes when its last child goes.
+        if (
+            parent in self.table
+            and self._named(parent, "sudo")
+            and not any(p.ppid == parent for p in self.table.values())
+        ):
+            self._exit(parent)
 
     def sleep(self, seconds: float) -> None:
         self.t += seconds
@@ -243,12 +267,105 @@ def _stop(box: _Box, *, grace: float = 10.0, delivery=None) -> list[int]:
 def test_a_stop_terms_the_whole_tree_and_touches_no_bystander() -> None:
     box = _Box(_table())
     assert _stop(box) == []
-    assert {pid for pid, _ in box.sent} == {200, 201, 202, 203, 204, 206}
+    # sudo (200) and runuser's child (202) are left to the wake's own relays (#404).
+    assert {pid for pid, _ in box.sent} == {201, 203, 204, 206}
     assert {sig for _, sig in box.sent} == {signal.SIGTERM}
+    assert box.relayed == [202]
+    assert not {200, 201, 202, 203, 204, 206} & set(box.table)  # the whole wake is gone
     # The daemon, the other agent's wake, the stray sudo, the pkill decoy, nova's process
     # for another delivery, and the forged mark on another account all live.
     for bystander in (100, 101, 300, 301, 302, 400, 500, 501):
         assert bystander in box.table
+
+
+def test_no_member_is_sent_a_sigterm_a_relay_already_delivers() -> None:
+    # #404: sudo relays a TERM to runuser, and a second TERM inside runuser's 2 s sleep
+    # skips it straight to SIGKILL; runuser relays one to its child. So neither sudo nor
+    # runuser's child is signalled, and the op sends no member a second copy.
+    box = _Box(_table())
+    _stop(box)
+    sent = [pid for pid, _ in box.sent]
+    assert 200 not in sent  # sudo: dies the way runuser does
+    assert 202 not in sent and box.relayed == [202]  # the binary: runuser's copy only
+    assert len(sent) == len(set(sent))
+
+
+def test_a_pty_monitor_sudo_is_left_to_relay_too() -> None:
+    # A host whose sudoers ran the command under a pty would put a second sudo between
+    # the root and runuser. It relays exactly as the root does, so it is spared the same.
+    table = _table()
+    table[201] = _p(201, 200, 0, ["sudo", WAKE_RUNNER, "--user", "nova"])  # the monitor
+    table[207] = _p(207, 201, 0, ["runuser", "-u", "nova", "--", "/bin/bash"])
+    table[202] = _p(202, 207, NOVA_UID, [NOVA_BIN], mark=DELIVERY)
+    box = _Box(table)
+    _stop(box)
+    assert {pid for pid, _ in box.sent} == {207, 203, 204, 206}
+
+
+def test_a_sudo_child_caught_before_its_exec_is_signalled_once_it_is_runuser() -> None:
+    # The stop lands between sudo's fork and its child's exec: the child is still `sudo`,
+    # a relay, so it is left alone. When it has become runuser it must get its TERM, or
+    # nothing in the chain is signalled and the binary loses its grace to the SIGKILL.
+    table = _table()
+    del table[202], table[203], table[204]
+    table[201] = _p(201, 200, 0, _wake_argv())  # the forked child, not yet exec'd
+    box = _Box(table, ignores_term={206})
+    reads = 0
+    real_read = box.read
+
+    def read():
+        nonlocal reads
+        reads += 1
+        if reads == 3 and 201 in box.table:  # the exec lands during the grace period
+            box.table[201] = _p(201, 200, 0, ["runuser", "-u", "nova"], start=2010)
+        return real_read()
+
+    stopper = box.stopper()
+    stopper.read = read
+    wakes = sw.find_wakes(real_read(), "nova", NOVA_UID, None, ROUTER_UID)
+    stopper.stop(wakes, by="john", grace=5.0)
+    assert (201, signal.SIGTERM) in box.sent
+    assert box.sent.count((201, signal.SIGTERM)) == 1
+
+
+def test_a_process_of_the_agents_that_names_itself_a_relay_is_still_signalled() -> None:
+    # Any process in the session can call itself `sudo` or `runuser`; only root-owned ones
+    # are the chain's relays. A forged name must not opt it, or its children, out.
+    table = _table()
+    table[204] = _p(204, 203, NOVA_UID, ["runuser", "fake"], mark=DELIVERY)
+    table[205] = _p(205, 204, NOVA_UID, ["sudo", "-n", "true"], mark=DELIVERY)
+    table[208] = _p(208, 205, NOVA_UID, ["tool"], mark=DELIVERY)
+    box = _Box(table)
+    _stop(box)
+    assert {204, 205, 208} <= {pid for pid, sig in box.sent if sig == signal.SIGTERM}
+
+
+def test_runuser_is_signalled_before_anything_beneath_it_even_when_pids_wrap() -> None:
+    # runuser's TERM must be pending before anything below it can exit, or it passes the
+    # binary's plain status up and the daemon reads a crash, not a stop. Pid order is not
+    # that order once pids wrap: here every descendant has a LOWER pid than runuser.
+    table = _table()
+    table[900] = _p(900, 200, 0, ["runuser", "-u", "nova", "--", "/bin/bash"])
+    del table[201]
+    table[202] = _p(202, 900, NOVA_UID, [NOVA_BIN], mark=DELIVERY)
+    box = _Box(table, ignores_term={900})  # runuser lingers, as it does, in its 2 s sleep
+    _stop(box)
+    order = [pid for pid, sig in box.sent if sig == signal.SIGTERM]
+    beneath = sw.tree(table, [900]) - {900}
+    assert beneath & set(order) == {203, 204}
+    assert all(order.index(900) < order.index(pid) for pid in (203, 204)), order
+
+
+def test_a_member_left_to_relay_that_outlives_the_grace_is_killed() -> None:
+    # The binary ignores the TERM runuser relays; sudo waits on it. Neither was sent a
+    # TERM by the stop, and neither escapes it: both are watched and SIGKILLed.
+    box = _Box(_table(), ignores_term={202})
+    box.table[201] = _p(201, 200, 0, ["runuser", "-u", "nova"])  # stays until its child goes
+    box.ignores_term.add(201)
+    assert _stop(box, grace=1.0) == []
+    assert (202, signal.SIGKILL) in box.sent
+    assert (200, signal.SIGKILL) in box.sent
+    assert (200, signal.SIGTERM) not in box.sent and (202, signal.SIGTERM) not in box.sent
 
 
 def test_a_child_born_while_the_tree_drains_is_stopped_too() -> None:
@@ -295,9 +412,10 @@ def test_the_stop_records_who_stopped_which_wake_on_both_lines() -> None:
     assert requested == (
         f"event=wake_stop_requested delivery={DELIVERY} agent=nova by=john signal=TERM pids=6"
     )
+    # pids= counts every member; signalled= only those this op sent a signal itself.
     assert done.startswith(
         f"event=wake_stop_done delivery={DELIVERY} agent=nova by=john outcome=stopped "
-        "signalled=6 killed=0 duration="
+        "signalled=4 killed=0 duration="
     )
 
 
@@ -328,9 +446,10 @@ def test_each_wake_reports_its_own_verdict_when_two_are_stopped_at_once() -> Non
     box = _Box(table, ignores_term={601})
     assert _stop(box, grace=1.0) == []
     done = {line.split()[1]: line for line in box.lines if "wake_stop_done" in line}
-    assert "outcome=stopped signalled=6 killed=0" in done[f"delivery={DELIVERY}"]
-    # 301 carries OTHER_DELIVERY too, so it is that wake's member and stopped with it.
-    assert "outcome=killed signalled=3 killed=1" in done[f"delivery={OTHER_DELIVERY}"]
+    assert "outcome=stopped signalled=4 killed=0" in done[f"delivery={DELIVERY}"]
+    # 301 carries OTHER_DELIVERY too, so it is that wake's member and stopped with it. The
+    # lingering wake's sudo, never sent a TERM, is killed with the child it still waits on.
+    assert "outcome=killed signalled=3 killed=2" in done[f"delivery={OTHER_DELIVERY}"]
 
 
 # --- /proc parsing ---------------------------------------------------------------

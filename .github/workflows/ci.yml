@@ -90,3 +90,15 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      # THE REAL PROCESS TREE (#404). tests/test_stop_wake_tree.py stops a real
+      # `sudo -> runuser -> <binary>` wake with the real stop-wake, which takes root; the
+      # step above runs as `runner`, where it skips. Here it runs as root on the runner's
+      # Ubuntu 24.04 (the boxes' sudo and util-linux), and STOP_WAKE_TREE_REQUIRED turns a
+      # skip into a failure, so the proof cannot go green by not running. No bytecode and
+      # no cache, so root writes nothing into the checkout. A STEP, so the required status
+      # context stays the single `CI`.
+      - name: Stop-Wake Against a Real Process Tree (Root)
+        run: >-
+          sudo env PATH="$PATH" STOP_WAKE_TREE_REQUIRED=1 PYTHONDONTWRITEBYTECODE=1
+          .venv/bin/python -m pytest -p no:cacheprovider tests/test_stop_wake_tree.py

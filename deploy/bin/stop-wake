@@ -20,7 +20,7 @@ WHAT IT SIGNALS, AND WHY NOT A PROCESS GROUP. A wake runs as
 `router daemon -> sudo -> wake-runner -> systemd-cat -> runuser -> <binary> -> …`, and
 none of those links starts a process group: proven on Ubuntu 24.04, the whole wake shares
 the DAEMON'S group, so `kill -- -<pgid>` would stop the router itself. So a wake's
-members are found two ways, and every member gets SIGTERM:
+members are found two ways:
 
   * its TREE — the `sudo` the daemon spawned for this agent (its argv is the wake-runner
     invocation, and its parent is the daemon's account), and every descendant by pid;
@@ -37,11 +37,48 @@ whatever outlives the grace period gets SIGKILL. Signalling `sudo` alone would n
 relays to `runuser`, which signals only its own child, so the session's grandchildren
 survive — the same orphans `pkill` leaves.
 
-WHAT THE ROUTER THEN SEES. `sudo` dies by the signal it was sent, so the daemon reads
-exit -15, logs `event=wake_stopped`, never retries, never writes `wake failed`, and marks
-the delivery done. That holds even when the binary traps SIGTERM and exits 0, because
-`runuser` re-raises a signal it caught, and even when a process ignores SIGTERM and needs
-the SIGKILL, because `sudo` has already died of the TERM by then.
+THE CHAIN'S RELAYS NEVER DOUBLE A SIGTERM (basecradle-router#404). Two links in
+the chain relay a SIGTERM down to their own child, and a second copy of the signal is not
+harmless. `runuser` catches the first, SIGTERMs its child, and sleeps 2 s before SIGKILL —
+the binary's grace. A second SIGTERM that lands during that sleep interrupts it, and
+`runuser` goes straight to SIGKILL (util-linux 2.39 `su-common.c`: the handler stays
+installed across the `sleep(2)`). Signalling every member did exactly that: `runuser` got
+this op's TERM and `sudo`'s relayed copy, and whether the copy landed before the sleep or
+inside it was a race of a few milliseconds; on 2026-11-03 it landed inside it, and an
+`@jt` wake was SIGKILLed 3 ms into its grace. So two members are left to the wake's own
+relays and sent nothing while it drains:
+
+  * `sudo`, the wake's root. Its relay is the second copy (on the box, ~1.5 ms after it
+    receives the TERM). It needs no signal of its own: sudo sends itself the signal that
+    ended its command (sudo(8)), so it dies of the TERM that `runuser` re-raises. A
+    `use_pty` monitor — a second `sudo` between the two, absent from the box's wakes — is
+    a relay of the same kind and is left alone the same way.
+  * `runuser`'s child, the binary. `runuser` SIGTERMs it the moment it catches its own, so
+    a copy from here would be a second one inside the binary's own handler.
+
+`runuser` is signalled directly rather than through `sudo`, and parents are signalled
+before their descendants, so its TERM is pending before anything below it can exit. That
+makes the catch deterministic: `runuser` always re-raises, and the daemon always reads a
+stop. Left to `sudo`'s relay instead, a binary signalled directly that exited before the
+relay arrived would let `runuser` pass its plain status up (0, or 143), which the daemon
+reads as a success or a crash — never a stop. The exempt members are still watched, and
+SIGKILLed if they outlive the grace period.
+
+Beneath the binary, every member still gets this op's own TERM, because `runuser` relays
+to its child alone. A binary that also forwards its TERM to its own children gives them a
+second copy; that relay is the binary's, and so is tolerating it.
+
+WHAT THE ROUTER THEN SEES. `sudo` dies by the signal that ended `runuser`, so the daemon
+reads exit -15, logs `event=wake_stopped`, never retries, never writes `wake failed`, and
+marks the delivery done. That holds even when the binary traps SIGTERM and exits 0, because
+`runuser` re-raises a signal it caught, and even when the binary ignores SIGTERM, because
+`runuser` SIGKILLs it after its 2 s and still re-raises. A grace period under 2 s cuts
+`runuser`'s own: what is left is SIGKILLed with `sudo`, and the daemon reads -9, still a
+stop.
+
+What it cannot see is a signal another hand sends `runuser` during the stop: it is no
+process's parent here and reads no exit status. The tell is the one the 2026-11-03 stop
+left — `duration=` under 2 s on a wake whose `runuser` was running.
 
 WHO STOPPED IT is `SUDO_USER` — asserted by sudo, not by the caller — or the account
 running this when it was not reached through sudo. It rides on both lines this writes per
@@ -280,6 +317,45 @@ def members(procs: Mapping[int, Proc], wake: Wake) -> set[int]:
     return tree(procs, [wake.root.pid, *marked])
 
 
+def left_to_relay(procs: Mapping[int, Proc], pids: Iterable[int]) -> set[int]:
+    """The members a stop sends no SIGTERM, because one of the chain's relays already will.
+
+    Every ``sudo`` — the wake's root, and a ``use_pty`` monitor if a host's sudoers ever
+    adds that hop — whose relayed copy would be a second TERM to ``runuser`` and cut its
+    2 s grace; and ``runuser``'s own child, which ``runuser`` SIGTERMs itself the moment
+    it catches its own (basecradle-router#404).
+
+    A relay is a ROOT-OWNED process of that name. Root-owned is what the agent cannot
+    forge: anything in its session may call itself ``sudo`` or ``runuser``, and naming
+    alone would let it opt a process, or its children, out of the TERM.
+    """
+    pids = set(pids)
+
+    def relay(pid: int, name: str) -> bool:
+        proc = procs[pid]
+        return proc.uid == 0 and bool(proc.argv) and os.path.basename(proc.argv[0]) == name
+
+    runusers = {pid for pid in pids if relay(pid, "runuser")}
+    return {pid for pid in pids if relay(pid, "sudo") or procs[pid].ppid in runusers}
+
+
+def by_depth(procs: Mapping[int, Proc], pids: Iterable[int]) -> list[int]:
+    """``pids`` with every ancestor before its descendants — never by pid, which wraps.
+
+    So ``runuser``'s TERM is pending before anything below it is signalled, and it catches
+    that TERM even if its child exits at once.
+    """
+
+    def depth(pid: int) -> int:
+        seen: set[int] = set()
+        while pid in procs and pid not in seen:
+            seen.add(pid)
+            pid = procs[pid].ppid
+        return len(seen)
+
+    return sorted(pids, key=lambda pid: (depth(pid), pid))
+
+
 def fields(**pairs: object) -> str:
     """A ``key=value`` run, dropping empty values — the router's own line grammar."""
     out = []
@@ -297,6 +373,8 @@ def fields(**pairs: object) -> str:
 class _Tracked:
     start: int
     wake: int  # index into the wakes being stopped, so each wake reports its own result
+    #: Whether this op has sent it a signal: a member left to a relay is watched, not sent.
+    signalled: bool = False
 
 
 @dataclass(slots=True)
@@ -311,7 +389,8 @@ class Stopper:
     _tracked: dict[int, _Tracked] = field(default_factory=dict)
 
     def stop(self, wakes: list[Wake], *, by: str, grace: float) -> list[int]:
-        """Signal every member of every wake; return the pids that survived SIGKILL."""
+        """Stop every member of every wake — SIGTERM where no relay delivers it, then
+        SIGKILL to whatever outlives ``grace`` — and return the pids that survived SIGKILL."""
         started = self.now()
         procs = self.read()
         for wake in wakes:
@@ -349,6 +428,7 @@ class Stopper:
         elapsed = f"{self.now() - started:.1f}s"
         for index, wake in enumerate(wakes):
             own = {pid for pid, t in self._tracked.items() if t.wake == index}
+            own_signalled = [pid for pid in own if self._tracked[pid].signalled]
             own_killed = sorted(own.intersection(killed))
             own_survivors = sorted(own.intersection(survivors))
             outcome = "survived" if own_survivors else ("killed" if own_killed else "stopped")
@@ -359,7 +439,7 @@ class Stopper:
                     agent=wake.agent,
                     by=by,
                     outcome=outcome,
-                    signalled=len(own),
+                    signalled=len(own_signalled),
                     killed=len(own_killed),
                     survivors=" ".join(map(str, own_survivors)) or None,
                     duration=elapsed,
@@ -376,17 +456,32 @@ class Stopper:
         )
 
     def _sweep(self, procs: Mapping[int, Proc], wakes: list[Wake], sig: int) -> list[int]:
-        """Signal every member not yet tracked, recording which wake it belongs to."""
+        """Track every member not yet tracked, recording which wake it belongs to, and
+        signal it — unless it is a SIGTERM a relay will deliver (:func:`left_to_relay`).
+        SIGKILL is never left to a relay: nothing relays it.
+
+        A tracked member left to a relay is looked at again on every sweep, because what a
+        pid is can change under it: a ``sudo`` child caught between its fork and its exec
+        is a relay at the first sweep and ``runuser`` at the next, and ``runuser``'s child
+        whose ``runuser`` has gone has no relay left. Each is signalled once it is no
+        longer exempt. Returns the members tracked for the first time."""
         fresh = []
         for index, wake in enumerate(wakes):
-            for pid in sorted(members(procs, wake)):
-                if pid not in self._tracked:
-                    self._tracked[pid] = _Tracked(start=procs[pid].start, wake=index)
-                    self._send(pid, sig)
+            pids = members(procs, wake)
+            relayed = left_to_relay(procs, pids) if sig == signal.SIGTERM else set()
+            for pid in by_depth(procs, pids):
+                tracked = self._tracked.get(pid)
+                if tracked is None:
+                    tracked = self._tracked[pid] = _Tracked(start=procs[pid].start, wake=index)
                     fresh.append(pid)
+                elif tracked.signalled or tracked.start != procs[pid].start:
+                    continue  # already sent its one signal, or a reused pid: never ours
+                if pid not in relayed:
+                    self._send(pid, sig)
         return fresh
 
     def _send(self, pid: int, sig: int) -> None:
+        self._tracked[pid].signalled = True
         # A process that exited between the read and the signal is the outcome we wanted.
         with contextlib.suppress(ProcessLookupError):
             self.kill(pid, sig)

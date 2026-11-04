@@ -145,7 +145,8 @@ class WakeStopped(Exception):
 #   -15 / -9   `sudo` died by the signal. That happens only when a signal from OUTSIDE the
 #              wake reached `sudo` or `runuser`: each relays it down and then re-raises it
 #              on itself, `runuser` even when the binary trapped SIGTERM and exited 0. The
-#              stop op (`deploy/bin/stop-wake`, which signals the whole wake) always lands
+#              stop op (`deploy/bin/stop-wake`, which stops the whole wake: it signals
+#              `runuser` and leaves `sudo` to die of its re-raise, #404) always lands
 #              here, as did the 2026-11-03 `pkill -f`.
 #
 # Nothing else is a stop. A signal death *inside* the wake — the binary, or a process it

@@ -766,7 +766,7 @@ sudo /opt/basecradle-router/bin/stop-wake --agent <slug> --grace 30        # sec
 ```
 
 It finds exactly the wake the daemon launched — the `sudo <wake-runner> --user <slug> … --` process whose
-parent is the `router` account — and SIGTERMs **every member of it**: that process and every descendant,
+parent is the `router` account — and stops **every member of it**: that process and every descendant,
 plus every process of the agent's own account whose environment carries the wake's
 `BASECRADLE_DELIVERY_ID`. The second set is what catches a process already reparented out of the tree — a
 tool's `nohup job &`, a `setsid` server — since the variable survives reparenting and a new session alike;
@@ -781,19 +781,50 @@ the agent's own journal:
 
 ```
 event=wake_stop_requested delivery=0192f3a4-… agent=ping by=ubuntu signal=TERM pids=7
-event=wake_stop_done      delivery=0192f3a4-… agent=ping by=ubuntu outcome=stopped signalled=7 killed=0 duration=2.1s
+event=wake_stop_done      delivery=0192f3a4-… agent=ping by=ubuntu outcome=stopped signalled=5 killed=0 duration=2.1s
 ```
+
+**The chain's relays never double a SIGTERM** (#404). Two links relay a SIGTERM down to their own
+child, and `runuser`'s grace depends on getting only one. `runuser` catches a SIGTERM, signals its child,
+and sleeps 2 s before SIGKILL; **a second SIGTERM landing inside that sleep interrupts it, and `runuser`
+SIGKILLs at once** (util-linux 2.39 `su-common.c`). The stop used to signal every member, so `runuser` got
+the op's TERM and `sudo`'s relayed copy about 1.5 ms later, and which side of the sleep the copy landed on
+was a race; on 2026-11-03 it landed inside, and an `@jt` wake was SIGKILLed 3 ms into its grace, before the
+harness could write a line. So the op leaves two members to the relays and sends them nothing while the wake
+drains:
+
+- **`sudo`** (and a `use_pty` monitor `sudo`, should a host's sudoers ever add that hop — the box's wakes have
+  none). Its relay is the second copy. It needs no signal: sudo sends itself the signal that ended its
+  command (sudo(8)), so it dies of the TERM `runuser` re-raises.
+- **`runuser`'s child**, the binary. `runuser` SIGTERMs it the moment it catches its own; a copy from the op
+  would be a second one inside the binary's own handler.
+
+`runuser` is signalled directly, not left to `sudo`'s relay, and every parent is signalled before its
+descendants (by depth, never by pid, which wraps). So `runuser`'s TERM is pending before anything beneath it
+can exit, and it always catches it and re-raises: left to the relay, a binary that exited first would have
+`runuser` pass its plain status up (`0`, or `143`), which the daemon reads as a success or a crash. Both
+exempt members are still watched, and SIGKILLed if they outlive the grace period. `pids=` counts every
+member; `signalled=` counts those the op itself signalled. Beneath the binary every member still gets the
+op's own TERM, since `runuser` relays to its child alone: a binary that also forwards its TERM to its own
+children gives them a second copy, and tolerating that relay is the binary's. `tests/test_stop_wake_tree.py` proves all of this
+against a real `sudo → runuser → <binary>` tree, run as root in CI.
+
+**What the op cannot see** is a signal some other hand sends `runuser` during a stop: it is no process's
+parent and reads no exit status. A full grace makes `duration=` at least 2 s whenever the wake had reached
+`runuser`; a shorter one there is the tell the 2026-11-03 stop left. `--grace` under 2 s cuts `runuser`'s
+grace on purpose: what is left is SIGKILLed with `sudo`, and the daemon reads `-9`, still a stop.
 
 `by=` is `SUDO_USER` — sudo's record of the caller, never a value the caller supplies. `outcome=` is
 `stopped` (all gone on SIGTERM), `killed` (something needed SIGKILL), or `survived` (a process outlived
 SIGKILL — uninterruptible sleep — named in `survivors=`). Exit `0` stopped, `1` survived, `3` no running
 wake matched, `77` not run as root.
 
-**The router then reads the stop as a stop.** `sudo` dies by the signal it was sent, so the daemon sees exit
-`-15` (or `-9`) and writes `event=wake_stopped` (WARNING), `stage=wake outcome=stopped`, and `event=wake_end
+**The router then reads the stop as a stop.** `sudo` dies by the signal that ended `runuser`, so the daemon
+sees exit `-15` (or `-9`) and writes `event=wake_stopped` (WARNING), `stage=wake outcome=stopped`, and `event=wake_end
 outcome=stopped` — never a `wake_retry`, never `outcome=failed`, so the NOC's *Wake Failed* alert never pages
 the operator who stopped it. That holds even when the agent's binary traps SIGTERM and exits 0: `runuser`
-re-raises a signal it caught. The delivery is marked done (a duplicate collapses), the stopped session
+re-raises a signal it caught. It holds when the binary ignores SIGTERM too: `runuser` SIGKILLs it after its
+2 s and still re-raises. The delivery is marked done (a duplicate collapses), the stopped session
 covers the deliveries it had already read (they coalesce rather than re-run the stopped work), and no wake
 evidence is recorded — a stop is neither the edge failing nor a gate refusing, and it never learned whether
 the wake would have succeeded.
