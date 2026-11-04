@@ -81,7 +81,9 @@ def _table(**extra) -> dict[int, object]:
         _p(1, 0, 0, ["/sbin/init"]),
         _p(100, 1, ROUTER_UID, ["/home/router/.local/bin/uv", "run", "uvicorn"]),
         _p(101, 100, ROUTER_UID, ["python3", "-m", "uvicorn"]),  # the daemon
-        _p(200, 101, 0, _wake_argv()),  # sudo — the wake's root
+        # sudo — the wake's root. Started by the daemon, so /proc's (real) uid is the
+        # router's, exactly as on the box (#404); only its effective uid is root.
+        _p(200, 101, ROUTER_UID, _wake_argv()),
         _p(201, 200, 0, ["runuser", "-u", "nova", "--", "/bin/bash", "-c", "…", NOVA_BIN]),
         _p(202, 201, NOVA_UID, [NOVA_BIN, "--timeline", "0192aaaa"], mark=DELIVERY),  # harness
         _p(203, 202, NOVA_UID, ["claude", "-p", "…"], mark=DELIVERY),  # the session's child
@@ -93,7 +95,7 @@ def _table(**extra) -> dict[int, object]:
         _p(301, 1, NOVA_UID, ["old-job"], mark=OTHER_DELIVERY),  # nova's, another wake's mark
         _p(302, 1, 1002, ["forged"], mark=DELIVERY),  # another account naming this delivery
         _p(400, 1, 0, _wake_argv()),  # a wake-runner sudo the DAEMON did not launch
-        _p(500, 101, 0, _wake_argv(user="orion", delivery=OTHER_DELIVERY)),  # another agent
+        _p(500, 101, ROUTER_UID, _wake_argv(user="orion", delivery=OTHER_DELIVERY)),
         _p(501, 500, 0, ["runuser", "-u", "orion"]),
     ]
     table = {p.pid: p for p in procs}
@@ -178,7 +180,7 @@ def test_the_members_add_the_agents_own_processes_carrying_this_wakes_mark() -> 
 
 def test_a_wake_with_no_carried_delivery_is_stopped_by_its_tree_alone() -> None:
     table = _table()
-    table[200] = _p(200, 101, 0, _wake_argv(delivery=None))
+    table[200] = _p(200, 101, ROUTER_UID, _wake_argv(delivery=None))
     # Unmarked processes of nova's that happen to carry no id must not be matched either.
     table[207] = _p(207, 1, NOVA_UID, ["stray"])
     assert sw.members(table, _wake(table)) == {200, 201, 202, 203, 204}
@@ -233,9 +235,12 @@ class _Box:
             self._exit(pid)
 
     def _named(self, pid: int, name: str) -> bool:
-        # Only the chain's root-owned links relay; a forged name in the session does not.
+        # Which processes really ARE sudo and runuser — the kernel's knowledge, kept apart
+        # from stop-wake's own (positional) reading of the tree, so the two can disagree and
+        # a test can catch it: the chain's links run as root or as the router; a process of
+        # the agent's that calls itself sudo or runuser is neither, and relays nothing.
         proc = self.table[pid]
-        return proc.uid == 0 and Path(proc.argv[0]).name == name
+        return proc.uid in (0, ROUTER_UID) and Path(proc.argv[0]).name == name
 
     def _exit(self, pid: int) -> None:
         parent = self.table.pop(pid).ppid
@@ -290,11 +295,33 @@ def test_no_member_is_sent_a_sigterm_a_relay_already_delivers() -> None:
     assert len(sent) == len(set(sent))
 
 
+def test_the_wakes_sudo_is_a_relay_by_its_place_in_the_tree_whatever_its_uid() -> None:
+    # The box's shape: /proc's uid for the wake's sudo is the router's (999), not root's.
+    # Reading a relay off its uid left that sudo signalled, and its relayed copy was
+    # runuser's second TERM on the box (#404). Its position as the wake's root is the test.
+    box = _Box(_table())
+    assert box.table[200].uid == ROUTER_UID
+    _stop(box)
+    assert 200 not in {pid for pid, _ in box.sent}
+    assert "signalled=4" in box.lines[-1]
+
+
+def test_a_link_that_forks_instead_of_execing_does_not_hide_runuser() -> None:
+    # Today wake-runner and systemd-cat exec straight through, so sudo's child IS runuser.
+    # Should a link ever fork instead, the path runs through it: runuser is still found,
+    # and its child is still left to it. The link itself is signalled like any member.
+    table = _table()
+    table[210] = _p(210, 200, 0, ["/bin/bash", WAKE_RUNNER])  # a forking wake-runner
+    table[201] = _p(201, 210, 0, ["runuser", "-u", "nova", "--", "/bin/bash"])
+    wake = _wake(table)
+    assert sw.left_to_relay(table, wake, sw.members(table, wake)) == {200, 202}
+
+
 def test_a_pty_monitor_sudo_is_left_to_relay_too() -> None:
     # A host whose sudoers ran the command under a pty would put a second sudo between
     # the root and runuser. It relays exactly as the root does, so it is spared the same.
     table = _table()
-    table[201] = _p(201, 200, 0, ["sudo", WAKE_RUNNER, "--user", "nova"])  # the monitor
+    table[201] = _p(201, 200, ROUTER_UID, ["sudo", WAKE_RUNNER, "--user", "nova"])
     table[207] = _p(207, 201, 0, ["runuser", "-u", "nova", "--", "/bin/bash"])
     table[202] = _p(202, 207, NOVA_UID, [NOVA_BIN], mark=DELIVERY)
     box = _Box(table)
@@ -308,7 +335,7 @@ def test_a_sudo_child_caught_before_its_exec_is_signalled_once_it_is_runuser() -
     # nothing in the chain is signalled and the binary loses its grace to the SIGKILL.
     table = _table()
     del table[202], table[203], table[204]
-    table[201] = _p(201, 200, 0, _wake_argv())  # the forked child, not yet exec'd
+    table[201] = _p(201, 200, ROUTER_UID, _wake_argv())  # forked, not yet exec'd
     box = _Box(table, ignores_term={206})
     reads = 0
     real_read = box.read
@@ -338,6 +365,21 @@ def test_a_process_of_the_agents_that_names_itself_a_relay_is_still_signalled() 
     box = _Box(table)
     _stop(box)
     assert {204, 205, 208} <= {pid for pid, sig in box.sent if sig == signal.SIGTERM}
+
+
+def test_a_relay_name_off_the_path_from_the_root_is_an_ordinary_member() -> None:
+    # A process of the session's that is a real sudo or runuser binary — setuid root, so
+    # the kernel itself would call it one — is still not one of the wake's relays: it is
+    # not on the path down from the wake's root, and it gets its TERM like any member.
+    table = _table()
+    table[204] = _p(204, 203, 0, ["sudo", "-n", "true"], mark=DELIVERY)
+    table[208] = _p(208, 204, 0, ["runuser", "-u", "nova", "--", "tool"], mark=DELIVERY)
+    table[209] = _p(209, 208, NOVA_UID, ["tool"], mark=DELIVERY)
+    wake = _wake(table)
+    assert sw.left_to_relay(table, wake, sw.members(table, wake)) == {200, 202}
+    box = _Box(table)
+    _stop(box)
+    assert {204, 208} <= {pid for pid, sig in box.sent if sig == signal.SIGTERM}
 
 
 def test_runuser_is_signalled_before_anything_beneath_it_even_when_pids_wrap() -> None:
@@ -441,7 +483,7 @@ def test_each_wake_reports_its_own_verdict_when_two_are_stopped_at_once() -> Non
     # Two wakes for one agent (one lingering beside a new one): one drains on TERM, the
     # other needs SIGKILL. Each delivery's done line must say what happened to *it*.
     table = _table()
-    table[600] = _p(600, 101, 0, _wake_argv(delivery=OTHER_DELIVERY))
+    table[600] = _p(600, 101, ROUTER_UID, _wake_argv(delivery=OTHER_DELIVERY))
     table[601] = _p(601, 600, NOVA_UID, [NOVA_BIN], mark=OTHER_DELIVERY)
     box = _Box(table, ignores_term={601})
     assert _stop(box, grace=1.0) == []

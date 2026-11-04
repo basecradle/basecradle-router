@@ -806,8 +806,15 @@ can exit, and it always catches it and re-raises: left to the relay, a binary th
 exempt members are still watched, and SIGKILLed if they outlive the grace period. `pids=` counts every
 member; `signalled=` counts those the op itself signalled. Beneath the binary every member still gets the
 op's own TERM, since `runuser` relays to its child alone: a binary that also forwards its TERM to its own
-children gives them a second copy, and tolerating that relay is the binary's. `tests/test_stop_wake_tree.py` proves all of this
-against a real `sudo → runuser → <binary>` tree, run as root in CI.
+children gives them a second copy, and tolerating that relay is the binary's.
+
+A relay is found by its **position**, walking down from the wake's root `sudo` — through any `sudo` directly
+beneath it, to the `runuser` on that path — never by its name or uid elsewhere in the wake. Nothing in the
+agent's session can sit between the root `sudo` and `runuser`, so a session process that calls itself
+`sudo` or `runuser`, even a setuid-root one, is an ordinary member and gets its TERM.
+`tests/test_stop_wake_tree.py` proves all of this against a real `sudo → runuser → <binary>` tree whose
+`sudo` is started by a non-root account through the box's own sudoers rule, as the daemon's is — run as root
+in CI.
 
 **What the op cannot see** is a signal some other hand sends `runuser` during a stop: it is no process's
 parent and reads no exit status. A full grace makes `duration=` at least 2 s whenever the wake had reached
