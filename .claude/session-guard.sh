@@ -38,6 +38,22 @@
 # mid-session is his. "Clean the hotel's towels; never the guest's suitcase."
 # There is deliberately no `docker system prune` anywhere in this file.
 #
+# ONE DOCKER DESKTOP, EVERY BUILDER (basecradle-noc#1255). Every laptop builder runs
+# under one macOS account and there is one Docker Desktop, so "it was running when I
+# began" is not "it is the laptop's own": on 2026-11-04 the router builder began beside
+# a harness builder's Docker Desktop, read it as the founder's, and once both had quit
+# their own copies its check demanded `docker desktop start`, re-creating a leftover
+# nothing would ever quit; the harness builder, its own leftovers gone, could not exit
+# past the router builder's Docker Desktop at all. So a session that starts Docker
+# Desktop records it in a LAPTOP-WIDE LEDGER, one file per session under a root no
+# carrier's name is in, holding its repo and the identity (pid + start time) of every
+# process under the bundle. Whose a running Docker Desktop is, is then read, never
+# assumed: one a live sibling's record proves is that sibling's, never this session's
+# to quit or to restore; one whose recorder has ended is ADOPTED and quit; one that
+# no record accounts for was running before any builder session (the founder's), and
+# is never quit. The first session out still quits the Docker Desktop it started,
+# even under a sibling that joined it; that sibling's next `docker-up` starts its own.
+#
 # LAPTOP-ONLY. Removed on migration to the fleet server along with
 # .claude/self-exit.sh — a server wake has no Docker Desktop and no browser.
 # On a box with no docker CLI every Docker check is inert by construction.
@@ -204,6 +220,28 @@ state_dir() {
   echo "$(state_root)/$(session_key)"
 }
 
+# The laptop-wide ledger of who started Docker Desktop (basecradle-noc#1255): the one path every
+# carrier shares, so it is named for no carrier. One file per session, written only by that session
+# (or by the session that adopts its Docker Desktop), so no two sessions ever write one file.
+shared_root() {
+  echo "${SESSION_GUARD_SHARED_ROOT:-$HOME/.cache/session-guard}"
+}
+
+desktop_ledger() {
+  echo "$(shared_root)/docker-desktop"
+}
+
+# Whether a session key's `claude` is still the process that key names: 0 it is, 1 it provably is
+# not, 2 the key is not a process key (a session id, a bare pid) and nothing can tell. A 2 is
+# treated as alive by every caller: never adopted, never deleted while its Docker Desktop runs.
+key_alive() {
+  local rest ident
+  case "$1" in claude-*) ;; *) return 2 ;; esac
+  rest="${1#claude-}"
+  if ident="$(proc_identity "${rest%%-*}")" && [ "$ident" = "$rest" ]; then return 0; fi
+  return 1
+}
+
 s_get() {  # s_get <name> [default]
   local f; f="$(state_dir)/$1"
   if [ -f "$f" ]; then cat "$f"; else printf '%s' "${2-}"; fi
@@ -285,76 +323,164 @@ docker_census() {  # docker_census begin|started|late
   s_put docker_census "$1"
 }
 
-# Which Docker Desktop this session started: the identity (pid + start time) of every process under
-# the bundle once its engine answers. A later session can then prove that a Docker Desktop still
-# running is that same one, and not one somebody started since (basecradle#709 item 4).
-record_desktop_procs() {
-  local pid ident out=""
+# Narrow the Docker baseline to what is still on the engine now (basecradle-noc#1255). An artefact
+# the baseline holds that is gone now and present later was made again during this session, and
+# an ID cannot say so: on 2026-11-04 the router builder's baseline held the harness builder's
+# `ubuntu:24.04`, the harness builder removed it, the router builder pulled it again under the same
+# content ID, and its check read the copy it pulled as one that was already there. Every moment
+# `docker-up` reaches the engine is a moment the laptop is measured, so the baseline is what was
+# there at all of them. Narrowing only ever adds to what `check` reports. A list the engine did not
+# answer narrows nothing, because an empty list here is the #707 (b) defect: everything reads new.
+docker_census_narrow() {
+  local d kind now gone=0 before; d="$(state_dir)"
+  for kind in containers images volumes; do
+    now="$("list_$kind")" || { echo "session-guard: the engine did not list $kind; that baseline is kept as it was." >&2; continue; }
+    before="$(wc -l < "$d/$kind.base" | tr -d ' ')"
+    comm -12 "$d/$kind.base" <(printf '%s\n' "$now" | sed '/^$/d') > "$d/$kind.base.next" && mv -f "$d/$kind.base.next" "$d/$kind.base"
+    gone=$((gone + before - $(wc -l < "$d/$kind.base" | tr -d ' ')))
+  done
+  # The build cache is narrowed to its smallest reading, by the same rule: only growth is a build.
+  local cache base cache_bytes base_bytes
+  cache="$(build_cache_size)"; base="$(s_get build_cache.base)"
+  if cache_bytes="$(size_bytes "$cache")"; then
+    if ! base_bytes="$(size_bytes "$base")"; then
+      # The one lever for an unreadable cache baseline (basecradle#709 item 6). Without it, the
+      # finding `check` raises could never clear, and self-exit has no override.
+      s_put build_cache.base "$cache"
+      s_put build_cache_late "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "session-guard: the build cache's size could not be read when the Docker baseline was taken; it is read now ($cache, LATE) — a build before now is attested by hand, not measured."
+    elif [ "$cache_bytes" -lt "$base_bytes" ]; then
+      s_put build_cache.base "$cache"
+    fi
+  elif ! size_bytes "$base" >/dev/null; then
+    echo "session-guard: the build cache's size still cannot be read ('$cache'); no cache baseline recorded." >&2
+    return 1
+  fi
+  [ "$gone" -eq 0 ] || echo "session-guard: narrowed the Docker baseline: $gone artefact(s) it held are gone now, so any that comes back counts as made during this session."
+  return 0
+}
+
+# Every Docker Desktop process running now, by identity (pid + start time).
+live_desktop_idents() {
+  local pid ident
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    ident="$(proc_identity "$pid")" && out+="$ident"$'\n'
+    ident="$(proc_identity "$pid")" && echo "$ident"
   done <<< "$(docker_desktop_pids)"
-  printf '%s' "$out" > "$(state_dir)/docker_desktop_procs"
+  return 0
 }
 
-# A RESUME IS A NEW PROCESS, so it takes a new key and a new baseline (basecradle#709 item 4). A
-# session killed after its `docker-up` left the record that it started Docker Desktop under its own
-# dead key, the new baseline saw Desktop running and called it pre-existing, and nothing ever quit
-# it: the basecradle-noc#790 leftover, on the resume path. So `begin` reads every OTHER process key
-# under this repo's state root whose `claude` is gone and which started Docker Desktop. If a process
-# it recorded is still alive, that is provably the same Docker Desktop, and this session ADOPTS it:
-# the record moves here and this session's sweep quits it, as the dead one would have. If none is
-# alive, the record is stale and is cleared. A record with no processes (written before they were
-# recorded, or a Desktop found only through `docker desktop status`) proves nothing: reported, kept.
-adopt_orphaned_desktop() {
-  local root dir key rest ident line live
-  root="$(state_root)"
-  [ -d "$root" ] || return 0
-  for dir in "$root"/claude-*; do
-    [ -d "$dir" ] || continue
-    key="${dir##*/}"
+# This session's record in the laptop-wide ledger that it started the running Docker Desktop: its
+# repo on the first line, then, with `procs`, the identity of every process under the bundle, which
+# is what lets another session prove a Docker Desktop still running is that same one, and not one
+# somebody started since (basecradle#709 item 4). Written before the start too, with no processes,
+# so a sibling that begins while it boots reads it as this session's and not as the founder's.
+# Written whole and renamed into place, so a reader never sees half of one.
+publish_desktop() {  # publish_desktop [procs]
+  local led tmp; led="$(desktop_ledger)"
+  mkdir -p "$led" || return 1
+  tmp="$led/.$(session_key).$$"
+  { echo "repo=$REPO_NAME"; if [ "${1-}" = "procs" ]; then live_desktop_idents; fi; } > "$tmp" \
+    && mv -f "$tmp" "$led/$(session_key)"
+}
+
+retract_desktop() {
+  rm -f "$(desktop_ledger)/$(session_key)"
+}
+
+# Every OTHER session's ledger record, judged against the Docker Desktop running now. One line each:
+#   sibling <key> <repo>   its processes are the ones running (or it is still booting one), and its
+#                          session is alive or cannot be told apart from alive
+#   orphan  <key> <repo>   its processes are the ones running, and its session has ended
+#   unproven <key> <repo>  its session ended while booting, so no process proves which Docker
+#                          Desktop it meant: reported and kept, never adopted
+#   stale   <key> <repo>   its Docker Desktop is gone and so is its session: the record is removed
+# A record whose Docker Desktop is gone but whose session is alive is that session's to retract.
+desktop_records() {
+  local led f key repo procs line live match alive
+  led="$(desktop_ledger)"
+  [ -d "$led" ] || return 0
+  live="$(live_desktop_idents)"
+  for f in "$led"/*; do
+    [ -f "$f" ] || continue
+    key="${f##*/}"
     [ "$key" != "$(session_key)" ] || continue
-    [ "$(cat "$dir/docker_started_by_session" 2>/dev/null)" = "1" ] || continue
-    rest="${key#claude-}"
-    if ident="$(proc_identity "${rest%%-*}")" && [ "$ident" = "$rest" ]; then
-      continue  # its claude is still running: not an orphan
-    fi
-    if [ ! -s "$dir/docker_desktop_procs" ]; then
-      echo "  WARNING: session $key ended without quitting the Docker Desktop it started, and recorded no process that proves a running one is that one — not adopted. Check Docker Desktop by hand."
+    repo="$(sed -n '1s/^repo=//p' "$f")"
+    procs="$(sed 1d "$f")"
+    key_alive "$key"; alive=$?
+    if [ -z "$procs" ]; then
+      if [ "$alive" = "1" ]; then
+        [ -n "$live" ] && printf 'unproven\t%s\t%s\n' "$key" "$repo"
+      elif [ -n "$live" ]; then
+        printf 'sibling\t%s\t%s\n' "$key" "$repo"
+      fi
       continue
     fi
-    live=0
+    match=0
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      if ident="$(proc_identity "${line%%-*}")" && [ "$ident" = "$line" ]; then live=1; fi
-    done < "$dir/docker_desktop_procs"
-    if [ "$live" = "1" ]; then
-      cp "$dir/docker_desktop_procs" "$(state_dir)/docker_desktop_procs"
-      s_put docker_started_by_session 1
-      s_put desktop_running 0
-      s_put adopted_from "$key"
-      rm -rf "$dir"
-      echo "  ADOPTED: session $key ended without quitting the Docker Desktop it started, and that same Docker Desktop is still running — this session quits it at sweep."
-    else
-      rm -rf "$dir"
-      echo "  cleared session $key's record: the Docker Desktop it started is no longer running."
+      if [ -n "$live" ] && grep -qxF -- "$line" <<< "$live"; then match=1; fi
+    done <<< "$procs"
+    if [ "$match" = "1" ]; then
+      if [ "$alive" = "1" ]; then printf 'orphan\t%s\t%s\n' "$key" "$repo"; else printf 'sibling\t%s\t%s\n' "$key" "$repo"; fi
+    elif [ "$alive" = "1" ] || { [ "$alive" = "2" ] && [ -n "$(find "$f" -mtime "+$STALE_STATE_DAYS" 2>/dev/null)" ]; }; then
+      rm -f "$f"
+      printf 'stale\t%s\t%s\n' "$key" "$repo"
     fi
   done
+  return 0
 }
 
-# Whether the engine must still answer: this session took a baseline from an engine that was
-# already running (at `begin`, or one that came up from outside before `docker-up`), or it started
-# Docker Desktop and has not quit it. An engine this session started and its own sweep then quit
-# is down because the session is done with it, not because something died. An ADOPTED Docker
-# Desktop is one this session started, by inheritance: its engine was up at `begin` only because
-# the dead session had not quit it yet.
+# The first live sibling that started the running Docker Desktop, as `<key> (<repo>)`, or nothing.
+desktop_sibling() {  # desktop_sibling <records>
+  awk -F'\t' '$1 == "sibling" { print $2 " (" $3 ")"; exit }' <<< "$1"
+}
+
+# A RESUME IS A NEW PROCESS, so it takes a new key and a new baseline (basecradle#709 item 4), and
+# a session can be killed with the Docker Desktop it started still running: the basecradle-noc#790
+# leftover. So a session that finds the running Docker Desktop proved to be an ended session's,
+# from any carrier, ADOPTS it: the record becomes this session's and this session's sweep quits it,
+# as the ended one would have. `begin` adopts, and so does `sweep`, for a session that was already
+# running when its sibling ended. A record whose Docker Desktop is gone is cleared.
+adopt_orphaned_desktop() {  # adopt_orphaned_desktop <records>
+  local class key repo
+  while IFS=$'\t' read -r class key repo; do
+    case "$class" in
+      orphan)
+        publish_desktop procs || { echo "  WARNING: could not write this session's ledger record; session $key's Docker Desktop is not adopted." >&2; continue; }
+        rm -f "$(desktop_ledger)/$key"
+        s_put docker_started_by_session 1
+        s_put docker_released 0
+        s_put adopted_from "$key"
+        echo "  ADOPTED: session $key ($repo) ended without quitting the Docker Desktop it started, and that same Docker Desktop is still running — this session quits it at sweep."
+        ;;
+      unproven)
+        echo "  WARNING: session $key ($repo) ended without quitting the Docker Desktop it started, and recorded no process that proves a running one is that one — not adopted. Check Docker Desktop by hand."
+        ;;
+      stale)
+        echo "  cleared session $key's record ($repo): the Docker Desktop it started is no longer running."
+        ;;
+    esac
+  done <<< "$1"
+  return 0
+}
+
+# Whether the engine must still answer, because this session may have made something on it that
+# `check` cannot see with it down:
+#   - it started (or adopted) Docker Desktop and has not quit it;
+#   - not once its own sweep checked the engine and quit it: down because the session is done;
+#   - it used the engine through `docker-up`;
+#   - the engine was the laptop's own at `begin` (no builder's record accounted for it), which
+#     nothing in this session should have stopped.
+# An engine a SIBLING was running at `begin`, and this session never reached through `docker-up`,
+# going down is that sibling's sweep doing its job (basecradle-noc#1255), not something this
+# session must answer for. Reaching a sibling's engine outside `docker-up` is out of protocol and
+# unmeasured once the sibling quits it: the residual, named.
 engine_must_answer() {
-  if [ -n "$(s_get adopted_from)" ]; then
-    [ "$(s_get docker_started_by_session 0)" = "1" ]
-    return
-  fi
-  case "$(s_get docker_census)" in begin|late) return 0 ;; esac
-  [ "$(s_get docker_started_by_session 0)" = "1" ]
+  [ "$(s_get docker_started_by_session 0)" = "1" ] && return 0
+  [ "$(s_get docker_released 0)" = "1" ] && return 1
+  [ "$(s_get docker_used 0)" = "1" ] && return 0
+  [ "$(s_get docker_census)" = "begin" ] && [ -z "$(s_get desktop_owner)" ]
 }
 
 # A DEV SERVER, OR ANYTHING ELSE LISTENING (the capital, on @origin's word, basecradle-noc#899): a
@@ -521,10 +647,21 @@ cmd_begin() {
 
   if has_docker; then s_put docker_present 1; else s_put docker_present 0; fi
   if engine_up; then s_put engine_up 1; else s_put engine_up 0; fi
-  if docker_desktop_running; then s_put desktop_running 1; else s_put desktop_running 0; fi
-  # After the Desktop reading, which an adoption overrides; before the stale sweep, which would
-  # otherwise delete a week-old orphan's record while its Docker Desktop still runs.
-  adopt_orphaned_desktop
+  # Whose a running Docker Desktop is (basecradle-noc#1255): a live sibling's, by its ledger record,
+  # is not the laptop's own, and is never this session's to restore once that sibling quits it.
+  local records owner
+  if docker_desktop_running; then
+    s_put desktop_running 1
+    records="$(desktop_records)"
+    owner="$(desktop_sibling "$records")"
+    [ -z "$owner" ] || s_put desktop_owner "$owner"
+    # One an ended session started is adopted, and was that session's, not the laptop's, too.
+    adopt_orphaned_desktop "$records"
+    [ -z "$(s_get adopted_from)" ] || s_put desktop_owner "$(s_get adopted_from)"
+  else
+    s_put desktop_running 0
+    adopt_orphaned_desktop "$(desktop_records)"
+  fi
 
   # This guard's own leftovers have a stated end too.
   if [ -d "$root" ]; then
@@ -548,6 +685,11 @@ cmd_begin() {
 
   echo "session-guard: baseline for $(session_key) at $(s_get began_at)"
   echo "  docker: present=$(s_get docker_present) engine_up=$(s_get engine_up) desktop_running=$(s_get desktop_running)"
+  if [ -n "$(s_get desktop_owner)" ]; then
+    echo "  docker desktop: started by builder session $(s_get desktop_owner), not the laptop's own — never this session's to restore"
+  elif [ "$(s_get desktop_running)" = "1" ]; then
+    echo "  docker desktop: no builder session's record accounts for it — the laptop's own, never quit"
+  fi
   if [ -n "$(s_get docker_census)" ]; then
     echo "  containers=$(wc -l < "$d/containers.base" | tr -d ' ') images=$(wc -l < "$d/images.base" | tr -d ' ') volumes=$(wc -l < "$d/volumes.base" | tr -d ' ') build_cache=$(s_get build_cache.base)"
   else
@@ -568,20 +710,15 @@ cmd_docker_up() {
 
   if engine_up; then
     echo "session-guard: Docker engine is already up; not recording a session start."
+    s_put docker_used 1
+    s_put docker_released 0
+    local sib; sib="$(desktop_sibling "$(desktop_records)")"
+    [ -z "$sib" ] || echo "session-guard: this Docker Desktop is sibling session $sib's: it quits it at its own sweep, and if that comes first, run docker-up again."
     if [ -z "$(s_get docker_census)" ]; then
       docker_census late
       echo "session-guard: it came up after this session began, so the Docker baseline is taken now (LATE) — anything this session made on the engine before now is attested by hand, not measured."
-    elif ! size_bytes "$(s_get build_cache.base)" >/dev/null; then
-      # The one lever for an unreadable cache baseline (basecradle#709 item 6). Without it, the
-      # finding `check` raises could never clear, and self-exit has no override.
-      local cache; cache="$(build_cache_size)"
-      if ! size_bytes "$cache" >/dev/null; then
-        echo "session-guard: the build cache's size still cannot be read ('$cache'); no cache baseline recorded." >&2
-        return 1
-      fi
-      s_put build_cache.base "$cache"
-      s_put build_cache_late "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      echo "session-guard: the build cache's size could not be read when the Docker baseline was taken; it is read now ($cache, LATE) — a build before now is attested by hand, not measured."
+    else
+      docker_census_narrow || return 1
     fi
     return 0
   fi
@@ -596,14 +733,21 @@ cmd_docker_up() {
 
   echo "session-guard: starting Docker Desktop (this session will quit it at sweep)."
   s_put docker_started_by_session 1
+  s_put docker_used 1
+  s_put docker_released 0
+  publish_desktop || echo "session-guard: WARNING: could not write this session's ledger record, so a sibling session cannot tell this Docker Desktop is this session's." >&2
   docker desktop start >/dev/null 2>&1 || open -a Docker >/dev/null 2>&1 || true
 
   local waited=0
   while [ "$waited" -lt "$START_WAIT_SECONDS" ]; do
     if engine_up; then
       echo "session-guard: engine up after ${waited}s."
-      record_desktop_procs
-      [ -n "$(s_get docker_census)" ] || docker_census started
+      publish_desktop procs || echo "session-guard: WARNING: could not record this Docker Desktop's processes in the ledger." >&2
+      if [ -z "$(s_get docker_census)" ]; then
+        docker_census started
+      else
+        docker_census_narrow || return 1
+      fi
       return 0
     fi
     sleep "$POLL_SECONDS"; waited=$((waited + POLL_SECONDS))
@@ -694,11 +838,26 @@ cmd_sweep() {
     return 1
   fi
 
+  # A Docker Desktop an ended session started is this session's to quit (basecradle-noc#1255): a
+  # session that was already running when its sibling ended adopts it here, as `begin` would have.
+  if [ "$(s_get docker_started_by_session 0)" != "1" ] && docker_desktop_running; then
+    adopt_orphaned_desktop "$(desktop_records)"
+  fi
+
   if [ "$(s_get docker_started_by_session 0)" = "1" ]; then
     local left; left="$(labelled_containers)$(labelled_images)$(session_builders)"
     if [ -n "$left" ]; then
       echo "session-guard: labelled artefacts remain; not quitting Docker Desktop." >&2
       return 1
+    fi
+    # Never quit the engine out from under what `check` must see: an image this session pulled
+    # carries no label, and with the engine down `check` could no longer list it.
+    if engine_up; then
+      check_engine_artefacts
+      if [ "$FINDINGS" -gt 0 ]; then
+        echo "session-guard: $FINDINGS finding(s) above — not quitting Docker Desktop, because with its engine down check could no longer see them." >&2
+        return 1
+      fi
     fi
     stop_docker_desktop || return 1
   fi
@@ -718,12 +877,128 @@ stop_docker_desktop() {
     if [ -z "$(docker_desktop_pids)" ]; then
       echo "session-guard: Docker Desktop stopped (no process under $DOCKER_APP_PREFIX) after ${waited}s."
       s_put docker_started_by_session 0
+      s_put docker_released 1
+      retract_desktop
       return 0
     fi
     sleep "$POLL_SECONDS"; waited=$((waited + POLL_SECONDS))
   done
   echo "session-guard: Docker Desktop is STILL RUNNING ${STOP_WAIT_SECONDS}s after the quit — quit it by hand." >&2
   return 1
+}
+
+# What is on the answering engine that this session cannot account for: its own labelled artefacts
+# still present, and every artefact that appeared since the Docker baseline that no builder's label
+# accounts for. `check` reports these, and `sweep` refuses to quit Docker Desktop while any stands,
+# because with the engine down `check` could no longer see them (basecradle-noc#1255).
+check_engine_artefacts() {
+  local d base_census; d="$(state_dir)"; base_census="$(s_get docker_census)"
+  local ids id extra sib
+  ids="$(labelled_containers)"
+  if [ -n "$ids" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      finding "labelled container still present: $id ($(describe_container "$id"))" ".claude/session-guard.sh sweep"
+    done <<< "$ids"
+  fi
+
+  ids="$(labelled_images)"
+  if [ -n "$ids" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      finding "labelled image still present: $id ($(describe_image "$id"))" ".claude/session-guard.sh sweep"
+    done <<< "$ids"
+  fi
+
+  ids="$(session_builders)"
+  if [ -n "$ids" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      finding "session buildx builder still present: $id" ".claude/session-guard.sh sweep"
+    done <<< "$ids"
+  fi
+
+  # Everything new that the label cannot account for. Reported with the exact
+  # command and never removed: an image someone else pulled during this
+  # session is theirs, and this guard cannot tell the two apart.
+  #
+  # Only against a census. With none, the engine was down at `begin` and came up
+  # from outside this session without a `docker-up`, so there is nothing to
+  # compare against: every artefact on the laptop would read as new, with `docker
+  # rmi` of someone else's image as the repair (basecradle#707 (b)). The labelled
+  # checks above still ran. The gap itself is a finding (basecradle#709 item 3):
+  # "we could not look" is never clean, and a session that used the engine out of
+  # protocol would otherwise exit clean. Its one lever is a LATE census, taken
+  # after checking by hand, which every later `check` names as late.
+  local engine_sib=""
+  [ -n "$base_census" ] || [ "$(s_get docker_used 0)" = "1" ] || engine_sib="$(desktop_sibling "$(desktop_records)")"
+  if [ -n "$engine_sib" ]; then
+    # A sibling's engine that came up after this session began, which this session never reached
+    # through `docker-up`, is that sibling's to answer for (basecradle-noc#1255): no baseline is
+    # needed for an engine this session did not use. The labelled checks above still ran.
+    echo "session-guard: not this session's: the Docker engine is sibling session ${engine_sib}'s, brought up after this session began and never reached from it through docker-up, so it needs no Docker baseline here."
+  elif [ -z "$base_census" ]; then
+    finding "no Docker baseline — the engine came up after this session began and the session never ran docker-up, so nothing here can say what it made on the engine." \
+            "check by hand (docker ps -a; docker image ls; docker volume ls), remove anything this session made, then .claude/session-guard.sh docker-up — it takes the Docker baseline now, which check names as LATE"
+  else
+    extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
+    if [ -n "$extra" ]; then
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        if sib="$(sibling_label container "$id")"; then
+          echo "session-guard: not this session's: container $id ($(describe_container "$id")) carries $sib=1, a sibling builder's label."
+          continue
+        fi
+        finding "container appeared during this session and carries no builder label of this session's: $id ($(describe_container "$id"))" \
+                "docker rm -f $id   (only if it is yours — check first)"
+      done <<< "$extra"
+    fi
+
+    extra="$(comm -23 <(comm -13 "$d/images.base" <(list_images)) <(labelled_images))"
+    if [ -n "$extra" ]; then
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        if sib="$(sibling_label image "$id")"; then
+          echo "session-guard: not this session's: image $id ($(describe_image "$id")) carries $sib=1, a sibling builder's label."
+          continue
+        fi
+        finding "image appeared during this session and carries no builder label of this session's: $id ($(describe_image "$id"))" \
+                "docker rmi $id   (only if it is yours — check first)"
+      done <<< "$extra"
+    fi
+
+    extra="$(comm -13 "$d/volumes.base" <(list_volumes))"
+    if [ -n "$extra" ]; then
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        if sib="$(sibling_label volume "$id")"; then
+          echo "session-guard: not this session's: volume $id carries $sib=1, a sibling builder's label."
+          continue
+        fi
+        finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
+      done <<< "$extra"
+    fi
+
+    # Only GROWTH is a build (basecradle#707 (c)). BuildKit's own garbage collection
+    # shrinks the cache on its schedule, and comparing the printed strings for
+    # inequality read that as a build this session ran, blocking an exit nothing
+    # could clear. Growth is still unattributable — someone else's build grows it
+    # too — so it is reported like every other unlabelled artefact, never pruned.
+    local cache_now cache_base now_bytes base_bytes
+    cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
+    # An unreadable BASELINE never becomes readable by re-running `check`, so it gets its own
+    # finding with its own lever (basecradle#709 item 6); an unreadable reading NOW may be a blip.
+    if ! base_bytes="$(size_bytes "$cache_base")"; then
+      finding "the shared build cache's size could not be read when the Docker baseline was taken ('${cache_base}'), so a build on a shared builder cannot be ruled out." \
+              "compare docker system df by hand, then .claude/session-guard.sh docker-up — it re-reads the cache baseline, which check names as LATE"
+    elif ! now_bytes="$(size_bytes "$cache_now")"; then
+      finding "the shared build cache's size could not be read now ('${cache_now}'; at the baseline: '${cache_base}'), so a build on a shared builder cannot be ruled out." \
+              "re-run .claude/session-guard.sh check; if it persists, compare docker system df by hand and say what you found in the completion comment"
+    elif [ "$now_bytes" -gt "$base_bytes" ]; then
+      finding "shared build cache grew during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
+              "build on your own throwaway builder (${BUILDER_PREFIX}<something>) so 'docker buildx rm' takes its cache with it; if the build was not this session's, say whose in the completion comment"
+    fi
+  fi
 }
 
 FINDINGS=0
@@ -762,130 +1037,52 @@ cmd_check() {
     return 1
   fi
 
-  local base_census base_desktop
-  base_census="$(s_get docker_census)"
+  local base_desktop
   base_desktop="$(s_get desktop_running 0)"
 
   if engine_up; then
-    local ids id extra sib
-    ids="$(labelled_containers)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "labelled container still present: $id ($(describe_container "$id"))" ".claude/session-guard.sh sweep"
-      done <<< "$ids"
-    fi
-
-    ids="$(labelled_images)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "labelled image still present: $id ($(describe_image "$id"))" ".claude/session-guard.sh sweep"
-      done <<< "$ids"
-    fi
-
-    ids="$(session_builders)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        finding "session buildx builder still present: $id" ".claude/session-guard.sh sweep"
-      done <<< "$ids"
-    fi
-
-    # Everything new that the label cannot account for. Reported with the exact
-    # command and never removed: an image someone else pulled during this
-    # session is theirs, and this guard cannot tell the two apart.
-    #
-    # Only against a census. With none, the engine was down at `begin` and came up
-    # from outside this session without a `docker-up`, so there is nothing to
-    # compare against: every artefact on the laptop would read as new, with `docker
-    # rmi` of someone else's image as the repair (basecradle#707 (b)). The labelled
-    # checks above still ran. The gap itself is a finding (basecradle#709 item 3):
-    # "we could not look" is never clean, and a session that used the engine out of
-    # protocol would otherwise exit clean. Its one lever is a LATE census, taken
-    # after checking by hand, which every later `check` names as late.
-    if [ -z "$base_census" ]; then
-      finding "no Docker baseline — the engine came up after this session began and the session never ran docker-up, so nothing here can say what it made on the engine." \
-              "check by hand (docker ps -a; docker image ls; docker volume ls), remove anything this session made, then .claude/session-guard.sh docker-up — it takes the Docker baseline now, which check names as LATE"
-    else
-      extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
-      if [ -n "$extra" ]; then
-        while IFS= read -r id; do
-          [ -n "$id" ] || continue
-          if sib="$(sibling_label container "$id")"; then
-            echo "session-guard: not this session's: container $id ($(describe_container "$id")) carries $sib=1, a sibling builder's label."
-            continue
-          fi
-          finding "container appeared during this session and carries no builder label of this session's: $id ($(describe_container "$id"))" \
-                  "docker rm -f $id   (only if it is yours — check first)"
-        done <<< "$extra"
-      fi
-
-      extra="$(comm -23 <(comm -13 "$d/images.base" <(list_images)) <(labelled_images))"
-      if [ -n "$extra" ]; then
-        while IFS= read -r id; do
-          [ -n "$id" ] || continue
-          if sib="$(sibling_label image "$id")"; then
-            echo "session-guard: not this session's: image $id ($(describe_image "$id")) carries $sib=1, a sibling builder's label."
-            continue
-          fi
-          finding "image appeared during this session and carries no builder label of this session's: $id ($(describe_image "$id"))" \
-                  "docker rmi $id   (only if it is yours — check first)"
-        done <<< "$extra"
-      fi
-
-      extra="$(comm -13 "$d/volumes.base" <(list_volumes))"
-      if [ -n "$extra" ]; then
-        while IFS= read -r id; do
-          [ -n "$id" ] || continue
-          if sib="$(sibling_label volume "$id")"; then
-            echo "session-guard: not this session's: volume $id carries $sib=1, a sibling builder's label."
-            continue
-          fi
-          finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
-        done <<< "$extra"
-      fi
-
-      # Only GROWTH is a build (basecradle#707 (c)). BuildKit's own garbage collection
-      # shrinks the cache on its schedule, and comparing the printed strings for
-      # inequality read that as a build this session ran, blocking an exit nothing
-      # could clear. Growth is still unattributable — someone else's build grows it
-      # too — so it is reported like every other unlabelled artefact, never pruned.
-      local cache_now cache_base now_bytes base_bytes
-      cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
-      # An unreadable BASELINE never becomes readable by re-running `check`, so it gets its own
-      # finding with its own lever (basecradle#709 item 6); an unreadable reading NOW may be a blip.
-      if ! base_bytes="$(size_bytes "$cache_base")"; then
-        finding "the shared build cache's size could not be read when the Docker baseline was taken ('${cache_base}'), so a build on a shared builder cannot be ruled out." \
-                "compare docker system df by hand, then .claude/session-guard.sh docker-up — it re-reads the cache baseline, which check names as LATE"
-      elif ! now_bytes="$(size_bytes "$cache_now")"; then
-        finding "the shared build cache's size could not be read now ('${cache_now}'; at the baseline: '${cache_base}'), so a build on a shared builder cannot be ruled out." \
-                "re-run .claude/session-guard.sh check; if it persists, compare docker system df by hand and say what you found in the completion comment"
-      elif [ "$now_bytes" -gt "$base_bytes" ]; then
-        finding "shared build cache grew during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
-                "build on your own throwaway builder (${BUILDER_PREFIX}<something>) so 'docker buildx rm' takes its cache with it; if the build was not this session's, say whose in the completion comment"
-      fi
-    fi
+    check_engine_artefacts
   elif engine_must_answer; then
     finding "the Docker engine is not reachable and this session used it — nothing here can certify what it left behind." \
             "bring the engine back (.claude/session-guard.sh docker-up) and re-check, or say so in the completion comment"
   fi
 
-  # Docker Desktop, both directions.
-  local now_desktop=0
+  # Docker Desktop, both directions, judged against the laptop's own state: a Docker Desktop that a
+  # builder session started is never the laptop's own (basecradle-noc#1255).
+  local now_desktop=0 base_owner records sib orphan
   docker_desktop_running && now_desktop=1
-  if [ "$base_desktop" = "0" ] && [ "$now_desktop" = "1" ]; then
-    if [ -n "$(s_get adopted_from)" ] && [ "$(s_get docker_started_by_session 0)" = "1" ]; then
-      finding "this session adopted the Docker Desktop that session $(s_get adopted_from) started and never quit, and it is still running." ".claude/session-guard.sh sweep"
-    elif [ "$(s_get docker_started_by_session 0)" = "1" ]; then
-      finding "this session started Docker Desktop and it is still running." ".claude/session-guard.sh sweep"
+  base_owner="$(s_get desktop_owner)"
+  if [ "$now_desktop" = "1" ]; then
+    if [ "$(s_get docker_started_by_session 0)" = "1" ]; then
+      if [ -n "$(s_get adopted_from)" ]; then
+        finding "this session adopted the Docker Desktop that session $(s_get adopted_from) started and never quit, and it is still running." ".claude/session-guard.sh sweep"
+      else
+        finding "this session started Docker Desktop and it is still running." ".claude/session-guard.sh sweep"
+      fi
     else
-      finding "Docker Desktop is running and was not at session start, and this session did not record starting it." \
-              "if it is yours, quit it by hand and say so; if it is not, confirm whose it is before exiting"
+      records="$(desktop_records)"
+      sib="$(desktop_sibling "$records")"
+      orphan="$(awk -F'\t' '$1 == "orphan" { print $2 " (" $3 ")"; exit }' <<< "$records")"
+      if [ -n "$sib" ]; then
+        echo "session-guard: not this session's: Docker Desktop is running for sibling session $sib, whose ledger record proves it started this one; that session quits it at its own sweep."
+      elif [ -n "$orphan" ]; then
+        finding "Docker Desktop is running, started by session $orphan, which has ended without quitting it." \
+                ".claude/session-guard.sh sweep   (it adopts that Docker Desktop and quits it)"
+      elif [ "$base_desktop" = "1" ] && [ -z "$base_owner" ]; then
+        :  # the laptop's own, as this session found it
+      elif [ "$base_desktop" = "1" ]; then
+        finding "Docker Desktop is running, and no builder session's record accounts for it: the one running at session start was builder session ${base_owner}'s, and nothing recorded starting this one." \
+                "if it is yours, quit it by hand and say so; if it is not, confirm whose it is before exiting"
+      else
+        finding "Docker Desktop is running and was not at session start, and this session did not record starting it." \
+                "if it is yours, quit it by hand and say so; if it is not, confirm whose it is before exiting"
+      fi
     fi
-  elif [ "$base_desktop" = "1" ] && [ "$now_desktop" = "0" ]; then
+  elif [ "$base_desktop" = "1" ] && [ -z "$base_owner" ]; then
     finding "Docker Desktop was running at session start and is not now — this session left the laptop in a different state." \
             "docker desktop start"
+  elif [ "$base_desktop" = "1" ]; then
+    echo "session-guard: not this session's: the Docker Desktop builder session $base_owner was running at session start has been quit since — that session's to quit, never this one's to restore."
   fi
 
   # Anything listening that was not listening at session start, in a process that did not exist at
@@ -1001,6 +1198,7 @@ cmd_check() {
 
 cmd_done() {
   cmd_check || return 1
+  retract_desktop
   rm -rf "$(state_dir)"
   echo "session-guard: state cleared."
 }

@@ -95,7 +95,16 @@ def save():
 
 
 a = sys.argv[1:]
-labelled = "--filter" in a and f"label={os.environ['DOCKER_STUB_LABEL']}" in a
+# The label a `--filter label=K=V` asks for. An artefact carries it when its `labels` hold K=V, or,
+# for `labelled`, when it is the label of the session asking (DOCKER_STUB_LABEL, set per session).
+want = next((x[len("label="):] for x in a if x.startswith("label=")), None)
+labelled = "--filter" in a and want is not None
+
+
+def carries(o):
+    key, _, value = want.partition("=")
+    own = o.get("labelled") and want == os.environ["DOCKER_STUB_LABEL"]
+    return bool(own) or (o.get("labels") or {}).get(key) == value
 
 if a[:1] == ["version"]:
     if not st["engine_up"]:
@@ -107,9 +116,15 @@ elif a[:2] == ["desktop", "status"]:
     print("Status              %s" % st["desktop_status"])
 elif a[:2] == ["desktop", "start"]:
     st["desktop_status"] = "running"
-    st["engine_up"] = True
+    # A Docker Desktop still booting: its processes are up, its engine does not answer yet.
+    st["engine_up"] = not st.get("desktop_boots_slowly")
     if "ps_lines_after_start" in st:
         st["ps_lines"] = st["ps_lines_after_start"]
+    if "desktop_start_epoch" in st:
+        # A started Docker Desktop is new processes, each start with a start time of its own.
+        st["desktop_start_epoch"] += 60
+        for line in st["ps_lines"]:
+            st["lstart"][line.split()[0]] = st["desktop_start_epoch"]
     save()
 elif a[:2] == ["desktop", "stop"]:
     # The stub always REPORTS success. Whether the processes actually go away is the
@@ -132,7 +147,7 @@ elif a[:1] == ["ps"]:
             if c["id"] == ident:
                 print("%s (%s)" % (c["image"], c["status"]))
         elif labelled:
-            if c["labelled"]:
+            if carries(c):
                 print(c["id"])
         else:
             print(c["id"])
@@ -142,7 +157,7 @@ elif a[:3] == ["image", "ls", "-a"] or a[:3] == ["image", "ls", "-aq"]:
     long_form = any("Repository" in x for x in a)
     for i in st["images"]:
         if labelled:
-            if i["labelled"]:
+            if carries(i):
                 print(i["id"])
         elif long_form:
             print("%s %s" % (i["id"], i["tag"]))
@@ -338,6 +353,8 @@ class Lab:
         self.calls = tmp_path / "docker-calls.log"
         self.calls.write_text("")
         self.state_root = tmp_path / "sessions"
+        # The laptop-wide Docker Desktop ledger every carrier shares (basecradle-noc#1255).
+        self.shared_root = tmp_path / "shared"
         # What a test adds on top of the lab's own environment (a CLAUDE_PID, say).
         self.extra_env: dict[str, str] = {}
 
@@ -354,6 +371,7 @@ class Lab:
                 "DOCKER_STUB_CALLS": str(self.calls),
                 "DOCKER_STUB_LABEL": LABEL,
                 "SESSION_GUARD_STATE_ROOT": str(self.state_root),
+                "SESSION_GUARD_SHARED_ROOT": str(self.shared_root),
                 "SESSION_GUARD_DOCKER_APP_PREFIX": FAKE_APP_PREFIX,
                 "CLAUDE_CODE_SESSION_ID": "test-session",
                 "SESSION_GUARD_STOP_WAIT": "2",
@@ -1542,6 +1560,15 @@ def _resume_lab(lab):
     return lb, as_session
 
 
+def _ledger(lb):
+    return lb.shared_root / "docker-desktop"
+
+
+def _record_of(lb, pid):
+    (only,) = _ledger(lb).glob(f"claude-{pid}-*")
+    return only
+
+
 def _state_of(lb, pid):
     (only,) = lb.state_root.glob(f"claude-{pid}-*")
     return only
@@ -1564,7 +1591,8 @@ def test_a_resume_adopts_the_docker_desktop_its_dead_predecessor_started(lab):
     began = b("begin")
     assert began.returncode == 0
     assert "ADOPTED" in began.stdout
-    assert [d.name.split("-")[1] for d in lb.state_root.iterdir()] == ["4712"]
+    # The ledger record moved to B; A's own state directory is its repo's, left to the stale sweep.
+    assert [f.name.split("-")[1] for f in _ledger(lb).iterdir()] == ["4712"]
 
     assert b("tabs-checked").returncode == 0
     got = b("check")
@@ -1606,14 +1634,267 @@ def test_a_record_with_no_process_to_prove_it_is_reported_and_never_adopted(lab)
     """A record written before the processes were recorded proves nothing about the Docker Desktop
     running now, so it is reported and left, never adopted."""
     lb, as_session = _resume_lab(lab)
-    procs = _state_of(lb, "4711") / "docker_desktop_procs"
-    assert procs.read_text().startswith(f"{DESKTOP_PID}-")  # what docker-up recorded
-    procs.write_text("")
+    record = _record_of(lb, "4711")
+    repo_line, procs = record.read_text().split("\n", 1)
+    assert repo_line == f"repo={REPO_NAME}"
+    assert procs.startswith(f"{DESKTOP_PID}-")  # what docker-up recorded
+    record.write_text(repo_line + "\n")  # the record a session killed while it booted leaves
     _kill(lb, "4711")
     began = as_session("4712")("begin")
     assert "ADOPTED" not in began.stdout
     assert "not adopted" in began.stdout
-    assert _state_of(lb, "4711").is_dir()
+    assert _record_of(lb, "4711").is_file()
+
+
+# ---------------------------- overlapping builders share one Docker Desktop (basecradle-noc#1255)
+
+OTHER_REPO = "basecradle-example"
+OTHER_KEY = f"{OTHER_REPO}-builder"
+UBUNTU = {"id": "sha256:" + "e" * 64, "tag": "ubuntu:24.04", "labelled": False}
+
+
+def _overlap_lab(lab, tmp_path, **over):
+    """Two builders of two carriers on one laptop: A (``claude`` 4711) runs this checkout's guard,
+    B (4712) a copy under another repo's name, with its own label and state root. Only the
+    laptop-wide Docker Desktop ledger is shared, as on the real laptop."""
+    state = {
+        "engine_up": False,
+        "desktop_status": "stopped",
+        "ps_lines": [],
+        "ps_lines_after_start": [DESKTOP_LINE],
+        "desktop_start_epoch": 1792656800,
+        "lstart": {"4711": 1792656776, "4712": 1792656777},
+    }
+    state.update(over)
+    lb = lab(**state)
+    other = _carrier(tmp_path, f"SESSION_GUARD_REPO={OTHER_REPO}\n")
+
+    def session(pid, guard, label, root):
+        env = lb.env | {
+            "CLAUDE_PID": pid,
+            "DOCKER_STUB_LABEL": label,
+            "SESSION_GUARD_STATE_ROOT": str(root),
+        }
+        return lambda *a: subprocess.run(
+            [str(guard), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+        )
+
+    a = session("4711", GUARD, LABEL, lb.state_root)
+    b = session("4712", other, f"{OTHER_KEY}=1", tmp_path / "other-sessions")
+    return lb, a, b
+
+
+def _ok(got):
+    assert got.returncode == 0, got.stdout + got.stderr
+    return got
+
+
+def _clean_exit(run):
+    """The check self-exit runs, then the state it clears: a session that can leave."""
+    _ok(run("tabs-checked"))
+    got = _ok(run("check"))
+    assert "docker desktop start" not in got.stdout
+    _ok(run("done"))
+    return got
+
+
+def _add(lb, kind, item):
+    lb.mutate(**{kind: lb.docker_state()[kind] + [item]})
+
+
+def _drop(lb, kind, ident):
+    lb.mutate(**{kind: [x for x in lb.docker_state()[kind] if x["id"] != ident]})
+
+
+@pytest.mark.parametrize("first_out", ["starter", "joiner"])
+def test_overlapping_builders_leave_no_docker_desktop_and_no_image_in_either_exit_order(
+    lab, tmp_path, first_out
+):
+    """The 2026-11-04 overlap: the harness builder started Docker Desktop, the router builder began
+    beside it and read it as the laptop's own, and between them they left Docker Desktop running
+    and an ``ubuntu:24.04`` on a laptop that had neither. A records starting it in the ledger, so B
+    reads it as A's. In the starter-first order, A quits it under B, B starts its own and pulls
+    ``ubuntu:24.04`` again under the ID its baseline already held; the narrowed baseline and the
+    sweep's refusal to quit over an unlabelled image are what catch that copy."""
+    lb, a, b = _overlap_lab(lab, tmp_path)
+    _ok(a("begin"))
+    _ok(a("docker-up"))
+    _add(lb, "images", UBUNTU)  # A pulls it
+    _add(lb, "containers", CONTAINER)  # A's labelled container
+
+    began = _ok(b("begin"))
+    assert "started by builder session claude-4711" in began.stdout
+    assert "sibling session claude-4711" in _ok(b("docker-up")).stdout
+    b_container = {**FOREIGN_CONTAINER, "id": "9" * 64, "labels": {OTHER_KEY: "1"}}
+    _add(lb, "containers", b_container)
+
+    if first_out == "starter":
+        got = a("check")
+        assert UBUNTU["id"] in _findings(got.stdout)  # A pulled it, A answers for it
+        assert b_container["id"] not in _findings(got.stdout)
+        _drop(lb, "images", UBUNTU["id"])
+        _ok(a("sweep"))
+        assert ["desktop", "stop"] in lb.calls_log()
+        _clean_exit(a)
+
+        # B's next Docker use starts its own Docker Desktop, and pulls the image A removed.
+        assert "starting Docker Desktop" in _ok(b("docker-up")).stdout
+        _add(lb, "images", UBUNTU)
+        swept = b("sweep")
+        assert swept.returncode != 0
+        assert "not quitting Docker Desktop" in swept.stderr
+        assert UBUNTU["id"] in swept.stdout
+        assert lb.docker_state()["desktop_status"] == "running"
+        _drop(lb, "images", UBUNTU["id"])
+        _ok(b("sweep"))
+        _clean_exit(b)
+    else:
+        _ok(b("sweep"))
+        assert ["desktop", "stop"] not in lb.calls_log()
+        got = _clean_exit(b)
+        assert "Docker Desktop is running for sibling session claude-4711" in got.stdout
+
+        assert UBUNTU["id"] in _findings(a("check").stdout)
+        _drop(lb, "images", UBUNTU["id"])
+        _ok(a("sweep"))
+        _clean_exit(a)
+
+    final = lb.docker_state()
+    assert final["desktop_status"] == "stopped"
+    assert final["images"] == []
+    assert final["containers"] == []
+    assert not list(_ledger(lb).iterdir())
+
+
+def test_a_session_whose_own_leftovers_are_gone_exits_past_a_siblings_docker_desktop(lab, tmp_path):
+    """The harness builder's refused exit at 22:56: its own Docker Desktop quit, its leftovers gone,
+    and a Docker Desktop the router builder started since, which it correctly would not quit, held
+    it open. A sibling's Docker Desktop, proved by the ledger, is named and never blocks."""
+    lb, a, b = _overlap_lab(lab, tmp_path)
+    _ok(a("begin"))
+    _ok(a("docker-up"))
+    _ok(a("sweep"))
+    _ok(b("begin"))
+    _ok(b("docker-up"))
+    _add(lb, "containers", {**FOREIGN_CONTAINER, "labels": {OTHER_KEY: "1"}})
+
+    got = _clean_exit(a)
+    assert "Docker Desktop is running for sibling session claude-4712" in got.stdout
+    assert lb.docker_state()["desktop_status"] == "running"
+    assert lb.calls_log().count(["desktop", "stop"]) == 1  # A's own, never B's
+
+
+def test_a_session_that_never_used_docker_exits_past_a_sibling_engine_either_way(lab, tmp_path):
+    """No Docker use at all: a sibling's engine that came up after this session began needs no
+    Docker baseline here, and one that was up at ``begin`` going down is the sibling's sweep."""
+    _, a, b = _overlap_lab(lab, tmp_path)
+    _ok(a("begin"))
+    _ok(b("begin"))
+    _ok(b("docker-up"))
+    got = _clean_exit(a)
+    assert "never reached from it through docker-up" in got.stdout
+
+    _ok(a("begin"))  # a fresh session of A, beside B's running engine
+    _ok(b("sweep"))
+    got = _clean_exit(a)
+    assert "has been quit since" in got.stdout
+
+
+def test_a_sibling_that_begins_while_docker_desktop_boots_reads_it_as_the_starters(lab, tmp_path):
+    """The record is written before the start, with no processes yet: a sibling that begins while
+    Docker Desktop boots must not read it as the laptop's own, the misreading #1255 began with."""
+    lb, a, b = _overlap_lab(lab, tmp_path, desktop_boots_slowly=True)
+    _ok(a("begin"))
+    assert a("docker-up").returncode != 0  # the engine is still booting when the wait runs out
+    assert lb.docker_state()["desktop_status"] == "running"
+    assert "started by builder session claude-4711" in _ok(b("begin")).stdout
+
+
+def test_a_docker_desktop_running_before_any_builder_is_never_quit_by_either(lab, tmp_path):
+    """No record accounts for it, so it is the laptop's own: both use it, and neither quits it."""
+    lb, a, b = _overlap_lab(
+        lab,
+        tmp_path,
+        engine_up=True,
+        desktop_status="running",
+        ps_lines=[DESKTOP_LINE],
+        lstart={"4711": 1792656776, "4712": 1792656777, DESKTOP_PID: 1792600000},
+    )
+    for run in (a, b):
+        assert "the laptop's own, never quit" in _ok(run("begin")).stdout
+        _ok(run("docker-up"))
+    for run in (b, a):
+        _ok(run("sweep"))
+        _clean_exit(run)
+    assert ["desktop", "stop"] not in lb.calls_log()
+    assert lb.docker_state()["desktop_status"] == "running"
+
+
+def test_a_sibling_that_ended_without_quitting_is_adopted_by_a_running_sessions_sweep(
+    lab, tmp_path
+):
+    """B was already running when A was killed, so no ``begin`` of B's saw an orphan: B's sweep
+    adopts the Docker Desktop A recorded, from another carrier's ledger record, and quits it."""
+    lb, a, b = _overlap_lab(lab, tmp_path)
+    _ok(a("begin"))
+    _ok(a("docker-up"))
+    _ok(b("begin"))
+    _kill(lb, "4711")
+    _ok(b("tabs-checked"))
+    got = b("check")
+    assert "which has ended without quitting it" in _findings(got.stdout)
+    swept = _ok(b("sweep"))
+    assert "ADOPTED" in swept.stdout
+    assert ["desktop", "stop"] in lb.calls_log()
+    _clean_exit(b)
+    assert not list(_ledger(lb).iterdir())
+
+
+def test_an_image_this_session_pulled_keeps_its_own_docker_desktop_up_until_removed(lab):
+    """A pulled image carries no label. Quitting the engine over it took it out of ``check``'s
+    sight, and the session exited clean with the image on the laptop."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
+    _ok(lb.run("begin"))
+    _ok(lb.run("docker-up"))
+    lb.mutate(ps_lines=[DESKTOP_LINE], images=[UBUNTU])
+    swept = lb.run("sweep")
+    assert swept.returncode != 0
+    assert ["desktop", "stop"] not in lb.calls_log()
+    lb.mutate(images=[])
+    _ok(lb.run("sweep"))
+    assert ["desktop", "stop"] in lb.calls_log()
+
+
+def test_an_artefact_removed_and_made_again_during_the_session_is_new(lab):
+    """The baseline is narrowed each time ``docker-up`` reaches the engine: an image the baseline
+    held that is gone by then and comes back afterwards was made during this session, whatever its
+    content ID says."""
+    lb = lab(images=[UBUNTU])
+    _ok(lb.run("begin"))
+    lb.mutate(images=[])  # its owner removes it
+    assert "narrowed the Docker baseline: 1 artefact(s)" in _ok(lb.run("docker-up")).stdout
+    lb.mutate(images=[UBUNTU])  # and this session pulls it again
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert UBUNTU["id"] in _findings(got.stdout)
+
+
+def test_a_narrowing_the_engine_did_not_answer_keeps_the_baseline(lab):
+    """An empty list is not an empty engine: narrowing to it would read every artefact on the
+    laptop as this session's (basecradle#707 (b))."""
+    lb = lab(containers=[FOREIGN_CONTAINER])
+    _ok(lb.run("begin"))
+    stub = lb.bin / "docker"
+    real = stub.read_text()
+    # `docker ps` alone stops answering; everything else, `docker version` included, still does.
+    stub.write_text(real.replace('elif a[:1] == ["ps"]:', 'elif a[:1] == ["ps"] and False:', 1))
+    got = lb.run("docker-up")
+    stub.write_text(real)
+    assert "did not list containers; that baseline is kept as it was" in got.stderr
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
 
 
 # ------------------------------------- one script, every laptop builder (basecradle-noc#1110)
