@@ -72,6 +72,12 @@ def _missing() -> str | None:
     for tool in ("sudo", "visudo", "runuser"):
         if shutil.which(tool) is None:
             return f"{tool} is not installed"
+    # The boxes run the original sudo (1.9.15p5 on Ubuntu 24.04). A different one — sudo-rs,
+    # Ubuntu 26.04's default — relays signals by its own code, so a pass would prove a stop
+    # against a sudo no box runs: not this suite's claim, so it does not run.
+    banner = subprocess.run(["sudo", "-V"], capture_output=True, text=True).stdout
+    if not banner.startswith("Sudo version 1."):
+        return f"sudo is not the boxes' sudo: {banner.splitlines()[:1]}"
     for account in (AGENT, DAEMON):
         try:
             if pwd.getpwnam(account).pw_uid == 0:
