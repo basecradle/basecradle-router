@@ -10,7 +10,10 @@ jobs:
   # requires the status context "CI" — so this job must be named CI (not the
   # workflow's `name:`, which GitHub does not use as the required context).
   CI:
-    runs-on: ubuntu-latest
+    # PINNED TO THE BOXES' OS (#404), like uv and Vector below. Both fleet servers run
+    # Ubuntu 24.04; `ubuntu-latest` moved to 26.04, whose sudo is sudo-rs, so the
+    # real-process-tree step below would prove the stop against a sudo no box runs.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -36,7 +39,7 @@ jobs:
 
       # Shell was the unlinted half of this repo (#299): the root-run wake path and
       # the reboot helper had no gate while Python had two. `shellcheck` is
-      # preinstalled on `ubuntu-latest`, so this is ~1s and no install step. A STEP
+      # preinstalled on the runner image, so this is ~1s and no install step. A STEP
       # in this job, not a job of its own, so the required status context stays the
       # single `CI` above and no ruleset change is needed.
       - name: Shell Lint
@@ -93,9 +96,10 @@ jobs:
 
       # THE REAL PROCESS TREE (#404). tests/test_stop_wake_tree.py stops a real
       # `sudo -> runuser -> <binary>` wake with the real stop-wake, which takes root; the
-      # step above runs as `runner`, where it skips. Here it runs as root on the runner's
-      # Ubuntu 24.04 (the boxes' sudo and util-linux), and STOP_WAKE_TREE_REQUIRED turns a
-      # skip into a failure, so the proof cannot go green by not running. No bytecode and
+      # step above runs as `runner`, where it skips. Here it runs as root on the job's
+      # pinned Ubuntu 24.04 (the boxes' sudo and util-linux), and STOP_WAKE_TREE_REQUIRED
+      # turns a skip — or a sudo that is not the boxes' kind — into a failure, so the proof
+      # cannot go green by not running, nor by running against the wrong sudo. No bytecode and
       # no cache, so root writes nothing into the checkout. A STEP, so the required status
       # context stays the single `CI`.
       - name: Stop-Wake Against a Real Process Tree (Root)

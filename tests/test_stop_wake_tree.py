@@ -8,32 +8,43 @@ inside that sleep cuts it short (util-linux 2.39 ``su-common.c``). The old stop 
 ``runuser`` two — its own, and ``sudo``'s relayed copy — and on 2026-11-03 the copy won the
 race and an ``@jt`` wake was SIGKILLed 3 ms into its grace.
 
-So this suite builds the wake's real shape — ``sudo -> <wake-runner> -> runuser -> bash ->
-<binary>`` — and stops it with the real program. Only two things are stand-ins, both for a
-reason that has nothing to do with signals: the wake-runner is a few lines that keep its
-shape (``exec runuser``, the delivery mark exported after the drop) without its registry
-gates, and the daemon is this test process, so the ``router`` account is root here. The
-agent is ``nobody``. The binary traps SIGTERM, holds its handler for :data:`HOLD` — well
-inside ``runuser``'s 2 s — and reports every SIGTERM it receives, so a test reads both
-whether the handler ran to its end and how many copies of the signal reached it.
+So this suite builds the wake's real shape — ``daemon -> sudo -> <wake-runner> -> runuser ->
+bash -> <binary>`` — and stops it with the real program. The daemon is a NON-ROOT account
+(``daemon``) that reaches ``sudo`` through a locked sudoers rule copied from the box's own
+(``deploy/sudoers/basecradle-router``), so the wake's ``sudo`` is what it is on the box: the
+daemon's process, whose /proc uid is the daemon's and only whose effective uid is root. A
+``sudo`` started as root would hide any reading of the tree that leans on that uid. The
+stand-ins left,
+each for a reason that has nothing to do with signals: the daemon is a few lines of
+Python that spawns ``sudo`` and dies the way it did; the wake-runner is a few lines that
+keep its shape (``exec runuser``, the delivery mark exported after the drop) without its
+registry gates; and the agent is ``nobody``. The binary traps SIGTERM, holds its handler
+for :data:`HOLD` — well inside ``runuser``'s 2 s — and reports every SIGTERM it receives,
+so a test reads both whether the handler ran to its end and how many copies of the signal
+reached it.
 
-It needs root, Linux, ``sudo`` and ``runuser``, so it skips on the laptop and anywhere
-else that lacks them. CI runs it as root in its own step with ``STOP_WAKE_TREE_REQUIRED=1``,
-which turns a skip into a failure: a proof that silently did not run is not a proof.
+It needs root (to install and remove the sudoers rule), Linux, ``sudo``, ``visudo``,
+``runuser`` and the ``daemon`` and ``nobody`` accounts, so it skips on the laptop and
+anywhere else that lacks them. CI runs it as root in its own step with
+``STOP_WAKE_TREE_REQUIRED=1``, which turns a skip into a failure: a proof that silently did
+not run is not a proof.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import pwd
+import re
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -41,6 +52,9 @@ import pytest
 from test_stop_wake import sw
 
 AGENT = "nobody"
+#: The daemon's stand-in account: anything but root, as `router` is on the box.
+DAEMON = "daemon"
+SUDOERS = Path(__file__).resolve().parents[1] / "deploy" / "sudoers" / "basecradle-router"
 DELIVERY = "0192f3a4-5b6c-7d8e-9f01-0000000000aa"
 #: How long the binary's SIGTERM handler runs: inside runuser's 2 s grace, and long enough
 #: that a grace cut short (by a second TERM ~0.3 s in) cannot be mistaken for a finish.
@@ -55,13 +69,21 @@ def _missing() -> str | None:
         return "Linux only: the chain under test is Linux's sudo and util-linux runuser"
     if os.geteuid() != 0:
         return "needs root: sudo -> runuser is the privilege drop under test"
-    for tool in ("sudo", "runuser"):
+    for tool in ("sudo", "visudo", "runuser"):
         if shutil.which(tool) is None:
             return f"{tool} is not installed"
-    try:
-        pwd.getpwnam(AGENT)
-    except KeyError:
-        return f"no {AGENT!r} account to drop to"
+    # The boxes run the original sudo (1.9.15p5 on Ubuntu 24.04). A different one — sudo-rs,
+    # Ubuntu 26.04's default — relays signals by its own code, so a pass would prove a stop
+    # against a sudo no box runs: not this suite's claim, so it does not run.
+    banner = subprocess.run(["sudo", "-V"], capture_output=True, text=True).stdout
+    if not banner.startswith("Sudo version 1."):
+        return f"sudo is not the boxes' sudo: {banner.splitlines()[:1]}"
+    for account in (AGENT, DAEMON):
+        try:
+            if pwd.getpwnam(account).pw_uid == 0:
+                return f"the {account!r} account is root here"
+        except KeyError:
+            return f"no {account!r} account"
     return None
 
 
@@ -84,8 +106,22 @@ while [ "$1" != "--" ]; do
 	shift 2
 done
 shift
+# The one account it drops to. The sudoers rule granting it outlives a killed run, so the
+# most a leftover grant can ever do is run a command as this account.
+[ "$user" = nobody ] || { echo "fake wake-runner: drops only to nobody" >&2; exit 1; }
 exec runuser -u "$user" -- /usr/bin/env "BASECRADLE_DELIVERY_ID=$delivery" \
 	/bin/bash -c 'exec "$@"' wake-runner "$@"
+"""
+
+# The daemon's stand-in, run as DAEMON: spawns the wake's sudo as its child, as the router
+# does, and dies the way sudo did, so the test reads the exit status the daemon would.
+DAEMON_STANDIN = r"""
+import os, signal, subprocess, sys
+code = subprocess.call(sys.argv[1:])
+if code < 0:
+    signal.signal(-code, signal.SIG_DFL)
+    os.kill(os.getpid(), -code)
+sys.exit(code)
 """
 
 # The binary: traps SIGTERM, says so for every copy it receives, and holds its handler
@@ -112,12 +148,16 @@ while True:
 
 
 class _Wake:
-    """One real wake: ``sudo`` spawned by this process, its output read as it lands."""
+    """One real wake: ``sudo`` spawned by the daemon's stand-in, its output read as it lands."""
 
     def __init__(self, runner: Path) -> None:
         self.proc = subprocess.Popen(
             [
-                "sudo",
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                DAEMON_STANDIN,
+                "sudo",  # the daemon's exact argv: stdin is /dev/null, so a prompt fails
                 str(runner),
                 "--user",
                 AGENT,
@@ -137,6 +177,9 @@ class _Wake:
             stderr=subprocess.PIPE,
             cwd="/",
             text=True,
+            user=DAEMON,
+            group=pwd.getpwnam(DAEMON).pw_gid,
+            extra_groups=[],
         )
         self.out: list[str] = []
         self.err: list[str] = []
@@ -159,10 +202,20 @@ class _Wake:
                 raise AssertionError(f"timed out: out={self.out} err={self.err}")
             time.sleep(0.02)
 
-    def chain(self) -> tuple[int, int]:
-        """``(runuser, binary)`` pids under this wake's ``sudo``, read from /proc."""
-        procs = sw.read_procs()
+    def sudo(self, procs: Mapping[int, sw.Proc]) -> int:
+        """The wake's ``sudo`` in ``procs``: the daemon stand-in's one child."""
         below = [p for p in procs.values() if p.ppid == self.proc.pid]
+        assert len(below) == 1, f"the daemon has {len(below)} children: {below}"
+        return below[0].pid
+
+    def chain(self) -> tuple[int, int]:
+        """``(runuser, binary)`` pids under this wake's ``sudo``, read from /proc.
+
+        It also pins the box's shape: ``sudo`` is the daemon's process, not root's."""
+        procs = sw.read_procs()
+        sudo = procs[self.sudo(procs)]
+        assert sudo.uid == pwd.getpwnam(DAEMON).pw_uid, sudo
+        below = [p for p in procs.values() if p.ppid == sudo.pid]
         assert len(below) == 1, f"sudo has {len(below)} children: {below}"
         runuser = below[0]
         assert os.path.basename(runuser.argv[0]) == "runuser", runuser.argv
@@ -172,23 +225,67 @@ class _Wake:
         return runuser.pid, binary[0].pid
 
     def ended(self, timeout: float = 15.0) -> int:
-        """``sudo``'s exit status — what the daemon reads — once every line has landed."""
+        """``sudo``'s exit status, as the daemon reads it, once every line has landed."""
         code = self.proc.wait(timeout=timeout)
         for drain in self._drains:
             drain.join(timeout=timeout)  # EOF: every process holding the pipes is gone
         return code
 
 
+DROPIN_PREFIX = "zz-basecradle-router-test-"
+
+
+def _rule(runner: Path) -> str:
+    """The box's sudoers rule, for DAEMON and this test's runner, and nothing else.
+
+    Comments go, every ``router`` token becomes DAEMON — a ``Defaults:router`` line added
+    to the box's rule one day comes along rather than silently staying the router's — and
+    the grant is pinned to the runner's exact bytes (``sha256:``), so it cannot run
+    anything else that is put at that path."""
+    lines = [
+        line
+        for line in SUDOERS.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    rule = "\n".join(lines).replace(sw.WAKE_RUNNER, str(runner)) + "\n"
+    rule = re.sub(r"(?<![\w/.-])router(?![\w.-])", DAEMON, rule)
+    assert "router" not in rule.replace(str(runner), ""), rule
+    digest = hashlib.sha256(runner.read_bytes()).hexdigest()
+    grant = f"{DAEMON} ALL=(root) NOPASSWD: {runner}"
+    assert grant in rule, rule
+    return rule.replace(grant, f"{DAEMON} ALL=(root) NOPASSWD: sha256:{digest} {runner}")
+
+
 @pytest.fixture
-def runner(tmp_path: Path, monkeypatch) -> Path:
+def runner(tmp_path: Path, monkeypatch) -> Iterator[Path]:
+    """The fake wake-runner, and the box's sudoers rule granting DAEMON exactly it.
+
+    The rule is the one write outside ``tmp_path`` in this repo's tests, and it cannot be
+    avoided: the box's own sudoers rule, granting a non-root account the wake-runner, is
+    part of the shape under test. So it is the narrowest write that does it: a uniquely
+    named ``/etc/sudoers.d`` drop-in, checked by ``visudo`` before it is installed and
+    removed on every exit. A run killed before its ``finally`` cannot leave it for long:
+    every drop-in carrying this suite's prefix is swept when the next run starts, and until
+    then it grants only the fake runner's own bytes, which drop only to ``nobody``."""
+    for stale in Path("/etc/sudoers.d").glob(f"{DROPIN_PREFIX}*"):
+        stale.unlink(missing_ok=True)  # a killed run's: this suite's prefix, nobody else's
     path = tmp_path / "wake-runner"
     path.write_text(FAKE_RUNNER)
     path.chmod(0o755)
-    # The real program's two constants, pointed at this test's tree: the wake-runner it
-    # matches a wake by, and the account the daemon runs as (this process: root).
-    monkeypatch.setattr(sw, "WAKE_RUNNER", str(path))
-    monkeypatch.setattr(sw, "ROUTER_USER", "root")
-    return path
+    staged = tmp_path / "sudoers"
+    staged.write_text(_rule(path))
+    staged.chmod(0o440)
+    subprocess.run(["visudo", "-cqf", str(staged)], check=True)
+    dropin = Path("/etc/sudoers.d") / f"{DROPIN_PREFIX}{secrets.token_hex(4)}"
+    try:
+        shutil.copy2(staged, dropin)
+        # The real program's two constants, pointed at this test's tree: the wake-runner
+        # it matches a wake by, and the account the daemon runs as.
+        monkeypatch.setattr(sw, "WAKE_RUNNER", str(path))
+        monkeypatch.setattr(sw, "ROUTER_USER", DAEMON)
+        yield path
+    finally:
+        dropin.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -223,8 +320,8 @@ def _stop(
 
     procs = sw.read_procs()
     uid = pwd.getpwnam(AGENT).pw_uid
-    wakes = sw.find_wakes(procs, AGENT, uid, DELIVERY, 0)
-    assert [w.root.pid for w in wakes] == [wake.proc.pid]
+    wakes = sw.find_wakes(procs, AGENT, uid, DELIVERY, pwd.getpwnam(DAEMON).pw_uid)
+    assert [w.root.pid for w in wakes] == [wake.sudo(procs)]
     lines: list[str] = []
     started = time.monotonic()
     survivors = sw.Stopper(read=sw.read_procs, kill=kill, log=lines.append).stop(
@@ -256,7 +353,7 @@ def test_the_old_stop_cut_the_grace_whichever_order_its_copies_landed_in(
     wake, monkeypatch, reverse
 ) -> None:
     """The stop as it was: every member signalled, sudo and the binary included."""
-    monkeypatch.setattr(sw, "left_to_relay", lambda procs, pids: set())
+    monkeypatch.setattr(sw, "left_to_relay", lambda procs, wake, pids: set())
     _stop(wake, monkeypatch, spaced=True, reverse=reverse)
     assert wake.ended() == -signal.SIGTERM
     assert "begin" in wake.out

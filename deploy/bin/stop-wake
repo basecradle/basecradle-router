@@ -56,6 +56,11 @@ relays and sent nothing while it drains:
   * `runuser`'s child, the binary. `runuser` SIGTERMs it the moment it catches its own, so
     a copy from here would be a second one inside the binary's own handler.
 
+Both are found by their POSITION on the path from the wake's root `sudo` down to
+`runuser` — the root's own links before the privilege drop, where nothing of the agent's
+session can stand — never by a name or a uid alone. A uid would not do: the wake's `sudo`
+is the router account's process, so /proc gives it the router's uid, not root's.
+
 `runuser` is signalled directly rather than through `sudo`, and parents are signalled
 before their descendants, so its TERM is pending before anything below it can exit. That
 makes the catch deterministic: `runuser` always re-raises, and the daemon always reads a
@@ -283,11 +288,17 @@ def find_wakes(
     return sorted(wakes, key=lambda w: w.root.pid)
 
 
+def children_of(procs: Mapping[int, Proc], pids: Iterable[int]) -> dict[int, list[int]]:
+    """Each parent pid's children among ``pids``, ascending — the one index of the tree."""
+    children: dict[int, list[int]] = {}
+    for pid in sorted(pids):
+        children.setdefault(procs[pid].ppid, []).append(pid)
+    return children
+
+
 def tree(procs: Mapping[int, Proc], roots: Iterable[int]) -> set[int]:
     """``roots`` and every live descendant of them, by parent pid."""
-    children: dict[int, list[int]] = {}
-    for proc in procs.values():
-        children.setdefault(proc.ppid, []).append(proc.pid)
+    children = children_of(procs, procs)
     seen: set[int] = set()
     stack = [pid for pid in roots if pid in procs]
     while stack:
@@ -317,26 +328,43 @@ def members(procs: Mapping[int, Proc], wake: Wake) -> set[int]:
     return tree(procs, [wake.root.pid, *marked])
 
 
-def left_to_relay(procs: Mapping[int, Proc], pids: Iterable[int]) -> set[int]:
+def left_to_relay(procs: Mapping[int, Proc], wake: Wake, pids: Iterable[int]) -> set[int]:
     """The members a stop sends no SIGTERM, because one of the chain's relays already will.
 
-    Every ``sudo`` — the wake's root, and a ``use_pty`` monitor if a host's sudoers ever
-    adds that hop — whose relayed copy would be a second TERM to ``runuser`` and cut its
-    2 s grace; and ``runuser``'s own child, which ``runuser`` SIGTERMs itself the moment
-    it catches its own (basecradle-router#404).
+    The relays sit on the path from the wake's root ``sudo`` down to ``runuser``: that
+    ``sudo``, whose relayed copy would be a second TERM to ``runuser`` and cut its 2 s
+    grace, and any ``sudo`` beneath it on the path (a ``use_pty`` monitor, should a host's
+    sudoers ever add that hop, or the root's own child caught between its fork and its
+    exec); and ``runuser``, whose children it SIGTERMs itself the moment it catches its own
+    (basecradle-router#404). So the exempt are every ``sudo`` on that path and the children
+    of the ``runuser`` that ends it. A link on the path that is neither — the wake-runner
+    before it execs ``runuser`` — is signalled as any member is.
 
-    A relay is a ROOT-OWNED process of that name. Root-owned is what the agent cannot
-    forge: anything in its session may call itself ``sudo`` or ``runuser``, and naming
-    alone would let it opt a process, or its children, out of the TERM.
+    A relay is found by POSITION AND NAME: a ``sudo`` or ``runuser`` on that path, never by
+    its name or its uid alone, anywhere else in the wake. The path is the root's own
+    descendants before the privilege drop, where nothing of the agent's session can stand,
+    so a session process that calls itself ``sudo`` or ``runuser`` — even a setuid-root one
+    — is just a member and gets its TERM. Nor is it a uid: the wake's ``sudo`` is the router
+    account's process, so /proc gives it the router's uid, not root's.
     """
     pids = set(pids)
+    children = children_of(procs, pids)
 
-    def relay(pid: int, name: str) -> bool:
-        proc = procs[pid]
-        return proc.uid == 0 and bool(proc.argv) and os.path.basename(proc.argv[0]) == name
+    def named(pid: int, name: str) -> bool:
+        argv = procs[pid].argv
+        return bool(argv) and os.path.basename(argv[0]) == name
 
-    runusers = {pid for pid in pids if relay(pid, "runuser")}
-    return {pid for pid in pids if relay(pid, "sudo") or procs[pid].ppid in runusers}
+    exempt: set[int] = set()
+    path = [wake.root.pid] if wake.root.pid in pids else []
+    while path:
+        pid = path.pop()
+        if named(pid, "runuser"):
+            exempt.update(children.get(pid, ()))  # the drop: the agent's own side begins
+            continue
+        if named(pid, "sudo"):
+            exempt.add(pid)
+        path.extend(children.get(pid, ()))
+    return exempt
 
 
 def by_depth(procs: Mapping[int, Proc], pids: Iterable[int]) -> list[int]:
@@ -468,7 +496,7 @@ class Stopper:
         fresh = []
         for index, wake in enumerate(wakes):
             pids = members(procs, wake)
-            relayed = left_to_relay(procs, pids) if sig == signal.SIGTERM else set()
+            relayed = left_to_relay(procs, wake, pids) if sig == signal.SIGTERM else set()
             for pid in by_depth(procs, pids):
                 tracked = self._tracked.get(pid)
                 if tracked is None:
