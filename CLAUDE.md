@@ -122,6 +122,17 @@ This is **not** a published package — the router daemon **runs on the fleet's 
 
 To author or maintain the `deploy/` contract (the version-controlled config the NOC's `deploy-router` op consumes) or to reason about how a merge reaches the live box, invoke the `router-deploy-contract` skill.
 
+## Responding to the Daily Dependency Scan
+
+**`uv.lock` is what the box runs.** The deploy's `uv sync --locked` installs every locked package, the development group included, onto `ai.basecradle.com`. A stale pin is therefore a stale package on the crown-jewels box. `.github/workflows/dependency-security-scan.yml` audits the lock daily (#410).
+
+- **The issue.** Findings land as one issue, `[SECURITY] Dependency Advisories Against main (Daily Scan)`. High or Critical carries `needs-human` and pages `@origin`. Anything lower carries `needs-capital`.
+- **Closing dismisses nothing.** The workflow never closes the `[SECURITY]` issue, and closing it by hand dismisses nothing.
+- **Decisions in code.** The decisions live in tested code, `.github/scripts/dependency_security_scan.py`. The workflow writes the issue as `basecradle-ai[bot]`, because a label `GITHUB_TOKEN` applies would page nobody.
+- **The fix.** A fix is a minimal lock bump, and it is live only once the NOC's unattended deploy carries it, never by this agent's hand.
+
+To respond to the issue, a red scan run, or an advisory found any other way, invoke the `security-scan-bump` skill.
+
 ## Where to Start
 
 The issue the capital dispatched is where you start; plan-first for anything non-trivial. The contract is this charter, the code, and its tests. `basecradle/basecradle#277` is the router's founding spec (closed 2026-06-30): read it for why the router exists, never as today's requirements. The open issues are context, never a queue, and reading them needs a minted `GH_TOKEN` in the same Bash call like every other (`bot-auth-setup` §0–§1):
