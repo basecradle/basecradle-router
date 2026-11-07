@@ -1,0 +1,147 @@
+name: Dependency Security Scan
+
+# The clock on this repository's dependencies (#410). Nothing here audited uv.lock on its
+# own: an advisory reached us only if Dependabot opened a pull request for it, and
+# Dependabot does not move a transitive pin. uv.lock is what the daemon's box installs (the
+# deploy's `uv sync --locked`, development group included), so this runs osv-scanner against
+# main every day and files what it finds as one [SECURITY] issue. An advisory rated High or
+# Critical carries needs-human, which pages @origin through the needs-human alert stub (his
+# ruling, 2026-11-05, basecradle#750); anything lower carries needs-capital. No model is
+# called.
+#
+# The decisions live in .github/scripts/dependency_security_scan.py, with tests
+# (tests/test_dependency_security_scan.py). This file only runs it and applies its plan. The
+# capital's workflow of the same name is the model, by way of basecradle-python's.
+#
+# It reads repository secrets, so it never runs on a pull request: a bot-opened PR's run
+# would see them empty, and a stranger's fork must never reach them.
+
+on:
+  schedule:
+    - cron: "57 14 * * *" # daily, 14:57 UTC
+  # By hand on main. A run on any other branch files against the same issue as main's,
+  # so it is only for proving the filing path, and its issue is closed after.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: dependency-security-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # Pinned like ci.yml, so the runner's own python3, which runs the script, does not
+    # move under it with the image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      # Pinned by version AND checksum, the checksum taken from the release's own
+      # osv-scanner_SHA256SUMS: a scanner that moves under us changes what "clean" means
+      # with nobody's diff to explain it, and a binary we cannot verify does not run.
+      # Dependabot does not see a download, so a bump is by hand: new version, new
+      # checksum from that release's SHA256SUMS, one PR. A run that fails here pings no
+      # heartbeat, so a broken install pages within the day and its grace.
+      - name: Install osv-scanner
+        env:
+          OSV_SCANNER_VERSION: v2.7.0
+          OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL --retry 3 --max-time 120 -o "$RUNNER_TEMP/bin/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION/osv-scanner_linux_amd64"
+          echo "$OSV_SCANNER_SHA256  $RUNNER_TEMP/bin/osv-scanner" | sha256sum --check --strict -
+          chmod +x "$RUNNER_TEMP/bin/osv-scanner"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # The issue and its label must come from the basecradle-ai App, never GITHUB_TOKEN:
+      # GitHub starts no workflow for an event GITHUB_TOKEN caused, so a needs-human label
+      # it applied would page nobody. Scoped to issues.
+      - name: Mint the basecradle-ai App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}
+          private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
+          permission-issues: write
+
+      # With their authors: this repository is public, so an issue carrying the scan's
+      # title is the scan's only if basecradle-ai[bot] wrote it (the script's SCAN_AUTHOR).
+      # The --author filter keeps anyone else's issues from pushing the scan's own past the
+      # limit; the script checks the author again.
+      - name: Read the Open Issues
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh issue list --state open --author 'basecradle-ai[bot]' --limit 1000 --json number,title,body,author > "$RUNNER_TEMP/open-issues.json"
+
+      # The runner's own python3: the script is standard library only.
+      - name: Scan
+        run: python3 .github/scripts/dependency_security_scan.py --open-issues "$RUNNER_TEMP/open-issues.json" --plan "$RUNNER_TEMP/plan.json"
+
+      # A label rides its message: on a new issue the body is the message; on an open one
+      # the comment is posted before the label is applied. The label is removed and
+      # re-added because adding one already present is no event, so no page. The body is
+      # written last: it carries what the next run compares against, so a step that fails
+      # midway is repeated tomorrow, never lost.
+      - name: File What the Scan Found
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          jq -c '.plans[]' "$RUNNER_TEMP/plan.json" | while read -r plan; do
+            number="$(jq -r '.number' <<<"$plan")"
+            jq -r '.body // ""' <<<"$plan" > "$RUNNER_TEMP/body.md"
+            jq -r '.comment // ""' <<<"$plan" > "$RUNNER_TEMP/comment.md"
+            case "$(jq -r '.action' <<<"$plan")" in
+              create)
+                gh issue create --title "$(jq -r '.title' <<<"$plan")" --body-file "$RUNNER_TEMP/body.md" --label "$(jq -r '.labels | join(",")' <<<"$plan")"
+                ;;
+              update)
+                gh issue comment "$number" --body-file "$RUNNER_TEMP/comment.md"
+                jq -r '.labels[]' <<<"$plan" | while read -r label; do
+                  gh issue edit "$number" --remove-label "$label"
+                  gh issue edit "$number" --add-label "$label"
+                done
+                gh issue edit "$number" --body-file "$RUNNER_TEMP/body.md"
+                ;;
+              close)
+                gh issue close "$number" --comment "$(cat "$RUNNER_TEMP/comment.md")"
+                ;;
+              *)
+                echo "Unknown plan action" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # The heartbeat answers one question: did this repository's dependency scan reach a
+      # verdict today? Pinged after the plan is applied, on a clean scan and on advisories
+      # alike, and withheld when a scanner could not reach a verdict: a check that could not
+      # answer never answers yes. A run that dies before this step pings nothing, and
+      # Better Stack pages when the day and the grace pass. The URL is write-only and never
+      # printed.
+      - name: Ping the basecradle-router Dependency Scan Heartbeat
+        if: ${{ success() }}
+        env:
+          HEARTBEAT_URL: ${{ secrets.DEPENDENCY_SCAN_HEARTBEAT_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$HEARTBEAT_URL" || { echo "no heartbeat URL in the repository's secrets" >&2; exit 1; }
+          if [ "$(jq -r '.verdict' "$RUNNER_TEMP/plan.json")" = "error" ]; then
+            echo "a scanner reached no verdict: the heartbeat is withheld"
+          else
+            curl -fsS --retry 3 --max-time 15 -o /dev/null "$HEARTBEAT_URL"
+          fi
+
+      # A run that found something, or could not look, is red.
+      - name: Fail Unless main Is Clean
+        run: test "$(jq -r '.verdict' "$RUNNER_TEMP/plan.json")" = "clean"
