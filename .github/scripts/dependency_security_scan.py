@@ -160,7 +160,9 @@ def parse_osv_scanner(output: str, exit_status: int) -> list[Advisory]:
     # the findings kept are always pairwise unrelated.
     advisories: list[Advisory] = []
     for result in results:
-        for entry in _list_of_dicts(result.get("packages", [])):
+        # A source with no packages may print them as null (a Go nil slice) rather than
+        # leave the key out; either is none. The exit status still has to agree.
+        for entry in _list_of_dicts(result.get("packages") or []):
             for advisory in _advisories_in(entry):
                 for seen in [a for a in advisories if _related(a, advisory)]:
                     advisories.remove(seen)

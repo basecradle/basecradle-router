@@ -290,6 +290,14 @@ def test_osv_scanner_output_that_is_not_a_verdict_raises_never_reads_as_clean(
         parse_osv_scanner(output, exit_status)
 
 
+def test_a_source_whose_packages_are_null_is_no_advisories_and_the_exit_must_agree() -> None:
+    null_packages = json.dumps({"results": [{"source": {"path": "uv.lock"}, "packages": None}]})
+
+    assert parse_osv_scanner(null_packages, 0) == []
+    with pytest.raises(ScanError):
+        parse_osv_scanner(null_packages, 1)
+
+
 def test_a_package_forked_into_two_versions_is_one_finding_naming_both() -> None:
     older = package("anyio", group("GHSA-1111-2222-3333"))
     newer = package("anyio", group("GHSA-1111-2222-3333"))
@@ -906,6 +914,15 @@ def test_the_workflow_reads_only_the_scans_own_issues_with_their_authors() -> No
     assert scan_module.SCAN_AUTHOR == "app/basecradle-ai"
 
 
+def test_a_repage_retries_its_add_so_no_issue_is_left_unlabelled() -> None:
+    filing = _step("File What the Scan Found")
+
+    remove = filing.index('--remove-label "$label"')
+    add = filing.index('--add-label "$label" && break')
+    assert remove < add, "removed, then re-added: adding a label already present is no event"
+    assert "for attempt in 1 2 3" in filing
+
+
 def test_every_github_write_is_the_basecradle_ai_apps_never_github_token() -> None:
     # A label GITHUB_TOKEN applies starts no workflow, so needs-human would page nobody.
     for name in ("Read the Open Issues", "File What the Scan Found"):
@@ -927,4 +944,5 @@ def test_the_heartbeat_is_withheld_when_a_scanner_reached_no_verdict() -> None:
     ping = _step("Ping the basecradle-router Dependency Scan Heartbeat")
 
     assert '= "error" ]' in ping and "withheld" in ping
+    assert "if:" not in ping, "it runs only when every step before it succeeded"
     assert 'test -n "$HEARTBEAT_URL"' in ping, "a missing secret fails loudly"

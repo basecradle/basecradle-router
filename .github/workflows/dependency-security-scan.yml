@@ -89,9 +89,11 @@ jobs:
 
       # A label rides its message: on a new issue the body is the message; on an open one
       # the comment is posted before the label is applied. The label is removed and
-      # re-added because adding one already present is no event, so no page. The body is
-      # written last: it carries what the next run compares against, so a step that fails
-      # midway is repeated tomorrow, never lost.
+      # re-added because adding one already present is no event, so no page; the add is
+      # retried, because a failure between the two would leave the issue with no routing
+      # label under a comment saying one was applied. The body is written last: it carries
+      # what the next run compares against, so a step that fails midway is repeated
+      # tomorrow, never lost.
       - name: File What the Scan Found
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -109,7 +111,11 @@ jobs:
                 gh issue comment "$number" --body-file "$RUNNER_TEMP/comment.md"
                 jq -r '.labels[]' <<<"$plan" | while read -r label; do
                   gh issue edit "$number" --remove-label "$label"
-                  gh issue edit "$number" --add-label "$label"
+                  for attempt in 1 2 3; do
+                    gh issue edit "$number" --add-label "$label" && break
+                    [ "$attempt" -lt 3 ] || exit 1
+                    sleep 10
+                  done
                 done
                 gh issue edit "$number" --body-file "$RUNNER_TEMP/body.md"
                 ;;
@@ -130,7 +136,6 @@ jobs:
       # Better Stack pages when the day and the grace pass. The URL is write-only and never
       # printed.
       - name: Ping the basecradle-router Dependency Scan Heartbeat
-        if: ${{ success() }}
         env:
           HEARTBEAT_URL: ${{ secrets.DEPENDENCY_SCAN_HEARTBEAT_URL }}
         run: |
