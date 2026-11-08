@@ -50,7 +50,14 @@ from pathlib import Path
 
 import pytest
 
-from basecradle_router.config import _AGENTS_VAR, ConfigError, route_secret_var
+from basecradle_router.config import (
+    _AGENTS_VAR,
+    _DEFAULT_ENABLED_ROUTES,
+    _ENABLED_ROUTES_VAR,
+    ConfigError,
+    load_config,
+    route_secret_var,
+)
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RecipientKeyring
 from basecradle_router.routes.basecradle import (
     _ACTIONABLE_EVENTS,
@@ -251,6 +258,15 @@ def test_env_value_is_empty_for_a_missing_key(tmp_path: Path) -> None:
     assert out.strip() == "|"
 
 
+def test_env_value_prints_its_absent_default_only_for_an_absent_key(tmp_path: Path) -> None:
+    """Absent and empty must stay apart: for the enabled routes they are the daemon's
+    default and a boot refusal."""
+    key = "BASECRADLE_ROUTER_ENABLED_ROUTES"
+    absent = _run_parsers(ENV_FILE, f'env_value {key} github; echo "|"', tmp_path)
+    empty = _run_parsers(f"{key}=\n", f'env_value {key} github; echo "|"', tmp_path)
+    assert (absent.strip(), empty.strip()) == ("github|", "|")
+
+
 def test_env_value_keeps_a_value_containing_equals_and_specials(tmp_path: Path) -> None:
     """The value is data, never code: `=`, `$`, and spaces survive verbatim."""
     env = "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=a=b$(echo hi) c==\n"
@@ -415,6 +431,62 @@ def test_shell_bool_env_is_loud_on_a_value_the_daemon_would_refuse(tmp_path: Pat
         _run_parsers(env, f"bool_env {SHARED_FALLBACK_VAR} true; echo", tmp_path)
     with pytest.raises(ConfigError):
         _bool_env({SHARED_FALLBACK_VAR: "flase"}, SHARED_FALLBACK_VAR, default=True)
+
+
+def _daemon_enabled_routes(raw: str | None, tmp_path: Path) -> frozenset[str]:
+    """The routes the daemon's own `load_config` enables for this router.env value."""
+    agents = tmp_path / "agents.json"
+    agents.write_text("{}")
+    env = {_AGENTS_VAR: str(agents)}
+    if raw is not None:
+        env[_ENABLED_ROUTES_VAR] = raw
+    return load_config(env).enabled_routes
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "github",
+        "basecradle",
+        "github,basecradle,probe",
+        " basecradle , github ",
+        "basecradle,,probe,",
+        "githubx,basecradle",
+        "Github",
+    ],
+)
+def test_shell_route_enabled_agrees_with_the_daemons_own(raw: str | None, tmp_path: Path) -> None:
+    """Cases 1-3 run exactly where the daemon enables github, and nowhere else.
+
+    A divergence is silent in the dangerous direction: a gate that read github as absent
+    on a box whose daemon serves it would skip the trust-gate proof on a deploy it then
+    passes. `None` is the variable absent from router.env, which the daemon reads as its
+    default — the case every pre-#417 box is in.
+    """
+    env = "" if raw is None else f"{_ENABLED_ROUTES_VAR}={raw}\n"
+    daemon = _daemon_enabled_routes(raw, tmp_path)
+    for route in ("github", "basecradle", "probe"):
+        out = _run_parsers(env, f"route_enabled {route}; echo", tmp_path)
+        assert out.strip() == ("true" if route in daemon else "false"), route
+
+
+@pytest.mark.parametrize("raw", ["", "  ", " , ,"])
+def test_shell_route_enabled_is_loud_on_a_list_the_daemon_would_refuse(
+    raw: str, tmp_path: Path
+) -> None:
+    """Set but naming no route: the daemon refuses to boot, so the gate must not answer."""
+    env = f"{_ENABLED_ROUTES_VAR}={raw}\n"
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_parsers(env, "route_enabled github; echo", tmp_path)
+    with pytest.raises(ConfigError, match="lists no routes"):
+        _daemon_enabled_routes(raw, tmp_path)
+
+
+def test_the_smoke_test_reads_the_daemons_enabled_routes_variable_and_default() -> None:
+    """A rename or a new default must move the gate with the daemon, never past it."""
+    assert _smoke_literal("ENABLED_ROUTES_VAR") == _ENABLED_ROUTES_VAR
+    assert _smoke_literal("DEFAULT_ENABLED_ROUTES") == ",".join(_DEFAULT_ENABLED_ROUTES)
 
 
 @requires_jq

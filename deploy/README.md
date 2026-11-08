@@ -1521,6 +1521,18 @@ traffic right now behave. Synthetic, HMAC-signed webhooks at the live endpoint �
 | 2 | valid sig, **untrusted** sender | **400** | the #52 trusted-actor gate **rejects** strangers |
 | 3 | valid sig, **trusted** sender, **unregistered** repo | **200** | the gate **admits** the fleet — and no agent is woken (resolve finds none) |
 
+Cases 1–3 run wherever the daemon enables the `github` route, read from `BASECRADLE_ROUTER_ENABLED_ROUTES`
+exactly as `load_config` reads it (absent means the default, `github`), and there the github secret and
+trusted actors are **required**, as the daemon requires them. They are gated on the route list, never on
+the secret's absence: a github box that lost its secret dies rather than quietly skipping the trust-gate
+proof. A box whose daemon does not enable github — `red.basecradle.com`, harness-only, is the first (#417) —
+skips them, never reads the github variables, and asserts instead that an unsigned github delivery sent on
+**loopback**, straight to the daemon, finds **no route** there (**404**) — loopback because a 404 through Caddy
+could be Caddy's own. That makes the skip a live fact rather than an inference: were `router.env` read one
+way by the gate and another by systemd, the answer is a 401 and the gate fails.
+`tests/test_smoke_test_enabled_routes.py` runs the whole script over both branches, and the shell parse is
+pinned to the daemon's own in `tests/test_smoke_test_assertions.py`.
+
 Cases 4–6 do the same for the `basecradle` route once the capital wires it (self-gated on the route-wide
 secret and on the running daemon actually serving the route):
 
@@ -1598,8 +1610,8 @@ no default host (#336). `tests/test_smoke_test_host.py` runs the whole shipped s
 once per host in `deploy/hosts/` and asserts every request it makes.
 
 The same status-code outcomes are pinned offline in `tests/test_server_e2e.py`, and the gate's own shell
-mirrors of the daemon's rules — the `<SLUG>` scrub, the boolean env parse, the registry read, and both
-journal regexes — are run against the daemon's own functions and rendered bytes in
+mirrors of the daemon's rules — the `<SLUG>` scrub, the boolean env parse, the enabled-routes parse, the
+registry read, and both journal regexes — are run against the daemon's own functions and rendered bytes in
 `tests/test_smoke_test_assertions.py`, so the smoke test can't bit-rot against the route logic unnoticed.
 
 ### Drift can never be silent: `deploy/drift-check.sh` + the timer
