@@ -1351,15 +1351,18 @@ each host carries its own copy of all three under **`deploy/hosts/<fqdn>/`**:
 
 | Host | What it is | Better Stack source (ingest host) | Reboot window |
 |---|---|---|---|
-| `ai.basecradle.com` | the production router box | **"AI"** (`s2531770.eu-fsn-3.betterstackdata.com`) | `05:00 America/Chicago` + ≤15 min |
+| `ai.basecradle.com` | the production router box | **`basecradle.com Fleet Servers`** (`s2531770.eu-fsn-3.betterstackdata.com`) | `05:00 America/Chicago` + ≤15 min |
+| `red.basecradle.com` | the red-team fleet server; no daemon deployed yet | **`basecradle.com Fleet Servers`**, shared with `ai` (`s2531770.eu-fsn-3.betterstackdata.com`) | `07:00 UTC` + ≤15 min |
 | `ubuntu-1.landfill.click` | @steve's box (Organization Landfill); no daemon deployed yet | **`landfill.click Fleet Servers`**, id 2780873 (`s2780873.eu-central-1a.betterstackdata.com`) | `12:00 UTC` + ≤15 min (interim slot) |
 
 - **`deploy/hosts/<fqdn>/Caddyfile`** — the daemon-fronting Caddyfile, its site name the host's FQDN.
   The NOC installs it only on a box whose daemon is deployed; until then that box's bootstrap `/up`
   responder stays. There is deliberately no "no daemon" Caddyfile here.
 - **`deploy/hosts/<fqdn>/vector.yaml`** — the scrubbed telemetry config (Part 5), its two sinks pointed at
-  that host's **own** Better Stack source. A User on one source never writes to another (@origin,
-  2026-09-21), so a box's telemetry never lands in another box's source.
+  its root domain's Better Stack source. A User on one source never writes to another (@origin,
+  2026-09-21), so a box's telemetry never lands in another root domain's source; boxes on one root
+  domain share that domain's source (`red` and `ai`), and a shared source makes their `vector.yaml`
+  byte-identical.
 - **`deploy/hosts/<fqdn>/basecradle-router-reboot.timer`** — the clean-reboot timer (Part 4), its
   `OnCalendar=` the host's slot in the fleet's reboot stagger registry (`basecradle/basecradle` →
   `provision-server` §2.3), which the capital assigns. Two router boxes rebooting in one window is what the

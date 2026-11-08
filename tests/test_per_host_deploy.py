@@ -33,18 +33,23 @@ REFERENCE = "ai.basecradle.com"
 
 #: Each host's Better Stack ingest host: the one value its vector.yaml differs by. A new
 #: host directory with no entry here fails the suite, so a copy of ai's files can never
-#: ship ai's sink to another box by omission.
+#: ship ai's sink to another box by omission. Hosts on one root domain share that domain's
+#: source (@origin: a red box is just another host in its root domain's source), so red's
+#: value is ai's on purpose and its vector.yaml is byte-identical to ai's.
 INGEST_HOSTS = {
     "ai.basecradle.com": "s2531770.eu-fsn-3.betterstackdata.com",
+    "red.basecradle.com": "s2531770.eu-fsn-3.betterstackdata.com",
     "ubuntu-1.landfill.click": "s2780873.eu-central-1a.betterstackdata.com",
 }
 
 #: Each host's reboot window: the one value its reboot timer differs by, and its slot in
 #: the fleet's reboot stagger registry (basecradle/basecradle → provision-server §2.3). The
 #: capital assigns the slot; this table only mirrors it, so a slot moves here when the
-#: registry moves. ai's is 5 AM Central, DST-tracking; ubuntu-1's is the interim 12:00 UTC.
+#: registry moves. ai's is 5 AM Central, DST-tracking; red's is 07:00 UTC; ubuntu-1's is the
+#: interim 12:00 UTC.
 REBOOT_WINDOWS = {
     "ai.basecradle.com": "*-*-* 05:00:00 America/Chicago",
+    "red.basecradle.com": "*-*-* 07:00:00 UTC",
     "ubuntu-1.landfill.click": "*-*-* 12:00:00 UTC",
 }
 
