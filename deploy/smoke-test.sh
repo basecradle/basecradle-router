@@ -19,6 +19,14 @@
 # proves the HMAC boundary in front of it. This is the test whose ABSENCE let the
 # box drift to pre-#52 code undetected (issue #54).
 #
+# Cases 1-3 run wherever the daemon enables the github route — read from
+# BASECRADLE_ROUTER_ENABLED_ROUTES exactly as the daemon reads it, absent meaning
+# `github` — and there the route's secret and trusted actors are required, as the daemon
+# requires them. A box whose daemon does not enable github (red.basecradle.com is the
+# first, #417) skips them, and asserts instead that an unsigned github delivery finds no
+# route on the running daemon (404), so the skip is proven live rather than inferred
+# from a file the daemon might read differently.
+#
 # Case 3 also drives a verified handoff through normalize, so it logs an INFO
 # `decision=woke` line. The test then asserts that line actually reached journald —
 # the LIVE half of #91, because the decision logging being merged + unit-tested is
@@ -144,6 +152,9 @@ smoke_host() {
 SMOKE_HOST="$(smoke_host "${1-}")" || exit 1
 SMOKE_BASE="https://${SMOKE_HOST}/webhooks"
 SMOKE_URL="${SMOKE_BASE}/github"
+# The daemon's own listener, bypassing Caddy: where a github-less box proves it serves no
+# github route (the unit binds uvicorn to 127.0.0.1:8000, as the probe's loopback case uses).
+GITHUB_LOCAL_URL="http://127.0.0.1:8000/webhooks/github"
 
 [[ -r "$ROUTER_ENV_FILE" ]] || die "cannot read $ROUTER_ENV_FILE (run with sudo / as root)"
 
@@ -164,14 +175,18 @@ SMOKE_URL="${SMOKE_BASE}/github"
 # a future edit ending on a false test would abort the whole gate under `set -e` with no
 # message — the same silent-status class as #172 itself. (The old code bought this with
 # a trailing `|| true`.)
+#
+# An optional second argument is printed instead when the key is ABSENT — never when it
+# is present with an empty value — for the one caller to which those differ (route_enabled).
 env_value() {
-	local key=$1 line
+	local key=$1 absent=${2-} line
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		if [[ "$line" == "${key}="* ]]; then
 			printf '%s' "${line#"${key}="}"
 			return 0
 		fi
 	done <"$ROUTER_ENV_FILE"
+	printf '%s' "$absent"
 	return 0
 }
 
@@ -225,16 +240,63 @@ bool_env() {
 	esac
 	return 0
 }
+
+# The daemon's own name for its enabled-routes variable, and the routes it enables when
+# the variable is absent (`config._ENABLED_ROUTES_VAR`, `config._DEFAULT_ENABLED_ROUTES`).
+# tests/test_smoke_test_assertions.py pins both to the daemon's, so a rename or a new
+# default cannot leave this gate reading a different box than the daemon boots on.
+ENABLED_ROUTES_VAR="BASECRADLE_ROUTER_ENABLED_ROUTES"
+DEFAULT_ENABLED_ROUTES="github"
+
+# Whether route $1 is enabled, printed as `true` or `false`, parsed the way the daemon's
+# `load_config` parses $ENABLED_ROUTES_VAR: absent, it is $DEFAULT_ENABLED_ROUTES; present,
+# a comma-separated list of trimmed names with the empties dropped. Present but naming no
+# route is a non-zero return, so the caller dies naming the variable: the daemon refuses
+# to boot on it, so any answer here would describe a box that does not exist.
+#
+# The default is env_value's absent-key value, so an absent variable and an empty one stay
+# apart — those two are the default and a refusal.
+route_enabled() {
+	local want=$1 raw listed=false found=false entry
+	local -a entries=()
+	raw="$(env_value "$ENABLED_ROUTES_VAR" "$DEFAULT_ENABLED_ROUTES")"
+	IFS=',' read -ra entries <<<"$raw" || true
+	for entry in ${entries[@]+"${entries[@]}"}; do
+		entry="${entry#"${entry%%[![:space:]]*}"}"
+		entry="${entry%"${entry##*[![:space:]]}"}"
+		if [[ -n "$entry" ]]; then
+			listed=true
+			if [[ "$entry" == "$want" ]]; then
+				found=true
+			fi
+		fi
+	done
+	if [[ "$listed" == "false" ]]; then
+		return 1
+	fi
+	printf '%s' "$found"
+	return 0
+}
 # <<< env_parsers <<<
 
-secret="$(env_value BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET)"
-actors="$(env_value BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS)"
-[[ -n "$secret" ]] || die "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET not set in $ROUTER_ENV_FILE"
-[[ -n "$actors" ]] || die "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS not set in $ROUTER_ENV_FILE"
+github_enabled="$(route_enabled github)" ||
+	die "$ENABLED_ROUTES_VAR is set in $ROUTER_ENV_FILE but lists no routes — the daemon refuses to boot on it"
 
-# First non-empty, trimmed trusted actor — a real fleet login the gate must admit.
-trusted_login="$(first_entry "$actors")"
-[[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
+# The github route's config is demanded exactly when the daemon demands it: an enabled
+# route must have its secret (`app._require_route_secrets`) and the github route its
+# trusted actors (`load_github_trusted_actors`). On a box whose daemon does not enable
+# github, neither variable is read at all — a leftover value there is the daemon's to
+# ignore, never this gate's to judge.
+if [[ "$github_enabled" == "true" ]]; then
+	secret="$(env_value BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET)"
+	actors="$(env_value BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS)"
+	[[ -n "$secret" ]] || die "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET not set in $ROUTER_ENV_FILE"
+	[[ -n "$actors" ]] || die "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS not set in $ROUTER_ENV_FILE"
+
+	# First non-empty, trimmed trusted actor — a real fleet login the gate must admit.
+	trusted_login="$(first_entry "$actors")"
+	[[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
+fi
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
@@ -256,11 +318,12 @@ payload() {
 
 sign() { openssl dgst -sha256 -hmac "$secret" "$1" | awk '{print $NF}'; }
 
-# POST a body file with a given signature header; echo the HTTP status code.
+# POST a body file with a given signature header, to $SMOKE_URL unless a third argument
+# names another URL; echo the HTTP status code.
 post() {
-	local body_file=$1 signature=$2
+	local body_file=$1 signature=$2 url=${3:-$SMOKE_URL}
 	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-		-X POST "$SMOKE_URL" \
+		-X POST "$url" \
 		-H 'Content-Type: application/json' \
 		-H 'X-GitHub-Event: issues' \
 		-H 'X-GitHub-Delivery: smoke-00000000-0000-0000-0000-000000000000' \
@@ -314,39 +377,61 @@ assert_journal_has() {
 }
 # <<< assert_journal_has <<<
 
-log "Smoke-testing the live daemon on ${SMOKE_HOST} at ${SMOKE_URL}"
-log "Trusted actor under test: ${trusted_login}"
+if [[ "$github_enabled" == "true" ]]; then
+	log "Smoke-testing the live daemon on ${SMOKE_HOST} at ${SMOKE_URL}"
+else
+	log "Smoke-testing the live daemon on ${SMOKE_HOST} at ${SMOKE_BASE}"
+fi
 
 # Journald boundary for the observability assertions below: capture it before any
 # POST so a decision line emitted by the cases that follow is guaranteed >= it.
 obs_since="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# Case 1 — bad signature. Body is otherwise valid; the signature is garbage.
-payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c1.json"
-check "bad signature rejected" 401 "$(post "$workdir/c1.json" "0000000000000000000000000000000000000000000000000000000000000000")"
+# --- github route (only where the daemon enables it) -------------------------
+#
+# Gated on the daemon's own enabled-routes list, never on the secret's absence: a github
+# box that lost its secret must die above, not quietly skip the trust-gate proof. A box
+# whose daemon does not enable github (red.basecradle.com, harness-only) skips cases 1-3,
+# and the skip is itself asserted live: an unsigned delivery must find no github route on
+# the running daemon (404). Were router.env read one way here and another way by systemd,
+# that answer is a 401, and the gate fails instead of skipping the proof it owes. It is
+# sent on LOOPBACK, straight to the daemon, because a 404 through Caddy could be Caddy's
+# own (it answers the probe path 404 itself) and would prove nothing about the daemon.
+if [[ "$github_enabled" == "true" ]]; then
+	log "Trusted actor under test: ${trusted_login}"
 
-# Case 2 — valid signature, UNTRUSTED sender. The #52 gate must reject (no wake).
-payload "$UNTRUSTED_LOGIN" "$UNREGISTERED_REPO" >"$workdir/c2.json"
-check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(sign "$workdir/c2.json")")"
+	# Case 1 — bad signature. Body is otherwise valid; the signature is garbage.
+	payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c1.json"
+	check "bad signature rejected" 401 "$(post "$workdir/c1.json" "0000000000000000000000000000000000000000000000000000000000000000")"
 
-# Case 3 — valid signature, TRUSTED sender, unregistered repo. Gate admits it;
-# resolve finds no agent, so it is accepted-and-logged with NO wake.
-payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
-check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
+	# Case 2 — valid signature, UNTRUSTED sender. The #52 gate must reject (no wake).
+	payload "$UNTRUSTED_LOGIN" "$UNREGISTERED_REPO" >"$workdir/c2.json"
+	check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(sign "$workdir/c2.json")")"
 
-# Case 3 also drove a verified handoff through normalize, which logs a WOKE
-# decision line (recipient = the unregistered repo) before resolve drops it. Assert
-# that INFO line actually reached journald — the live observability check (#91).
-assert_journal_has "github decision line emitted (#91)" \
-	"event=delivery_decision source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
+	# Case 3 — valid signature, TRUSTED sender, unregistered repo. Gate admits it;
+	# resolve finds no agent, so it is accepted-and-logged with NO wake.
+	payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
+	check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
 
-# The same line must carry the DELIVERY ID (#170) — the key that joins this route
-# decision to the core's stage lines and to the wake's own journal. Asserted against
-# the exact id this smoke run POSTed, so a passing regex proves the id is threaded
-# through from the header, not merely that some `delivery=` field exists.
-assert_journal_has "delivery id threaded onto the decision line (#170)" \
-	"event=delivery_decision source=github .*delivery=smoke-00000000-0000-0000-0000-000000000000" \
-	"$obs_since"
+	# Case 3 also drove a verified handoff through normalize, which logs a WOKE
+	# decision line (recipient = the unregistered repo) before resolve drops it. Assert
+	# that INFO line actually reached journald — the live observability check (#91).
+	assert_journal_has "github decision line emitted (#91)" \
+		"event=delivery_decision source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
+
+	# The same line must carry the DELIVERY ID (#170) — the key that joins this route
+	# decision to the core's stage lines and to the wake's own journal. Asserted against
+	# the exact id this smoke run POSTed, so a passing regex proves the id is threaded
+	# through from the header, not merely that some `delivery=` field exists.
+	assert_journal_has "delivery id threaded onto the decision line (#170)" \
+		"event=delivery_decision source=github .*delivery=smoke-00000000-0000-0000-0000-000000000000" \
+		"$obs_since"
+else
+	log "github route not enabled; skipping cases 1-3 ($ENABLED_ROUTES_VAR omits github in $ROUTER_ENV_FILE)"
+	payload "$UNTRUSTED_LOGIN" "$UNREGISTERED_REPO" >"$workdir/c0.json"
+	check "github route not served by the running daemon" 404 \
+		"$(post "$workdir/c0.json" "0000000000000000000000000000000000000000000000000000000000000000" "$GITHUB_LOCAL_URL")"
+fi
 
 # --- basecradle route (only once the capital has wired it) -----------------
 #
@@ -391,7 +476,8 @@ assert_journal_has "delivery id threaded onto the decision line (#170)" \
 # reaching resolve. Post-cutover that would mean signing as a registered agent with an
 # actionable event — which is precisely the delivery that wakes a real harness — so it
 # stays offline (tests/test_basecradle_route.py, tests/test_server_e2e.py). The github
-# route still covers accept -> normalize -> resolve-miss live, in case 3.
+# route still covers accept -> normalize -> resolve-miss live, in case 3, on every box
+# that enables it.
 BC_URL="${SMOKE_BASE}/basecradle"
 BC_SECRET_VAR="BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET"
 # The daemon derives a per-recipient variable as the route-wide name plus `_<SLUG>`
@@ -759,8 +845,10 @@ assert_foreign_argv_hidden() {
 assert_foreign_argv_hidden "other accounts' argv hidden inside the wake's namespace (#271)" basecradle-router
 
 echo
-if [[ $rc -eq 0 ]]; then
+if [[ $rc -eq 0 && "$github_enabled" == "true" ]]; then
 	green "LIVE SMOKE TEST PASSED — the running daemon enforces the #52 trust gate."
+elif [[ $rc -eq 0 ]]; then
+	green "LIVE SMOKE TEST PASSED — github is not enabled on this daemon, so the #52 trust gate was not under test."
 else
 	red "LIVE SMOKE TEST FAILED — the running daemon does NOT behave as expected. Do NOT consider this deploy done."
 fi
