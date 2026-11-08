@@ -287,6 +287,32 @@ def test_env_value_takes_the_last_of_a_duplicated_key_as_systemd_does(tmp_path: 
     assert out.strip() == "second"
 
 
+def test_the_parser_refuses_a_path_that_is_not_a_regular_file(tmp_path: Path) -> None:
+    """A directory passes the gate's `-r` check; read as an empty environment it would
+    make every key absent and route_enabled fall back to the default routes, describing
+    a box systemd would never have started (#419). The gate dies on the refusal."""
+    out = _run_parsers(
+        ENV_FILE,
+        'if systemd_env_file "${ROUTER_ENV_FILE%/*}"; then echo parsed; else echo refused; fi',
+        tmp_path,
+    )
+    assert out.strip() == "refused"
+
+
+def test_the_gate_parses_router_env_once_in_its_main_shell() -> None:
+    """Every `$(env_value …)` inherits that one parse; the per-call parse is only the
+    fallback for a caller that skipped it, and dies on the same refusal."""
+    text = SMOKE_TEST.read_text()
+    after_parsers = text.split("# <<< env_parsers <<<\n", 1)[1]
+    first_code = next(
+        line for line in after_parsers.splitlines() if line and not line.startswith("#")
+    )
+    assert first_code == (
+        'systemd_env_file "$ROUTER_ENV_FILE" || '
+        'die "cannot read $ROUTER_ENV_FILE as a regular file"'
+    )
+
+
 def test_env_value_ignores_a_key_that_is_only_a_substring(tmp_path: Path) -> None:
     """`FOO=` must not match `PREFIX_FOO=` — the old grep anchored with `^`."""
     key = "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET"

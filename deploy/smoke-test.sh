@@ -177,7 +177,9 @@ GITHUB_LOCAL_URL="http://127.0.0.1:8000/webhooks/github"
 # EnvironmentFile= (src/basic/env-file.c parse_env_file_internal, then load_env_file_push
 # and strv_env_clean): a direct transcription of that state machine, never `source`.
 # Sets the parallel arrays ENV_FILE_NAMES / ENV_FILE_VALUES to the assignments the unit
-# gets, each name once, at its first position, carrying its LAST value.
+# gets, each name once, at its first position, carrying its LAST value, and sets
+# ENV_FILE_PARSED. Returns non-zero when $1 cannot be opened as a regular file, which
+# systemd would refuse too: never an empty environment that reads as every key absent.
 #
 # What that means for a file, so the cases below need no C to read:
 #   - `#` and `;` start a comment; leading and trailing whitespace, around the key and
@@ -201,7 +203,9 @@ systemd_env_file() {
 	local LC_ALL=C
 	local content='' c state=pre_key key='' value='' key_ws=-1 value_ws=-1 i j n
 	local -a names=() values=()
-	IFS= read -r -d '' content <"$1" || true
+	[[ -f "$1" ]] || return 1
+	# `read` exits 1 at the end of a file with no NUL, so only the redirect's failure counts.
+	{ IFS= read -r -d '' content || true; } <"$1" || return 1
 	n=${#content} # once: bash recounts a string's length on every ${#...}
 	ENV_FILE_NAMES=()
 	ENV_FILE_VALUES=()
@@ -240,7 +244,8 @@ systemd_env_file() {
 		pre_value | value | value_escape | single_quote | double_quote | double_quote_escape)
 			# The states a push can end, at a newline or at the end of the file.
 			if [[ "$c" == eof ]] ||
-				{ [[ "$state" == pre_value || "$state" == value ]] && [[ "$c" == $'\n' || "$c" == $'\r' ]]; }; then
+				{ [[ "$state" == pre_value || "$state" == value ]] &&
+					[[ "$c" == $'\n' || "$c" == $'\r' ]]; }; then
 				if [[ "$state" == value ]] && ((value_ws >= 0)); then
 					value=${value:0:value_ws}
 				fi
@@ -329,6 +334,8 @@ systemd_env_file() {
 			;;
 		esac
 	done
+	# shellcheck disable=SC2034 # env_value reads it; this block is shared verbatim
+	ENV_FILE_PARSED=1
 	return 0
 }
 # <<< systemd_env_file <<<
@@ -336,19 +343,17 @@ systemd_env_file() {
 # env_value and first_entry end in an explicit `return 0`: a missing key must yield ""
 # and let the friendly die() below fire. Without it the function would return its last
 # command's status, and a future edit ending on a false test would abort the whole gate
-# under `set -e` with no message — the same silent-status class as #172 itself. (The old code bought this with
-# a trailing `|| true`.)
+# under `set -e` with no message — the same silent-status class as #172 itself.
 #
 # An optional second argument is printed instead when the key is ABSENT — never when it
 # is present with an empty value — for the one caller to which those differ (route_enabled).
 #
-# The file is parsed afresh on every call rather than once into a cache: env_value runs
-# in command substitutions, whose subshells could never fill a cache for the parent, and
-# a parse of a 5.7 KB file (production's router.env is 1.3 KB) takes a tenth of a second
-# on bash 3.2.
+# The gate parses router.env once, in the main shell, right after these definitions;
+# every `$(env_value …)` subshell inherits the arrays. A caller that skipped that parse
+# (the offline tests) gets it here, so env_value never answers from an unread file.
 env_value() {
 	local key=$1 absent=${2-} i
-	systemd_env_file "$ROUTER_ENV_FILE"
+	[[ -n "${ENV_FILE_PARSED-}" ]] || systemd_env_file "$ROUTER_ENV_FILE" || return 1
 	for ((i = 0; i < ${#ENV_FILE_NAMES[@]}; i++)); do
 		if [[ "${ENV_FILE_NAMES[i]}" == "$key" ]]; then
 			printf '%s' "${ENV_FILE_VALUES[i]}"
@@ -447,6 +452,8 @@ route_enabled() {
 	return 0
 }
 # <<< env_parsers <<<
+
+systemd_env_file "$ROUTER_ENV_FILE" || die "cannot read $ROUTER_ENV_FILE as a regular file"
 
 github_enabled="$(route_enabled github)" ||
 	die "$ENABLED_ROUTES_VAR is set in $ROUTER_ENV_FILE but lists no routes — the daemon refuses to boot on it"

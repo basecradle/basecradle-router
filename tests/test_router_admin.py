@@ -116,6 +116,61 @@ def test_an_export_prefixed_line_is_dropped_as_systemd_drops_it(tmp_path) -> Non
     assert result.stdout.strip() == "fake-plain-secret"
 
 
+@pytest.mark.parametrize("name", ["i", "env_pairs", "ENV_FILE_NAMES", "ENV_FILE_VALUES"])
+def test_a_key_named_like_the_wrappers_own_state_never_disturbs_the_export(
+    tmp_path, name: str
+) -> None:
+    # Every name router.env sets lands in the wrapper's own shell. A key that shared the
+    # export loop's counter or list once cut the loop short, so a later key never reached
+    # the CLI although systemd hands it to the daemon (#419).
+    result = _run_wrapper(
+        tmp_path, f"{name}=3\nBASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-later-secret\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fake-later-secret"
+
+
+@pytest.mark.parametrize("name", ["UID", "PPID", "SHELLOPTS", "APP_DIR", "EXIT_UNPROVABLE"])
+def test_a_key_bash_will_not_set_is_could_not_prove_never_proven_broken(
+    tmp_path, name: str
+) -> None:
+    # systemd sets these for the daemon without complaint, so the wrapper cannot hand the
+    # CLI the daemon's config: its own failure, which the exit contract says is 75. A
+    # bare `export` of a readonly name would have killed the shell with exit 1 instead,
+    # and a key named like the wrapper's own settings would have redirected its exec.
+    result = _run_wrapper(
+        tmp_path, f"{name}=1000\nBASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-secret\n"
+    )
+
+    assert result.returncode == EXIT_UNPROVABLE
+    assert f"cannot pass {name} " in result.stderr
+
+
+def test_an_env_file_that_is_not_a_regular_file_is_the_unprovable_exit_code(tmp_path) -> None:
+    # A directory passes `-r`, and a read of it used to parse as an empty environment:
+    # a CLI describing a config with every key absent. systemd would not start on it.
+    env_dir = tmp_path / "router.env.d"
+    env_dir.mkdir()
+    script = ROUTER_ADMIN.read_text().split("# Prefer the venv's python")[0]
+    harness = tmp_path / "harness.sh"
+    harness.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        ["bash", str(harness)],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "BASECRADLE_ROUTER_ENV_FILE": str(env_dir),
+            "BASECRADLE_ROUTER_USER": _current_user(),
+            "HOME": str(tmp_path),
+        },
+    )
+
+    assert result.returncode == EXIT_UNPROVABLE
+    assert "as a regular file" in result.stderr
+
+
 def test_an_unreadable_env_file_is_the_unprovable_exit_code(tmp_path) -> None:
     # 75 (EX_TEMPFAIL) = "we never got an answer" — the wrapper could not even reach the
     # config the probe needs. It must not land in a different bucket than the tool it
