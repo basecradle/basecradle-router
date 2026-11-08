@@ -874,7 +874,8 @@ now emits **claims** and records **evidence** for the NOC's claims-vs-evidence l
 (`basecradle-noc#406`). The router emits; the NOC judges — we never grade our own homework.
 
 **The admin CLI is the whole interface**, reached through one wrapper the deploy installs. It does
-the privilege drop and sources `router.env` itself, so the NOC schedules one stable path:
+the privilege drop and reads `router.env` itself, exactly as systemd hands it to the daemon (#419), so
+the NOC schedules one stable path:
 
 ```bash
 /opt/basecradle-router/app/deploy/bin/router-admin claims                 # Contract v1 manifests (JSON array)
@@ -1330,8 +1331,9 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
 - **The admin CLI wrapper** (`deploy/bin/router-admin`, #198) — the one stable path the NOC's converge
   and its Layer-3 synthetic-exercise scheduler call for the claims manifests and the freeze probe. It
   lives inside the `app/` tree (so the app-mirror keeps it in lockstep with `main`, no separate root
-  install), re-execs itself as `router` via `runuser` when invoked as root, sources `router.env` after
-  the drop, and prefers the venv's python over `uv run` so a scheduled probe never re-syncs the
+  install), re-execs itself as `router` via `runuser` when invoked as root, reads `router.env` after
+  the drop — parsed by a transcription of systemd's own `EnvironmentFile=` parser, never `source`d
+  (#109, #419) — and prefers the venv's python over `uv run` so a scheduled probe never re-syncs the
   daemon's dependencies underneath it. It is **read-only**: it never writes the evidence document,
   so a probe run under the wrong identity cannot take that file's ownership from the daemon. Details
   and exit codes: *Proving what the router claims* in Part 1.
@@ -1597,7 +1599,9 @@ unit that opts into a private mount namespace.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
-the trusted-actor list, and the registry path from `router.env` (`router:router 0600`), so it runs on the box
+the trusted-actor list, and the registry path from `router.env` (`router:router 0600`), read exactly as systemd's
+`EnvironmentFile=` hands them to the daemon (#419) — the parser `router-admin` carries, which
+`tests/test_router_env_parse.py` pins to systemd 255's own parse — so it runs on the box
 (the `deploy-router` op runs it as root post-restart; or `sudo deploy/smoke-test.sh <fqdn>` by hand); the
 basecradle cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`.
 
