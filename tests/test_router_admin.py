@@ -96,10 +96,24 @@ def test_comments_and_non_assignments_are_skipped(tmp_path) -> None:
     result = _run_wrapper(
         tmp_path,
         "# a comment\n\nnot an assignment\n"
-        "export BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-exported-secret\n",
+        "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-plain-secret\n",
     )
 
-    assert result.stdout.strip() == "fake-exported-secret"
+    assert result.stdout.strip() == "fake-plain-secret"
+
+
+def test_an_export_prefixed_line_is_dropped_as_systemd_drops_it(tmp_path) -> None:
+    # systemd reads `export KEY` as the name, which is not a valid one, so the daemon
+    # never sees the value (#419). The wrapper once honoured the prefix and so described
+    # a config the daemon did not have. The whole grammar is pinned to systemd's own in
+    # tests/test_router_env_parse.py.
+    result = _run_wrapper(
+        tmp_path,
+        "export BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-exported-secret\n"
+        "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET=fake-plain-secret\n",
+    )
+
+    assert result.stdout.strip() == "fake-plain-secret"
 
 
 def test_an_unreadable_env_file_is_the_unprovable_exit_code(tmp_path) -> None:

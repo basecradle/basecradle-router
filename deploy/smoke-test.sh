@@ -158,8 +158,11 @@ GITHUB_LOCAL_URL="http://127.0.0.1:8000/webhooks/github"
 
 [[ -r "$ROUTER_ENV_FILE" ]] || die "cannot read $ROUTER_ENV_FILE (run with sudo / as root)"
 
-# Pull only the values we need; do not source arbitrary lines into the shell. Value
-# of the first `KEY=` line, or empty if absent — so the friendly die() below fires.
+# Pull only the values we need; do not source arbitrary lines into the shell. A value is
+# read the way systemd's EnvironmentFile= hands it to the daemon (systemd_env_file,
+# #419), so the gate tests the environment the daemon actually booted on: the LAST line
+# of a duplicated key, quotes resolved as systemd resolves them, an `export `-prefixed
+# line not there at all. A missing key is empty, so the friendly die() below fires.
 #
 # Pure bash, deliberately: no pipeline, so no stage can short-circuit a producer into
 # a SIGPIPE that `pipefail` would promote to the whole pipeline's status. That class
@@ -169,23 +172,189 @@ GITHUB_LOCAL_URL="http://127.0.0.1:8000/webhooks/github"
 # The markers let tests/test_smoke_test_assertions.py run these EXACT shipped bodies
 # offline, so a regression here fails in CI rather than on the box.
 # >>> env_parsers >>>
+# >>> systemd_env_file >>>
+# Reads env file $1 exactly the way the daemon's unit receives it through systemd 255's
+# EnvironmentFile= (src/basic/env-file.c parse_env_file_internal, then load_env_file_push
+# and strv_env_clean): a direct transcription of that state machine, never `source`.
+# Sets the parallel arrays ENV_FILE_NAMES / ENV_FILE_VALUES to the assignments the unit
+# gets, each name once, at its first position, carrying its LAST value.
 #
-# Both end in an explicit `return 0`: a missing key must yield "" and let the friendly
-# die() below fire. Without it the function would return its last command's status, and
-# a future edit ending on a false test would abort the whole gate under `set -e` with no
-# message — the same silent-status class as #172 itself. (The old code bought this with
+# What that means for a file, so the cases below need no C to read:
+#   - `#` and `;` start a comment; leading and trailing whitespace, around the key and
+#     around an unquoted value, is dropped; interior whitespace is kept.
+#   - '...' is literal; "..." honours \" \\ \` \$ and keeps any other backslash; both
+#     may span lines. Quotes concatenate (`"a" 'b'c` is `abc`), but a quote AFTER the
+#     first unquoted character is a literal byte. Unquoted, `\x` is `x`, and a
+#     trailing `\` joins the next line.
+#   - No expansion: `$X` and `$(...)` are bytes, never evaluated.
+#   - A name that is not a valid shell variable name is dropped, so an `export `
+#     prefix (name `export KEY`) drops the line: systemd does not strip it.
+#
+# One gap, deliberately left: systemd refuses a file whose keys or values are not
+# valid UTF-8, and then the unit does not start at all. Bash cannot check that
+# cheaply, and a daemon that never starts fails every gate on its own.
+#
+# Byte semantics (LC_ALL=C) so `${content:i:1}` is one byte, as the C reads it. The
+# whole file is read, NUL excepted, so a quoted value's trailing newlines survive.
+# Pure bash, no pipeline: see tests/test_shell_pipeline_safety.py.
+systemd_env_file() {
+	local LC_ALL=C
+	local content='' c state=pre_key key='' value='' key_ws=-1 value_ws=-1 i j n
+	local -a names=() values=()
+	IFS= read -r -d '' content <"$1" || true
+	n=${#content} # once: bash recounts a string's length on every ${#...}
+	ENV_FILE_NAMES=()
+	ENV_FILE_VALUES=()
+	for ((i = 0; i <= n; i++)); do
+		if ((i == n)); then
+			c=eof
+		else
+			c=${content:i:1}
+		fi
+		case "$state" in
+		pre_key)
+			case "$c" in
+			eof) ;;
+			'#' | ';') state=comment ;;
+			' ' | $'\t' | $'\n' | $'\r') ;;
+			*)
+				state=key key_ws=-1 key=$c
+				;;
+			esac
+			;;
+		key)
+			case "$c" in
+			eof) ;;
+			$'\n' | $'\r') state=pre_key key='' ;;
+			'=') state=pre_value value_ws=-1 value='' ;;
+			' ' | $'\t')
+				((key_ws >= 0)) || key_ws=${#key}
+				key+=$c
+				;;
+			*)
+				key_ws=-1
+				key+=$c
+				;;
+			esac
+			;;
+		pre_value | value | value_escape | single_quote | double_quote | double_quote_escape)
+			# The states a push can end, at a newline or at the end of the file.
+			if [[ "$c" == eof ]] ||
+				{ [[ "$state" == pre_value || "$state" == value ]] && [[ "$c" == $'\n' || "$c" == $'\r' ]]; }; then
+				if [[ "$state" == value ]] && ((value_ws >= 0)); then
+					value=${value:0:value_ws}
+				fi
+				((key_ws < 0)) || key=${key:0:key_ws}
+				for ((j = 0; j < ${#names[@]}; j++)); do
+					[[ "${names[j]}" != "$key" ]] || break
+				done
+				names[j]=$key
+				values[j]=$value
+				state=pre_key key='' value=''
+				continue
+			fi
+			case "$state" in
+			pre_value)
+				case "$c" in
+				"'") state=single_quote ;;
+				'"') state=double_quote ;;
+				\\) state=value_escape ;;
+				' ' | $'\t') ;;
+				*)
+					state=value
+					value+=$c
+					;;
+				esac
+				;;
+			value)
+				case "$c" in
+				\\)
+					state=value_escape value_ws=-1
+					;;
+				' ' | $'\t')
+					((value_ws >= 0)) || value_ws=${#value}
+					value+=$c
+					;;
+				*)
+					value_ws=-1
+					value+=$c
+					;;
+				esac
+				;;
+			value_escape)
+				state=value
+				[[ "$c" == $'\n' || "$c" == $'\r' ]] || value+=$c
+				;;
+			single_quote)
+				if [[ "$c" == "'" ]]; then state=pre_value; else value+=$c; fi
+				;;
+			double_quote)
+				case "$c" in
+				'"') state=pre_value ;;
+				\\) state=double_quote_escape ;;
+				*) value+=$c ;;
+				esac
+				;;
+			double_quote_escape)
+				state=double_quote
+				case "$c" in
+				'"' | \\ | '`' | '$') value+=$c ;;
+				$'\n') ;;
+				*) value+="\\$c" ;;
+				esac
+				;;
+			esac
+			;;
+		comment)
+			case "$c" in
+			\\) state=comment_escape ;;
+			$'\n' | $'\r') state=pre_key ;;
+			esac
+			;;
+		comment_escape)
+			case "$c" in
+			$'\n' | $'\r') state=pre_key ;;
+			*) state=comment ;;
+			esac
+			;;
+		esac
+	done
+	# strv_env_clean: a name systemd would not set is dropped, never passed on.
+	for ((j = 0; j < ${#names[@]}; j++)); do
+		case "${names[j]}" in
+		'' | [0-9]* | *[!A-Za-z0-9_]*) ;;
+		*)
+			ENV_FILE_NAMES+=("${names[j]}")
+			ENV_FILE_VALUES+=("${values[j]}")
+			;;
+		esac
+	done
+	return 0
+}
+# <<< systemd_env_file <<<
+
+# env_value and first_entry end in an explicit `return 0`: a missing key must yield ""
+# and let the friendly die() below fire. Without it the function would return its last
+# command's status, and a future edit ending on a false test would abort the whole gate
+# under `set -e` with no message — the same silent-status class as #172 itself. (The old code bought this with
 # a trailing `|| true`.)
 #
 # An optional second argument is printed instead when the key is ABSENT — never when it
 # is present with an empty value — for the one caller to which those differ (route_enabled).
+#
+# The file is parsed afresh on every call rather than once into a cache: env_value runs
+# in command substitutions, whose subshells could never fill a cache for the parent, and
+# a parse of a 5.7 KB file (production's router.env is 1.3 KB) takes a tenth of a second
+# on bash 3.2.
 env_value() {
-	local key=$1 absent=${2-} line
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		if [[ "$line" == "${key}="* ]]; then
-			printf '%s' "${line#"${key}="}"
+	local key=$1 absent=${2-} i
+	systemd_env_file "$ROUTER_ENV_FILE"
+	for ((i = 0; i < ${#ENV_FILE_NAMES[@]}; i++)); do
+		if [[ "${ENV_FILE_NAMES[i]}" == "$key" ]]; then
+			printf '%s' "${ENV_FILE_VALUES[i]}"
 			return 0
 		fi
-	done <"$ROUTER_ENV_FILE"
+	done
 	printf '%s' "$absent"
 	return 0
 }

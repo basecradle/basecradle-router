@@ -75,28 +75,181 @@ fi
 # secret, and a credential is DATA, not code. `set -a; . "$ENV_FILE"` would evaluate
 # every value, so a secret containing `$` would be mangled (and abort under `set -u`)
 # and one containing `$( )` would EXECUTE as the daemon user. systemd's
-# EnvironmentFile= parses literally, so this is also what keeps the CLI's view of the
-# config byte-identical to the running daemon's.
+# EnvironmentFile= parses literally, and systemd_env_file below is a transcription of
+# that parser (#419) — the same block deploy/smoke-test.sh carries, pinned identical by
+# tests/test_router_admin.py — so the CLI's view of the config is byte-identical to the
+# running daemon's: the last line of a duplicated key wins, and a line systemd drops (an
+# `export ` prefix among them) is dropped here too.
 if [ ! -r "$ENV_FILE" ]; then
     echo "router-admin: cannot read $ENV_FILE as $(id -un)" >&2
     exit "$EXIT_UNPROVABLE"
 fi
-while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in '' | '#'*) continue ;; esac
-    line=${line#export }                       # tolerate an `export ` prefix
-    case "$line" in *=*) ;; *) continue ;; esac  # no `=` -> not an assignment
-    key=${line%%=*}                            # everything before the FIRST =
-    value=${line#*=}                           # the rest, verbatim
-    case "$key" in '' | *[!A-Za-z0-9_]*) continue ;; esac
-    # Strip ONE layer of matching surrounding quotes, as systemd does.
-    case "$value" in
-        \"*\") value=${value#\"}; value=${value%\"} ;;
-        \'*\') value=${value#\'}; value=${value%\'} ;;
-    esac
-    # `export NAME=VALUE` assigns the literal bytes — never re-parsed for expansion
-    # or command substitution.
-    export "$key=$value"
-done <"$ENV_FILE"
+# >>> systemd_env_file >>>
+# Reads env file $1 exactly the way the daemon's unit receives it through systemd 255's
+# EnvironmentFile= (src/basic/env-file.c parse_env_file_internal, then load_env_file_push
+# and strv_env_clean): a direct transcription of that state machine, never `source`.
+# Sets the parallel arrays ENV_FILE_NAMES / ENV_FILE_VALUES to the assignments the unit
+# gets, each name once, at its first position, carrying its LAST value.
+#
+# What that means for a file, so the cases below need no C to read:
+#   - `#` and `;` start a comment; leading and trailing whitespace, around the key and
+#     around an unquoted value, is dropped; interior whitespace is kept.
+#   - '...' is literal; "..." honours \" \\ \` \$ and keeps any other backslash; both
+#     may span lines. Quotes concatenate (`"a" 'b'c` is `abc`), but a quote AFTER the
+#     first unquoted character is a literal byte. Unquoted, `\x` is `x`, and a
+#     trailing `\` joins the next line.
+#   - No expansion: `$X` and `$(...)` are bytes, never evaluated.
+#   - A name that is not a valid shell variable name is dropped, so an `export `
+#     prefix (name `export KEY`) drops the line: systemd does not strip it.
+#
+# One gap, deliberately left: systemd refuses a file whose keys or values are not
+# valid UTF-8, and then the unit does not start at all. Bash cannot check that
+# cheaply, and a daemon that never starts fails every gate on its own.
+#
+# Byte semantics (LC_ALL=C) so `${content:i:1}` is one byte, as the C reads it. The
+# whole file is read, NUL excepted, so a quoted value's trailing newlines survive.
+# Pure bash, no pipeline: see tests/test_shell_pipeline_safety.py.
+systemd_env_file() {
+    local LC_ALL=C
+    local content='' c state=pre_key key='' value='' key_ws=-1 value_ws=-1 i j n
+    local -a names=() values=()
+    IFS= read -r -d '' content <"$1" || true
+    n=${#content} # once: bash recounts a string's length on every ${#...}
+    ENV_FILE_NAMES=()
+    ENV_FILE_VALUES=()
+    for ((i = 0; i <= n; i++)); do
+        if ((i == n)); then
+            c=eof
+        else
+            c=${content:i:1}
+        fi
+        case "$state" in
+        pre_key)
+            case "$c" in
+            eof) ;;
+            '#' | ';') state=comment ;;
+            ' ' | $'\t' | $'\n' | $'\r') ;;
+            *)
+                state=key key_ws=-1 key=$c
+                ;;
+            esac
+            ;;
+        key)
+            case "$c" in
+            eof) ;;
+            $'\n' | $'\r') state=pre_key key='' ;;
+            '=') state=pre_value value_ws=-1 value='' ;;
+            ' ' | $'\t')
+                ((key_ws >= 0)) || key_ws=${#key}
+                key+=$c
+                ;;
+            *)
+                key_ws=-1
+                key+=$c
+                ;;
+            esac
+            ;;
+        pre_value | value | value_escape | single_quote | double_quote | double_quote_escape)
+            # The states a push can end, at a newline or at the end of the file.
+            if [[ "$c" == eof ]] ||
+                { [[ "$state" == pre_value || "$state" == value ]] && [[ "$c" == $'\n' || "$c" == $'\r' ]]; }; then
+                if [[ "$state" == value ]] && ((value_ws >= 0)); then
+                    value=${value:0:value_ws}
+                fi
+                ((key_ws < 0)) || key=${key:0:key_ws}
+                for ((j = 0; j < ${#names[@]}; j++)); do
+                    [[ "${names[j]}" != "$key" ]] || break
+                done
+                names[j]=$key
+                values[j]=$value
+                state=pre_key key='' value=''
+                continue
+            fi
+            case "$state" in
+            pre_value)
+                case "$c" in
+                "'") state=single_quote ;;
+                '"') state=double_quote ;;
+                \\) state=value_escape ;;
+                ' ' | $'\t') ;;
+                *)
+                    state=value
+                    value+=$c
+                    ;;
+                esac
+                ;;
+            value)
+                case "$c" in
+                \\)
+                    state=value_escape value_ws=-1
+                    ;;
+                ' ' | $'\t')
+                    ((value_ws >= 0)) || value_ws=${#value}
+                    value+=$c
+                    ;;
+                *)
+                    value_ws=-1
+                    value+=$c
+                    ;;
+                esac
+                ;;
+            value_escape)
+                state=value
+                [[ "$c" == $'\n' || "$c" == $'\r' ]] || value+=$c
+                ;;
+            single_quote)
+                if [[ "$c" == "'" ]]; then state=pre_value; else value+=$c; fi
+                ;;
+            double_quote)
+                case "$c" in
+                '"') state=pre_value ;;
+                \\) state=double_quote_escape ;;
+                *) value+=$c ;;
+                esac
+                ;;
+            double_quote_escape)
+                state=double_quote
+                case "$c" in
+                '"' | \\ | '`' | '$') value+=$c ;;
+                $'\n') ;;
+                *) value+="\\$c" ;;
+                esac
+                ;;
+            esac
+            ;;
+        comment)
+            case "$c" in
+            \\) state=comment_escape ;;
+            $'\n' | $'\r') state=pre_key ;;
+            esac
+            ;;
+        comment_escape)
+            case "$c" in
+            $'\n' | $'\r') state=pre_key ;;
+            *) state=comment ;;
+            esac
+            ;;
+        esac
+    done
+    # strv_env_clean: a name systemd would not set is dropped, never passed on.
+    for ((j = 0; j < ${#names[@]}; j++)); do
+        case "${names[j]}" in
+        '' | [0-9]* | *[!A-Za-z0-9_]*) ;;
+        *)
+            ENV_FILE_NAMES+=("${names[j]}")
+            ENV_FILE_VALUES+=("${values[j]}")
+            ;;
+        esac
+    done
+    return 0
+}
+# <<< systemd_env_file <<<
+systemd_env_file "$ENV_FILE"
+# `export NAME=VALUE` assigns the literal bytes — never re-parsed for expansion or
+# command substitution.
+for ((i = 0; i < ${#ENV_FILE_NAMES[@]}; i++)); do
+    export "${ENV_FILE_NAMES[i]}=${ENV_FILE_VALUES[i]}"
+done
 
 # Prefer the venv's python directly: it is faster than `uv run` and, more to the
 # point, side-effect-free — a probe the NOC runs on a schedule must never re-sync
