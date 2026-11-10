@@ -44,8 +44,8 @@
 #     a metadata FIELD, which no message-level redaction reaches (basecradle-noc#443);
 #   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`
 #     user tokens, `bc_isk_` integration signing keys, provider API keys — `sk-…`, `xai-…`,
-#     `AIza…` and kin — and Steel's `ste-…` keys plus any `apiKey=` query value) from the
-#     message as defense in depth.
+#     `AIza…` and kin — Steel's `ste-…` keys plus any `apiKey=` query value, and refuseless
+#     `abl_…`, Perplexity `pplx-…` and ntfy `tk_…`) from the message as defense in depth.
 #
 # The `_CMDLINE` deletion is UNCONDITIONAL — the guard is on the field, never on an allow-list of
 # identifiers known to be dangerous. The `sudo` drop above was written as if `sudo` were *the* argv
@@ -153,13 +153,14 @@ transforms:
       #
       # TWO PASSES, IN THIS ORDER, AND ONE WORD RULE (basecradle-router#398). Both are the harness's:
       # the one definition is basecradle-harness docs/telemetry.md → Credential Scrubbing
-      # (`_observability.scrub` and `_is_word`, harness 0.177.0). This copy follows it and never
+      # (`_observability.scrub` and `_is_word`, harness 0.185.0). This copy follows it and never
       # varies it. What differs here is only the box's rule set (a subset of the harness's shapes:
       # the harness is the superset by design), its minimums and its labels.
       #   1. The rules anchored on a literal of their own: a heartbeat URL, an `api_key=` assignment
       #      or query value, a bearer header. Each is redacted wherever it matches.
       #   2. The rules anchored on a vendor prefix: `github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`,
-      #      `sk-`, `xai-`, `AIza`, `hf_`, `r8_`, `ste-`. A match the word rule reads as a word is kept.
+      #      `sk-`, `xai-`, `AIza`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`, `tk_`. A match the word rule
+      #      reads as a word is kept.
       # Literal rules first, because a prefix rule's run is made of the characters their literals
       # are. When the `sk-` rule ran first, `task-runner-pipeline-api-key=abc123secret` lost
       # `api-key` into the run `sk-runner-pipeline-api-key`, the secret after `=` matched nothing,
@@ -231,6 +232,13 @@ transforms:
       #     one; this is the belt for the braces. `sk-` covers the whole family that shares the
       #     prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one rule.
       #   * `ste-`: Steel keys, wherever they land, the `steel-api-key` header included.
+      #   * `abl_`, `pplx-`, `tk_`: refuseless and Perplexity API keys and ntfy access tokens, the
+      #     harness's three newest shapes (harness 0.185.0, basecradle-router#421), all of them
+      #     keys a harness agent holds. As of harness 0.185.0, on a box this pass is the only layer
+      #     that redacts one inside a prose line (basecradle-harness#857). The `tk_` run also takes
+      #     `_` and `-`, which ntfy's own validator admits in a token's 29 characters, so it also
+      #     takes a `-word` glued after a token, and a `tk_` identifier not glued to a letter or digit
+      #     (`self.tk_root_window_initialized`) is redacted, as the harness's is.
       #
       # THE WORD RULE (basecradle-harness#794). A vendor prefix inside a word is a word, not a
       # credential: `risk-assessment-pending-review` holds `sk-` and is no key. A match is kept only
@@ -240,7 +248,11 @@ transforms:
       # (`Bearer%20sk-…`, `ESC[33msk-…`, `密钥sk-…`), and a random key of a vendor's length holds a
       # digit or a capital with overwhelming certainty. The stated residuals, as the harness's: a
       # glued word whose run holds a digit or a capital is redacted (the scrub errs toward
-      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept.
+      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept. One more
+      # residual is the harness's open defect, basecradle-harness#858, carried here unchanged until
+      # the harness ships its fix: an alphanumeric run glued straight onto a second key takes the
+      # letters of that key's prefix and stops at its `_` or `-`, so the rest of the second key
+      # matches no rule and ships (`hf_Ab3…Mntk_q8m…` ships `_q8m…`).
       #
       # VRL's regex has no lookbehind and the closure is not given the match's offset, so the
       # pattern captures the one character before the key as `before` (empty at the start of the
@@ -265,9 +277,12 @@ transforms:
             | hf_(?P<hf>[A-Za-z0-9]{20,})
             | r8_(?P<r8>[A-Za-z0-9]{20,})
             | ste-(?P<ste>[A-Za-z0-9]{20,})
+            | abl_(?P<abl>[A-Za-z0-9]{20,})
+            | pplx-(?P<pplx>[A-Za-z0-9]{20,})
+            | tk_(?P<tk>[A-Za-z0-9_-]{20,})
           )') -> |key| {
           before = string(key.before) ?? ""
-          run = string(key.pat) ?? string(key.gh) ?? string(key.bc) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? ""
+          run = string(key.pat) ?? string(key.gh) ?? string(key.bc) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? string(key.abl) ?? string(key.pplx) ?? string(key.tk) ?? ""
           if run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
               key.string
           } else if key.pat != null || key.gh != null {
