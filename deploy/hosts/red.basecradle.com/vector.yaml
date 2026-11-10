@@ -44,8 +44,9 @@
 #     a metadata FIELD, which no message-level redaction reaches (basecradle-noc#443);
 #   * REDACTS secret-shaped patterns (GitHub tokens, `Bearer` creds, `/heartbeat/` URLs, `bc_uat_`
 #     user tokens, `bc_isk_` integration signing keys, provider API keys — `sk-…`, `xai-…`,
-#     `AIza…` and kin — Steel's `ste-…` keys plus any `apiKey=` query value, and refuseless
-#     `abl_…`, Perplexity `pplx-…` and ntfy `tk_…`) from the message as defense in depth.
+#     `AIza…` and kin — Steel's `ste-…` keys plus any `apiKey=` query value, refuseless
+#     `abl_…`, Perplexity `pplx-…` and ntfy `tk_…`, and any `x-api-key` header value) from the
+#     message as defense in depth.
 #
 # The `_CMDLINE` deletion is UNCONDITIONAL — the guard is on the field, never on an allow-list of
 # identifiers known to be dangerous. The `sudo` drop above was written as if `sudo` were *the* argv
@@ -153,11 +154,12 @@ transforms:
       #
       # TWO PASSES, IN THIS ORDER, AND ONE WORD RULE (basecradle-router#398). Both are the harness's:
       # the one definition is basecradle-harness docs/telemetry.md → Credential Scrubbing
-      # (`_observability.scrub` and `_is_word`, harness 0.185.0). This copy follows it and never
+      # (`_observability.scrub` and `_is_word`, harness 0.186.0). This copy follows it and never
       # varies it. What differs here is only the box's rule set (a subset of the harness's shapes:
       # the harness is the superset by design), its minimums and its labels.
-      #   1. The rules anchored on a literal of their own: a heartbeat URL, an `api_key=` assignment
-      #      or query value, a bearer header. Each is redacted wherever it matches.
+      #   1. The rules anchored on a literal of their own: a heartbeat URL, an `x-api-key` header
+      #      value, an `api_key=` assignment or query value, a bearer header. Each is redacted
+      #      wherever it matches.
       #   2. The rules anchored on a vendor prefix: `github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`,
       #      `sk-`, `xai-`, `AIza`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`, `tk_`. A match the word rule
       #      reads as a word is kept.
@@ -184,17 +186,55 @@ transforms:
       #     letter or digit is put back, so a secret whose last letters merely spell it
       #     (`…/heartbeat/K9xbearer`) is redacted whole. The word is put back as captured, so what
       #     ships is only ever the word the pattern matched.
+      #     A kv value's closing quote ending the run is put back too (basecradle-router#423, the
+      #     harness's `_CLOSING_QUOTE`, harness 0.186.0): taken with the URL, it left
+      #     `url="[REDACTED_HEARTBEAT_URL] next=1`, a line with an unclosed value that no kv parser
+      #     reads. A closing quote is a `"` followed by the next `key=` (coloured or not), by the line's
+      #     end, or by the colour reset closing a coloured pair, so the pattern captures what follows
+      #     the run as `after` and the closure puts back the quote, the reset and `after` exactly as
+      #     matched; `after` is spaces, a colour code and a field name, never part of the secret, and
+      #     every later rule still reads it. The URL itself is always redacted, even when nothing
+      #     follows `/heartbeat/` but the quote: the harness keeps a quoted value ending in
+      #     `/heartbeat/`, since it holds no secret, but this rule's match from the scheme on is what
+      #     keeps userinfo before the host from ever shipping, and that holds only if the match is
+      #     never handed back. So the guard only ever restores a quote, and nothing redacted before is
+      #     redacted less.
+      #   * The `x-api-key` header rule before the assignment rule (basecradle-router#423, the
+      #     harness's first literal rule, basecradle-harness#861). A credential sent as an `x-api-key`
+      #     header value is redacted by its name, never its shape, because the vendor that sends it
+      #     there (Wiro) states no shape for its key. The name is any case, with `_` for either
+      #     hyphen, followed by `:` or `=>` (a header dump, a Ruby hash), or by a quote, escaped or
+      #     not, and then `:`, `=`, `=>` or `,` (`"x-api-key": "…"`, JSON inside a JSON string, a
+      #     `('x-api-key', '…')` header tuple). The value may open with a quote, an escaped quote, a
+      #     bytes literal's `b'`, or bearer scheme words, and runs to the next space, quote, backslash
+      #     or `&`; a bearer header glued to it (`x-api-key: KBearer eyJ…`) is taken with its token.
+      #     The unquoted `X-API-Key=…` is left to the assignment rule, which takes it with the wider
+      #     value it allows. It runs before that rule so the header's name goes with its value, and
+      #     its label carries a `:`, never a `=`, so the assignment rule never reads it again. A
+      #     single quote is written `\x27`, because a raw string cannot hold one.
       #   * The assignment rule before the bearer rule. The bearer rule's token class takes an
       #     assignment's name and its `=`, so with bearer first, `Bearer api_key=SECRET` lost
       #     `api_key=` into a bearer value and the secret shipped. The assignment rule takes every
       #     bearer scheme in its value, as the harness's does, so `AUTH_API_KEY=Bearer eyJ…` is
-      #     redacted whole rather than stopping at the space after `Bearer`.
+      #     redacted whole rather than stopping at the space after `Bearer`. Its value may open with
+      #     a `"`, and a bearer header glued to the value goes with it, as the harness's does
+      #     (basecradle-router#423, basecradle-harness#866): `API_KEY="…"` matched nothing, because
+      #     the value could not start at the quote, and `api_key=KBearer eyJ…` ended the value at the
+      #     scheme word and left its token to no rule. The value is two alternatives, the first a
+      #     value ending in a glued `bearer` and its token. On the box this one rule is also the
+      #     query-value rule (`?apiKey=…`); the harness's wider query rule for `token=` and `key=` is
+      #     a shape the box does not carry.
       #   * The bearer rule takes EVERY scheme word before the token, as the harness's does: a token
       #     stored with its scheme and sent with another reads `Bearer Bearer eyJ…`, and one scheme
       #     word taken alone is the value, leaving the token.
-      msg = replace_with(msg, r'(?:https?://\S*)?/heartbeat/\S+') -> |url| {
-          kept = parse_regex(url.string, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}
-          "[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "")
+      msg = replace_with(msg, r'(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?') -> |hb| {
+          url = string(hb.url) ?? ""
+          closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}
+          quote = string(closing.quote) ?? ""
+          if quote == "\"" && hb.after == null { quote = "" }
+          if quote != "" { url = string(closing.body) ?? url }
+          kept = parse_regex(url, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}
+          "[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "") + quote + (string(hb.after) ?? "")
       }
       # Any `apiKey=` value, whatever it looks like. A Steel (steel.dev) launcher, the browser backend
       # behind Playwright MCP (basecradle/basecradle#582, basecradle-noc#797), puts its key in the
@@ -208,7 +248,8 @@ transforms:
       # what they captured: a capture-group back-reference needs a dollar sign, which Vector
       # interpolates (see the header), and no pattern carries a single quote, which would close the
       # raw string.
-      msg = replace(msg, r'(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+', "apiKey=[REDACTED]")
+      msg = replace(msg, r'(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?(?:(?i:bearer)\s+)*(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)', "x-api-key: [REDACTED]")
+      msg = replace(msg, r'(?i)api[-_]?key="?(?:bearer\s+)*(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+)', "apiKey=[REDACTED]")
       msg = replace(msg, r'(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
       # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is
       # never read again by another rule, where a pass per rule would let `hf_…` inside a kept word be
@@ -234,8 +275,9 @@ transforms:
       #   * `ste-`: Steel keys, wherever they land, the `steel-api-key` header included.
       #   * `abl_`, `pplx-`, `tk_`: refuseless and Perplexity API keys and ntfy access tokens, the
       #     harness's three newest shapes (harness 0.185.0, basecradle-router#421), all of them
-      #     keys a harness agent holds. As of harness 0.185.0, on a box this pass is the only layer
-      #     that redacts one inside a prose line (basecradle-harness#857). The `tk_` run also takes
+      #     keys a harness agent holds. Before harness 0.186.0 scrubbed every rendered record at
+      #     its source (basecradle-harness#857), this pass was the only layer that redacted one
+      #     inside a prose line, and it still is for any program that does not. The `tk_` run also takes
       #     `_` and `-`, which ntfy's own validator admits in a token's 29 characters, so it also
       #     takes a `-word` glued after a token, and a `tk_` identifier not glued to a letter or digit
       #     (`self.tk_root_window_initialized`) is redacted, as the harness's is.
@@ -248,11 +290,34 @@ transforms:
       # (`Bearer%20sk-…`, `ESC[33msk-…`, `密钥sk-…`), and a random key of a vendor's length holds a
       # digit or a capital with overwhelming certainty. The stated residuals, as the harness's: a
       # glued word whose run holds a digit or a capital is redacted (the scrub errs toward
-      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept. One more
-      # residual is the harness's open defect, basecradle-harness#858, carried here unchanged until
-      # the harness ships its fix: an alphanumeric run glued straight onto a second key takes the
-      # letters of that key's prefix and stops at its `_` or `-`, so the rest of the second key
-      # matches no rule and ships (`hf_Ab3…Mntk_q8m…` ships `_q8m…`).
+      # redaction), and a glued key made only of lowercase letters, `_` and `-` is kept.
+      #
+      # A NARROW RUN NEVER SWALLOWS THE HEAD OF A KEY GLUED AFTER IT (basecradle-router#423, the
+      # harness's `_rule` and `_GLUED_KEY`, basecradle-harness#858). A run whose class lacks `_` or
+      # `-` once took the letters of a following key's prefix and stopped at its `_` or `-`, so the
+      # rest of the second key matched no rule and shipped (`hf_Ab3…Mntk_q8m…` shipped `_q8m…`),
+      # and a first match kept as a word kept the second key with it. The narrow rules are
+      # `github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `xai-` (narrow here, where the harness's run
+      # also takes `_` and `-`), `hf_`, `r8_`, `ste-`, `abl_` and `pplx-`. Each is now two
+      # alternatives, the first tried first: its run, as short as it can be, then a WHOLE KEY BY ITS
+      # OWN RULE at that rule's own minimum (every rule of this pass, at this box's minimums, so
+      # `sk-` at 16), then everything after it in the widest class, so a third key glued on goes
+      # with the second; otherwise the run as it always was. That is a negative lookahead written
+      # without one, because VRL's regex has none. Each rule captures its glued alternative under
+      # its own name (`hf_glued`, …), because the regex allows no name twice, and a match whose
+      # glued capture is set is NEVER kept as a word: its tail can hold a later key that was no
+      # part of any word (`xhf_…ghp_…-sk-…`, whose `sk-` follows a `-`), and read as one
+      # all-lowercase run it would be kept. No word holds a whole key by a rule's own shape. The
+      # word test refuses it twice over: a glued capture leaves every plain run capture unset, so
+      # `run` is empty, and the test also asks `glued == ""` outright, as the harness's
+      # `_is_word` does, so a run chain that one day reads a glued capture cannot keep one. A
+      # glued match takes the first key's label. The cost is the harness's over-redaction in the
+      # rare glued case: a `-word` glued after the second key goes with it. A wide run already
+      # takes a glued key whole. The `bc_uat_` and `bc_isk_` glued alternatives never match here: a
+      # glued key makes the run eight or more characters of the wide class, and the wide `bc_???_`
+      # rule before them takes it first, as it does in the harness. They are kept so this pass
+      # stays the harness's, rule for rule. The ten copies of the whole-key alternation are one
+      # string, pinned identical by tests/test_log_surface.py.
       #
       # VRL's regex has no lookbehind and the closure is not given the match's offset, so the
       # pattern captures the one character before the key as `before` (empty at the start of the
@@ -266,30 +331,51 @@ transforms:
       msg = replace_with(msg, r'(?x)
           (?P<before>^|[\s\S])
           (?:
-              github_pat_(?P<pat>[A-Za-z0-9_]{20,})
-            | gh[a-z]_(?P<gh>[A-Za-z0-9]{20,})
+              github_pat_(?:(?P<pat_glued>[A-Za-z0-9_]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<pat>[A-Za-z0-9_]{20,}))
+            | gh[a-z]_(?:(?P<gh_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<gh>[A-Za-z0-9]{20,}))
             | bc_(?P<bc_kind>[a-z]{3})_(?P<bc>[A-Za-z0-9_-]{8,})
-            | bc_uat_(?P<bc_uat>[A-Za-z0-9]+)
-            | bc_isk_(?P<bc_isk>[A-Za-z0-9]+)
+            | bc_uat_(?:(?P<bc_uat_glued>[A-Za-z0-9]+?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<bc_uat>[A-Za-z0-9]+))
+            | bc_isk_(?:(?P<bc_isk_glued>[A-Za-z0-9]+?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<bc_isk>[A-Za-z0-9]+))
             | sk-(?P<sk>[A-Za-z0-9_-]{16,})
-            | xai-(?P<xai>[A-Za-z0-9]{16,})
+            | xai-(?:(?P<xai_glued>[A-Za-z0-9]{16,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<xai>[A-Za-z0-9]{16,}))
             | AIza(?P<aiza>[A-Za-z0-9_-]{20,})
-            | hf_(?P<hf>[A-Za-z0-9]{20,})
-            | r8_(?P<r8>[A-Za-z0-9]{20,})
-            | ste-(?P<ste>[A-Za-z0-9]{20,})
-            | abl_(?P<abl>[A-Za-z0-9]{20,})
-            | pplx-(?P<pplx>[A-Za-z0-9]{20,})
+            | hf_(?:(?P<hf_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<hf>[A-Za-z0-9]{20,}))
+            | r8_(?:(?P<r8_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<r8>[A-Za-z0-9]{20,}))
+            | ste-(?:(?P<ste_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<ste>[A-Za-z0-9]{20,}))
+            | abl_(?:(?P<abl_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<abl>[A-Za-z0-9]{20,}))
+            | pplx-(?:(?P<pplx_glued>[A-Za-z0-9]{20,}?
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  [A-Za-z0-9_-]*)|(?P<pplx>[A-Za-z0-9]{20,}))
             | tk_(?P<tk>[A-Za-z0-9_-]{20,})
           )') -> |key| {
           before = string(key.before) ?? ""
           run = string(key.pat) ?? string(key.gh) ?? string(key.bc) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? string(key.abl) ?? string(key.pplx) ?? string(key.tk) ?? ""
-          if run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
+          glued = string(key.pat_glued) ?? string(key.gh_glued) ?? string(key.bc_uat_glued) ?? string(key.bc_isk_glued) ?? string(key.xai_glued) ?? string(key.hf_glued) ?? string(key.r8_glued) ?? string(key.ste_glued) ?? string(key.abl_glued) ?? string(key.pplx_glued) ?? ""
+          if glued == "" && run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
               key.string
-          } else if key.pat != null || key.gh != null {
+          } else if key.pat != null || key.pat_glued != null || key.gh != null || key.gh_glued != null {
               before + "[REDACTED_GH_TOKEN]"
-          } else if key.bc_isk != null || key.bc_kind == "isk" {
+          } else if key.bc_isk != null || key.bc_isk_glued != null || key.bc_kind == "isk" {
               before + "[REDACTED_BC_INTEGRATION_SECRET]"
-          } else if key.bc_uat != null || key.bc != null {
+          } else if key.bc_uat != null || key.bc_uat_glued != null || key.bc != null {
               before + "[REDACTED_BC_TOKEN]"
           } else {
               before + "[REDACTED_API_KEY]"

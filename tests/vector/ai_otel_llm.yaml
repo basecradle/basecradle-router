@@ -563,8 +563,9 @@ tests:
           - type: "vrl"
             source: |
               # One record, one line; the double quotes inside are single quotes, so the only
-              # outcome= outside a quoted value is the line's own.
-              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"upstream said: [31m 'outcome=ok' x-api-key: [REDACTED_API_KEY]\"")
+              # outcome= outside a quoted value is the line's own. The key is an `x-api-key` header
+              # value, so the header rule takes it under its own label (basecradle-router#423).
+              assert_eq!(.message, "[basecradle-wake-nova] WARNING llm provider=anthropic purpose=main model=claude-opus-5-5 outcome=failed reason=server_error detail=\"upstream said: [31m 'outcome=ok' x-api-key: [REDACTED]\"")
 
   # The router's own `log_fields` renders this same input to these same bytes:
   # tests/test_logfmt.py reads this case back out of this file and asserts it (#396).
