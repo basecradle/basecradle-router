@@ -5,7 +5,7 @@
 #
 # The rule under test is the harness's: two passes, literal rules then prefix rules, and a prefixed
 # match kept only when `_is_word` reads it as a word (basecradle-harness docs/telemetry.md →
-# Credential Scrubbing, harness 0.185.0). The samples are the harness's own (its
+# Credential Scrubbing, harness 0.186.0). The samples are the harness's own (its
 # tests/test_log_value_cut.py), lengthened to the box's minimums where the harness's are shorter:
 # the box's `sk-` run needs 16 characters where the harness's needs 8, so `task-specification`, whose
 # run is 13, never met the box's rule at all, and the long forms below are the ones that did.
@@ -682,3 +682,200 @@ tests:
               # Every key and every neighbour was sent: 17 keys after 24 neighbours.
               assert_eq!(.count, 408)
               assert_eq!(.message, .expected)
+
+  # --- harness 0.186.0: a narrow run never swallows a key glued after it (basecradle-router#423) ---
+
+  - name: "a narrow run glued straight onto a second key is redacted with it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The harness's reproducers (basecradle-harness#858). Before the fix the first run took the
+          # letters of the second key's prefix and stopped at its `_` or `-`, and the rest shipped:
+          # `_q8m…`, `_Zx8…`, `-ant-api03-…` and `-Fab1cated…` after the first label.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "a hf_Ab3Cd5Ef7Gh9Ij1Kl3Mntk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l b hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe c xai-Fab1catedXaiKey0001sk-ant-api03-Fab1catedKey0001xyz d github_pat_11ABCDEFG0Fab1catedPat_Fab1catedste-Fab1catedFab1catedFab1cated e"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              # `xai-` is narrow on this box (its run takes no `_` or `-`), so it gets the fix too.
+              assert_eq!(.message, "[basecradle-router] a [REDACTED_API_KEY] b [REDACTED_API_KEY] c [REDACTED_API_KEY] d [REDACTED_GH_TOKEN] e")
+
+  - name: "a third key glued onto the second goes with it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "chain hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Feste-Fab1catedFab1catedFab1cated rejected"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] chain [REDACTED_API_KEY] rejected")
+
+  - name: "a glued match takes the label of its first key"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fehf_Ab3Cd5Ef7Gh9Ij1Kl3Mn | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] [REDACTED_GH_TOKEN] | [REDACTED_API_KEY]")
+
+  - name: "a match that took a glued key is never kept as a word"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The harness's first-pass defect, caught in its review: glued to a letter and all lowercase,
+          # the chain read as one word and was kept whole, the `-sk-…` key after it included, which
+          # the scrub before the fix redacted on its own. The box's `sk-` run needs 16.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "see xhf_abcdefghijklmnopqrstuvwghp_abcdefghijklmnopqrstuvw-sk-cdefghijklmnopqrs end"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] see x[REDACTED_API_KEY] end")
+
+  - name: "a narrow run with no whole key glued after it matches as it always did"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A word with no key glued on is still a word, and a glued remainder shorter than its own
+          # rule's minimum is no key, so the run stops at the `_` as before.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "xhf_abcdefghijklmnopqrstuvw kept | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_short cut"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] xhf_abcdefghijklmnopqrstuvw kept | [REDACTED_API_KEY]_short cut")
+
+  # --- harness 0.186.0: an x-api-key header value, redacted by its name (basecradle-router#423) ---
+
+  - name: "an x-api-key header value is redacted in every form it travels in"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Wiro's key has no stated shape, so only the header's name can find it (basecradle-harness#861):
+          # a header dump, JSON, JSON inside a JSON string, a Ruby hash either way, a Python header
+          # tuple and its bytes form, any case, `_` for either hyphen. A `=>` glued to the name is the
+          # case that needs this rule to run before the assignment rule, which would take it as `key=`.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "x-api-key: novaWiroFabricatedKey0001 | {\"x-api-key\": \"novaWiroFabricatedKey0001\"} | body=\"{\\\"x-api-key\\\":\\\"novaWiroFabricatedKey0001\\\"}\" | {\"x-api-key\"=>\"novaWiroFabricatedKey0001\"} | x-api-key => novaWiroFabricatedKey0001 | x-api-key=>novaWiroFabricatedKey0001 | ('x-api-key', 'novaWiroFabricatedKey0001') | (b'x-api-key', b'novaWiroFabricatedKey0001') | X-API-KEY: novaWiroFabricatedKey0001 | X_Api_Key: novaWiroFabricatedKey0001 | x-apikey: novaWiroFabricatedKey0001"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED] | {\"x-api-key: [REDACTED]\"} | body=\"{\\\"x-api-key: [REDACTED]\\\"}\" | {\"x-api-key: [REDACTED]\"} | x-api-key: [REDACTED] | x-api-key: [REDACTED] | ('x-api-key: [REDACTED]') | (b'x-api-key: [REDACTED]') | x-api-key: [REDACTED] | x-api-key: [REDACTED] | x-api-key: [REDACTED]")
+
+  - name: "an x-api-key value that is a bearer header is taken with its token"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A bearer header glued to the value would end it at the scheme word and leave the token.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "x-api-key: Bearer eyJhbGciOiJIUzI1NiJ9.e30 | x-api-key: KBearer eyJhbGciOiJIUzI1NiJ9.e30 | \"x-api-key\": \"Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30\""}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED] | x-api-key: [REDACTED] | \"x-api-key: [REDACTED]\"")
+
+  - name: "a bare x-api-key is a word and the unquoted assignment stays the api-key rule's"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "missing x-api-key header | set X-API-Key=novaWiroFabricatedKey0001 first"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] missing x-api-key header | set X-apiKey=[REDACTED] first")
+
+  # --- harness 0.186.0: a quoted api-key value and a glued bearer (basecradle-router#423) ---------
+
+  - name: "an api-key value that opens with a quote is redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Before the fix the value could not start at the quote, so the rule matched nothing.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "loaded NOVA_API_KEY=\"novaOpaqueFabricatedValue0001\" from env"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] loaded NOVA_apiKey=[REDACTED]\" from env")
+
+  - name: "a bearer header glued to an api-key value goes with it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Before the fix the value ended at `KBearer`, and the token after the space shipped. The
+          # box carries no `token=` query rule, so there the bearer rule takes the token alone.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "AUTH_API_KEY=KBearer eyJhbGciOiJIUzI1NiJ9.e30 | GET /v1?api_key=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1 | GET /v1?token=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] AUTH_apiKey=[REDACTED] | GET /v1?apiKey=[REDACTED] HTTP/1.1 | GET /v1?token=KBearer [REDACTED] HTTP/1.1")
+
+  # --- harness 0.186.0: a heartbeat URL never takes a kv value's closing quote (basecradle-router#423)
+
+  - name: "a quoted heartbeat url keeps its closing quote before the next field and at the end"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "stage=ping url=\"https://uptime.example.com/api/v1/heartbeat/K9fab1catedSecret\" outcome=failed next=\"https://uptime.example.com/api/v1/heartbeat/K8fab1catedSecret\""}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] stage=ping url=\"[REDACTED_HEARTBEAT_URL]\" outcome=failed next=\"[REDACTED_HEARTBEAT_URL]\"")
+
+  - name: "a coloured or multi-line kv value keeps its closing quote"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "\u{1b}[31murl=\"https://h.example.com/heartbeat/K9fab1cated\"\u{1b}[0m next=1 | url=\"https://h.example.com/heartbeat/K9fab1cated\" \u{1b}[32moutcome=ok | url=\"https://h.example.com/heartbeat/K9fab1cated\"\nsecond line"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] \u{1b}[31murl=\"[REDACTED_HEARTBEAT_URL]\"\u{1b}[0m next=1 | url=\"[REDACTED_HEARTBEAT_URL]\" \u{1b}[32moutcome=ok | url=\"[REDACTED_HEARTBEAT_URL]\"\nsecond line")
+
+  - name: "only a closing quote is put back and the url is always redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A quote followed by prose is not a kv value's closing quote, so it goes with the URL as it
+          # always did. A quoted URL with nothing after `/heartbeat/` is still redacted from the
+          # scheme on (the harness keeps it), because that match is what keeps userinfo from shipping.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "said \"https://h.example.com/heartbeat/K9fab1cated\" twice | url=\"https://john:hunter2@uptime.example.com/api/v1/heartbeat/\" next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] said \"[REDACTED_HEARTBEAT_URL] twice | url=\"[REDACTED_HEARTBEAT_URL]\" next=1")

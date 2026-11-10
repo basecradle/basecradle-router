@@ -149,28 +149,98 @@ def test_the_prefix_is_applied_after_redaction_not_before() -> None:
 #: The statement that opens the prefix pass, the one `replace_with` in `ai_scrub`.
 _PREFIX_PASS = "msg = replace_with(msg, r'(?x)"
 
+#: The widest run class, the one a rule's run takes when it already takes a glued key whole.
+_WIDE = "[A-Za-z0-9_-]"
+
+#: The prefix pass, rule for rule, in pattern order: the prefix as written, the name its run is
+#: captured under, the run's class and its minimum. These are the box's rules and minimums, a
+#: subset of the harness's `_PREFIXED` (`sk-` is 16 here, and `xai-`'s run is alphanumeric, so it
+#: is narrow here). Spelled once, so the pattern pinned below is built from it and never retyped.
+_PREFIX_RULES = (
+    ("github_pat_", "pat", "[A-Za-z0-9_]", 20),
+    ("gh[a-z]_", "gh", "[A-Za-z0-9]", 20),
+    ("bc_(?P<bc_kind>[a-z]{3})_", "bc", _WIDE, 8),
+    ("bc_uat_", "bc_uat", "[A-Za-z0-9]", 1),
+    ("bc_isk_", "bc_isk", "[A-Za-z0-9]", 1),
+    ("sk-", "sk", _WIDE, 16),
+    ("xai-", "xai", "[A-Za-z0-9]", 16),
+    ("AIza", "aiza", _WIDE, 20),
+    ("hf_", "hf", "[A-Za-z0-9]", 20),
+    ("r8_", "r8", "[A-Za-z0-9]", 20),
+    ("ste-", "ste", "[A-Za-z0-9]", 20),
+    ("abl_", "abl", "[A-Za-z0-9]", 20),
+    ("pplx-", "pplx", "[A-Za-z0-9]", 20),
+    ("tk_", "tk", _WIDE, 20),
+)
+
+#: Every rule's whole key at exactly its own minimum, the harness's `_GLUED_KEY` built from the
+#: box's rules (basecradle-router#423).
+_GLUED_KEY = (
+    "(?:"
+    + "|".join(
+        f"{prefix.replace('(?P<bc_kind>[a-z]{3})', '[a-z]{3}')}{run}{{{least}}}"
+        for prefix, _, run, least in _PREFIX_RULES
+    )
+    + ")"
+)
+
+
+def _at_least(least: int, *, lazy: bool = False) -> str:
+    return ("+" if least == 1 else f"{{{least},}}") + ("?" if lazy else "")
+
+
+def _rule_pattern(prefix: str, name: str, run: str, least: int) -> str:
+    """One rule as the pass must spell it: a wide run as is, a narrow one ending where a glued key
+    begins — the harness's `_rule`, with the glued alternative named per rule (`<name>_glued`),
+    because the regex allows no name twice."""
+    if run == _WIDE:
+        return f"{prefix}(?P<{name}>{run}{_at_least(least)})"
+    glued = f"(?P<{name}_glued>{run}{_at_least(least, lazy=True)}{_GLUED_KEY}{_WIDE}*)"
+    return f"{prefix}(?:{glued}|(?P<{name}>{run}{_at_least(least)}))"
+
+
+def _prefix_pattern() -> str:
+    """The shipped prefix pattern with the free-spacing whitespace taken out, which `(?x)` ignores
+    (no class in it holds a space)."""
+    source = _scrub_source()
+    start = source.index(_PREFIX_PASS) + len(_PREFIX_PASS)
+    return re.sub(r"\s+", "", source[start : source.index("') -> |key| {", start)])
+
+
+def _has_rule(prefix: str) -> bool:
+    (rule,) = [rule for rule in _PREFIX_RULES if rule[0] == prefix]
+    return _rule_pattern(*rule) in _prefix_pattern()
+
+
+def test_the_prefix_pass_is_the_rules_table_with_the_glued_key_in_every_narrow_rule() -> None:
+    # A narrow run never swallows the head of a key glued after it (basecradle-router#423, the
+    # harness's fix for basecradle-harness#858). The fix repeats the whole-key alternation once per
+    # narrow rule, because VRL composes no pattern from parts: ten copies of one long string, where
+    # one copy at a different minimum, or missing a rule, would leave that rule's glued key to
+    # ship. So the pattern is pinned whole, built from the one table above.
+    expected = r"(?P<before>^|[\s\S])(?:" + "|".join(_rule_pattern(*r) for r in _PREFIX_RULES) + ")"
+    assert _prefix_pattern() == expected
+    narrow = [name for _, name, run, _ in _PREFIX_RULES if run != _WIDE]
+    assert narrow == ["pat", "gh", "bc_uat", "bc_isk", "xai", "hf", "r8", "ste", "abl", "pplx"]
+    assert _prefix_pattern().count(_GLUED_KEY) == len(narrow)
+
 
 def test_provider_api_keys_are_redacted() -> None:
     # Harness and builder agents run with provider keys in their env, and a wake's
     # stdout+stderr now flows into journald (#168) and therefore through here. Nothing
     # is known to print one; this is the belt for the braces.
-    source = _scrub_source()
-    assert r"sk-(?P<sk>[A-Za-z0-9_-]{16,})" in source  # openai / anthropic / openrouter / …
-    assert r"xai-(?P<xai>[A-Za-z0-9]{16,})" in source
-    assert r"AIza(?P<aiza>[A-Za-z0-9_-]{20,})" in source
-    assert r"hf_(?P<hf>[A-Za-z0-9]{20,})" in source
-    assert r"r8_(?P<r8>[A-Za-z0-9]{20,})" in source
+    for prefix in ("sk-", "xai-", "AIza", "hf_", "r8_"):  # `sk-`: openai / anthropic / openrouter
+        assert _has_rule(prefix), prefix
 
 
 def test_the_harness_0_185_0_key_shapes_are_redacted() -> None:
     # refuseless, Perplexity and ntfy (basecradle-router#421): the harness's `_PREFIXED` rows
-    # `abl_`, `pplx-` and `tk_`, at the harness's own minimums. As of harness 0.185.0, on a box
-    # this pass is the only layer that redacts one inside a prose line (basecradle-harness#857).
-    # `tk_`'s run takes `_` and `-`, because ntfy's validator admits them.
-    source = _scrub_source()
-    assert r"abl_(?P<abl>[A-Za-z0-9]{20,})" in source
-    assert r"pplx-(?P<pplx>[A-Za-z0-9]{20,})" in source
-    assert r"tk_(?P<tk>[A-Za-z0-9_-]{20,})" in source
+    # `abl_`, `pplx-` and `tk_`, at the harness's own minimums. Before harness 0.186.0 scrubbed a
+    # prose line at its source (basecradle-harness#857), this pass was the only layer that redacted
+    # one there, and it still is for any program that does not. `tk_`'s run takes `_` and `-`,
+    # because ntfy's validator admits them.
+    for prefix in ("abl_", "pplx-", "tk_"):
+        assert _has_rule(prefix), prefix
 
 
 def test_every_prefix_rule_hands_its_run_to_the_word_rule() -> None:
@@ -178,7 +248,8 @@ def test_every_prefix_rule_hands_its_run_to_the_word_rule() -> None:
     # chain. A rule added to the pattern but not to the chain fails safe (an empty run is never
     # kept), yet over-redacts every word that holds its prefix, so it is no longer the harness's
     # verdict. Every run capture, in pattern order, must be in the chain, and nothing else:
-    # `before` is the neighbour and `bc_kind` names a label, neither is a run.
+    # `before` is the neighbour, `bc_kind` names a label, and a `_glued` capture is a match that
+    # took a second key, which is read by the `glued` chain instead.
     source = _scrub_source()
     start = source.index(_PREFIX_PASS)
     end = source.index(") -> |key| {", start)
@@ -186,8 +257,35 @@ def test_every_prefix_rule_hands_its_run_to_the_word_rule() -> None:
     chain = re.search(r"^ *run = (?P<chain>.+)$", source[end:], re.MULTILINE)
     assert chain, "the prefix pass has no `run` chain"
     runs = re.findall(r"string\(key\.(\w+)\)", chain.group("chain"))
-    assert runs == [name for name in captures if name not in ("before", "bc_kind")]
+    not_runs = ("before", "bc_kind")
+    assert runs == [n for n in captures if n not in not_runs and not n.endswith("_glued")]
     assert chain.group("chain").endswith('?? ""'), "an unmatched run must come back empty"
+
+
+def test_a_match_that_took_a_glued_key_is_never_a_word_and_keeps_its_first_label() -> None:
+    # The harness's `_is_word` (basecradle-harness#858): a glued tail can hold a later key that was
+    # no part of any word, and read as one all-lowercase run it would be kept. Every `_glued`
+    # capture is in the `glued` chain, the word test refuses any match whose chain is not empty,
+    # and each glued capture takes the label of the rule it belongs to.
+    source = _scrub_source()
+    start = source.index(_PREFIX_PASS)
+    end = source.index(") -> |key| {", start)
+    glued = [name for name in re.findall(r"\(\?P<(\w+)>", source[start:end]) if "_glued" in name]
+    chain = re.search(r"^ *glued = (?P<chain>.+)$", source[end:], re.MULTILINE)
+    assert chain, "the prefix pass has no `glued` chain"
+    assert re.findall(r"string\(key\.(\w+)\)", chain.group("chain")) == glued
+    assert chain.group("chain").endswith('?? ""')
+    assert re.search(r'^ *if glued == "" && run != "" && match\(before,', source[end:], re.M)
+    # A rule whose plain capture names its own label carries its glued capture beside it; every
+    # other rule's plain and glued captures alike fall to the default `[REDACTED_API_KEY]`.
+    for name in glued:
+        plain = name.removesuffix("_glued")
+        if f"key.{plain} != null" in source:
+            assert f"key.{plain} != null || key.{name} != null" in source, name
+        else:
+            assert f"key.{name} != null" not in source, name
+    labelled = [n for n in glued if f"key.{n} != null" in source]
+    assert labelled == ["pat_glued", "gh_glued", "bc_uat_glued", "bc_isk_glued"]
 
 
 # One `msg = replace(msg, r'…', "…")` statement, the shape every fixed rule carries (the two
@@ -200,17 +298,40 @@ _REPLACE = re.compile(
 )
 
 
-_HEARTBEAT_PASS = r"msg = replace_with(msg, r'(?:https?://\S*)?/heartbeat/\S+') -> |url| {"
+_HEARTBEAT_PASS = (
+    r"msg = replace_with(msg, r'(?P<url>(?:https?://\S*)?/heartbeat/\S+)"
+    r"(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?') -> |hb| {"
+)
 
-# The heartbeat rule's whole closure (basecradle-router#402), pinned offline because the `vector
-# test` suite that asserts its bytes runs only on the boxes' Vector release. It returns fixed
-# strings and nothing of the match but the one captured bearer word, so no part of the URL can ship.
+# The heartbeat rule's whole closure (basecradle-router#402, #423), pinned offline because the
+# `vector test` suite that asserts its bytes runs only on the boxes' Vector release. It returns
+# fixed strings and nothing of the URL but the one captured bearer word and a kv value's closing
+# quote (with the colour reset closing a coloured pair), so no part of the URL can ship; `after` is
+# put back as matched, spaces, a colour code and the next field's name, and every later rule
+# still reads it.
 _HEARTBEAT_CLOSURE = [
     _HEARTBEAT_PASS,
-    r"kept = parse_regex(url.string, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}",
-    r'"[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "")',
+    r'url = string(hb.url) ?? ""',
+    r"""closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}""",
+    r'quote = string(closing.quote) ?? ""',
+    r'if quote == "\"" && hb.after == null { quote = "" }',
+    r'if quote != "" { url = string(closing.body) ?? url }',
+    r"kept = parse_regex(url, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}",
+    r'"[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "") + quote + (string(hb.after) ?? "")',
     "}",
 ]
+
+# The `x-api-key` header rule (basecradle-router#423, basecradle-harness#861) and the assignment
+# rule whose value may open with a quote and takes a glued bearer (basecradle-harness#866), as the
+# harness spells them; a single quote is `\x27`, which a raw string cannot hold.
+_X_API_KEY = (
+    r"""(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?"""
+    r"""(?:(?i:bearer)\s+)*(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)"""
+)
+_API_KEY = (
+    r"""(?i)api[-_]?key="?(?:bearer\s+)*"""
+    r"""(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+)"""
+)
 
 
 def _statements(source: str) -> list[str]:
@@ -239,24 +360,29 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
         line.strip() for line in _scrub_source().splitlines() if re.match(r"^ *msg *=", line)
     ]
     assert assignments[-1].startswith(_PREFIX_PASS), assignments
-    # The heartbeat URL, then the assignment, then bearer: the bearer rule's token class takes a
-    # URL's `https` and an assignment's `api_key=`. After it, a heartbeat URL would keep its
-    # userinfo out of the redaction, and an assignment would ship its secret. The assignment takes
-    # every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
+    # The heartbeat URL, then the `x-api-key` header, then the assignment, then bearer: the bearer
+    # rule's token class takes a URL's `https` and an assignment's `api_key=`. After it, a
+    # heartbeat URL would keep its userinfo out of the redaction, and an assignment would ship its
+    # secret. The assignment takes every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…`
+    # is redacted whole.
     #
-    # The heartbeat rule is the one closure in the pass (basecradle-router#402): it puts back a
-    # bearer word ending its run, so the bearer rule still takes the word and its token. Its
-    # pattern is pinned here; what it returns is pinned by the `vector test` suite, which asserts
-    # the shipped bytes. The other two are fixed `replace`s in the one safe shape.
+    # The heartbeat rule is the one closure in the pass (basecradle-router#402, #423): it puts back
+    # a bearer word ending its run, so the bearer rule still takes the word and its token, and a kv
+    # value's closing quote with what follows it. Its whole closure is pinned here; what it returns
+    # is pinned by the `vector test` suite, which asserts the shipped bytes. The other three are
+    # fixed `replace`s in the one safe shape.
     assert literal[0] == _HEARTBEAT_PASS, f"pass 1 must open with the heartbeat rule: {literal!r}"
     lines = [line.strip() for line in _scrub_source().splitlines()]
     start = lines.index(_HEARTBEAT_PASS)
     assert lines[start : start + len(_HEARTBEAT_CLOSURE)] == _HEARTBEAT_CLOSURE
     for line in literal[1:]:
         assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
+    # The `x-api-key` rule goes before the assignment rule, so the header's name goes with its
+    # value: the assignment rule reads `x-api-key=>V` as `key=` and takes it under its own label.
     patterns = [_REPLACE.match(line).group("pattern") for line in literal[1:]]
     assert patterns == [
-        r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""",
+        _X_API_KEY,
+        _API_KEY,
         r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
     ]
 
@@ -267,10 +393,14 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     # (basecradle-noc#797). The `ste-` rule catches the key wherever it lands; the query
     # rule catches `apiKey=` whatever its value, so a future key format in a URL is covered.
     source = _scrub_source()
-    assert r"ste-(?P<ste>[A-Za-z0-9]{20,})" in source
-    assert r"""(?i)api[-_]?key=(?:bearer\s+)*[^&\s"]+""" in source
+    assert _has_rule("ste-")
+    assert _API_KEY in source
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    for rule in (_PREFIX_PASS, "msg = replace(msg, r'(?i)api[-_]?key="):
+    for rule in (
+        _PREFIX_PASS,
+        "msg = replace(msg, r'(?i:x[-_]api[-_]?key)",
+        "msg = replace(msg, r'(?i)api[-_]?key=",
+    ):
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
 
 
@@ -326,12 +456,12 @@ def test_basecradle_integration_signing_keys_are_redacted() -> None:
     # (basecradle/basecradle#497). The box that holds the secrets is the one that must carry
     # the rule: the harness's wide `bc_???_` rule takes a key of eight or more, and the short
     # `bc_isk_` rule takes a shorter one, under its own label.
-    source = _scrub_source()
-    assert r"bc_isk_(?P<bc_isk>[A-Za-z0-9]+)" in source
+    assert _has_rule("bc_isk_")
     # The harness's wide rule, ahead of the two short ones, so a glued second key is taken whole.
-    wide = r"bc_(?P<bc_kind>[a-z]{3})_(?P<bc>[A-Za-z0-9_-]{8,})"
-    assert source.index(wide) < source.index(r"bc_uat_(?P<bc_uat>")
-    assert r"bc_uat_(?P<bc_uat>[A-Za-z0-9]+)" in source
+    pattern = _prefix_pattern()
+    assert _has_rule("bc_(?P<bc_kind>[a-z]{3})_") and _has_rule("bc_uat_")
+    wide = _rule_pattern(*_PREFIX_RULES[2])
+    assert pattern.index(wide) < pattern.index("bc_uat_(?:(?P<bc_uat_glued>")
 
 
 def test_the_integration_signing_key_redaction_is_unconditional() -> None:
@@ -350,7 +480,7 @@ def test_the_pre_existing_scrub_rules_survive() -> None:
     for pattern in ("REDACTED_GH_TOKEN", "REDACTED_HEARTBEAT_URL", "REDACTED_BC_TOKEN"):
         assert pattern in source
     # GitHub fine-grained personal access tokens (#398), a rule of the prefix pass.
-    assert r"github_pat_(?P<pat>[A-Za-z0-9_]{20,})" in source
+    assert _has_rule("github_pat_")
     assert 'SYSLOG_IDENTIFIER == "sudo"' in source  # the whole-event drop for argv leaks
 
 

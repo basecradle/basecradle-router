@@ -1786,7 +1786,9 @@ Caddy, no database) and has four load-bearing properties:
    `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`, `hf_…`, `r8_…`; and Steel's
    `ste-…` keys plus any `apiKey=` query value, since a Steel launcher puts its key on the
    `wss://connect.steel.dev` URL — basecradle-noc#797; and refuseless `abl_…`, Perplexity `pplx-…`
-   and ntfy `tk_…`, harness 0.185.0's shapes — basecradle-router#421) as defense in depth. The
+   and ntfy `tk_…`, harness 0.185.0's shapes — basecradle-router#421; and any `x-api-key` header
+   value, whatever its shape, since Wiro states none for its key — basecradle-router#423) as
+   defense in depth. The
    provider-key rules are the belt for the braces (basecradle-router#170): agents run with those
    keys in their env, and a wake's stdout+stderr now flows into journald (#168) and therefore
    through here — nothing is *known* to print one, and a traceback that did would otherwise ship
@@ -1794,9 +1796,10 @@ Caddy, no database) and has four load-bearing properties:
    weaken them.
    **The redaction runs in two passes, in this order, with one word rule** (basecradle-router#398).
    The one definition of both is the harness's: basecradle-harness `docs/telemetry.md` → Credential
-   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.185.0). `ai_scrub` follows it and
+   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.186.0). `ai_scrub` follows it and
    never varies it; only the box's rules (a subset of the harness's shapes), minimum lengths and labels differ.
-   - **Pass 1, the literal rules** — the heartbeat URL, then `api[-_]?key=`, then bearer — each
+   - **Pass 1, the literal rules** — the heartbeat URL, then the `x-api-key` header, then
+     `api[-_]?key=`, then bearer — each
      redacted wherever it matches. They go first because a prefix rule's run is made of the
      characters their literals are: with `sk-` first, `task-runner-pipeline-api-key=abc123secret`
      lost `api-key` into the run, and the secret after `=` shipped. The heartbeat rule anchors on
@@ -1809,7 +1812,19 @@ Caddy, no database) and has four load-bearing properties:
      (basecradle-router#402, the harness's `_TRAILING_BEARER`): taken with the URL, the word left
      its token in the next run, which no rule matched, so compact JSON
      (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query value (`…&access_token=Bearer eyJ…`)
-     shipped the token. Inside the pass the rules run one after another (the harness's
+     shipped the token. A kv value's closing quote ending that run (a `"` followed by the next
+     `key=`, the line's end, or a colour reset) is put back as well (basecradle-router#423, the
+     harness's `_CLOSING_QUOTE`), so `url="…/heartbeat/K9" next=1` ships as
+     `url="[REDACTED_HEARTBEAT_URL]" next=1`, a line a kv parser still reads. The URL is always
+     redacted, even a quoted `/heartbeat/` with no secret after it, which the harness keeps: the
+     match from the scheme on is what keeps userinfo from shipping, so the guard only ever restores
+     a quote. The `x-api-key` header rule (basecradle-router#423, basecradle-harness#861) redacts a
+     header value by its name, never its shape — `x-api-key: …`, `"x-api-key": "…"`, escaped JSON,
+     a Ruby `=>`, a `('x-api-key', '…')` tuple, any case, `_` for either hyphen — and runs before
+     the assignment rule so the name goes with its value; the unquoted `X-API-Key=…` stays the
+     assignment rule's. The assignment rule's value may open with a `"` (`API_KEY="…"` matched
+     nothing before), and a bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
+     (basecradle-router#423, basecradle-harness#866). Inside the pass the rules run one after another (the harness's
      are one alternation), so their order is load-bearing: the bearer rule's token class takes an
      assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`
      ships its secret. The assignment rule takes every bearer scheme in its value, as the harness's
@@ -1829,10 +1844,15 @@ Caddy, no database) and has four load-bearing properties:
      `replace_with` closure that captures the one character before the match and applies both tests.
    The stated residuals, as the harness's: a glued word whose run holds a digit or a capital is
    redacted (the scrub errs toward redaction), and a glued key made only of lowercase letters, `_`
-   and `-` is kept. A third is the harness's open defect, basecradle-harness#858, carried here
-   unchanged until the harness ships its fix: an alphanumeric run glued straight onto a second key
-   takes the letters of that key's prefix and stops at its `_` or `-`, so the rest of the second
-   key matches no rule and ships. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
+   and `-` is kept. **A narrow run never swallows the head of a key glued after it**
+   (basecradle-router#423, the harness's fix for basecradle-harness#858): every rule whose run
+   lacks `_` or `-` (`github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `xai-`, `hf_`, `r8_`, `ste-`,
+   `abl_`, `pplx-`) first tries a run as short as it can be followed by a whole key by its own rule
+   at this box's minimums, then everything after it in the widest class, so
+   `hf_Ab3…Mntk_q8m…` no longer ships `_q8m…`; a match that took a glued key is never kept as a
+   word. That is a negative lookahead written without one, because VRL's regex has none, and it is
+   linear: `tests/test_vector_unit.py` runs the shipped VRL over 200,000-character space-free texts
+   and checks the compiled pattern's headroom under the regex engine's size limit. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
    `Bearer`), so a long word glued to a pass-1 match is cut by the word rule
    (`task-runner-pipeline-api-key=…` ships as `ta[REDACTED_API_KEY]=[REDACTED]`). That errs toward
    redaction, and the secret never ships.
