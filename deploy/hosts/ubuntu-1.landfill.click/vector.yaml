@@ -271,7 +271,11 @@ transforms:
       #     stdout+stderr (a traceback, a curl echo, a misconfigured debug print) flows into journald
       #     under basecradle-wake-<slug> (#168), so it flows through here. Nothing is known to print
       #     one; this is the belt for the braces. `sk-` covers the whole family that shares the
-      #     prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one rule.
+      #     prefix (sk-ant-, sk-proj-, sk-or-v1-, …) in one rule. The `xai-` run takes `_` and `-`,
+      #     as the harness's does (basecradle-router#425): an xAI management key, the
+      #     `xai_account_balance` tool's credential, is `xai-`, five alphanumerics, a `_` or `-`,
+      #     then an 80-character run, and an alphanumeric run matched none of it, so it shipped
+      #     whole. Its minimum stays this box's 16, as `sk-`'s does, where the harness's is 8.
       #   * `ste-`: Steel keys, wherever they land, the `steel-api-key` header included.
       #   * `abl_`, `pplx-`, `tk_`: refuseless and Perplexity API keys and ntfy access tokens, the
       #     harness's three newest shapes (harness 0.185.0, basecradle-router#421), all of them
@@ -297,9 +301,9 @@ transforms:
       # `-` once took the letters of a following key's prefix and stopped at its `_` or `-`, so the
       # rest of the second key matched no rule and shipped (`hf_Ab3…Mntk_q8m…` shipped `_q8m…`),
       # and a first match kept as a word kept the second key with it. The narrow rules are
-      # `github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `xai-` (narrow here, where the harness's run
-      # also takes `_` and `-`), `hf_`, `r8_`, `ste-`, `abl_` and `pplx-`. Each is now two
-      # alternatives, the first tried first: its run, as short as it can be, then a WHOLE KEY BY ITS
+      # `github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `hf_`, `r8_`, `ste-`, `abl_` and `pplx-`
+      # (`xai-` was one until its run took the harness's class, basecradle-router#425). Each is now
+      # two alternatives, the first tried first: its run, as short as it can be, then a WHOLE KEY BY ITS
       # OWN RULE at that rule's own minimum (every rule of this pass, at this box's minimums, so
       # `sk-` at 16), then everything after it in the widest class, so a third key glued on goes
       # with the second; otherwise the run as it always was. That is a negative lookahead written
@@ -316,7 +320,7 @@ transforms:
       # takes a glued key whole. The `bc_uat_` and `bc_isk_` glued alternatives never match here: a
       # glued key makes the run eight or more characters of the wide class, and the wide `bc_???_`
       # rule before them takes it first, as it does in the harness. They are kept so this pass
-      # stays the harness's, rule for rule. The ten copies of the whole-key alternation are one
+      # stays the harness's, rule for rule. The nine copies of the whole-key alternation are one
       # string, pinned identical by tests/test_log_surface.py.
       #
       # VRL's regex has no lookbehind and the closure is not given the match's offset, so the
@@ -332,43 +336,41 @@ transforms:
           (?P<before>^|[\s\S])
           (?:
               github_pat_(?:(?P<pat_glued>[A-Za-z0-9_]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<pat>[A-Za-z0-9_]{20,}))
             | gh[a-z]_(?:(?P<gh_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<gh>[A-Za-z0-9]{20,}))
             | bc_(?P<bc_kind>[a-z]{3})_(?P<bc>[A-Za-z0-9_-]{8,})
             | bc_uat_(?:(?P<bc_uat_glued>[A-Za-z0-9]+?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<bc_uat>[A-Za-z0-9]+))
             | bc_isk_(?:(?P<bc_isk_glued>[A-Za-z0-9]+?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<bc_isk>[A-Za-z0-9]+))
             | sk-(?P<sk>[A-Za-z0-9_-]{16,})
-            | xai-(?:(?P<xai_glued>[A-Za-z0-9]{16,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
-                  [A-Za-z0-9_-]*)|(?P<xai>[A-Za-z0-9]{16,}))
+            | xai-(?P<xai>[A-Za-z0-9_-]{16,})
             | AIza(?P<aiza>[A-Za-z0-9_-]{20,})
             | hf_(?:(?P<hf_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<hf>[A-Za-z0-9]{20,}))
             | r8_(?:(?P<r8_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<r8>[A-Za-z0-9]{20,}))
             | ste-(?:(?P<ste_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<ste>[A-Za-z0-9]{20,}))
             | abl_(?:(?P<abl_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<abl>[A-Za-z0-9]{20,}))
             | pplx-(?:(?P<pplx_glued>[A-Za-z0-9]{20,}?
-                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
+                  (?:github_pat_[A-Za-z0-9_]{20}|gh[a-z]_[A-Za-z0-9]{20}|bc_[a-z]{3}_[A-Za-z0-9_-]{8}|bc_uat_[A-Za-z0-9]{1}|bc_isk_[A-Za-z0-9]{1}|sk-[A-Za-z0-9_-]{16}|xai-[A-Za-z0-9_-]{16}|AIza[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{20}|r8_[A-Za-z0-9]{20}|ste-[A-Za-z0-9]{20}|abl_[A-Za-z0-9]{20}|pplx-[A-Za-z0-9]{20}|tk_[A-Za-z0-9_-]{20})
                   [A-Za-z0-9_-]*)|(?P<pplx>[A-Za-z0-9]{20,}))
             | tk_(?P<tk>[A-Za-z0-9_-]{20,})
           )') -> |key| {
           before = string(key.before) ?? ""
           run = string(key.pat) ?? string(key.gh) ?? string(key.bc) ?? string(key.bc_uat) ?? string(key.bc_isk) ?? string(key.sk) ?? string(key.xai) ?? string(key.aiza) ?? string(key.hf) ?? string(key.r8) ?? string(key.ste) ?? string(key.abl) ?? string(key.pplx) ?? string(key.tk) ?? ""
-          glued = string(key.pat_glued) ?? string(key.gh_glued) ?? string(key.bc_uat_glued) ?? string(key.bc_isk_glued) ?? string(key.xai_glued) ?? string(key.hf_glued) ?? string(key.r8_glued) ?? string(key.ste_glued) ?? string(key.abl_glued) ?? string(key.pplx_glued) ?? ""
+          glued = string(key.pat_glued) ?? string(key.gh_glued) ?? string(key.bc_uat_glued) ?? string(key.bc_isk_glued) ?? string(key.hf_glued) ?? string(key.r8_glued) ?? string(key.ste_glued) ?? string(key.abl_glued) ?? string(key.pplx_glued) ?? ""
           if glued == "" && run != "" && match(before, r'^[\p{L}\p{N}\p{M}]') && !match(run, r'[0-9A-Z]') {
               key.string
           } else if key.pat != null || key.pat_glued != null || key.gh != null || key.gh_glued != null {

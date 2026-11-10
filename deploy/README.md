@@ -1783,7 +1783,9 @@ Caddy, no database) and has four load-bearing properties:
    `_CMDLINE` field from every event** (below), and **redacts**
    secret-shaped patterns (`github_pat_…`, `gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`,
    `bc_isk_…`, and **provider API keys** — `sk-…` covering the whole
-   `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`, `hf_…`, `r8_…`; and Steel's
+   `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…` (its run takes `_` and `-`, as the
+   harness's does, so an xAI management key — `xai-`, five alphanumerics, a `_` or `-`, then an
+   80-character run — is redacted whole, basecradle-router#425), `AIza…`, `hf_…`, `r8_…`; and Steel's
    `ste-…` keys plus any `apiKey=` query value, since a Steel launcher puts its key on the
    `wss://connect.steel.dev` URL — basecradle-noc#797; and refuseless `abl_…`, Perplexity `pplx-…`
    and ntfy `tk_…`, harness 0.185.0's shapes — basecradle-router#421; and any `x-api-key` header
@@ -1846,11 +1848,16 @@ Caddy, no database) and has four load-bearing properties:
    redacted (the scrub errs toward redaction), and a glued key made only of lowercase letters, `_`
    and `-` is kept. **A narrow run never swallows the head of a key glued after it**
    (basecradle-router#423, the harness's fix for basecradle-harness#858): every rule whose run
-   lacks `_` or `-` (`github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `xai-`, `hf_`, `r8_`, `ste-`,
+   lacks `_` or `-` (`github_pat_`, `gh?_`, `bc_uat_`, `bc_isk_`, `hf_`, `r8_`, `ste-`,
    `abl_`, `pplx-`) first tries a run as short as it can be followed by a whole key by its own rule
    at this box's minimums, then everything after it in the widest class, so
    `hf_Ab3…Mntk_q8m…` no longer ships `_q8m…`; a match that took a glued key is never kept as a
-   word. That is a negative lookahead written without one, because VRL's regex has none, and it is
+   word. A wide run (`sk-`, `xai-`, `bc_???_`, `AIza`, `tk_`) takes a glued key into its own run,
+   so the word rule reads the two as one: a key glued after a lowercase word holding the prefix
+   is kept only when it too is all lowercase (`maxai-pipeline-tk_abc…`), the glued residual
+   above, and the glued key takes the first key's label. Since `xai-`'s run became wide
+   (basecradle-router#425), a lowercase `xai-` name of 16 or more at a word's start
+   (`xai-compatible-endpoint-v2`) is redacted, as the harness redacts it. That is a negative lookahead written without one, because VRL's regex has none, and it is
    linear: `tests/test_vector_unit.py` runs the shipped VRL over 200,000-character space-free texts
    and checks the compiled pattern's headroom under the regex engine's size limit. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
    `Bearer`), so a long word glued to a pass-1 match is cut by the word rule

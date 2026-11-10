@@ -109,10 +109,12 @@ def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path) -> None
 # * SIZE. VRL compiles a regex literal when the program loads, under the regex engine's default
 #   size limit, and a pattern over it is a load error: the transform never runs, and the NOC's
 #   pre-install validation refuses the apply. Measured at #423 on Vector 0.56.0: the limit is
-#   10,485,760 bytes, 38 copies of the shipped prefix pattern compile and 40 do not, so it is
-#   about 1/39 of the limit. The check asserts that 16 copies still compile, so the shipped
-#   pattern stays under 1/16 of it, and that 128 copies fail with the engine's size error, so
-#   the check can tell the two apart and never passes vacuously.
+#   10,485,760 bytes, 38 copies of the then prefix pattern (ten whole-key alternations) compile
+#   and 40 do not, so it was about 1/39 of the limit. #425 took one alternation out (`xai-`'s run
+#   became wide), so the shipped pattern is smaller and the headroom only grew. The check
+#   asserts that 16 copies still compile, so the shipped pattern stays under 1/16 of it, and
+#   that 128 copies fail with the engine's size error, so the check can tell the two apart and
+#   never passes vacuously.
 # * TIME. The glued alternative's lazy run is what keeps the pass linear; a backtracking engine
 #   would be quadratic on a long space-free run. Rust's regex, under VRL, is not, and the
 #   check proves it on the shipped program: every adversarial 200,000-character space-free text
