@@ -162,6 +162,34 @@ def test_provider_api_keys_are_redacted() -> None:
     assert r"r8_(?P<r8>[A-Za-z0-9]{20,})" in source
 
 
+def test_the_harness_0_185_0_key_shapes_are_redacted() -> None:
+    # refuseless, Perplexity and ntfy (basecradle-router#421): the harness's `_PREFIXED` rows
+    # `abl_`, `pplx-` and `tk_`, at the harness's own minimums. As of harness 0.185.0, on a box
+    # this pass is the only layer that redacts one inside a prose line (basecradle-harness#857).
+    # `tk_`'s run takes `_` and `-`, because ntfy's validator admits them.
+    source = _scrub_source()
+    assert r"abl_(?P<abl>[A-Za-z0-9]{20,})" in source
+    assert r"pplx-(?P<pplx>[A-Za-z0-9]{20,})" in source
+    assert r"tk_(?P<tk>[A-Za-z0-9_-]{20,})" in source
+
+
+def test_every_prefix_rule_hands_its_run_to_the_word_rule() -> None:
+    # The word rule reads a match's run, captured apart from its prefix, out of the one `run`
+    # chain. A rule added to the pattern but not to the chain fails safe (an empty run is never
+    # kept), yet over-redacts every word that holds its prefix, so it is no longer the harness's
+    # verdict. Every run capture, in pattern order, must be in the chain, and nothing else:
+    # `before` is the neighbour and `bc_kind` names a label, neither is a run.
+    source = _scrub_source()
+    start = source.index(_PREFIX_PASS)
+    end = source.index(") -> |key| {", start)
+    captures = re.findall(r"\(\?P<(\w+)>", source[start:end])
+    chain = re.search(r"^ *run = (?P<chain>.+)$", source[end:], re.MULTILINE)
+    assert chain, "the prefix pass has no `run` chain"
+    runs = re.findall(r"string\(key\.(\w+)\)", chain.group("chain"))
+    assert runs == [name for name in captures if name not in ("before", "bc_kind")]
+    assert chain.group("chain").endswith('?? ""'), "an unmatched run must come back empty"
+
+
 # One `msg = replace(msg, r'…', "…")` statement, the shape every fixed rule carries (the two
 # closures, the heartbeat rule and the prefix pass, are pinned on their own): a raw
 # string with no single quote inside it (one would close it early), and a fixed replacement

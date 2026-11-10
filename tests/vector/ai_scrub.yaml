@@ -5,7 +5,7 @@
 #
 # The rule under test is the harness's: two passes, literal rules then prefix rules, and a prefixed
 # match kept only when `_is_word` reads it as a word (basecradle-harness docs/telemetry.md →
-# Credential Scrubbing, harness 0.177.0). The samples are the harness's own (its
+# Credential Scrubbing, harness 0.185.0). The samples are the harness's own (its
 # tests/test_log_value_cut.py), lengthened to the box's minimums where the harness's are shorter:
 # the box's `sk-` run needs 16 characters where the harness's needs 8, so `task-specification`, whose
 # run is 13, never met the box's rule at all, and the long forms below are the ones that did.
@@ -421,6 +421,22 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] the abc_def_ghijklmnop table")
 
+  - name: "the harness 0.185.0 prefixes inside a word survive whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The harness's own words for its three newest prefixes (basecradle-router#421), and one for
+          # `pplx-`, which it has none of. The `tk_` run takes `_`, so `gtk_window_…` is decided by the
+          # word rule, never by where the run stops.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "tabl_partitionmaintenancewindow kabl_verbindungsueberwachungsdienst xpplx-abcdefghijklmnopqrstuvwxyz atk_objectgetaccessiblename gtk_window_set_default_size_request"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] tabl_partitionmaintenancewindow kabl_verbindungsueberwachungsdienst xpplx-abcdefghijklmnopqrstuvwxyz atk_objectgetaccessiblename gtk_window_set_default_size_request")
+
   - name: "a word glued by a digit, a combining mark or any script is kept"
     inputs:
       - insert_at: "ai_scrub"
@@ -531,6 +547,80 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] [REDACTED_GH_TOKEN] rejected")
 
+  # --- the harness 0.185.0 shapes: refuseless, Perplexity and ntfy (basecradle-router#421) ------
+
+  - name: "a refuseless, a perplexity and an ntfy key are redacted as values"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The samples are the harness's (tests/test_log_value_cut.py): a 52-character `abl_` key, the
+          # vendor's shape, a `pplx-` key kept shorter than a real one's 48, and a 32-character `tk_`.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "stage=wake outcome=failed refuseless_key=abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3 perplexity_key=pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1 ntfy_token=tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] stage=wake outcome=failed refuseless_key=[REDACTED_API_KEY] perplexity_key=[REDACTED_API_KEY] ntfy_token=[REDACTED_API_KEY]")
+
+  - name: "a refuseless, a perplexity and an ntfy key are redacted in free text"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "refuseless refused the key abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3, check AI_API_KEY; perplexity refused pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1. ntfy refused tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] refuseless refused the key [REDACTED_API_KEY], check AI_API_KEY; perplexity refused [REDACTED_API_KEY]. ntfy refused [REDACTED_API_KEY]: unauthorized")
+
+  - name: "a refuseless, a perplexity and an ntfy key are redacted inside a quoted error body"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A vendor's quoted error body is the realistic carrier, the harness's case.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "upstream said \"{\"error\":{\"message\":\"Incorrect API key provided: abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3\",\"code\":401}}\" perplexity said 'pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1' ntfy said \"{\"token\":\"tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l\",\"code\":40101}\""}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] upstream said \"{\"error\":{\"message\":\"Incorrect API key provided: [REDACTED_API_KEY]\",\"code\":401}}\" perplexity said '[REDACTED_API_KEY]' ntfy said \"{\"token\":\"[REDACTED_API_KEY]\",\"code\":40101}\"")
+
+  - name: "an ntfy token in every shape its validator admits is redacted whole"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # ntfy generates lowercase letters and digits, and its validator also admits capitals, `_` and
+          # `-` in a token's 29 characters, so a provisioned token's `-` or `_` never cuts it short.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ntfy refused tk_q8m2zr5wk-xt7nb4pv9_hc3jd6fs0: unauthorized | ntfy refused tk_Q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ntfy refused [REDACTED_API_KEY]: unauthorized | ntfy refused [REDACTED_API_KEY]: unauthorized")
+
+  - name: "a tk_ identifier not glued to a letter or digit is redacted, as the harness's is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The word rule keeps only a match glued to a letter, digit or mark, so after a `.` the run
+          # is read as a token whatever its letters, the residual the harness states for every rule.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "self.tk_root_window_initialized ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] self.[REDACTED_API_KEY] ok")
+
   - name: "every prefixed key after every left neighbour is still redacted"
     inputs:
       - insert_at: "ai_scrub"
@@ -552,7 +642,10 @@ tests:
             ["AIzaAb3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
             ["hf_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
             ["r8_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
-            ["ste-Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"]
+            ["ste-Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["abl_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["pplx-Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"],
+            ["tk_Ab3Cd5Ef7Gh9Ij1Kl3Mn", "[REDACTED_API_KEY]"]
           ]
           # Every left neighbour a credential can follow, the harness's list. The first group is a
           # separator; the second ends in a letter, digit or mark (a serialization, a colour code, a
@@ -586,6 +679,6 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              # Every key and every neighbour was sent: 14 keys after 24 neighbours.
-              assert_eq!(.count, 336)
+              # Every key and every neighbour was sent: 17 keys after 24 neighbours.
+              assert_eq!(.count, 408)
               assert_eq!(.message, .expected)

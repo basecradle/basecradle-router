@@ -1785,14 +1785,16 @@ Caddy, no database) and has four load-bearing properties:
    `bc_isk_…`, and **provider API keys** — `sk-…` covering the whole
    `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…`, `AIza…`, `hf_…`, `r8_…`; and Steel's
    `ste-…` keys plus any `apiKey=` query value, since a Steel launcher puts its key on the
-   `wss://connect.steel.dev` URL — basecradle-noc#797) as defense in depth. The provider-key rules
-   are the belt for the braces (basecradle-router#170): agents run with those keys in their env, and
-   a wake's stdout+stderr now flows into journald (#168) and therefore through here — nothing is
-   *known* to print one, and a traceback that did would otherwise ship it. The drop rules and every
-   redaction shape are NOC's `noc_scrub` plus these additions; do not weaken them.
+   `wss://connect.steel.dev` URL — basecradle-noc#797; and refuseless `abl_…`, Perplexity `pplx-…`
+   and ntfy `tk_…`, harness 0.185.0's shapes — basecradle-router#421) as defense in depth. The
+   provider-key rules are the belt for the braces (basecradle-router#170): agents run with those
+   keys in their env, and a wake's stdout+stderr now flows into journald (#168) and therefore
+   through here — nothing is *known* to print one, and a traceback that did would otherwise ship
+   it. The drop rules and every redaction shape are NOC's `noc_scrub` plus these additions; do not
+   weaken them.
    **The redaction runs in two passes, in this order, with one word rule** (basecradle-router#398).
    The one definition of both is the harness's: basecradle-harness `docs/telemetry.md` → Credential
-   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.177.0). `ai_scrub` follows it and
+   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.185.0). `ai_scrub` follows it and
    never varies it; only the box's rules (a subset of the harness's shapes), minimum lengths and labels differ.
    - **Pass 1, the literal rules** — the heartbeat URL, then `api[-_]?key=`, then bearer — each
      redacted wherever it matches. They go first because a prefix rule's run is made of the
@@ -1814,10 +1816,10 @@ Caddy, no database) and has four load-bearing properties:
      does, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole, and the bearer rule takes every scheme
      word before its token, so a doubled `Bearer Bearer eyJ…` is too.
    - **Pass 2, the prefix rules** (`github_pat_`, `gh?_`, `bc_???_`, `bc_uat_`, `bc_isk_`, `sk-`,
-     `xai-`, `AIza`, `hf_`, `r8_`, `ste-`), as **one** alternation, so a word one rule kept is never
-     cut by the next. The `bc_` rules are the harness's two: any `bc_` + three lowercase letters +
-     `_` with a run of eight or more that takes `_` and `-`, tried first, so a key glued onto
-     another (`bc_uat_ABCbc_isk_DEF123`) is redacted whole; then `bc_uat_` and `bc_isk_` with a run
+     `xai-`, `AIza`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`, `tk_`), as **one** alternation, so a word
+     one rule kept is never cut by the next. The `bc_` rules are the harness's two: any `bc_` +
+     three lowercase letters + `_` with a run of eight or more that takes `_` and `-`, tried first,
+     so a key glued onto another (`bc_uat_ABCbc_isk_DEF123`) is redacted whole; then `bc_uat_` and `bc_isk_` with a run
      of any length. A match is **kept as a word** only when **both** hold: a letter, digit or
      combining mark, in any script, comes right before it, **and** its run after the prefix holds no
      digit and no uppercase letter. So `risk-assessment-pending-review` survives, and
@@ -1827,7 +1829,10 @@ Caddy, no database) and has four load-bearing properties:
      `replace_with` closure that captures the one character before the match and applies both tests.
    The stated residuals, as the harness's: a glued word whose run holds a digit or a capital is
    redacted (the scrub errs toward redaction), and a glued key made only of lowercase letters, `_`
-   and `-` is kept. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
+   and `-` is kept. A third is the harness's open defect, basecradle-harness#858, carried here
+   unchanged until the harness ships its fix: an alphanumeric run glued straight onto a second key
+   takes the letters of that key's prefix and stops at its `_` or `-`, so the rest of the second
+   key matches no rule and ships. One residual is the box's own: its pass-1 labels carry capitals (`apiKey=`,
    `Bearer`), so a long word glued to a pass-1 match is cut by the word rule
    (`task-runner-pipeline-api-key=…` ships as `ta[REDACTED_API_KEY]=[REDACTED]`). That errs toward
    redaction, and the secret never ships.
