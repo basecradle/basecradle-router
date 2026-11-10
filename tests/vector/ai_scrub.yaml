@@ -692,14 +692,16 @@ tests:
         source: |
           # The harness's reproducers (basecradle-harness#858). Before the fix the first run took the
           # letters of the second key's prefix and stopped at its `_` or `-`, and the rest shipped:
-          # `_q8m…`, `_Zx8…`, `-ant-api03-…` and `-Fab1cated…` after the first label.
+          # `_q8m…`, `_Zx8…`, `-ant-api03-…` and `-Fab1cated…` after the first label. The `xai-` run
+          # was narrow then and is wide since basecradle-router#425; its reproducer stays here.
           . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "a hf_Ab3Cd5Ef7Gh9Ij1Kl3Mntk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l b hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe c xai-Fab1catedXaiKey0001sk-ant-api03-Fab1catedKey0001xyz d github_pat_11ABCDEFG0Fab1catedPat_Fab1catedste-Fab1catedFab1catedFab1cated e"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              # `xai-` is narrow on this box (its run takes no `_` or `-`), so it gets the fix too.
+              # `xai-`'s run is wide since basecradle-router#425, so it takes the glued key whole,
+              # as a wide run always did.
               assert_eq!(.message, "[basecradle-router] a [REDACTED_API_KEY] b [REDACTED_API_KEY] c [REDACTED_API_KEY] d [REDACTED_GH_TOKEN] e")
 
   - name: "a third key glued onto the second goes with it"
@@ -758,6 +760,58 @@ tests:
           - type: "vrl"
             source: |
               assert_eq!(.message, "[basecradle-router] xhf_abcdefghijklmnopqrstuvw kept | [REDACTED_API_KEY]_short cut")
+
+  # --- an xAI management key, whose run holds a `_` or `-` (basecradle-router#425) -----------------
+
+  - name: "an xai management key is redacted whole in a value in prose and in a quoted error body"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The `xai_account_balance` tool's credential: `xai-`, five alphanumerics, a `_` or `-`,
+          # then an 80-character run, 90 characters in all (fabricated). With an alphanumeric run the
+          # rule matched none of it, because five characters is under the minimum and the run stopped
+          # at the `_`, so the whole key shipped. The run takes the harness's class now.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "message": "XAI_MANAGEMENT_KEY=xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | balance lookup with xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 failed | xai said {\"error\":\"Incorrect API key provided: xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\\\"}\""}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] XAI_MANAGEMENT_KEY=[REDACTED_API_KEY] | balance lookup with [REDACTED_API_KEY] failed | xai said {\"error\":\"Incorrect API key provided: [REDACTED_API_KEY]\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"[REDACTED_API_KEY]\\\"}\"")
+
+  - name: "a wide xai run keeps the word rule and takes a key glued after it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Glued to a letter, a management key is still redacted: its run holds digits and capitals.
+          # A lowercase word that holds `xai-` is still a word, now with its `_` and `-` read as part
+          # of the run. A key glued after a wide run goes with it, as it does for `sk-`.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "KEYxai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | maxai-pipeline_stage-runner kept | xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0hf_Ab3Cd5Ef7Gh9Ij1Kl3Mn end"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] KEY[REDACTED_API_KEY] | maxai-pipeline_stage-runner kept | [REDACTED_API_KEY] end")
+
+  - name: "a wide xai run is redacted from the box minimum of 16 with its _ and -"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The box's minimum is 16 (the harness's is 8, as for `sk-`): a run of 16 that holds a `_`
+          # and a `-` is redacted, and one of 15 is under it and ships. A lowercase `xai-` name at a
+          # word's start is now read as a key, as the harness reads it: the scrub errs toward
+          # redaction.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "a xai-Ab3_Cd5-Ef7Gh9Ij b xai-Ab3_Cd5-Ef7Gh9I c using xai-compatible-endpoint-v2 now"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] a [REDACTED_API_KEY] b xai-Ab3_Cd5-Ef7Gh9I c using [REDACTED_API_KEY] now")
 
   # --- harness 0.186.0: an x-api-key header value, redacted by its name (basecradle-router#423) ---
 

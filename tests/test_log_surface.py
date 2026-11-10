@@ -154,8 +154,12 @@ _WIDE = "[A-Za-z0-9_-]"
 
 #: The prefix pass, rule for rule, in pattern order: the prefix as written, the name its run is
 #: captured under, the run's class and its minimum. These are the box's rules and minimums, a
-#: subset of the harness's `_PREFIXED` (`sk-` is 16 here, and `xai-`'s run is alphanumeric, so it
-#: is narrow here). Spelled once, so the pattern pinned below is built from it and never retyped.
+#: subset of the harness's `_PREFIXED` (`sk-` and `xai-` are 16 here, where the harness's are 8).
+#: Every run's class was diffed by hand against the harness's `_PREFIXED` at v0.187.0 and is the
+#: harness's: a run narrower than the source's is a key the box ships whole while the harness
+#: catches it, as `xai-`'s alphanumeric run shipped an xAI management key (basecradle-router#425).
+#: Nothing here can read the harness, so a class the harness widens later is a hand diff again.
+#: Spelled once, so the pattern pinned below is built from it and never retyped.
 _PREFIX_RULES = (
     ("github_pat_", "pat", "[A-Za-z0-9_]", 20),
     ("gh[a-z]_", "gh", "[A-Za-z0-9]", 20),
@@ -163,7 +167,7 @@ _PREFIX_RULES = (
     ("bc_uat_", "bc_uat", "[A-Za-z0-9]", 1),
     ("bc_isk_", "bc_isk", "[A-Za-z0-9]", 1),
     ("sk-", "sk", _WIDE, 16),
-    ("xai-", "xai", "[A-Za-z0-9]", 16),
+    ("xai-", "xai", _WIDE, 16),
     ("AIza", "aiza", _WIDE, 20),
     ("hf_", "hf", "[A-Za-z0-9]", 20),
     ("r8_", "r8", "[A-Za-z0-9]", 20),
@@ -215,13 +219,13 @@ def _has_rule(prefix: str) -> bool:
 def test_the_prefix_pass_is_the_rules_table_with_the_glued_key_in_every_narrow_rule() -> None:
     # A narrow run never swallows the head of a key glued after it (basecradle-router#423, the
     # harness's fix for basecradle-harness#858). The fix repeats the whole-key alternation once per
-    # narrow rule, because VRL composes no pattern from parts: ten copies of one long string, where
+    # narrow rule, because VRL composes no pattern from parts: nine copies of one long string, where
     # one copy at a different minimum, or missing a rule, would leave that rule's glued key to
     # ship. So the pattern is pinned whole, built from the one table above.
     expected = r"(?P<before>^|[\s\S])(?:" + "|".join(_rule_pattern(*r) for r in _PREFIX_RULES) + ")"
     assert _prefix_pattern() == expected
     narrow = [name for _, name, run, _ in _PREFIX_RULES if run != _WIDE]
-    assert narrow == ["pat", "gh", "bc_uat", "bc_isk", "xai", "hf", "r8", "ste", "abl", "pplx"]
+    assert narrow == ["pat", "gh", "bc_uat", "bc_isk", "hf", "r8", "ste", "abl", "pplx"]
     assert _prefix_pattern().count(_GLUED_KEY) == len(narrow)
 
 
