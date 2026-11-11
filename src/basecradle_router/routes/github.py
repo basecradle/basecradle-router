@@ -571,6 +571,12 @@ class GithubRoute:
     recipient_kind = "repo"
     #: Real traffic: a delivery here is a genuine event a human or a bot caused.
     synthetic = False
+    #: GitHub's own ceiling: it caps a webhook payload at 25 MB and does not deliver a
+    #: larger one, and a ``push`` or ``pull_request`` payload can genuinely run to
+    #: megabytes. Any bound below that would refuse real deliveries, which GitHub never
+    #: redelivers. It equals the edge's ``request_body max_size 25MB`` exactly (Caddy
+    #: reads ``MB`` as 10^6), so the app and the edge refuse the same bodies (#427).
+    max_body_bytes = 25_000_000
 
     def __init__(
         self,

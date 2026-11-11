@@ -200,6 +200,8 @@ class Stage(Enum):
     """The ordered stages a webhook passes through."""
 
     ROUTE = "route"
+    # The body cap (#427): after the route is known, before a body byte is verified.
+    BODY = "body"
     VERIFY = "verify"
     NORMALIZE = "normalize"
     RESOLVE = "resolve"
@@ -279,6 +281,34 @@ class AcceptResult:
 
 
 @dataclass(frozen=True, slots=True)
+class Admission:
+    """The outcome of :meth:`Pipeline.admit` — what the path alone decided (#427).
+
+    ``route`` is the source's route, or ``None`` when the path named no registered
+    route, in which case ``result`` carries the rejection and the caller answers it
+    without reading the body. ``result`` is the trip's record from its first stage, so
+    the stages that follow append to the same one.
+    """
+
+    source: str
+    result: PipelineResult
+    route: Route | None
+
+
+#: How much of an unregistered source name the route-rejection line carries. The name
+#: is the caller's own path segment, logged before anything about the caller is known,
+#: so it is bounded: a route name is a short word, and a longer one is noise (#427).
+_SHOWN_SOURCE_CHARS = 64
+
+
+def _shown_source(source: str) -> str:
+    """``source`` as the route-rejection line may carry it: whole if short, else cut."""
+    if len(source) <= _SHOWN_SOURCE_CHARS:
+        return source
+    return f"{source[:_SHOWN_SOURCE_CHARS]}…(+{len(source) - _SHOWN_SOURCE_CHARS})"
+
+
+@dataclass(frozen=True, slots=True)
 class Pipeline:
     """Orchestrates the stages for one source's webhooks.
 
@@ -333,17 +363,101 @@ class Pipeline:
             self.execute(agent, event, accepted.result)
         return accepted.result
 
-    def accept(self, source: str, request: InboundRequest) -> AcceptResult:
+    def admit(self, source: str) -> Admission:
+        """The route stage alone, decided from the path before any body is read; never raises.
+
+        The server calls this first, so a request for a source with no registered route —
+        unknown, or a known source this box has not enabled, which the registry never
+        holds — is answered without the daemon reading, buffering, or hashing a byte of
+        its body (#427). An admitted route also says how much body it can legitimately
+        send (:attr:`~basecradle_router.routes.base.Route.max_body_bytes`), which is the
+        cap the server reads under.
+        """
+        result = PipelineResult()
+        try:
+            route: Route | None = self.registry.get(source)
+        except UnknownRouteError:
+            # The name is the caller's, so it is shown bounded, and the registry's own
+            # message — which repeats it whole — is not logged (#427). The registered
+            # routes are, because they are what points at a source a box forgot to enable.
+            self._record(
+                result,
+                Stage.ROUTE,
+                Outcome.REJECTED,
+                source=_shown_source(source),
+                known=",".join(sorted(self.registry.names())) or "(none)",
+                error="no route registered for this source",
+            )
+            route = None
+        except Exception as exc:  # last-resort: a stage bug must never crash the daemon
+            self._record(
+                result,
+                Stage.ROUTE,
+                Outcome.FAILED,
+                source=_shown_source(source),
+                error=f"unexpected: {exc}",
+            )
+            route = None
+        else:
+            self._record(result, Stage.ROUTE, Outcome.OK, source=source)
+        return Admission(source=source, result=result, route=route)
+
+    def refuse_body(self, admission: Admission, *, declared: int | None = None) -> None:
+        """Record that ``admission``'s body was refused for exceeding its route's cap.
+
+        The server stops reading at the cap (or refuses on a declared ``Content-Length``
+        over it without reading at all), then calls this, and answers ``413``. The
+        ``BODY``/``REJECTED`` record is the one thing that answer depends on, so it is
+        all this does: one WARNING line naming the route and its cap.
+
+        **It records no evidence, deliberately.** The delivery-sink counters are the
+        classification (no consumer parses a reason string), and ``rejected`` means a
+        delivery that reached verification and failed it — the mismatched-secret signal
+        the NOC reads off ``accepted=0 rejected=N``. A body over the cap never reached
+        verification, and no source this router serves can send one: the github cap *is*
+        GitHub's own payload ceiling, and a platform or probe delivery is fixed-shape
+        metadata a hundred times smaller than its cap. So a ``413`` says nothing about
+        whether a sink is armed, and counting it would let anyone blur that signal — and
+        rewrite the evidence document — with a header and no body, exactly as an unknown
+        source is kept out of it. Should a source ever outgrow its cap, the source sees
+        the ``413`` on its own delivery log, and this line says so here.
+        """
+        route = admission.route
+        limit = route.max_body_bytes if route is not None else None
+        self._record(
+            admission.result,
+            Stage.BODY,
+            Outcome.REJECTED,
+            source=admission.source,
+            limit=limit,
+            declared=declared,
+            error=f"body over the {limit}-byte cap",
+        )
+
+    def accept(
+        self, source: str, request: InboundRequest, *, admission: Admission | None = None
+    ) -> AcceptResult:
         """The fast half: route → verify → normalize → resolve; never raises.
 
         Returns an :class:`AcceptResult` whose ``pending`` is the ``(agent,
         event)`` to wake when the event is an actionable handoff, or ``None``
         otherwise (rejected, ignored, or failed to resolve). No wake runs here —
         this half is cheap enough to answer a webhook within its timeout.
+
+        ``admission`` is the server's :meth:`admit` for this same request, taken before
+        its body was read; without one the route stage runs here, which is the whole
+        trip for a caller that already holds the body (the offline tests, :meth:`handle`).
+        When one is given, its source is the one used throughout, so the route that
+        verifies and the source the evidence and stage lines name can never differ.
         """
-        result = PipelineResult()
+        if admission is None:
+            admission = self.admit(source)
+        source = admission.source
+        result = admission.result
+        if admission.route is None:
+            return AcceptResult(result=result, pending=None)
         try:
-            pending = self._accept(source, request, result)
+            pending = self._accept(source, admission.route, request, result)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(
                 result, Stage.ROUTE, Outcome.FAILED, source=source, error=f"unexpected: {exc}"
@@ -519,21 +633,16 @@ class Pipeline:
             self._record(result, Stage.WAKE, Outcome.FAILED, **who, error=f"unexpected: {exc}")
 
     def _accept(
-        self, source: str, request: InboundRequest, result: PipelineResult
+        self, source: str, route: Route, request: InboundRequest, result: PipelineResult
     ) -> tuple[Agent, Event] | None:
-        """Drive the accept stages; return ``(agent, event)`` iff there is a wake to run."""
-        # Route: find the source's module. Unknown source is a rejection. The core
-        # cannot know the delivery id yet — the header carrying it is the *source's*
-        # vocabulary, which only the route reads — so the accept stages ahead of
-        # normalize are keyed by `source` alone. That is the "from the point it is
-        # known" boundary; the route logs its own decision line with the id.
-        try:
-            route = self.registry.get(source)
-        except UnknownRouteError as exc:
-            self._record(result, Stage.ROUTE, Outcome.REJECTED, source=source, error=str(exc))
-            return None
-        self._record(result, Stage.ROUTE, Outcome.OK, source=source)
+        """Drive the stages after the route; return ``(agent, event)`` iff there is a wake to run.
 
+        The route stage has already run, in :meth:`admit`. The core cannot know the
+        delivery id yet — the header carrying it is the *source's* vocabulary, which only
+        the route reads — so the stages ahead of normalize are keyed by ``source`` alone.
+        That is the "from the point it is known" boundary; the route logs its own
+        decision line with the id.
+        """
         # Verify: the security boundary. A missing secret is our misconfiguration,
         # not a bad request — fail the stage rather than reject the caller.
         #

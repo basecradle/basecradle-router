@@ -33,6 +33,9 @@ class FakeRoute:
     # route states its own answer — there is no default, so a route that forgot is
     # rejected by the registry rather than silently counted as real.
     synthetic = False
+    # Also part of the protocol, with no default: the most body this source can send,
+    # which the server reads no further than (#427).
+    max_body_bytes = 1024
 
     def verify(self, request: InboundRequest, secret: str) -> None:
         if request.header("X-Fake-Signature") != secret:
@@ -129,6 +132,43 @@ def test_registry_rejects_nonconforming_route() -> None:
 
     with pytest.raises(TypeError, match="does not implement"):
         RouteRegistry().register(HalfRoute())  # type: ignore[arg-type]
+
+
+def test_a_route_that_declares_no_body_cap_is_rejected_by_the_registry() -> None:
+    # No default (#427): a route that forgot its cap would otherwise be read unbounded.
+    class Uncapped:
+        name = "uncapped"
+        recipient_kind = "repo"
+        synthetic = False
+
+        def verify(self, request, secret) -> None: ...
+
+        def normalize(self, request):
+            return None
+
+    with pytest.raises(TypeError, match="does not implement"):
+        RouteRegistry().register(Uncapped())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("cap", [0, -1, 1.5, True, "1024", None])
+def test_a_body_cap_that_bounds_nothing_is_rejected_by_the_registry(cap: object) -> None:
+    # The protocol proves the member exists, never that it is a byte count; a zero, a
+    # negative, a float, a bool, a string or None would each mean something else.
+    route = FakeRoute()
+    route.max_body_bytes = cap  # type: ignore[assignment]
+    with pytest.raises(TypeError, match="max_body_bytes as a positive int"):
+        RouteRegistry().register(route)
+
+
+def test_every_shipped_route_declares_the_cap_its_source_needs() -> None:
+    # The values are the decision, so they are pinned: github's is GitHub's own 25 MB
+    # payload ceiling and the edge's `request_body max_size 25MB` exactly (Caddy reads
+    # MB as 10^6); the platform's and the probe's payloads are under a kilobyte.
+    from basecradle_router.routes import BasecradleRoute, GithubRoute, ProbeRoute
+
+    assert GithubRoute.max_body_bytes == 25_000_000
+    assert BasecradleRoute.max_body_bytes == 64 * 1024
+    assert ProbeRoute.max_body_bytes == 64 * 1024
 
 
 def test_registry_unknown_source_fails_with_known_list() -> None:

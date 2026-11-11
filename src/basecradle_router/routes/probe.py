@@ -96,6 +96,9 @@ class ProbeRoute:
     #: Manufactured, by definition. This is the flag that keeps a probe out of the
     #: production edge count and out of the production sinks — see the module docstring.
     synthetic = True
+    #: 64 KiB. The one sender is this repo's own injector, whose body is a recipient
+    #: slug and a marker — well under a kilobyte (#427).
+    max_body_bytes = 64 * 1024
 
     def verify(self, request: InboundRequest, secret: Secret | None) -> None:
         """Raise :class:`SignatureError` unless the request carries a valid signature.

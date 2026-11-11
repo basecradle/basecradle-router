@@ -26,6 +26,12 @@ class RouteRegistry:
             raise ValueError("route must declare a non-empty name")
         if not isinstance(route, Route):
             raise TypeError(f"route {name!r} does not implement verify/normalize")
+        # The protocol check proves the member exists, never that it bounds anything: a
+        # zero, a negative, a float or a bool would each make the body cap mean something
+        # other than "this many bytes", so boot refuses them here (#427).
+        limit = route.max_body_bytes
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise TypeError(f"route {name!r} must declare max_body_bytes as a positive int")
         if name in self._routes:
             raise ValueError(f"route {name!r} is already registered")
         self._routes[name] = route
