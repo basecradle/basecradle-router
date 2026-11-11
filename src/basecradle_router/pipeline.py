@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -306,6 +307,26 @@ def _shown_source(source: str) -> str:
     if len(source) <= _SHOWN_SOURCE_CHARS:
         return source
     return f"{source[:_SHOWN_SOURCE_CHARS]}…(+{len(source) - _SHOWN_SOURCE_CHARS})"
+
+
+#: A route bug's message can carry the sender's own bytes (a ``KeyError`` names the key it
+#: missed), so it is bounded wherever it is written (#434), and its traceback is the frames
+#: alone, the innermost of them, never the message again and never a whole deep recursion.
+_SHOWN_CRASH_CHARS = 200
+_SHOWN_CRASH_FRAMES = 30
+
+
+def _shown_crash(exc: BaseException) -> str:
+    """A route bug as its stage line and its ``event=normalize_crashed`` line carry it."""
+    message = str(exc)
+    if len(message) > _SHOWN_CRASH_CHARS:
+        message = f"{message[:_SHOWN_CRASH_CHARS]}…(+{len(message) - _SHOWN_CRASH_CHARS})"
+    return f"{type(exc).__name__}: {message}"
+
+
+def _crash_frames(exc: BaseException) -> str:
+    """Where the route bug was raised: the innermost frames, without the message."""
+    return "".join(traceback.format_tb(exc.__traceback__, limit=-_SHOWN_CRASH_FRAMES))
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,6 +693,24 @@ class Pipeline:
             event = route.normalize(request)
         except (PayloadError, UntrustedSenderError) as exc:
             self._record(result, Stage.NORMALIZE, Outcome.REJECTED, source=source, error=str(exc))
+            return None
+        except Exception as exc:  # a route bug, closed at the one boundary (#434)
+            # Anything else a route's normalize raises on a *verified* delivery is a router
+            # bug, never the sender's fault. Caught here, the one call every route's
+            # normalize passes through, it is recorded at the stage it happened in and
+            # answered 500, rather than escaping to `accept`'s last resort, which names the
+            # wrong stage and answers 200: a delivery acknowledged and dropped. So an escape
+            # from any helper normalize calls is closed without first being found. The
+            # frames are the whole diagnosis of a bug.
+            shown = _shown_crash(exc)
+            logger.error(
+                "event=normalize_crashed %s\n%s",
+                log_fields(source=source, error=shown),
+                _crash_frames(exc),
+            )
+            self._record(
+                result, Stage.NORMALIZE, Outcome.FAILED, source=source, error=f"unexpected: {shown}"
+            )
             return None
         if event is None:
             self.evidence.record_delivery_decision(source, woke=False)
