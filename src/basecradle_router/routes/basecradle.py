@@ -559,9 +559,11 @@ def _recipient_hint(body: bytes) -> str | None:
     except Exception:  # noqa: BLE001 — see below; the hint is never load-bearing
         # Deliberately broader than :class:`PayloadError`. This is the one parse that
         # runs on **unauthenticated** input, and not every way a hostile body breaks a
-        # decoder is a decode *error*: a deeply-nested one raises ``RecursionError``,
-        # which is not a ``JSONDecodeError`` and would otherwise escape a security
-        # boundary that has not yet checked a signature. Swallowing it costs nothing —
+        # decoder is a decode *error*: a deeply-nested one raises ``RecursionError``.
+        # :func:`parse_json_object` now names every class the decoder is known to
+        # raise (#433), but this guard does not lean on that list being complete —
+        # anything it missed would escape a security boundary that has not yet
+        # checked a signature. Swallowing it costs nothing —
         # every failure here means "no per-recipient key", and the delivery is still
         # put through the same HMAC verify it faces today. No branch of this can widen
         # what a valid signature means; the worst it can do is fall back.

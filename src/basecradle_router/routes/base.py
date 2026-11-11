@@ -114,11 +114,31 @@ def parse_json_object(body: bytes) -> dict[str, Any]:
     The shared body-parse boundary every JSON source uses, so a malformed body is
     a uniform, well-described :class:`PayloadError` (a 400) rather than a per-route
     re-implementation that could drift in its error shape.
+
+    **Every way the decoder can refuse a body is a** :class:`PayloadError`, not only a
+    decode error (basecradle-router#433). Three ordinary bodies break ``json.loads``
+    without a :class:`json.JSONDecodeError`: an integer longer than the interpreter's
+    digit limit (4300 digits by default, about 4.3 KB) raises a plain
+    :class:`ValueError`; bytes that are not UTF-8 raise :class:`UnicodeDecodeError`,
+    also a ``ValueError``; and deep nesting raises :class:`RecursionError`, which is not
+    a ``ValueError`` at all. Each used to escape this boundary into the core's
+    last-resort handler, which records ``stage=route outcome=failed`` and answers
+    ``200``: a validly signed delivery was acknowledged and dropped, and GitHub never
+    redelivers a ``200``. Raised here, inside ``normalize``, each is a ``stage=normalize
+    outcome=rejected`` and a ``400``, like any other malformed body.
+
+    Those three get their own message, naming the class, rather than "not valid JSON":
+    a long integer or a deep nesting *is* valid JSON, refused only by the interpreter's
+    limit, so an operator should look there and not at the sender's serializer.
     """
     try:
         data = json.loads(body)
     except json.JSONDecodeError as exc:
         raise PayloadError(f"body is not valid JSON: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        raise PayloadError(
+            f"body could not be decoded as JSON ({type(exc).__name__}): {exc}"
+        ) from exc
     if not isinstance(data, dict):
         raise PayloadError("webhook body must be a JSON object")
     return data

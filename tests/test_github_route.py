@@ -267,6 +267,20 @@ def test_normalize_ignores_non_actionable_action() -> None:
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
+@pytest.mark.parametrize("event", ["issues", "issue_comment"])
+@pytest.mark.parametrize("action", [["opened"], {"opened": True}, None, 1, True])
+def test_an_action_that_is_not_a_string_is_an_ignore_never_an_escape(event, action) -> None:
+    """A list or an object is unhashable, so testing it against an action set raised
+    ``TypeError`` out of ``normalize``, and the core answered that signed delivery
+    ``200`` and dropped it (#433). It is an action the route does not act on: an ignore.
+
+    The payload is stamped like a real one (``state``, ``updated_at``), because the issue
+    ledger returns early on a bare one and never reaches its own action test, which is
+    the read that escaped first."""
+    payload = {**_stamped(_issues_payload(action="opened")), "action": action}
+    assert GithubRoute(TRUSTED).normalize(_issues_request(payload, event=event)) is None
+
+
 def test_normalize_rejects_malformed_json() -> None:
     with pytest.raises(PayloadError, match="not valid JSON"):
         GithubRoute(TRUSTED).normalize(_issues_request(raw_body=b"{not json"))
