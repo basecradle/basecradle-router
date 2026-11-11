@@ -95,6 +95,11 @@ def _run_smoke(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess[
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),
+            # Each host's own tree copy stands in for the installed file, so case 10 reads a
+            # real site block and sends its request rather than refusing before it. This fake
+            # curl writes no header dump, so case 10 then FAILs here; the runs that assert a
+            # pass (test_smoke_test_enabled_routes, _registry_states) answer it properly.
+            "CADDYFILE": str(DEPLOY / "hosts" / (args[0] if args else "absent") / "Caddyfile"),
         },
     )
     return result, log.read_text().splitlines()
@@ -108,15 +113,18 @@ def _public(urls: list[str]) -> list[str]:
 def test_every_public_request_goes_to_the_host_it_was_given(host: str, tmp_path: Path) -> None:
     result, urls = _run_smoke(tmp_path, host)
     public = _public(urls)
-    # The github cases, the basecradle route probe, and the public probe deny — every
-    # route's public URL, each derived from <fqdn>.
+    # The github cases, the basecradle route probe, the public probe deny, and the edge's
+    # header check (#437) — every public URL, each derived from <fqdn>.
     assert {urlsplit(u).path for u in public} == {
         "/webhooks/github",
         "/webhooks/basecradle",
         "/webhooks/probe",
+        "/up",
     }, result.stderr
     assert {urlsplit(u).netloc for u in public} == {host}
-    assert all(u.startswith(f"https://{host}/webhooks/") for u in public)
+    assert all(
+        u.startswith(f"https://{host}/webhooks/") or u == f"https://{host}/up" for u in public
+    )
     assert LOOPBACK in urls, "the loopback probe case must still run, and stay on loopback"
     assert f"Smoke-testing the live daemon on {host} at https://{host}/webhooks/github" in (
         result.stdout

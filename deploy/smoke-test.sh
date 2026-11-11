@@ -68,6 +68,14 @@
 #
 # It is asserted unconditionally for the same reason as case 7.
 #
+# The last case reads the edge's answer rather than the daemon's (#437):
+#
+#  10. GET /up through the edge, over       -> every header the INSTALLED Caddyfile sets
+#      HTTP/1.1 and over HTTP/2                arrives once with its value, and that file
+#                                              sets at least the six of #428 and #432
+#
+# Also unconditional: the edge fronts every route, wired or not.
+#
 # Runs ON THE BOX (it reads the signing secret + trusted-actor list from
 # router.env, which is router:router 0600 — the daemon's account and root only). The
 # NOC's deploy-router op runs it on-box after a restart, rolling the deploy back on
@@ -84,6 +92,7 @@
 #
 # Config (env overrides):
 #   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
+#   CADDYFILE         path to the installed Caddyfile (default /etc/caddy/Caddyfile)
 #
 # It never waits on a wake and never touches a real agent, so it is safe to run
 # against production at any time.
@@ -91,6 +100,7 @@
 set -euo pipefail
 
 ROUTER_ENV_FILE="${ROUTER_ENV_FILE:-/etc/basecradle-router/router.env}"
+CADDYFILE="${CADDYFILE:-/etc/caddy/Caddyfile}"
 HOSTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hosts"
 
 # A repo that is never in the registry, so case 3 resolves to no agent => no wake.
@@ -1028,6 +1038,243 @@ assert_foreign_argv_hidden() {
 # Case 9 — ALWAYS asserted: the leak it guards is open to every agent session on the
 # box, whether or not any route is wired.
 assert_foreign_argv_hidden "other accounts' argv hidden inside the wake's namespace (#271)" basecradle-router
+
+# --- the edge's security headers (#437) ---------------------------------------
+#
+#  10. GET /up through the edge, over HTTP/1.1 and over HTTP/2  -> every header the installed
+#      Caddyfile sets arrives exactly once, with the value it sets
+#
+# `tests/test_caddyfile.py` pins the header set in this tree's Caddyfiles, offline, and
+# nothing else read a response header: the box's installed file could diverge from the
+# repo's copy, or a Caddy release could stop applying `header` to a proxied answer, and
+# every other case would stay green while the edge sent none of the set (#428, #432).
+#
+# The expected values are read from the INSTALLED Caddyfile, never from this tree's copy
+# and never from a second copy here, for the reason case 7 gives: the NOC runs this script
+# against a new tree BEFORE it applies that tree's Caddyfile, so a smoke assertion must hold
+# under the old file and the new one alike (deploy/README.md), and only the file Caddy runs
+# says what Caddy should send. What reading the installed file cannot catch is a file that
+# simply stopped setting a header, which would be asserted against nothing, so a floor
+# backs it: the six headers of #428 and #432, names only, never values.
+#
+# The floor obeys the same old-and-new rule, so it moves in one direction per commit:
+#   - It may SHRINK in the commit that drops a header from the tree's Caddyfiles, which
+#     `tests/test_edge_headers.py` forces, since it pins the floor inside every one of them.
+#   - It may GROW only after every router box's INSTALLED Caddyfile already sets the new
+#     name: a floor that grew in the same commit as the Caddyfile would fail every box
+#     before that Caddyfile was applied, roll the deploy back, and hold the apply behind it.
+#     A header added to the Caddyfile is asserted from the first apply regardless; only the
+#     floor waits.
+#
+# The reader takes only the one form this tree writes, `header <Name> "<value>"` directly
+# in the host's site block, with a value that is literal: no surrounding whitespace, which
+# HTTP strips on the wire, and no `{`/`}`, which Caddy reads as a placeholder and
+# substitutes before sending. Any other `header` line (a matcher, a block, a +/- operation,
+# an unquoted value, a trailing comment, one nested in a sub-block, which applies only to
+# what that block matches) is refused by line number, never guessed at, so a Caddyfile that
+# outgrows the reader turns this gate red instead of quietly asserting less.
+#
+# Asserted unconditionally, like cases 7 and 9: the edge fronts every route, wired or not.
+# Read-only: one GET of the liveness path per protocol.
+#
+# The markers let tests/test_edge_headers.py run these EXACT shipped bodies offline.
+# >>> edge_headers >>>
+EDGE_FLOOR_HEADERS=(
+	Strict-Transport-Security
+	X-Content-Type-Options
+	X-Frame-Options
+	Referrer-Policy
+	Permissions-Policy
+	Content-Security-Policy
+)
+
+# ASCII lower case, for comparing header names: HTTP/2 sends every name lower-cased. `tr`,
+# because bash 3.2 (macOS) has no `${x,,}`; a here-string, so there is no pipeline. Each
+# name is lowered once, where it is read, never inside a comparison loop.
+lower() {
+	LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"
+}
+
+# caddy_site_headers <caddyfile> <site>: the `header` directives the site block for <site>
+# sets, into the parallel arrays SITE_HEADER_NAMES (as written), SITE_HEADER_KEYS (lower
+# case) and SITE_HEADER_VALUES. On a refusal it returns non-zero with the reason in
+# SITE_HEADER_ERROR. Blocks are read the way `caddy fmt` lays them out: a line ending `{`
+# opens one and a line that is only `}` closes it, either may carry a trailing comment.
+caddy_site_headers() {
+	local file=$1 site=$2 line shape key value n=0 depth=0 in_site=false found=false i
+	local header_re='^header[[:space:]]+([A-Za-z0-9-]+)[[:space:]]+"([^"\\{}]*)"$'
+	SITE_HEADER_NAMES=()
+	SITE_HEADER_KEYS=()
+	SITE_HEADER_VALUES=()
+	SITE_HEADER_ERROR=""
+	if [[ ! -f "$file" || ! -r "$file" ]]; then
+		SITE_HEADER_ERROR="cannot read the installed Caddyfile ${file}"
+		return 1
+	fi
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		n=$((n + 1))
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		if [[ -z "$line" || "$line" == \#* ]]; then
+			continue
+		fi
+		if $in_site && [[ "$line" =~ ^header([[:space:]]|$) ]]; then
+			value=""
+			if ((depth == 1)) && [[ "$line" =~ $header_re ]]; then
+				value="${BASH_REMATCH[2]}"
+			fi
+			if [[ -z "$value" || "$value" != "${value#[[:space:]]}" ||
+				"$value" != "${value%[[:space:]]}" ]]; then
+				SITE_HEADER_ERROR="${file}:${n}: a header directive this gate cannot read: ${line}"
+				return 1
+			fi
+			key="$(lower "${BASH_REMATCH[1]}")"
+			for ((i = 0; i < ${#SITE_HEADER_KEYS[@]}; i++)); do
+				if [[ "${SITE_HEADER_KEYS[i]}" == "$key" ]]; then
+					SITE_HEADER_ERROR="${file}:${n}: sets ${BASH_REMATCH[1]} a second time"
+					return 1
+				fi
+			done
+			SITE_HEADER_NAMES+=("${BASH_REMATCH[1]}")
+			SITE_HEADER_KEYS+=("$key")
+			SITE_HEADER_VALUES+=("$value")
+			continue
+		fi
+		# Only the block structure is read from any other line, so a trailing comment on it
+		# is dropped first.
+		shape="${line%%[[:space:]]#*}"
+		if [[ "$shape" == "}" ]]; then
+			depth=$((depth - 1))
+			if ((depth == 0)); then
+				in_site=false
+			fi
+			continue
+		fi
+		if ((depth == 0)) && [[ "$shape" == "$site {" ]]; then
+			in_site=true
+			found=true
+		fi
+		if [[ "$shape" == *"{" ]]; then
+			depth=$((depth + 1))
+		fi
+	done <"$file"
+	if ! $found; then
+		SITE_HEADER_ERROR="${file} has no site block \`${site} {\`"
+		return 1
+	fi
+	return 0
+}
+
+# edge_response <dump>: a `curl -D` header dump, into RESP_PROTO (the status line's
+# protocol, so the HTTP/2 case proves it was HTTP/2 and not a quiet fall-back to 1.1) and
+# the parallel arrays RESP_KEYS (lower case) / RESP_VALUES (trimmed, as HTTP trims them).
+edge_response() {
+	local dump=$1 line value first=true
+	RESP_PROTO=""
+	RESP_KEYS=()
+	RESP_VALUES=()
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line%$'\r'}"
+		if $first; then
+			RESP_PROTO="${line%% *}"
+			first=false
+			continue
+		fi
+		if [[ -z "$line" ]]; then
+			break
+		fi
+		if [[ "$line" != *:* ]]; then
+			continue
+		fi
+		value="${line#*:}"
+		value="${value#"${value%%[![:space:]]*}"}"
+		value="${value%"${value##*[![:space:]]}"}"
+		RESP_KEYS+=("$(lower "${line%%:*}")")
+		RESP_VALUES+=("$value")
+	done <"$dump"
+	return 0
+}
+
+# Every floor header must be one the installed site sets.
+assert_edge_floor() {
+	local floor key i set
+	for floor in "${EDGE_FLOOR_HEADERS[@]}"; do
+		key="$(lower "$floor")"
+		set=false
+		for ((i = 0; i < ${#SITE_HEADER_KEYS[@]}; i++)); do
+			if [[ "${SITE_HEADER_KEYS[i]}" == "$key" ]]; then
+				set=true
+			fi
+		done
+		if $set; then
+			green "  PASS  edge header ${floor} is set by the installed Caddyfile"
+		else
+			red "  FAIL  edge header ${floor} is not set by the installed Caddyfile"
+			rc=1
+		fi
+	done
+	return 0
+}
+
+# assert_edge_headers <url> <curl protocol flag> <protocol>: GET <url> and assert every
+# header the installed site sets arrived exactly once with its value, one line each.
+assert_edge_headers() {
+	local url=$1 flag=$2 proto=$3 dump="$workdir/edge-headers.dump" err="$workdir/edge-headers.err"
+	local i j want got count
+	# Emptied first, so a curl that wrote nothing can never be read as an earlier answer.
+	: >"$dump"
+	if ! curl -sS -D "$dump" -o /dev/null --max-time 15 "$flag" "$url" 2>"$err"; then
+		red "  FAIL  edge headers over ${proto}: GET ${url} failed: $(<"$err")"
+		rc=1
+		return 0
+	fi
+	if [[ ! -s "$dump" ]]; then
+		red "  FAIL  edge headers over ${proto}: GET ${url} returned no headers to read"
+		rc=1
+		return 0
+	fi
+	edge_response "$dump"
+	if [[ "$RESP_PROTO" != "$proto" ]]; then
+		red "  FAIL  edge headers over ${proto}: answered over ${RESP_PROTO:-nothing} (EXPECTED ${proto})"
+		rc=1
+		return 0
+	fi
+	for ((i = 0; i < ${#SITE_HEADER_KEYS[@]}; i++)); do
+		want="${SITE_HEADER_VALUES[i]}"
+		count=0
+		got=""
+		for ((j = 0; j < ${#RESP_KEYS[@]}; j++)); do
+			if [[ "${RESP_KEYS[j]}" == "${SITE_HEADER_KEYS[i]}" ]]; then
+				count=$((count + 1))
+				got="${RESP_VALUES[j]}"
+			fi
+		done
+		if ((count == 0)); then
+			red "  FAIL  edge header ${SITE_HEADER_NAMES[i]} over ${proto}: absent (EXPECTED ${want})"
+			rc=1
+		elif ((count > 1)); then
+			red "  FAIL  edge header ${SITE_HEADER_NAMES[i]} over ${proto}: sent ${count} times (EXPECTED once: ${want})"
+			rc=1
+		elif [[ "$got" != "$want" ]]; then
+			red "  FAIL  edge header ${SITE_HEADER_NAMES[i]} over ${proto}: ${got} (EXPECTED ${want})"
+			rc=1
+		else
+			green "  PASS  edge header ${SITE_HEADER_NAMES[i]} over ${proto}: ${got}"
+		fi
+	done
+	return 0
+}
+# <<< edge_headers <<<
+
+EDGE_URL="https://${SMOKE_HOST}/up"
+if caddy_site_headers "$CADDYFILE" "$SMOKE_HOST"; then
+	assert_edge_floor
+	assert_edge_headers "$EDGE_URL" --http1.1 HTTP/1.1
+	assert_edge_headers "$EDGE_URL" --http2 HTTP/2
+else
+	red "  FAIL  edge security headers: ${SITE_HEADER_ERROR}"
+	rc=1
+fi
 
 echo
 if [[ $rc -eq 0 && "$github_enabled" == "true" ]]; then

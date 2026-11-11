@@ -29,6 +29,7 @@ AI). Secrets are correctly-shaped fakes; the uuid is a well-formed UUIDv7.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import textwrap
@@ -98,9 +99,11 @@ JOURNAL = "\n".join(
 #: rejects the unsigned delivery. Every request is logged as `<url> <delivery> <status>`.
 FAKE_CURL = textwrap.dedent(
     """\
-    url="" sig="" delivery="" body=""
+    url="" sig="" delivery="" body="" dump="" proto="HTTP/1.1"
     while (($#)); do
       case "$1" in
+        -D) dump="$2"; shift ;;
+        --http2) proto="HTTP/2" ;;
         -H) case "$2" in
               X-Hub-Signature-256:*|X-BaseCradle-Signature:*) sig="${2#*: }" ;;
               X-GitHub-Delivery:*|X-BaseCradle-Delivery:*) delivery="${2#*: }" ;;
@@ -110,6 +113,11 @@ FAKE_CURL = textwrap.dedent(
       esac
       shift
     done
+    # Case 10: an edge that sends exactly the headers the host's Caddyfile sets (#437).
+    if [[ "$url" == */up ]]; then
+      { printf '%s 200 \\r\\n' "$proto"; cat "EDGE"; printf '\\r\\n'; } >"$dump"
+      exit 0
+    fi
     case "$url" in
       */webhooks/github)
         if [[ "$sig" == "ZERO" ]]; then code=401
@@ -127,6 +135,15 @@ FAKE_CURL = textwrap.dedent(
 )
 
 
+def _edge_headers(tmp_path: Path) -> Path:
+    """The header block a correct edge sends for HOST: each `header` its Caddyfile sets."""
+    caddyfile = (DEPLOY / "hosts" / HOST / "Caddyfile").read_text()
+    lines = re.findall(r'(?m)^\s*header\s+(\S+)\s+"([^"]*)"\s*$', caddyfile)
+    path = tmp_path / "edge-headers.txt"
+    path.write_text("".join(f"{name}: {value}\r\n" for name, value in lines))
+    return path
+
+
 def _fake_bin(tmp_path: Path, log: Path) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -136,6 +153,7 @@ def _fake_bin(tmp_path: Path, log: Path) -> Path:
         FAKE_CURL.replace('"ZERO"', f'"{ZERO_SIG}"')
         .replace('"CASE6"', f'"{CASE_6_DELIVERY}"')
         .replace('"LOG"', f'"{log}"')
+        .replace('"EDGE"', f'"{_edge_headers(tmp_path)}"')
     )
     fakes = {
         "curl": curl,
@@ -190,6 +208,7 @@ def _run(
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),
+            "CADDYFILE": str(DEPLOY / "hosts" / HOST / "Caddyfile"),
         },
     )
     requests = [tuple(line.split(" ")) for line in log.read_text().splitlines()]
