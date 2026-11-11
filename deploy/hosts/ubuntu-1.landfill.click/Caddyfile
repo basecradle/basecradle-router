@@ -6,23 +6,59 @@
 # Caddy automatically obtains and renews a Let's Encrypt certificate for the
 # hostname below (needs inbound 80 for the ACME challenge + 443 for traffic).
 # It reverse-proxies to the local uvicorn the systemd unit runs on 127.0.0.1:8000.
+{
+	servers {
+		# A request on 443 whose Host is not the name its TLS handshake asked for is answered
+		# 421 Misdirected Request by Caddy itself, before any site is consulted (#428). Without
+		# it, a foreign Host under this box's SNI matched no site and Caddy answered an empty
+		# 200, so the box confirmed every name anyone tried. HTTP/2 and HTTP/3 carry the Host
+		# as :authority, which is checked the same way. It binds TLS only; port 80 is the
+		# catch-all `http://` site at the end of this file.
+		strict_sni_host on
+	}
+}
 
 ubuntu-1.landfill.click {
-	# Cap the request body: GitHub webhook deliveries are small; this bounds a
-	# hostile-payload DoS before the body is read and verified. (GitHub's own
-	# delivery cap is 25 MB; we sit comfortably under it.)
+	# HSTS (#428): a browser that has once reached this name over TLS never tries it in
+	# plain HTTP again. Two years, the age the major browsers' guidance gives. No
+	# includeSubDomains: this box serves one name and does not own the names below it, so
+	# it makes no promise for them. The response headers a browser page would need
+	# (Content-Security-Policy, X-Frame-Options, Referrer-Policy, X-Content-Type-Options)
+	# are left out on purpose: every answer here is a JSON verdict or the fixed /up body,
+	# each with an explicit Content-Type and none echoing a caller's input, so each would
+	# guard a page that does not exist. The Server and Via banners stay: they name only
+	# what this public repository already publishes, and they are the one cue that tells
+	# an operator whether Caddy or the daemon answered.
+	header Strict-Transport-Security "max-age=63072000"
+
+	# Cap the request body at the edge: the outer fence. GitHub caps its own deliveries at
+	# 25 MB, so this is the largest any source sends. The daemon holds each route to its own,
+	# tighter cap from the path alone, before it reads a byte (#427); this bounds what reaches
+	# it at all.
 	request_body {
 		max_size 25MB
 	}
 
-	# The synthetic-wake injection point is ON-BOX ONLY (basecradle-router#208). The
-	# probe CLI posts to 127.0.0.1:8000 directly, so it never passes through here — and
-	# nothing legitimate ever arrives from the internet for this path. Answering 404 is
-	# the same answer an unknown route already gives, so this leaks nothing about
-	# whether the route is enabled; it only removes a fleet-wide wake trigger from the
-	# public surface, where its only remaining protection would be one shared secret.
-	@probe path /webhooks/probe /webhooks/probe/*
-	respond @probe 404
+	# The synthetic-wake injection point is ON-BOX ONLY (basecradle-router#208). The probe
+	# CLI posts to 127.0.0.1:8000 directly, so it never passes through here, and nothing
+	# legitimate ever arrives from the internet for this path. So the path is rewritten to
+	# one that names no route, and the daemon answers it as it answers an unknown source
+	# (#428): `/webhooks/probe` exactly as `/webhooks/<unknown>`, and anything below it
+	# exactly as `/webhooks/<unknown>/<anything>`, status, body and headers alike, because the
+	# same code writes both. So the answer never depends on whether the route is enabled on
+	# the daemon behind this edge, which is the one thing the mask hides. (Answering it here
+	# instead gave Caddy's empty 404 against the daemon's JSON one.) The rewrite runs before
+	# the proxy, so the route is never reached from here: the path matcher merges slashes and
+	# reads the decoded path, so `//probe` and `%70robe` are caught too. It also ignores case
+	# and resolves `.` and `..` segments, which the daemon does not, so `/WEBHOOKS/PROBE` and
+	# `/webhooks/./probe` are answered as an unknown source where `/WEBHOOKS/FOO` and
+	# `/webhooks/./foo` get the daemon's not-found and no-route answers. That shows the mask
+	# is here, which this public file says anyway, and nothing about the route behind it.
+	# `tests/test_caddyfile.py` pins that the target names no route the daemon can register.
+	@probe path /webhooks/probe /webhooks/probe/
+	rewrite @probe /webhooks/probe-masked
+	@probe_below path /webhooks/probe/*
+	rewrite @probe_below /webhooks/probe-masked/below
 
 	reverse_proxy 127.0.0.1:8000 {
 		# Hold a request across a daemon restart instead of answering it 502 (#264). Every
@@ -54,5 +90,16 @@ ubuntu-1.landfill.click {
 	}
 }
 
-# Optional: set an ACME account email for Let's Encrypt expiry notices by adding a
-# global options block above this site:  { email ops@basecradle.com }
+# Port 80 redirects only this box's own name to HTTPS (#428). Caddy's automatic redirect
+# still serves that name, because the site above is the one it manages, and the ACME HTTP
+# challenge is answered before any site is consulted. Every other Host — a made-up name,
+# a bare IP — reaches this catch-all and is refused 421, instead of the 308 to
+# `https://<Host as sent>` the automatic catch-all used to send: a redirect anyone could aim
+# at any name, and for a bare IP one that could never complete a TLS handshake.
+http:// {
+	respond 421
+}
+
+# Optional: set an ACME account email for Let's Encrypt expiry notices by adding
+#   email ops@basecradle.com
+# to the global options block at the top of this file.

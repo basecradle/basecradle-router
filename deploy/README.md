@@ -398,7 +398,7 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins: drawkkwa
 # The synthetic wake (issue #208) — add "probe" to enable the router's own lever for the
 # wake-edge claims. A route with no secret does not boot, deliberately: a probe is a
 # genuine signed delivery, not a back door into the middle of the path. Its injection
-# point is loopback-only (the Caddyfile 404s /webhooks/probe from the internet):
+# point is loopback-only (the Caddyfile masks /webhooks/probe from the internet):
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe
 # BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds the other copy>
 # BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000   # optional; must be the address uvicorn binds
@@ -1235,8 +1235,12 @@ before the deadline). The refused-vs-failed split the evidence store already dra
 proven either way.
 
 **The injection point is not reachable from the internet.** The CLI posts over loopback, and the
-Caddyfile answers `/webhooks/probe` with a `404` — the same answer an unknown route gives, so it
-leaks nothing about whether the route exists.
+Caddyfile rewrites `/webhooks/probe` to a path that names no route, and anything under it to a path under
+that one, so the daemon answers each exactly as it answers an unknown source and an unknown source's
+subpath: the same status, body and headers, written by the same code (#428). Caddy's matcher also ignores
+case and resolves `.`/`..` segments where the daemon does not, so those spellings show the mask is there,
+which the public Caddyfile says anyway, and never whether the route is enabled behind it. It leaks nothing about whether the route exists. Before #428 Caddy answered the path
+itself, with an empty `404` that an unknown source's JSON `404` told apart.
 
 ### Ingress — the TLS webhook endpoint (`ai.basecradle.com`)
 - **Caddy** terminates TLS with automatic Let's Encrypt certificates + renewal and reverse-proxies to
@@ -1332,11 +1336,26 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
     5 s is under GitHub's 10 s delivery timeout. This needs Caddy ≥ 2.11.4, the first release whose
     retry re-sends an unread POST body intact. The comment in the file carries the full reasoning, and
     `tests/test_caddyfile.py` pins the directive in every host's copy.
-  - **The deploy tick does not carry it.** `deploy-router` installs only the paths in the contract
-    table below, and the Caddyfile is not among them. The NOC installs the deployed tree's copy with its
-    box-level Caddyfile step, which today is the idempotent `arm-probe-route` op. So a merged Caddyfile
-    change reaches the box only when that step runs, and the change has to be handed to the NOC through
-    the capital.
+  - **It hardens the edge (#428).** `Strict-Transport-Security: max-age=63072000` on the site (no
+    `includeSubDomains`: the box does not own the names below its own). No other browser-page header,
+    because every answer is a JSON verdict or the fixed `/up` body with an explicit `Content-Type`, none
+    echoing a caller's input. The `Server`/`Via` banners stay: they name only what this public repo
+    publishes, and they tell an operator which layer answered. `strict_sni_host on` answers a foreign
+    `Host` under this box's SNI `421` (it was an empty `200`). Port 80's catch-all `http://` site answers
+    every name but the box's own `421`, so Caddy's automatic redirect serves only the managed name (it
+    was a `308` to `https://<Host as sent>`). The probe path is rewritten, not answered (see *Proving
+    what the router claims*). `tests/test_caddyfile.py` pins each line; each behaviour was measured on
+    Caddy 2.11.4 before it was pinned.
+  - **How a change reaches the box.** `deploy-router` installs only the paths in the contract table
+    below, and the Caddyfile is not among them. The NOC's `auto-converge` tick installs the deployed
+    tree's copy unattended, straight after the router deploy that moved it (basecradle-noc#710), through
+    the restart-free path of its `arm-probe-route` op: it validates, reloads Caddy gracefully, runs
+    `smoke-test.sh` live, and restores the previous file on any failure. It acts only on a box whose probe
+    route is armed and whose installed file is byte-identical to the previous deployed tree's; any other
+    state is held for a person, and needs `arm-probe-route` run by hand through the capital. Because the
+    smoke test runs against a new tree *before* its Caddyfile is applied, **a smoke assertion must hold
+    under both the old Caddyfile and the new one**, or the router deploy fails, rolls back, and the
+    Caddyfile apply is held behind it.
 - **The ASGI entrypoint** `basecradle_router.app:create_app` + the `uvicorn` dependency (#37) — the
   composition root the systemd unit's `ExecStart` runs.
 - **The admin CLI wrapper** (`deploy/bin/router-admin`, #198) — the one stable path the NOC's converge
@@ -1540,8 +1559,8 @@ trusted actors are **required**, as the daemon requires them. They are gated on 
 the secret's absence: a github box that lost its secret dies rather than quietly skipping the trust-gate
 proof. A box whose daemon does not enable github — `red.basecradle.com`, harness-only, is the first (#417) —
 skips them, never reads the github variables, and asserts instead that an unsigned github delivery sent on
-**loopback**, straight to the daemon, finds **no route** there (**404**) — loopback because a 404 through Caddy
-could be Caddy's own. That makes the skip a live fact rather than an inference: were `router.env` read one
+**loopback**, straight to the daemon, finds **no route** there (**404**) — loopback because what reaches the
+daemon through Caddy is Caddy's routing as well. That makes the skip a live fact rather than an inference: were `router.env` read one
 way by the gate and another by systemd, the answer is a 401 and the gate fails.
 `tests/test_smoke_test_enabled_routes.py` runs the whole script over both branches, and the shell parse is
 pinned to the daemon's own in `tests/test_smoke_test_assertions.py`.
@@ -1585,7 +1604,7 @@ Cases 7–8 pin where the **synthetic wake's** injection point lives (#208):
 
 | Case | Request | Asserted | Proves |
 |---|---|---|---|
-| 7 | `POST` the **public** `/webhooks/probe` | **404** | the injection point is **not reachable from the internet** — Caddy denies it |
+| 7 | `POST` the **public** `/webhooks/probe` | **404** | the injection point is **not reachable from the internet** — Caddy masks it |
 | 8 | `POST` **loopback** `/webhooks/probe`, bad signature | **401** | the daemon serves it on-box, and the shared HMAC boundary rejects |
 
 **Case 7 is asserted unconditionally**, unlike every other route case, and that asymmetry is the point: the

@@ -53,7 +53,7 @@
 # Two more prove the synthetic wake's injection point is where it is supposed to be —
 # on the box and nowhere else (#208):
 #
-#   7. the PUBLIC /webhooks/probe         -> 404  (Caddy denies it; ALWAYS asserted)
+#   7. the PUBLIC /webhooks/probe         -> 404  (Caddy masks it; ALWAYS asserted)
 #   8. LOOPBACK, bad signature            -> 401  (served locally, HMAC rejects)
 #
 # Case 7 is a security assertion, not a liveness one, so unlike every other route case
@@ -571,8 +571,9 @@ obs_since="$(date '+%Y-%m-%d %H:%M:%S')"
 # and the skip is itself asserted live: an unsigned delivery must find no github route on
 # the running daemon (404). Were router.env read one way here and another way by systemd,
 # that answer is a 401, and the gate fails instead of skipping the proof it owes. It is
-# sent on LOOPBACK, straight to the daemon, because a 404 through Caddy could be Caddy's
-# own (it answers the probe path 404 itself) and would prove nothing about the daemon.
+# sent on LOOPBACK, straight to the daemon, because what reaches the daemon through Caddy
+# is Caddy's routing as well (it rewrites the probe path, #428), so a 404 there would prove
+# nothing about the daemon's own routes.
 if [[ "$github_enabled" == "true" ]]; then
 	log "Trusted actor under test: ${trusted_login}"
 
@@ -870,7 +871,7 @@ fi
 #
 # Two cases, and the first is the one that matters most:
 #
-#   7. the PUBLIC endpoint            -> 404  (Caddy denies it; the injection point is
+#   7. the PUBLIC endpoint            -> 404  (Caddy masks it; the injection point is
 #                                              on-box only, never internet-reachable)
 #   8. LOOPBACK, bad signature        -> 401  (the daemon serves it locally and the
 #                                              shared HMAC boundary rejects)
@@ -878,7 +879,15 @@ fi
 # Case 7 is a boundary assertion, not a liveness one: the probe route can fire a wake
 # at ANY registered agent, so the one thing that must never be true is that it is
 # reachable from the internet behind a single shared secret. It is asserted against the
-# same public URL every other case uses, so a Caddyfile that lost the deny fails here.
+# same public URL every other case uses, so a Caddyfile that lost the mask fails here.
+#
+# The mask is a rewrite to a path that names no route, so the daemon answers it exactly as
+# it answers any unknown source (#428). This case deliberately asserts only the 404, never
+# that the answer equals an unknown source's: the NOC runs this script against a freshly
+# deployed tree BEFORE it applies that tree's Caddyfile, and the previous Caddyfile answered
+# the path itself, so an equality check here would fail the deploy and roll it back, and the
+# Caddyfile apply is held behind a deploy that did not land. tests/test_caddyfile.py pins
+# the rewrite offline instead.
 #
 # Case 8 self-gates like basecradle's: skipped if the secret is unset, and skipped if
 # the running daemon does not serve the route (a bad-sig probe returns 404, not 401).
