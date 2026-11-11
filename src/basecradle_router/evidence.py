@@ -645,7 +645,9 @@ class EvidenceStore:
             self._flush_locked()
 
     def record_delivery_rejected(self, route: str, reason: str) -> None:
-        """A delivery for ``route`` was rejected (bad signature, malformed payload)."""
+        """A delivery for ``route`` reached verification and was rejected: a bad
+        signature, or no secret to verify it with. A body over the route's cap never
+        reaches verification and is deliberately not counted here (#427)."""
         with self._lock:
             sink = self._doc.delivery_sinks.setdefault(route, DeliverySinkEvidence())
             sink.rejected += 1

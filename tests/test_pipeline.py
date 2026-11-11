@@ -897,7 +897,7 @@ def test_the_breaker_ignore_line_names_the_agent_and_the_delivery(caplog) -> Non
 # as the surface that must newly carry `source=`. It is derived by SUBTRACTION on
 # purpose: a Stage added later falls into it by default and fails the coverage assertion
 # below until it is exercised, rather than slipping through untested.
-_ACCEPT_STAGES = (Stage.ROUTE, Stage.VERIFY, Stage.NORMALIZE, Stage.RESOLVE)
+_ACCEPT_STAGES = (Stage.ROUTE, Stage.BODY, Stage.VERIFY, Stage.NORMALIZE, Stage.RESOLVE)
 _WAKE_STAGES = tuple(stage for stage in Stage if stage not in _ACCEPT_STAGES)
 
 PROBE_DELIVERY = "dd5443c7af3a475abb31af8a1b07e4f7"

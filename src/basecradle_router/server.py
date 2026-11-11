@@ -24,9 +24,19 @@ request path, answers immediately, and runs the slow
 as a *background task* on the thread pool. The HTTP response therefore reflects
 the **accept** stage:
 ``202`` accepted-and-now-processing, ``401`` bad signature, ``404`` no such
-source, ``400`` malformed payload, ``200`` ignored or logged-failure. The wake's
+source, ``413`` a body over the route's cap, ``400`` malformed payload, ``200``
+ignored or logged-failure. The wake's
 own outcome is not in the response — it lands in the structured log, and the
 woken agent reports separately by commenting on the issue.
+
+**The body is read last, and bounded** (#427). Everything a request can be refused for
+from its path — a source with no registered route — is answered before a byte of its
+body is read, and a registered route's body is read only up to that route's
+:attr:`~basecradle_router.routes.base.Route.max_body_bytes`: refused at once on a
+declared ``Content-Length`` over it, and cut off at the cap when the length is not
+declared. The webhook path is unauthenticated until ``verify`` runs, and the body is
+the one thing a caller can make the daemon hold before then. The edge's
+``request_body max_size`` stays as the outer fence.
 
 In-flight and queued wakes are owned by the scheduler, so
 :meth:`WebhookServer.drain` awaits *its* idle rather than tracking asyncio tasks —
@@ -210,7 +220,31 @@ class WebhookServer:
             await self._send(send, 404, {"error": "no route in path"})
             return
 
-        body = await self._read_body(receive)
+        # Everything above and this admission is decided from the path alone. The body is
+        # the one thing an unauthenticated caller can make the daemon hold, so nothing
+        # reads it until the path has named a registered route, and then no more of it
+        # than that route can legitimately send (#427). The edge's own cap stays the
+        # outer fence; this is the one that knows which source is asking.
+        admission = self.pipeline.admit(source)
+        if admission.route is None:
+            await self._send(send, _status_for(admission.result), _summary(admission.result))
+            return
+        limit = admission.route.max_body_bytes
+        declared = _declared_length(scope)
+        if declared is not None and declared > limit:
+            body = None  # announced over the cap: refused without reading a byte of it
+        else:
+            try:
+                body = await self._read_body(receive, limit)
+            except _ClientGone:
+                # The caller left mid-body. A truncated body is not a delivery to verify:
+                # hashing it would only record a signature failure that never happened,
+                # and there is no one left to answer.
+                return
+        if body is None:
+            self.pipeline.refuse_body(admission, declared=declared)
+            await self._send(send, _status_for(admission.result), _summary(admission.result))
+            return
         request = InboundRequest(headers=self._headers(scope), body=body)
 
         # Fast-ack: the accept half (HMAC verify + JSON normalize + a dict lookup)
@@ -218,7 +252,7 @@ class WebhookServer:
         # minutes-long wake to a background task. Keeping accept off the thread
         # pool is deliberate — if wakes saturate the pool, acks must not queue
         # behind them, or fast-ack would defeat itself under load.
-        accepted = self.pipeline.accept(source, request)
+        accepted = self.pipeline.accept(source, request, admission=admission)
         if accepted.pending is not None:
             # Snapshot the accept-half summary *before* spawning the wake: the wake
             # appends to this same result object, and the ack must reflect only what
@@ -373,19 +407,32 @@ class WebhookServer:
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
-    async def _read_body(self, receive) -> bytes:
-        # Collect the whole raw body before verifying: the signature is over the
-        # exact bytes, so a partial read would reject a valid request.
-        chunks: list[bytes] = []
+    @staticmethod
+    async def _read_body(receive, limit: int) -> bytes | None:
+        """The whole raw body, or ``None`` the moment it exceeds ``limit`` bytes.
+
+        Raises :class:`_ClientGone` when the client disconnects before the body is
+        complete, so a partial body is never mistaken for the delivery.
+
+        Collected whole before verifying, because the signature is over the exact bytes
+        and a partial read would reject a valid request. Bounded, because this runs
+        before anything about the caller is known (#427): reading stops at the first
+        chunk that crosses the cap, so a chunked body that declared no length is held to
+        at most ``limit`` plus one chunk, and a declared length over the cap is refused
+        by the caller before this is reached at all.
+        """
+        body = bytearray()
         while True:
             message = await receive()
             if message["type"] == "http.request":
-                chunks.append(message.get("body", b""))
+                body += message.get("body", b"")
+                if len(body) > limit:
+                    return None
                 if not message.get("more_body", False):
                     break
             elif message["type"] == "http.disconnect":
-                break
-        return b"".join(chunks)
+                raise _ClientGone
+        return bytes(body)
 
     @staticmethod
     def _headers(scope: dict) -> dict[str, str]:
@@ -442,8 +489,31 @@ def _status_for(result: PipelineResult) -> int:
             return 401  # bad or missing signature
         if last.stage is Stage.ROUTE:
             return 404  # no such webhook source
+        if last.stage is Stage.BODY:
+            return 413  # a body larger than the route's source can send (#427)
         return 400  # malformed payload
     return 200  # IGNORED, or an internally-logged FAILED — the event is accepted
+
+
+class _ClientGone(Exception):
+    """The client disconnected before its request body was complete."""
+
+
+def _declared_length(scope: dict) -> int | None:
+    """The request's declared ``Content-Length``, or ``None`` when it declares none.
+
+    Read so a body the caller has *announced* is over the cap is refused before a byte of
+    it is read (#427). The HTTP server has already refused a malformed or conflicting
+    length (h11 answers it ``400`` before the app is called), but this does not lean on
+    that: only digits are a length here (``int`` alone would also take ``+5``, `` 5 ``
+    and ``1_000``), and anything else is treated as no declaration. The streaming cap
+    in :meth:`WebhookServer._read_body` still binds, so a value this does not read can
+    only cost a read, never widen one.
+    """
+    for key, value in scope["headers"]:
+        if key.lower() == b"content-length":
+            return int(value) if value.isdigit() else None
+    return None
 
 
 def _summary(result: PipelineResult) -> dict:

@@ -1311,6 +1311,17 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   (the wrapper loads the agent's `agent.env` after the drop).
 - **Fast-ack** in `server.py`: `accept` runs inline → `202`, `execute` (the wake) runs as a tracked
   background task drained on shutdown.
+- **The body is read last, and bounded per route** (#427). A path that names no registered route (an
+  unknown source, or one this box has not enabled) is answered `404` before a byte of the body is read.
+  A registered route's body is read only up to the route's `max_body_bytes` — `github` 25,000,000 (GitHub's
+  own payload ceiling, and exactly the Caddyfile's `25MB`), `basecradle` and `probe` 64 KiB (their real
+  payloads are under a kilobyte) — and a body over it is answered `413`: at once on a declared
+  `Content-Length`, at the cap when none is declared. A `413` is one `stage=body outcome=rejected`
+  WARNING line and **no** evidence: the delivery-sink `rejected` counter means "reached verification and
+  failed it" (the mismatched-secret signal), and no source we serve can send a body over its cap, so
+  counting one would only let a caller blur that signal with a header and no body. A request whose
+  client disconnects mid-body is dropped unanswered, never verified as a truncated body. The
+  Caddyfile's `request_body max_size` stays as the outer fence.
 - **The Caddyfile** (`deploy/hosts/<fqdn>/Caddyfile`, one per host — see *One router, many hosts*
   below): TLS via Let's Encrypt for that host's FQDN, reverse-proxy to the local uvicorn
   (`127.0.0.1:8000`). Install to `/etc/caddy/Caddyfile`, then `caddy validate` + `systemctl reload caddy`.

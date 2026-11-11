@@ -183,6 +183,7 @@ def test_a_route_that_declares_no_provenance_is_rejected_by_the_registry() -> No
     class Forgetful:
         name = "forgetful"
         recipient_kind = "repo"
+        max_body_bytes = 1024  # so the one member it forgot is the provenance flag
 
         def verify(self, request, secret) -> None: ...
 

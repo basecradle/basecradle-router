@@ -395,6 +395,12 @@ class BasecradleRoute:
     #: Real traffic: the platform delivers these because something happened on a
     #: timeline the agent views.
     synthetic = False
+    #: 64 KiB. An Event Delivery is fixed-shape metadata — ids, the event name, a
+    #: timestamp, the timeline and the resource's type, uuid and URL — and never the
+    #: content itself, so a real one is about half a kilobyte. The bound leaves two
+    #: orders of magnitude for the payload to grow, and it is what keeps the one parse
+    #: this route runs on an *unverified* body (``_recipient_hint``) small (#427).
+    max_body_bytes = 64 * 1024
 
     def __init__(self, keyring: RecipientKeyring | None = None) -> None:
         """``keyring`` selects the per-recipient verification key; see :class:`RecipientKeyring`.

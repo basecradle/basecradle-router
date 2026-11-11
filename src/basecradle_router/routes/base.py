@@ -254,11 +254,22 @@ class Route(Protocol):
     answer explicitly — there is no default, so the registry's ``isinstance`` gate
     rejects a route that forgot to, and no source can be synthetic by accident or
     real by omission.
+
+    ``max_body_bytes`` is the largest request body this source can legitimately send,
+    and the server reads no further (basecradle-router#427). The webhook path is
+    unauthenticated until ``verify`` runs, and ``verify`` needs the whole body, so the
+    body is the one thing a caller can make the daemon hold before it knows who the
+    caller is. The route knows its source's payloads; the core does not, so the route
+    states the bound and the core enforces it from the path alone, before a byte is
+    read. Required, with no default, for the reason ``synthetic`` is: a default large
+    enough for every source is the unbounded read this exists to end, and one small
+    enough to matter would silently refuse a source's real deliveries.
     """
 
     name: str
     recipient_kind: str
     synthetic: bool
+    max_body_bytes: int
 
     def verify(self, request: InboundRequest, secret: Secret | None) -> None:
         """Raise :class:`SignatureError` if the request is unsigned or tampered.
