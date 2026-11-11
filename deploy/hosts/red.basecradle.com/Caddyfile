@@ -19,17 +19,43 @@
 }
 
 red.basecradle.com {
-	# HSTS (#428): a browser that has once reached this name over TLS never tries it in
-	# plain HTTP again. Two years, the age the major browsers' guidance gives. No
-	# includeSubDomains: this box serves one name and does not own the names below it, so
-	# it makes no promise for them. The response headers a browser page would need
-	# (Content-Security-Policy, X-Frame-Options, Referrer-Policy, X-Content-Type-Options)
-	# are left out on purpose: every answer here is a JSON verdict or the fixed /up body,
-	# each with an explicit Content-Type and none echoing a caller's input, so each would
-	# guard a page that does not exist. The Server and Via banners stay: they name only
-	# what this public repository already publishes, and they are the one cue that tells
-	# an operator whether Caddy or the daemon answered.
+	# The security response headers, the full set (F-002: #428, #432). Each is set directly in
+	# the site, so it rides every answer the site gives (a proxied answer, the masked probe
+	# path, a 502 while the daemon is down) and nothing nested can drop it. Answers Caddy gives
+	# before any site runs carry none of them: the 421 for a foreign Host under this box's SNI,
+	# and everything on port 80 (the catch-all's 421, the redirect to HTTPS).
+	#
+	# HSTS: a browser that has once reached this name over TLS never tries it in plain HTTP
+	# again. Two years, the age the major browsers' guidance gives. No includeSubDomains,
+	# reconsidered in #432 and still left off: this box serves one name and does not own the
+	# names below it, so it makes no promise for them. No preload, which is a commitment for a
+	# registrable domain, not a host.
+	#
+	# X-Content-Type-Options guards today's answers: a browser keeps their declared
+	# Content-Type (a JSON verdict, the fixed /up body) and never sniffs one into HTML or
+	# script.
+	#
+	# The other four guard a page this name does not serve yet: no answer echoes a caller's
+	# input. They are sent for completeness, as defense in depth: they cost nothing on these
+	# answers, they are already right the day a real page is served here, and a box on a
+	# security-research platform is expected to carry the whole set, which every scan checks.
+	# - X-Frame-Options, for older browsers, and the CSP's frame-ancestors, for current ones:
+	#   no answer can be framed.
+	# - Referrer-Policy: a link followed from an answer sends no Referer.
+	# - Permissions-Policy: the powerful features a page could ask for (sensors, camera,
+	#   microphone, screen capture, location, payment, USB) are denied to every origin.
+	# - Content-Security-Policy: nothing may load from anywhere. default-src does not cover
+	#   base-uri, form-action or frame-ancestors, so each is denied by name.
+	#
+	# The Server and Via banners stay: they name only what this public repository already
+	# publishes, and they are the one cue that tells an operator whether Caddy or the daemon
+	# answered.
 	header Strict-Transport-Security "max-age=63072000"
+	header X-Content-Type-Options "nosniff"
+	header X-Frame-Options "DENY"
+	header Referrer-Policy "no-referrer"
+	header Permissions-Policy "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+	header Content-Security-Policy "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 	# Cap the request body at the edge: the outer fence. GitHub caps its own deliveries at
 	# 25 MB, so this is the largest any source sends. The daemon holds each route to its own,

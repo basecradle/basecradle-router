@@ -1336,10 +1336,17 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
     5 s is under GitHub's 10 s delivery timeout. This needs Caddy ≥ 2.11.4, the first release whose
     retry re-sends an unread POST body intact. The comment in the file carries the full reasoning, and
     `tests/test_caddyfile.py` pins the directive in every host's copy.
-  - **It hardens the edge (#428).** `Strict-Transport-Security: max-age=63072000` on the site (no
-    `includeSubDomains`: the box does not own the names below its own). No other browser-page header,
-    because every answer is a JSON verdict or the fixed `/up` body with an explicit `Content-Type`, none
-    echoing a caller's input. The `Server`/`Via` banners stay: they name only what this public repo
+  - **It hardens the edge (#428, #432).** The full security-header set on the site:
+    `Strict-Transport-Security: max-age=63072000` (no `includeSubDomains`: the box does not own the names
+    below its own), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+    `Referrer-Policy: no-referrer`, a `Permissions-Policy` denying the powerful features a page could
+    ask for, and
+    `Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
+    `nosniff` guards today's JSON and `/up` answers. The other four guard a page this name does not serve
+    yet, and are sent for completeness and as defense in depth: a security-research box is expected to
+    carry the whole set, and it is already right the day a real page is served. They ride every answer
+    the site gives; answers Caddy gives before any site runs (the `421`s, the port-80 redirect) carry
+    none. The `Server`/`Via` banners stay: they name only what this public repo
     publishes, and they tell an operator which layer answered. `strict_sni_host on` answers a foreign
     `Host` under this box's SNI `421` (it was an empty `200`). Port 80's catch-all `http://` site answers
     every name but the box's own `421`, so Caddy's automatic redirect serves only the managed name (it
