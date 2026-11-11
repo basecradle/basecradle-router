@@ -1634,6 +1634,32 @@ probe first reads its own `/proc/self` entry, so a probe that never reached `/pr
 `tests/test_proc_isolation.py` runs the shipped bodies offline and pins `ProtectProc=invisible` on every
 unit that opts into a private mount namespace.
 
+Case 10 reads the **edge's** answer rather than the daemon's (#437):
+
+| Case | Request | Asserted | Proves |
+|---|---|---|---|
+| 10 | `GET https://<fqdn>/up`, over **HTTP/1.1** and over **HTTP/2** | every `header` the **installed** Caddyfile's site sets arrives **once**, with **its value**, and that file sets at least the six of #428/#432 | the box's edge really sends the security-header set the Caddyfile says it does |
+
+`tests/test_caddyfile.py` pins the set in this tree's Caddyfiles, but nothing else on the box read a
+response header, so an installed file that diverged from the repo's, or a Caddy release that stopped
+applying `header` to a proxied answer, left every other case green. The expected values are read from the
+**installed** file (`CADDYFILE`, default `/etc/caddy/Caddyfile`), never from the tree's copy, because the
+smoke test runs against a new tree *before* its Caddyfile is applied and must hold under both (*How a change
+reaches the box*, above). A **floor** of the six header names backs it, so an installed file that stopped
+setting one fails rather than being asserted against nothing. The floor obeys the same old-and-new rule,
+so it moves one way per commit: it **shrinks** in the commit that drops a header from the tree
+(`tests/test_edge_headers.py` pins it inside every host's Caddyfile here, which forces that), and it
+**grows** only after every box's *installed* Caddyfile already sets the new name, since a floor that grew
+with the Caddyfile would fail every box before the apply and hold the apply behind the rollback. A header
+added to the Caddyfile is asserted from its first apply regardless; only the floor waits.
+`tests/test_caddyfile.py` pins the floor to the header set it pins, so the set is written once. The reader
+takes only the form this tree writes, `header <Name> "<value>"` directly in the host's site block with a
+literal value (no surrounding whitespace, no `{…}` placeholder Caddy would substitute), and refuses any
+other `header` line by line number rather than guessing. Each header is
+one `PASS`/`FAIL` line per protocol, and the HTTP/2 run fails if the answer came back over anything but
+HTTP/2. Asserted unconditionally, like cases 7 and 9. `tests/test_edge_headers.py` runs the shipped bodies
+offline against every host's Caddyfile and a fake `curl`.
+
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
 the trusted-actor list, and the registry path from `router.env` (`router:router 0600`), read exactly as systemd's
@@ -1644,7 +1670,7 @@ basecradle cases additionally need `jq`, which the box already requires for `dep
 
 **It targets the host it is given (#334).** `<fqdn>` is the router host the box *is* — the same token the
 NOC's per-host ops take — and must name a `deploy/hosts/<fqdn>/` directory in the tree, or the test refuses
-before sending anything. Every public URL it sends to (`https://<fqdn>/webhooks/{github,basecradle,probe}`) is
+before sending anything. Every public URL it sends to (`https://<fqdn>/webhooks/{github,basecradle,probe}` and `https://<fqdn>/up`) is
 derived from it; there is no URL override. The host is named by the caller, never read from `hostname`
 (basecradle-noc#409). The host is **required**: with no argument the test refuses and sends nothing — there is
 no default host (#336). `tests/test_smoke_test_host.py` runs the whole shipped script against a fake `curl`

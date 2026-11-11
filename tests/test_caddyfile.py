@@ -180,6 +180,19 @@ SECURITY_HEADERS = {
 }
 
 
+def test_the_smoke_tests_floor_is_the_set_this_file_pins() -> None:
+    """The live gate's floor (#437) is HSTS plus this set, so the set is written once.
+
+    The floor may lag a header this set gains, never lead it: it grows only after every
+    box's installed Caddyfile sets the name (deploy/smoke-test.sh). A failure here after
+    adding a header means the floor waits, not that it is wrong.
+    """
+    script = (Path(__file__).resolve().parents[1] / "deploy" / "smoke-test.sh").read_text()
+    match = re.search(r"^EDGE_FLOOR_HEADERS=\(\n(.*?)^\)", script, re.DOTALL | re.MULTILINE)
+    assert match, "EDGE_FLOOR_HEADERS not found in deploy/smoke-test.sh"
+    assert match.group(1).split() == ["Strict-Transport-Security", *SECURITY_HEADERS]
+
+
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
 @pytest.mark.parametrize("name", list(SECURITY_HEADERS))
 def test_the_site_sends_the_rest_of_the_security_header_set(caddyfile: Path, name: str) -> None:
