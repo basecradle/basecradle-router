@@ -1384,7 +1384,7 @@ each host carries its own copy of all three under **`deploy/hosts/<fqdn>/`**:
 | Host | What it is | Better Stack source (ingest host) | Reboot window |
 |---|---|---|---|
 | `ai.basecradle.com` | the production router box | **`basecradle.com Fleet Servers`** (`s2531770.eu-fsn-3.betterstackdata.com`) | `05:00 America/Chicago` + ≤15 min |
-| `red.basecradle.com` | the red-team fleet server; no daemon deployed yet | **`basecradle.com Fleet Servers`**, shared with `ai` (`s2531770.eu-fsn-3.betterstackdata.com`) | `07:00 UTC` + ≤15 min |
+| `red.basecradle.com` | the red-team fleet server; daemon deployed, harness-only (the `basecradle` route, no `github`, #417) | **`basecradle.com Fleet Servers`**, shared with `ai` (`s2531770.eu-fsn-3.betterstackdata.com`) | `07:00 UTC` + ≤15 min |
 | `ubuntu-1.landfill.click` | @steve's box (Organization Landfill); no daemon deployed yet | **`landfill.click Fleet Servers`**, id 2780873 (`s2780873.eu-central-1a.betterstackdata.com`) | `12:00 UTC` + ≤15 min (interim slot) |
 
 - **`deploy/hosts/<fqdn>/Caddyfile`** — the daemon-fronting Caddyfile, its site name the host's FQDN.
