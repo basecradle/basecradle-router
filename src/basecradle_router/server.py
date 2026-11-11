@@ -480,10 +480,19 @@ def _status_for(result: PipelineResult) -> int:
     that is well-formed but not actionable — ignored, or a misconfiguration we
     log (no agent for the repo, no secret for the route) — is *accepted* (200),
     because returning 5xx would only invite a retry storm that cannot help.
+
+    The one ``FAILED`` that is not accepted is a route raising on a verified delivery
+    (#434): that is a router bug, so it is answered ``500``. A 400 would blame the
+    sender and a 200 would say the delivery was handled — the silent drop. GitHub
+    redelivers no status on its own; the BaseCradle platform retries any non-2xx, a
+    400 included, so a 500 costs it nothing a 400 does not.
     """
     if not result.records:
         return 500  # never happens — accept() always records at least the route
     last = result.records[-1]
+    if (last.stage, last.outcome) == (Stage.NORMALIZE, Outcome.FAILED):
+        return 500  # a route bug on a verified delivery, never the sender's fault
+
     if last.outcome is Outcome.REJECTED:
         if last.stage is Stage.VERIFY:
             return 401  # bad or missing signature

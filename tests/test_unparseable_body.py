@@ -13,6 +13,10 @@ verification. They drive each route through the real ASGI app, then the same req
 through ``Pipeline.accept`` and ``_status_for``, so the status is the consequence of the
 recorded stage and not a coincidence of the transport.
 
+The last section pins the boundary that closes the class rather than one escape (#434):
+anything else a route raises on a verified delivery is recorded at normalize and answered
+``500``, so an escape nobody has found yet is never a ``200``-and-drop either.
+
 Cast: John Doe (``john``, human) and Nova Digital (``nova``, AI). Every secret, uuid and
 signature is fabricated.
 """
@@ -32,7 +36,7 @@ import pytest
 from basecradle_router.config import Config
 from basecradle_router.evidence import EvidenceStore
 from basecradle_router.models import Agent, Event
-from basecradle_router.pipeline import Outcome, Pipeline, Stage
+from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage, StageRecord
 from basecradle_router.routes import (
     BasecradleRoute,
     GithubRoute,
@@ -262,3 +266,119 @@ def test_the_400_is_the_normalize_rejection_never_the_last_resort_failure(route,
     assert accepted.result.event is None
     assert _status_for(accepted.result) == 400
     assert waker.calls == []
+
+
+# --- the class, closed at the boundary (#434) ------------------------------------------
+#
+# The tests above close the escapes found so far one call site at a time. These pin the
+# boundary itself: whatever else a route raises after its signature verified is recorded
+# at normalize as a failure and answered 500, so the next escape nobody has found yet is
+# still never a 200-and-drop. Each route's real ``normalize`` is replaced by one that
+# raises, so no particular payload is needed to reach the case.
+
+
+class _RouteBug(Exception):
+    """Stands for a defect in a route's own code: no route raises it on purpose."""
+
+
+def _crash(*_args: object) -> Event:
+    raise _RouteBug("nova's payload took a path nobody wrote")
+
+
+@pytest.mark.parametrize("route", ROUTE_HEADERS)
+def test_a_route_bug_on_a_verified_delivery_is_a_500_and_wakes_no_one(monkeypatch, route) -> None:
+    pipeline, waker = _pipeline()
+    monkeypatch.setattr(pipeline.registry.get(route), "normalize", _crash)
+    body = b'{"harness_key": "nova"}'
+
+    status, summary = _post(
+        WebhookServer(pipeline), f"/webhooks/{route}", body, _signed(route, body)
+    )
+
+    assert status == 500
+    assert summary == {
+        "outcome": "failed",
+        "stages": [["route", "ok"], ["verify", "ok"], ["normalize", "failed"]],
+    }
+    assert waker.calls == []
+
+
+@pytest.mark.parametrize("route", ROUTE_HEADERS)
+def test_a_route_bug_is_recorded_at_normalize_never_as_the_last_resort_route_failure(
+    monkeypatch, caplog, route
+) -> None:
+    """The stage is the point: evidence and any alert keyed on it name where it broke."""
+    pipeline, waker = _pipeline()
+    monkeypatch.setattr(pipeline.registry.get(route), "normalize", _crash)
+    body = b'{"harness_key": "nova"}'
+
+    with caplog.at_level("INFO", logger="basecradle_router"):
+        accepted = pipeline.accept(route, InboundRequest(headers=_signed(route, body), body=body))
+
+    last = accepted.result.records[-1]
+    assert (last.stage, last.outcome) == (Stage.NORMALIZE, Outcome.FAILED)
+    assert "unexpected: _RouteBug: nova's payload took a path nobody wrote" in last.detail
+    assert [(r.stage, r.outcome) for r in accepted.result.records].count(
+        (Stage.ROUTE, Outcome.FAILED)
+    ) == 0
+    assert accepted.pending is None
+    assert accepted.result.event is None
+    assert _status_for(accepted.result) == 500
+    assert waker.calls == []
+
+    # One ERROR line with the traceback: a router bug, not a sender's fault.
+    crashed = [r for r in caplog.records if "event=normalize_crashed" in r.getMessage()]
+    assert len(crashed) == 1
+    assert crashed[0].levelname == "ERROR"
+    assert f"source={route}" in crashed[0].getMessage()
+    assert "in _crash" in crashed[0].getMessage(), "the frames where it was raised"
+
+
+@pytest.mark.parametrize("route", ROUTE_HEADERS)
+def test_a_route_bug_counts_the_delivery_accepted_and_records_no_decision(
+    monkeypatch, route
+) -> None:
+    """Evidence is unchanged by #434: the signature verified, and the route decided nothing."""
+    pipeline, _waker = _pipeline()
+    monkeypatch.setattr(pipeline.registry.get(route), "normalize", _crash)
+    body = b'{"harness_key": "nova"}'
+
+    pipeline.accept(route, InboundRequest(headers=_signed(route, body), body=body))
+
+    sink = pipeline.evidence.snapshot().delivery_sinks[route]
+    assert (sink.accepted, sink.rejected, sink.woke, sink.ignored) == (1, 0, 0, 0)
+
+
+def test_only_a_failure_at_normalize_is_a_500_every_other_failure_stays_accepted() -> None:
+    """A missing secret (verify) and an unregistered repo (resolve) are ours to log: 200."""
+
+    def ending_at(stage: Stage) -> PipelineResult:
+        result = PipelineResult()
+        result.records.append(StageRecord(stage=stage, outcome=Outcome.FAILED, detail=""))
+        return result
+
+    assert _status_for(ending_at(Stage.NORMALIZE)) == 500
+    for stage in (Stage.ROUTE, Stage.VERIFY, Stage.RESOLVE):
+        assert _status_for(ending_at(stage)) == 200
+
+
+def test_a_route_bugs_message_is_bounded_wherever_it_is_written(monkeypatch, caplog) -> None:
+    """A route bug's message can carry the sender's bytes: one signed body never fills a log."""
+    flood = "nova" * 10_000
+
+    def crash_with_the_payload(*_args: object) -> Event:
+        raise KeyError(flood)
+
+    pipeline, _waker = _pipeline()
+    monkeypatch.setattr(pipeline.registry.get("github"), "normalize", crash_with_the_payload)
+    body = b'{"harness_key": "nova"}'
+
+    with caplog.at_level("INFO", logger="basecradle_router"):
+        accepted = pipeline.accept(
+            "github", InboundRequest(headers=_signed("github", body), body=body)
+        )
+
+    assert len(accepted.result.records[-1].detail) < 400
+    assert all(len(r.getMessage()) < 4_000 for r in caplog.records)
+    assert not any(flood in r.getMessage() for r in caplog.records)
+    assert all(r.exc_info is None for r in caplog.records), "a traceback would repeat the message"
