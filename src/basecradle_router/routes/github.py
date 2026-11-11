@@ -366,7 +366,7 @@ class IssueLedger:
             for label in labels
             if isinstance(label, dict) and isinstance(label.get("name"), str)
         )
-        action = data.get("action") if event_type == ISSUES_EVENT else None
+        action = _action(data) if event_type == ISSUES_EVENT else None
         report = _IssueState(
             updated_at,
             state == "open",
@@ -747,7 +747,7 @@ class GithubRoute:
         # `closed`/`reopened`/`unlabeled` ones this path ignores most of all — so it is
         # observed before the action gate decides whether it wakes anyone (#272).
         self._ledger.observe(data, event_type=event_type)
-        action = data.get("action")
+        action = _action(data)
         if action not in _ACTIONABLE_ACTIONS:
             return self._ignore(event_type, delivery)
 
@@ -788,7 +788,7 @@ class GithubRoute:
         # A comment payload carries the issue's state as of the comment — the agent's
         # own progress notes included — so it is observed ahead of every gate (#272).
         self._ledger.observe(data, event_type=event_type)
-        if data.get("action") != _ACTIONABLE_COMMENT_ACTION:
+        if _action(data) != _ACTIONABLE_COMMENT_ACTION:
             return self._ignore(event_type, delivery)
 
         issue = _require_issue(data)
@@ -854,7 +854,7 @@ class GithubRoute:
         repo = _repo_full_name(data)
         if repo is not None:
             self._pulls.observe(repo, pull)
-        if data.get("action") != _ACTIONABLE_PULL_REQUEST_ACTION or not isinstance(pull, dict):
+        if _action(data) != _ACTIONABLE_PULL_REQUEST_ACTION or not isinstance(pull, dict):
             return self._ignore(event_type, delivery)
         if pull.get("merged") is not True:
             return self._ignore(event_type, delivery)
@@ -897,7 +897,7 @@ class GithubRoute:
         """
         data = parse_json_object(request.body)
         run = data.get("workflow_run")
-        if data.get("action") != _ACTIONABLE_WORKFLOW_RUN_ACTION or not isinstance(run, dict):
+        if _action(data) != _ACTIONABLE_WORKFLOW_RUN_ACTION or not isinstance(run, dict):
             return self._ignore(event_type, delivery)
         if run.get("conclusion") != _FAILED_CONCLUSION:
             return self._ignore(event_type, delivery)
@@ -1288,6 +1288,20 @@ def _merge_target(
     if len(chosen) > 1:
         return None, AMBIGUOUS_HANDOFF
     return chosen[0], None
+
+
+def _action(data: dict[str, Any]) -> str | None:
+    """The payload's ``action``, or ``None`` when it is absent or not a string.
+
+    The one reader of the field, because every reader tests it against a set of the
+    actions it acts on, and a list or an object in a set-membership test raises
+    ``TypeError`` (unhashable). Raised inside ``normalize``, that escaped into the core's
+    last-resort handler, which answers ``200``: a signed delivery acknowledged and dropped
+    (#433). An action that is not a string is not one of ours, so it reads as none, and
+    every path treats it exactly as it treats an action it does not act on.
+    """
+    action = data.get("action")
+    return action if isinstance(action, str) else None
 
 
 def _require_issue(data: dict[str, Any]) -> dict[str, Any]:
