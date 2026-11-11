@@ -164,6 +164,81 @@ def test_the_site_sends_hsts_for_its_own_name_only(caddyfile: Path) -> None:
     assert touching == direct, f"another line touches the HSTS header: {touching}"
 
 
+#: The rest of F-002's set (#432), each with the exact value the site must send. None guards
+#: a page that exists today; @origin ruled for the whole set, as defense in depth.
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), "
+        "magnetometer=(), microphone=(), payment=(), usb=()"
+    ),
+    "Content-Security-Policy": (
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+}
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("name", list(SECURITY_HEADERS))
+def test_the_site_sends_the_rest_of_the_security_header_set(caddyfile: Path, name: str) -> None:
+    # Same shape as HSTS above: set once, directly in the site, so it covers every answer the
+    # site gives, and touched by no other line, so nothing nested can delete or override it.
+    expected = f'header {name} "{SECURITY_HEADERS[name]}"'
+    direct = [line for line in _depth_one(_site(caddyfile)) if line == expected]
+    assert direct == [expected], f"the site must set {name} once, directly, to the pinned value"
+    touching = [line for line in _directive_lines(caddyfile) if name.lower() in line.lower()]
+    assert touching == direct, f"another line touches {name}: {touching}"
+
+
+def _shipped_csp(caddyfile: Path) -> dict[str, str]:
+    """The site's Content-Security-Policy as ``{directive: value}``, read from the file itself.
+
+    Empty parts (a trailing ``;``) are skipped and a directive with no value maps to ``""``, so
+    a legitimate edit fails on the invariant it breaks, never on the parse.
+    """
+    prefix = 'header Content-Security-Policy "'
+    lines = [line for line in _depth_one(_site(caddyfile)) if line.startswith(prefix)]
+    assert len(lines) == 1, "the site must set Content-Security-Policy once, directly"
+    assert lines[0].endswith('"'), f"unterminated value: {lines[0]!r}"
+    policy = lines[0][len(prefix) : -1]
+    directives: dict[str, str] = {}
+    for part in policy.split(";"):
+        words = part.split(None, 1)
+        if words:
+            directives[words[0]] = words[1] if len(words) > 1 else ""
+    return directives
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_the_content_security_policy_denies_what_default_src_does_not_cover(
+    caddyfile: Path,
+) -> None:
+    # default-src is the fallback for fetch directives only. base-uri, form-action and
+    # frame-ancestors never fall back to it, so a policy of default-src alone would still let a
+    # page be framed, re-based or post a form. Each must be denied by name, in the shipped file.
+    directives = _shipped_csp(caddyfile)
+    for directive in ("default-src", "base-uri", "form-action", "frame-ancestors"):
+        assert directives.get(directive) == "'none'", f"{directive} must be 'none'"
+
+
+def test_every_hosts_caddyfile_is_the_same_file_but_for_its_own_name() -> None:
+    # The hosts' edges are one design: the rationale comments and every directive are shared,
+    # and only the site name differs. A wording fix or a header value changed in one copy and
+    # missed in another would otherwise drift silently, since the tests above pin directives,
+    # never the comments that explain them.
+    texts = {
+        path.parent.name: path.read_text().replace(path.parent.name, "<host>")
+        for path in CADDYFILES
+    }
+    reference = texts[CADDYFILES[0].parent.name]
+    drifted = sorted(host for host, text in texts.items() if text != reference)
+    assert not drifted, (
+        f"these hosts' Caddyfiles differ from {CADDYFILES[0].parent.name}'s: {drifted}"
+    )
+
+
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
 def test_a_foreign_host_under_this_boxs_sni_is_refused(caddyfile: Path) -> None:
     # F-005, port 443: without strict_sni_host a foreign Host matched no site and Caddy
