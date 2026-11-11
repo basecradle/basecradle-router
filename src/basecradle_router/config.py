@@ -51,7 +51,8 @@ _SELF_URL_VAR = f"{ENV_PREFIX}SELF_URL"
 #: (``uvicorn --host 127.0.0.1 --port 8000``). Loopback and not the public hostname on
 #: purpose — the probe must exercise the daemon, not Caddy's TLS front end, and the
 #: injection point is deliberately not reachable from the internet (every host's Caddyfile
-#: answers ``/webhooks/probe`` with a 404).
+#: rewrites ``/webhooks/probe`` to a path that names no route, so the daemon answers it as
+#: an unknown source, #428).
 DEFAULT_SELF_URL = "http://127.0.0.1:8000"
 
 #: Where the deploy installs the wrapper that runs a probe with the daemon's own
