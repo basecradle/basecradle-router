@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from caddy_edge import edge_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE_TEST = ROOT / "deploy" / "smoke-test.sh"
 CADDYFILES = sorted((ROOT / "deploy" / "hosts").glob("*/Caddyfile"))
@@ -63,11 +65,13 @@ def _run(snippet: str, tmp_path: Path, *, path: str | None = None) -> subprocess
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
 
 
-def _read_site(caddyfile: Path, site: str, tmp_path: Path) -> subprocess.CompletedProcess:
+def _read_site(
+    caddyfile: Path, site: str, tmp_path: Path, *, path: str = "/up"
+) -> subprocess.CompletedProcess:
     return _run(
         textwrap.dedent(
             f"""\
-            if caddy_site_headers {caddyfile} {site}; then
+            if caddy_site_headers {caddyfile} {site} {path}; then
                 for ((i = 0; i < ${{#SITE_HEADER_NAMES[@]}}; i++)); do
                     printf '%s\\t%s\\n' "${{SITE_HEADER_NAMES[i]}}" "${{SITE_HEADER_VALUES[i]}}"
                 done
@@ -81,9 +85,10 @@ def _read_site(caddyfile: Path, site: str, tmp_path: Path) -> subprocess.Complet
     )
 
 
-def _independent_parse(caddyfile: Path) -> list[tuple[str, str]]:
-    """Every `header` directive in the file, by a regex that shares nothing with the reader."""
-    return re.findall(r'(?m)^\s*header\s+(\S+)\s+"([^"]*)"\s*$', caddyfile.read_text())
+def _independent_parse(caddyfile: Path, path: str = "/up") -> list[tuple[str, str]]:
+    """Every `header` directive as sent on ``path``, by a parser that shares nothing with the
+    reader."""
+    return edge_headers(caddyfile.read_text(), path)
 
 
 # --- the reader against this tree's Caddyfiles -------------------------------------
@@ -93,14 +98,15 @@ def test_the_glob_found_every_hosts_caddyfile() -> None:
     assert len(CADDYFILES) >= 3
 
 
+@pytest.mark.parametrize("path", ["/up", "/up/", "/webhooks/github"])
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
 def test_every_header_a_hosts_caddyfile_sets_is_one_the_gate_asserts(
-    caddyfile: Path, tmp_path: Path
+    caddyfile: Path, path: str, tmp_path: Path
 ) -> None:
-    result = _read_site(caddyfile, caddyfile.parent.name, tmp_path)
+    result = _read_site(caddyfile, caddyfile.parent.name, tmp_path, path=path)
     assert result.returncode == 0, result.stdout + result.stderr
     read = [tuple(line.split("\t", 1)) for line in result.stdout.splitlines()]
-    assert read == _independent_parse(caddyfile)
+    assert read == _independent_parse(caddyfile, path)
     assert read, "a site with no headers would make the gate assert nothing"
 
 
@@ -162,6 +168,46 @@ def test_a_header_line_the_reader_cannot_read_is_refused_by_line(
     assert f"REFUSED {caddyfile}:" in result.stdout, why
 
 
+MAP = 'map {path} {csp} {\n\t/up "up-policy"\n\tdefault "bare-policy"\n}\n'
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"), [("/up", "up-policy"), ("/up/", "bare-policy"), ("/", "bare-policy")]
+)
+def test_a_header_written_by_a_path_map_expects_that_paths_entry(
+    path: str, expected: str, tmp_path: Path
+) -> None:
+    caddyfile = _caddyfile(tmp_path, MAP + 'header Content-Security-Policy "{csp}"\n')
+    result = _read_site(caddyfile, SITE, tmp_path, path=path)
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.splitlines() == [f"Content-Security-Policy\t{expected}"]
+
+
+@pytest.mark.parametrize(
+    ("site_body", "why"),
+    [
+        ('header Content-Security-Policy "{csp}"\n' + MAP, "the map comes after the header"),
+        ('header Content-Security-Policy "{csp}"\n', "no map writes the variable"),
+        ('map {host} {csp} {\n\tdefault "x"\n}\n', "a map on another input"),
+        ('map {path} {csp} {\n\t~^/up "x"\n\tdefault "y"\n}\n', "a regular-expression key"),
+        ('map {path} {csp} {\n\t/up x\n\tdefault "y"\n}\n', "an unquoted entry"),
+        ('map {path} {csp} {\n\t/up "x"\n\t/up "z"\n\tdefault "y"\n}\n', "a key twice"),
+        ('map {path} {csp} {\n\t/up "{host}"\n\tdefault "y"\n}\n', "a placeholder entry"),
+        ('map {path} {csp} {\n\t/foo "x"\n}\n', "no entry for the path and no default"),
+        (MAP + MAP, "a second map writing the same variable"),
+        ("handle /x {\n\t" + MAP.replace("\n", "\n\t").rstrip("\t") + "}\n", "a nested map"),
+        ('map {path} {csp} {a} {\n\tdefault "x y"\n}\n', "a map with two outputs"),
+    ],
+)
+def test_a_map_the_reader_cannot_resolve_is_refused_by_line(
+    site_body: str, why: str, tmp_path: Path
+) -> None:
+    caddyfile = _caddyfile(tmp_path, site_body)
+    result = _read_site(caddyfile, SITE, tmp_path)
+    assert result.returncode == 3, f"{why}: {result.stdout}"
+    assert f"REFUSED {caddyfile}:" in result.stdout, why
+
+
 def test_a_missing_site_block_is_refused(tmp_path: Path) -> None:
     caddyfile = _caddyfile(tmp_path, 'header X-Frame-Options "DENY"\n')
     result = _read_site(caddyfile, "john.example.com", tmp_path)
@@ -189,7 +235,7 @@ def test_only_the_hosts_own_site_is_read(tmp_path: Path) -> None:
 def test_an_installed_file_without_the_floor_fails_never_passes_vacuously(tmp_path: Path) -> None:
     caddyfile = _caddyfile(tmp_path, 'header X-Frame-Options "DENY"\n')
     result = _run(
-        f"caddy_site_headers {caddyfile} {SITE}\nassert_edge_floor\necho rc=$rc\n", tmp_path
+        f"caddy_site_headers {caddyfile} {SITE} /up\nassert_edge_floor\necho rc=$rc\n", tmp_path
     )
     assert result.stdout.count("  FAIL  ") == 5
     assert "  PASS  edge header X-Frame-Options is set" in result.stdout
@@ -235,7 +281,7 @@ def _assert_edge(
     )
     bindir = _fake_curl(tmp_path, dump, exit_code=exit_code)
     return _run(
-        f"caddy_site_headers {caddyfile} {SITE}\n"
+        f"caddy_site_headers {caddyfile} {SITE} /up\n"
         f"assert_edge_headers https://{SITE}/up {flag} {proto}\n"
         "echo rc=$rc\n",
         tmp_path,
@@ -324,7 +370,7 @@ def test_a_curl_that_wrote_no_headers_fails_never_reads_an_earlier_answer(tmp_pa
     (tmp_path / "work").mkdir()
     (tmp_path / "work" / "edge-headers.dump").write_text(GOOD_H2)
     result = _run(
-        f"caddy_site_headers {caddyfile} {SITE}\n"
+        f"caddy_site_headers {caddyfile} {SITE} /up\n"
         f"assert_edge_headers https://{SITE}/up --http2 HTTP/2\necho rc=$rc\n",
         tmp_path,
         path=str(bindir),

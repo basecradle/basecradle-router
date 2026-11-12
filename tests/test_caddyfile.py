@@ -46,7 +46,8 @@ def _block_at(lines: list[str], start: int) -> tuple[list[str], int]:
     """The lines inside the block opened at ``lines[start]``, and the index just past it.
 
     The one brace walk every helper here uses. It counts braces per line, which is enough
-    for these files: none puts a brace inside a quoted value.
+    for these files: the one brace inside a quoted value is a whole placeholder
+    (`"{csp}"`), which opens and closes on its own line.
     """
     assert lines[start].endswith("{"), f"no block opens at {lines[start]!r}"
     depth = 0
@@ -174,10 +175,14 @@ SECURITY_HEADERS = {
         "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), "
         "magnetometer=(), microphone=(), payment=(), usb=()"
     ),
+    # The bare policy, which every path but /up gets byte for byte (#440).
     "Content-Security-Policy": (
         "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     ),
 }
+
+#: The one header whose value is chosen per path, through the site's map (#440).
+CSP = "Content-Security-Policy"
 
 
 def test_the_smoke_tests_floor_is_the_set_this_file_pins() -> None:
@@ -193,45 +198,120 @@ def test_the_smoke_tests_floor_is_the_set_this_file_pins() -> None:
     assert match.group(1).split() == ["Strict-Transport-Security", *SECURITY_HEADERS]
 
 
-@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
-@pytest.mark.parametrize("name", list(SECURITY_HEADERS))
-def test_the_site_sends_the_rest_of_the_security_header_set(caddyfile: Path, name: str) -> None:
+def _set_once_directly(caddyfile: Path, name: str, value: str) -> None:
     # Same shape as HSTS above: set once, directly in the site, so it covers every answer the
     # site gives, and touched by no other line, so nothing nested can delete or override it.
-    expected = f'header {name} "{SECURITY_HEADERS[name]}"'
+    expected = f'header {name} "{value}"'
     direct = [line for line in _depth_one(_site(caddyfile)) if line == expected]
-    assert direct == [expected], f"the site must set {name} once, directly, to the pinned value"
+    assert direct == [expected], f"the site must set {name} once, directly, to {value!r}"
     touching = [line for line in _directive_lines(caddyfile) if name.lower() in line.lower()]
     assert touching == direct, f"another line touches {name}: {touching}"
 
 
-def _shipped_csp(caddyfile: Path) -> dict[str, str]:
-    """The site's Content-Security-Policy as ``{directive: value}``, read from the file itself.
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("name", [name for name in SECURITY_HEADERS if name != CSP])
+def test_the_site_sends_the_rest_of_the_security_header_set(caddyfile: Path, name: str) -> None:
+    _set_once_directly(caddyfile, name, SECURITY_HEADERS[name])
+
+
+#: The placeholder the site's map writes the per-path policy into.
+CSP_VAR = "{csp}"
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_the_content_security_policy_is_set_once_from_the_map(caddyfile: Path) -> None:
+    # The value is the map's output, so the header is still one line, directly in the site,
+    # on every answer the site gives; only which policy it carries depends on the path.
+    _set_once_directly(caddyfile, CSP, CSP_VAR)
+
+
+def _csp_map(caddyfile: Path) -> dict[str, str]:
+    """The site's ``map {path} {csp}`` entries as ``{key: policy}``, read from the file itself."""
+    site = _site(caddyfile)
+    head = f"map {{path}} {CSP_VAR} {{"
+    starts = [i for i, line in enumerate(site) if line == head]
+    assert len(starts) == 1 and site[starts[0]] in _depth_one(site), (
+        f"the site must declare `{head}` once, directly"
+    )
+    assert not [line for line in site if line.startswith("map ") and line != head], (
+        "another map in the site could write the policy too"
+    )
+    entries: dict[str, str] = {}
+    for line in _block_at(site, starts[0])[0]:
+        match = re.fullmatch(r'(\S+) "([^"]*)"', line)
+        assert match, f"a map entry this test cannot read: {line!r}"
+        key, policy = match.groups()
+        assert key not in entries, f"the map sets {key} twice"
+        entries[key] = policy
+    return entries
+
+
+def _directives(policy: str) -> dict[str, str]:
+    """A policy as ``{directive: value}``.
 
     Empty parts (a trailing ``;``) are skipped and a directive with no value maps to ``""``, so
     a legitimate edit fails on the invariant it breaks, never on the parse.
     """
-    prefix = 'header Content-Security-Policy "'
-    lines = [line for line in _depth_one(_site(caddyfile)) if line.startswith(prefix)]
-    assert len(lines) == 1, "the site must set Content-Security-Policy once, directly"
-    assert lines[0].endswith('"'), f"unterminated value: {lines[0]!r}"
-    policy = lines[0][len(prefix) : -1]
     directives: dict[str, str] = {}
     for part in policy.split(";"):
         words = part.split(None, 1)
         if words:
+            assert words[0] not in directives, f"{words[0]} appears twice in {policy!r}"
             directives[words[0]] = words[1] if len(words) > 1 else ""
     return directives
 
 
+def _up_style_attribute_source() -> str:
+    """The CSP source that allows /up's one inline style attribute: its hash, recomputed.
+
+    Read from the body the daemon really serves, so a change to that body that the policy
+    does not follow fails here rather than as a white page.
+    """
+    import base64
+    import hashlib
+
+    from basecradle_router.server import LIVENESS_BODY
+
+    styles = re.findall(rb'style="([^"]*)"', LIVENESS_BODY)
+    assert styles == [b"background-color: green"], "the /up body's styling changed"
+    assert b"<style" not in LIVENESS_BODY.lower(), "a <style> element needs style-src-elem"
+    digest = base64.b64encode(hashlib.sha256(styles[0]).digest()).decode()
+    return f"'unsafe-hashes' 'sha256-{digest}'"
+
+
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_only_up_carries_the_style_exception(caddyfile: Path) -> None:
+    # The map compares the exact path, so these two keys mean /up gets the exception and
+    # every other path, `/up/` and `/UP` included, gets the default. A `~` key would be a
+    # regular expression and could match more, so none is allowed.
+    entries = _csp_map(caddyfile)
+    assert set(entries) == {"/up", "default"}
+    assert entries["default"] == SECURITY_HEADERS[CSP], "every other path keeps today's policy"
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_up_gets_the_bare_policy_plus_exactly_its_own_style_attribute(caddyfile: Path) -> None:
+    # One directive is added and nothing else moves: no 'unsafe-inline', no style-src (which
+    # would also govern <style> elements), and no other source in the one directive.
+    up = _csp_map(caddyfile)["/up"]
+    assert "'unsafe-inline'" not in up
+    expected = {
+        **_directives(SECURITY_HEADERS[CSP]),
+        "style-src-attr": _up_style_attribute_source(),
+    }
+    assert _directives(up) == expected
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("key", ["/up", "default"])
 def test_the_content_security_policy_denies_what_default_src_does_not_cover(
-    caddyfile: Path,
+    caddyfile: Path, key: str
 ) -> None:
     # default-src is the fallback for fetch directives only. base-uri, form-action and
     # frame-ancestors never fall back to it, so a policy of default-src alone would still let a
-    # page be framed, re-based or post a form. Each must be denied by name, in the shipped file.
-    directives = _shipped_csp(caddyfile)
+    # page be framed, re-based or post a form. Each must be denied by name, in every policy the
+    # shipped file can send.
+    directives = _directives(_csp_map(caddyfile)[key])
     for directive in ("default-src", "base-uri", "form-action", "frame-ancestors"):
         assert directives.get(directive) == "'none'", f"{directive} must be 'none'"
 

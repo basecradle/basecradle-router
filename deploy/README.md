@@ -1342,6 +1342,9 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
     `Referrer-Policy: no-referrer`, a `Permissions-Policy` denying the powerful features a page could
     ask for, and
     `Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
+    `/up` alone also gets `style-src-attr 'unsafe-hashes' 'sha256-…'`, the hash of its body's one inline
+    style attribute, so a browser paints the page green instead of white (#440); a `map` on the exact
+    path chooses the policy, so every other path keeps the bare one byte for byte.
     `nosniff` guards today's JSON and `/up` answers. The other four guard a page this name does not serve
     yet, and are sent for completeness and as defense in depth: a security-research box is expected to
     carry the whole set, and it is already right the day a real page is served. They ride every answer
@@ -1678,7 +1681,7 @@ Case 10 reads the **edge's** answer rather than the daemon's (#437):
 
 | Case | Request | Asserted | Proves |
 |---|---|---|---|
-| 10 | `GET https://<fqdn>/up`, over **HTTP/1.1** and over **HTTP/2** | every `header` the **installed** Caddyfile's site sets arrives **once**, with **its value**, and that file sets at least the six of #428/#432 | the box's edge really sends the security-header set the Caddyfile says it does |
+| 10 | `GET https://<fqdn>/up`, over **HTTP/1.1** and over **HTTP/2** | every `header` the **installed** Caddyfile's site sets arrives **once**, with **its value** for `/up` (a `map {path}` entry, else its default), and that file sets at least the six of #428/#432 | the box's edge really sends the security-header set the Caddyfile says it does |
 
 `tests/test_caddyfile.py` pins the set in this tree's Caddyfiles, but nothing else on the box read a
 response header, so an installed file that diverged from the repo's, or a Caddy release that stopped

@@ -47,6 +47,15 @@ ai.basecradle.com {
 	# - Content-Security-Policy: nothing may load from anywhere. default-src does not cover
 	#   base-uri, form-action or frame-ancestors, so each is denied by name.
 	#
+	# /up gets the one exception (#440). Its fixed body paints the page green with a single
+	# inline style attribute, `background-color: green`, and default-src 'none' governs style
+	# attributes too, so under the bare policy a browser refused it and showed the page white.
+	# On /up alone the policy also allows exactly that attribute, by its hash: style-src-attr
+	# with 'unsafe-hashes' and the sha256 of those 23 bytes. Nothing else is allowed, there is
+	# no 'unsafe-inline', and the body echoes no input, so no other style can match the hash.
+	# The map picks the policy by exact path, so every other path, `/up/` included, keeps the
+	# bare policy byte for byte, and the header is still set by one line, directly in the site.
+	#
 	# The Server and Via banners stay: they name only what this public repository already
 	# publishes, and they are the one cue that tells an operator whether Caddy or the daemon
 	# answered.
@@ -55,7 +64,11 @@ ai.basecradle.com {
 	header X-Frame-Options "DENY"
 	header Referrer-Policy "no-referrer"
 	header Permissions-Policy "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
-	header Content-Security-Policy "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	map {path} {csp} {
+		/up "default-src 'none'; style-src-attr 'unsafe-hashes' 'sha256-SYA5Rvt/4mtTFmPcI2Waa1tuW+qqev+OP/UMRlh1n/E='; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		default "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	}
+	header Content-Security-Policy "{csp}"
 
 	# Cap the request body at the edge: the outer fence. GitHub caps its own deliveries at
 	# 25 MB, so this is the largest any source sends. The daemon holds each route to its own,

@@ -1066,13 +1066,19 @@ assert_foreign_argv_hidden "other accounts' argv hidden inside the wake's namesp
 #     A header added to the Caddyfile is asserted from the first apply regardless; only the
 #     floor waits.
 #
-# The reader takes only the one form this tree writes, `header <Name> "<value>"` directly
-# in the host's site block, with a value that is literal: no surrounding whitespace, which
-# HTTP strips on the wire, and no `{`/`}`, which Caddy reads as a placeholder and
-# substitutes before sending. Any other `header` line (a matcher, a block, a +/- operation,
-# an unquoted value, a trailing comment, one nested in a sub-block, which applies only to
-# what that block matches) is refused by line number, never guessed at, so a Caddyfile that
-# outgrows the reader turns this gate red instead of quietly asserting less.
+# The reader takes only the two forms this tree writes, each directly in the host's site
+# block. One is `header <Name> "<value>"` with a value that is literal: no surrounding
+# whitespace, which HTTP strips on the wire, and no `{`/`}`, which Caddy reads as a
+# placeholder and substitutes before sending. The other is `header <Name> "{<var>}"`, where
+# <var> is written by an earlier `map {path} {<var>} {` block whose entries are each
+# `<exact path or default> "<literal value>"`; the value expected is the map's entry for the
+# path this gate GETs, else its default, because that is what Caddy sends there (#440, the
+# Content-Security-Policy that differs on /up). Any other `header` line (a matcher, a block,
+# a +/- operation, an unquoted value, a trailing comment, one nested in a sub-block, which
+# applies only to what that block matches) and any other `map` in the site (another input,
+# a regular-expression key, a second writer of a variable) is refused by line number, never
+# guessed at, so a Caddyfile that outgrows the reader turns this gate red instead of quietly
+# asserting less.
 #
 # Asserted unconditionally, like cases 7 and 9: the edge fronts every route, wired or not.
 # Read-only: one GET of the liveness path per protocol.
@@ -1095,14 +1101,22 @@ lower() {
 	LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"
 }
 
-# caddy_site_headers <caddyfile> <site>: the `header` directives the site block for <site>
-# sets, into the parallel arrays SITE_HEADER_NAMES (as written), SITE_HEADER_KEYS (lower
-# case) and SITE_HEADER_VALUES. On a refusal it returns non-zero with the reason in
-# SITE_HEADER_ERROR. Blocks are read the way `caddy fmt` lays them out: a line ending `{`
-# opens one and a line that is only `}` closes it, either may carry a trailing comment.
+# caddy_site_headers <caddyfile> <site> <path>: the `header` directives the site block for
+# <site> sets on an answer to <path>, into the parallel arrays SITE_HEADER_NAMES (as
+# written), SITE_HEADER_KEYS (lower case) and SITE_HEADER_VALUES. On a refusal it returns
+# non-zero with the reason in SITE_HEADER_ERROR. Blocks are read the way `caddy fmt` lays
+# them out: a line ending `{` opens one and a line that is only `}` closes it, either may
+# carry a trailing comment.
 caddy_site_headers() {
-	local file=$1 site=$2 line shape key value n=0 depth=0 in_site=false found=false i
+	local file=$1 site=$2 path=$3 line shape name key value var n=0 depth=0 i
+	local in_site=false found=false in_map=false map_var="" map_hit="" map_default="" map_keys=""
 	local header_re='^header[[:space:]]+([A-Za-z0-9-]+)[[:space:]]+"([^"\\{}]*)"$'
+	local header_var_re='^header[[:space:]]+([A-Za-z0-9-]+)[[:space:]]+"[{]([a-z_]+)[}]"$'
+	local map_re='^map[[:space:]]+[{]path[}][[:space:]]+[{]([a-z_]+)[}][[:space:]]+[{]$'
+	local entry_re='^(default|/[^[:space:]"\\{}]*)[[:space:]]+"([^"\\{}]*)"$'
+	# What each map read so far resolves to for <path>, in parallel (bash 3.2 has no
+	# associative arrays).
+	local -a map_vars=() map_values=()
 	SITE_HEADER_NAMES=()
 	SITE_HEADER_KEYS=()
 	SITE_HEADER_VALUES=()
@@ -1118,24 +1132,91 @@ caddy_site_headers() {
 		if [[ -z "$line" || "$line" == \#* ]]; then
 			continue
 		fi
+		# Inside a map: an entry, or the brace that closes it. Caddy compares an entry's key
+		# to the whole path, so the entry for <path> wins and the default answers otherwise.
+		if $in_map; then
+			shape="${line%%[[:space:]]#*}"
+			if [[ "$shape" == "}" ]]; then
+				in_map=false
+				depth=$((depth - 1))
+				value="${map_hit:-$map_default}"
+				if [[ -z "$value" ]]; then
+					SITE_HEADER_ERROR="${file}:${n}: the map writing {${map_var}} sets nothing for ${path} and has no default"
+					return 1
+				fi
+				map_vars+=("$map_var")
+				map_values+=("$value")
+				continue
+			fi
+			key=""
+			value=""
+			if [[ "$line" =~ $entry_re ]]; then
+				key="${BASH_REMATCH[1]}"
+				value="${BASH_REMATCH[2]}"
+			fi
+			if [[ -z "$value" || "$value" != "${value#[[:space:]]}" ||
+				"$value" != "${value%[[:space:]]}" || "$map_keys" == *" ${key} "* ]]; then
+				SITE_HEADER_ERROR="${file}:${n}: a map entry this gate cannot read: ${line}"
+				return 1
+			fi
+			map_keys+=" ${key} "
+			if [[ "$key" == "$path" ]]; then
+				map_hit=$value
+			elif [[ "$key" == default ]]; then
+				map_default=$value
+			fi
+			continue
+		fi
+		if $in_site && [[ "$line" =~ ^map([[:space:]]|$) ]]; then
+			var=""
+			if ((depth == 1)) && [[ "$line" =~ $map_re ]]; then
+				var="${BASH_REMATCH[1]}"
+			fi
+			for ((i = 0; i < ${#map_vars[@]}; i++)); do
+				if [[ "${map_vars[i]}" == "$var" ]]; then
+					var=""
+				fi
+			done
+			if [[ -z "$var" ]]; then
+				SITE_HEADER_ERROR="${file}:${n}: a map this gate cannot read: ${line}"
+				return 1
+			fi
+			in_map=true
+			map_var=$var
+			map_hit=""
+			map_default=""
+			map_keys=""
+			depth=$((depth + 1))
+			continue
+		fi
 		if $in_site && [[ "$line" =~ ^header([[:space:]]|$) ]]; then
+			name=""
 			value=""
 			if ((depth == 1)) && [[ "$line" =~ $header_re ]]; then
+				name="${BASH_REMATCH[1]}"
 				value="${BASH_REMATCH[2]}"
+			elif ((depth == 1)) && [[ "$line" =~ $header_var_re ]]; then
+				name="${BASH_REMATCH[1]}"
+				var="${BASH_REMATCH[2]}"
+				for ((i = 0; i < ${#map_vars[@]}; i++)); do
+					if [[ "${map_vars[i]}" == "$var" ]]; then
+						value="${map_values[i]}"
+					fi
+				done
 			fi
 			if [[ -z "$value" || "$value" != "${value#[[:space:]]}" ||
 				"$value" != "${value%[[:space:]]}" ]]; then
 				SITE_HEADER_ERROR="${file}:${n}: a header directive this gate cannot read: ${line}"
 				return 1
 			fi
-			key="$(lower "${BASH_REMATCH[1]}")"
+			key="$(lower "$name")"
 			for ((i = 0; i < ${#SITE_HEADER_KEYS[@]}; i++)); do
 				if [[ "${SITE_HEADER_KEYS[i]}" == "$key" ]]; then
-					SITE_HEADER_ERROR="${file}:${n}: sets ${BASH_REMATCH[1]} a second time"
+					SITE_HEADER_ERROR="${file}:${n}: sets ${name} a second time"
 					return 1
 				fi
 			done
-			SITE_HEADER_NAMES+=("${BASH_REMATCH[1]}")
+			SITE_HEADER_NAMES+=("$name")
 			SITE_HEADER_KEYS+=("$key")
 			SITE_HEADER_VALUES+=("$value")
 			continue
@@ -1266,8 +1347,9 @@ assert_edge_headers() {
 }
 # <<< edge_headers <<<
 
-EDGE_URL="https://${SMOKE_HOST}/up"
-if caddy_site_headers "$CADDYFILE" "$SMOKE_HOST"; then
+EDGE_PATH=/up
+EDGE_URL="https://${SMOKE_HOST}${EDGE_PATH}"
+if caddy_site_headers "$CADDYFILE" "$SMOKE_HOST" "$EDGE_PATH"; then
 	assert_edge_floor
 	assert_edge_headers "$EDGE_URL" --http1.1 HTTP/1.1
 	assert_edge_headers "$EDGE_URL" --http2 HTTP/2
