@@ -2034,11 +2034,12 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 > human reconciles it. So a box-only edit is never durable on its own: it holds every later apply until
 > the same change lands here. The hand `install` line below is the first install only.
 >
-> **No dollar sign in any comment in `vector.yaml`.** Vector interpolates environment variables — both
+> **No dollar sign in any comment in `vector.yaml`.** With interpolation on, as every box's unit runs it
+> (the `20-env-interpolation.conf` drop-in below), Vector interpolates environment variables — both
 > `${VAR}` and bare `$VAR` — across the whole file before it parses the YAML, comments included, so a
-> dollar sign in a comment can fail the NOC's pre-install validation (verified on Vector 0.56: either form
-> naming an unset variable, inside a comment, is `Missing environment variable in config`) and the apply
-> is refused. The two sink `token:` values are the
+> dollar sign in a comment can fail the NOC's pre-install validation (verified on Vector 0.56, and on
+> 0.61.0 with interpolation on: either form naming an unset variable, inside a comment, is
+> `Missing environment variable in config`) and the apply is refused. The two sink `token:` values are the
 > only dollar signs the file carries; write "dollar sign" in words anywhere else.
 
 > **Division of labor (issue #116, basecradle-noc#202, basecradle-noc#677).** The router seat authors the
@@ -2059,7 +2060,7 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 # config that embeds the token in every component id (Vector logs component ids constantly — the exact
 # path that self-leaked the NOC token ~40×). The .deb carries no token and avoids both. The timber.io
 # apt repo is dead (Vector moved to Datadog), so pin the release from GitHub.
-VECTOR_VERSION=0.56.0
+VECTOR_VERSION=0.61.0
 curl -fsSL -o /tmp/vector.deb \
   "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb"
 sudo apt-get install -y /tmp/vector.deb && rm -f /tmp/vector.deb
@@ -2079,13 +2080,22 @@ sudo install -D -o root -g root -m 644 \
   /etc/systemd/system/vector.service.d/10-ai-betterstack-env.conf
 sudo systemctl daemon-reload
 
+# the interpolation drop-in (required from Vector 0.57): one fixed file, these exact bytes. Without
+# it the config's ${…} placeholders load as their own literal text, `vector validate` still passes,
+# and every request to the sinks is refused. The NOC's guards read it back by its bytes
+# (`interpolation_dropin_missing`) and its `upgrade-vector` op writes the same file.
+printf '[Service]\nEnvironment=VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true\n' \
+  | sudo tee /etc/systemd/system/vector.service.d/20-env-interpolation.conf >/dev/null
+sudo systemctl daemon-reload
+
 # install the canonical scrubbed config (from the repo checkout), validate, then enable + start.
 # First install only — every later vector.yaml update is the NOC's `deploy-vector` op, run unattended
 # by its auto-converge tick, which installs from the deployed router tree, validates, rolls back on
 # failure, and reads back.
 # <fqdn> is this box's own: never another host's file, whose sinks name another source.
 sudo install -o root -g vector -m 640 deploy/hosts/<fqdn>/vector.yaml /etc/vector/vector.yaml
-sudo bash -c 'set -a; . /etc/vector/betterstack.env; vector validate /etc/vector/vector.yaml'
+# validate with interpolation on, exactly as the unit will load it
+sudo bash -c 'set -a; . /etc/vector/betterstack.env; VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true vector validate /etc/vector/vector.yaml'
 sudo systemctl enable --now vector
 ```
 
@@ -2095,7 +2105,8 @@ In **Better Stack → Live Tail** for **the host's own** source (**"AI"** for `a
 system/journald logs flow, (b) the router's own daemon/unit logs flow, (c) host metrics populate the
 **"Host (Vector)"** dashboard (source = the host's) — and **zero secret values** anywhere (the scrub is the gate). To test the scrub
 offline, run the suite CI runs, `vector test deploy/hosts/<fqdn>/vector.yaml tests/vector/ai_scrub.yaml`
-(with `BETTERSTACK_AI_SOURCE_TOKEN` set to any fake value). For a one-off line, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`: a
+(with `BETTERSTACK_AI_SOURCE_TOKEN` set to any fake value and `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`,
+as the unit runs it). For a one-off line, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`: a
 synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and a message carrying a
 `ghs_…`/`…/heartbeat/…` token must come back `[REDACTED_…]`. Re-test after a reboot:
 `systemctl status vector` active and Live Tail resumes.

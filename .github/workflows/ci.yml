@@ -82,8 +82,8 @@ jobs:
       # PATH but this job's own copy.
       - name: Install Vector
         env:
-          VECTOR_VERSION: "0.56.0"
-          VECTOR_DEB_SHA256: "15978ce37ea17e8228bfd7ce28810237c06b77fdeb6943d8aa3de834cb19d4b1"
+          VECTOR_VERSION: "0.61.0"
+          VECTOR_DEB_SHA256: "1cf2bc77f865e05e539c177feb0eb5feee20ee2762ea379f101610c9625fc4b8"
         run: |
           deb="$RUNNER_TEMP/vector.deb"
           curl -fsSL -o "$deb" "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb"

@@ -18,7 +18,15 @@ CI installs that release (ci.yml → "Install Vector"), so there the binary is r
 laptop without it, or with a different release, skips: point `VECTOR_BIN` at the pinned
 release to run it locally.
 
-No network, model or agent: `vector test` runs transforms only, never a source or a sink.
+Every run carries the environment the boxes' `vector.service` runs under (#441): from Vector 0.57
+a config's placeholders are filled only when `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION` is
+on, and the boxes switch it on with a fixed drop-in. Off, a placeholder loads as its own literal
+text and every check here would still pass, so a run without it would prove a load the unit
+never performs. Each host's file is also validated as the unit loads it, and a run with a sink
+token withheld must fail, so the switch is shown to be live, never assumed.
+
+No network, model or agent: `vector test` runs transforms only, never a source or a sink, and
+`vector validate --no-environment` builds the topology without a component or health check.
 """
 
 from __future__ import annotations
@@ -38,6 +46,20 @@ README = REPO / "deploy" / "README.md"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 HOSTS_DIR = REPO / "deploy" / "hosts"
 SUITES = sorted((REPO / "tests" / "vector").glob("*.yaml"))
+HOSTS = sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir())
+
+#: The switch the boxes' unit sets, in its drop-in
+#: `/etc/systemd/system/vector.service.d/20-env-interpolation.conf`.
+INTERPOLATION = "VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION"
+
+#: A fabricated value for every variable a shipped vector.yaml names. None leaves the process:
+#: neither `vector test` nor `vector validate --no-environment` builds a sink.
+SINK_TOKENS = {"BETTERSTACK_AI_SOURCE_TOKEN": "fabricated-test-token"}
+
+
+def _env(variables: dict[str, str]) -> dict[str, str]:
+    """The unit's environment: interpolation on, plus exactly the variables given."""
+    return {"PATH": os.environ.get("PATH", ""), "NO_COLOR": "1", INTERPOLATION: "true", **variables}
 
 
 def _pinned_version() -> str:
@@ -73,23 +95,71 @@ def test_every_suite_is_run() -> None:
     assert {suite.name for suite in SUITES} >= {"ai_otel_llm.yaml", "ai_scrub.yaml"}
 
 
+def test_the_readme_recipe_switches_interpolation_on_as_the_unit_does() -> None:
+    # The recipe is how a box gets the drop-in; one that drifted from these bytes would install
+    # a unit that loads its placeholders as text, and a validate run without the switch would pass
+    # it. The NOC's guard reads the drop-in back by these same bytes.
+    recipe = README.read_text()
+    dropin = "/etc/systemd/system/vector.service.d/20-env-interpolation.conf"
+    dropin_step = (
+        f"printf '[Service]\\nEnvironment={INTERPOLATION}=true\\n' \\\n  | sudo tee {dropin}"
+    )
+    assert dropin_step in recipe
+    # Every command line in a bash block that runs `vector validate`, however it is indented or
+    # wrapped; a comment line naming the command is prose, not a run.
+    commands = [
+        line.strip()
+        for block in re.findall(r"^```bash\n(.*?)^```$", recipe, re.MULTILINE | re.DOTALL)
+        for line in block.splitlines()
+        if not line.strip().startswith("#")
+    ]
+    validates = [line for line in commands if "vector validate" in line]
+    assert validates, "deploy/README.md must validate the config before starting Vector"
+    for line in validates:
+        assert f"{INTERPOLATION}=true vector validate" in line, line
+
+
+def _validate(
+    vector: str, host: str, variables: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [vector, "validate", "--no-environment", str(HOSTS_DIR / host / "vector.yaml")],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env(variables),
+    )
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_a_hosts_config_loads_as_the_unit_loads_it(host: str) -> None:
+    got = _validate(_vector(), host, SINK_TOKENS)
+    assert got.returncode == 0, got.stdout + got.stderr
+    assert "Validated" in got.stdout, got.stdout + got.stderr
+
+
+@pytest.mark.parametrize("host", HOSTS)
+@pytest.mark.parametrize("withheld", sorted(SINK_TOKENS))
+def test_interpolation_is_live_in_every_run(host: str, withheld: str) -> None:
+    # With interpolation off, a withheld variable loads as its placeholder's text and validates
+    # (measured on 0.61.0, #441); so only a refusal here proves the switch above is really on,
+    # and that the host's file reads the variable the unit supplies.
+    variables = {name: value for name, value in SINK_TOKENS.items() if name != withheld}
+    got = _validate(_vector(), host, variables)
+    assert got.returncode != 0, got.stdout + got.stderr
+    assert f'Missing environment variable in config. name = "{withheld}"' in got.stdout + got.stderr
+
+
 @pytest.mark.parametrize("suite", SUITES, ids=lambda suite: suite.stem)
-@pytest.mark.parametrize("host", sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir()))
+@pytest.mark.parametrize("host", HOSTS)
 def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path) -> None:
     vector = _vector()
-    # A sink token is interpolated at load; this fake one never leaves the process, because
-    # `vector test` builds no sink.
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "BETTERSTACK_AI_SOURCE_TOKEN": "fabricated-test-token",
-        "NO_COLOR": "1",
-    }
     got = subprocess.run(
         [vector, "test", str(HOSTS_DIR / host / "vector.yaml"), str(suite)],
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=_env(SINK_TOKENS),
     )
     report = got.stdout + got.stderr
     assert got.returncode == 0, report
@@ -167,11 +237,11 @@ def _compile_copies(
         capture_output=True,
         text=True,
         check=False,
-        env={"PATH": os.environ.get("PATH", ""), "NO_COLOR": "1"},
+        env=_env({}),
     )
 
 
-@pytest.mark.parametrize("host", sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir()))
+@pytest.mark.parametrize("host", HOSTS)
 def test_the_prefix_pattern_stays_far_under_the_regex_size_limit(host: str, tmp_path: Path) -> None:
     vector = _vector()
     body = _prefix_body(host)
@@ -219,7 +289,7 @@ def test_the_scrub_is_linear_on_a_long_space_free_text(shape: str, tmp_path: Pat
         text=True,
         check=False,
         timeout=_TIME_BOUND_SECONDS * 6,
-        env={"PATH": os.environ.get("PATH", ""), "NO_COLOR": "1"},
+        env=_env({}),
     )
     elapsed = time.monotonic() - started
     assert got.returncode == 0, got.stdout + got.stderr
