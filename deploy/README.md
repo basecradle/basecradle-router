@@ -2061,11 +2061,17 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 # path that self-leaked the NOC token ~40×). The .deb carries no token and avoids both. The timber.io
 # apt repo is dead (Vector moved to Datadog), so pin the release from GitHub.
 VECTOR_VERSION=0.61.0
-curl -fsSL -o /tmp/vector.deb \
-  "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb"
-sudo apt-get install -y /tmp/vector.deb && rm -f /tmp/vector.deb
+# checked against the release's own SHA256SUMS before it is installed — never an unverified package
+cd /tmp && curl -fsSLO "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb" \
+  && curl -fsSLO "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector-${VECTOR_VERSION}-SHA256SUMS" \
+  && grep " vector_${VECTOR_VERSION}-1_amd64.deb\$" "vector-${VECTOR_VERSION}-SHA256SUMS" | sha256sum -c - \
+  && sudo apt-get install -y "./vector_${VECTOR_VERSION}-1_amd64.deb" \
+  && rm -f "vector_${VECTOR_VERSION}-1_amd64.deb" "vector-${VECTOR_VERSION}-SHA256SUMS" && cd -
 # the .deb enables+starts Vector on its stock config — stop+disable until the scrubbed config is in place
 sudo systemctl disable --now vector
+# REQUIRED: without the journal group the journald source reads nothing, `vector validate` passes,
+# health is green, and the stream is empty
+sudo usermod -aG systemd-journal vector
 
 # the token's only home (chmod 640 root:vector) — substitute the real token; never commit it.
 # Pass it via stdin (this piped heredoc) or scp a pre-written file — never as a command argument.
