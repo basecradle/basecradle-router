@@ -1398,7 +1398,8 @@ each host carries its own copy of all three under **`deploy/hosts/<fqdn>/`**:
   The NOC installs it only on a box whose daemon is deployed; until then that box's bootstrap `/up`
   responder stays. There is deliberately no "no daemon" Caddyfile here.
 - **`deploy/hosts/<fqdn>/vector.yaml`** — the scrubbed telemetry config (Part 5), its two sinks pointed at
-  its root domain's Better Stack source. A User on one source never writes to another (@origin,
+  its root domain's Better Stack source (and on `ubuntu-1` alone, its owner's own destination beside
+  them; see "An Owner's Own Destination" below). A User on one source never writes to another (@origin,
   2026-09-21), so a box's telemetry never lands in another root domain's source; boxes on one root
   domain share that domain's source (`red` and `ai`), and a shared source makes their `vector.yaml`
   byte-identical.
@@ -1409,7 +1410,7 @@ each host carries its own copy of all three under **`deploy/hosts/<fqdn>/`**:
 
 Everything else is shared by every host: the other units, the wrappers, the Vector drop-in
 `deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`, and the token variable name
-`BETTERSTACK_AI_SOURCE_TOKEN`. That name is only a name; each box's own `/etc/vector/betterstack.env`
+`BETTERSTACK_AI_SOURCE_TOKEN` (`ubuntu-1` reads one more, its owner's `AXIOM_INGEST_TOKEN`, below). That name is only a name; each box's own `/etc/vector/betterstack.env`
 holds that box's own token, placed by the capital out of band.
 
 **How the NOC finds a host's files:** by the host's FQDN, at `deploy/hosts/<fqdn>/Caddyfile`,
@@ -1419,8 +1420,8 @@ rendering step and **no fallback**: a host with no directory has no config, neve
 
 **What keeps the copies honest:** `tests/test_per_host_deploy.py`. Each host's files must equal the
 reference host's (`ai.basecradle.com`) with only that host's own values swapped in (the site name; the
-ingest host; the reboot window), so a scrub rule, a proxy directive or a timer setting can never land on one
-box and miss another. Each host's window is pinned to its registry slot, and no two hosts may share one.
+ingest host; the reboot window; plus a declared owner destination, below), so a scrub rule, a proxy
+directive or a timer setting can never land on one box and miss another. Each host's window is pinned to its registry slot, and no two hosts may share one.
 Hosts on different root domains can never share a source, and a host directory missing from the test's table
 fails the suite. `tests/test_caddyfile.py` checks the retry contract in every host's Caddyfile.
 
@@ -1430,8 +1431,47 @@ fails the suite. `tests/test_caddyfile.py` checks the retry contract in every ho
 2. Here: create `deploy/hosts/<fqdn>/`, copy the reference host's three files into it, change the
    Caddyfile's site line to the FQDN, the two sink `uri:` lines to the new ingest host, and the timer's
    `OnCalendar=` to the host's registry slot, and add the host to `INGEST_HOSTS` and `REBOOT_WINDOWS` in
-   `tests/test_per_host_deploy.py`. The suite fails until they all agree.
+   `tests/test_per_host_deploy.py` and to `UNIT_VARIABLES` in `tests/test_vector_unit.py`. The suite fails
+   until they all agree.
 3. The NOC adds the host to its inventory and reads the host's files from the deployed tree.
+
+#### An Owner's Own Destination (`ubuntu-1.landfill.click` Only, #442)
+
+`ubuntu-1.landfill.click` is a box its owner pays for. Its telemetry ships to Better Stack exactly as
+every host's does, and by founder order (2026-11-11) **the same scrubbed logs and host metrics also ship
+to the owner's own Axiom account**: two sinks, `axiom_logs` (dataset `fleet-servers-logs`) and
+`axiom_metrics` (dataset `fleet-servers-metrics`), carried in that host's `vector.yaml` beside the two
+Better Stack sinks. **The owner's Axiom receives the owner's box and nothing else.**
+
+- **Declared, and only outside `basecradle.com`.** `tests/test_per_host_deploy.py` holds the exact bytes
+  in its `OWNER_DESTINATIONS` table. A host's file must equal the reference with its ingest host
+  swapped, plus its declared block, byte for byte. A host with no entry carries no Axiom sink, no Axiom
+  variable and no extra sink of any kind. An entry for one of our own hosts fails the suite.
+- **A best-effort copy that never holds Better Stack back.** Both sinks have a disk buffer of
+  268,435,488 bytes (about 256 MiB) with `when_full: "drop_newest"`. With Vector's default (`block`), a hanging Axiom froze the Better
+  Stack sink. With `drop_newest`, Better Stack ran at full rate through a hang and through a refused
+  token (the capital measured both on Vector 0.61.0). A short outage loses nothing. Once the buffer
+  fills, the newest events are dropped from this copy only. The test holds every sink in a declared
+  block to `drop_newest`.
+- **Scrubbed before it leaves.** `axiom_logs` takes `ai_scrub`, never a raw source: the scrub is the
+  boundary for anything leaving the box, and this is a second store we cannot purge. `axiom_metrics`
+  takes `ai_host_metrics` directly, as the Better Stack metrics sink does.
+- **Dated by the event, bounded on shutdown.** Each sink's `url` names the field that holds the event's
+  own time, so Axiom dates an event by when it happened and a batch replayed after an outage is dated
+  correctly. For a log that field is **`dt`**: `ai_scrub` ends `.dt = del(.timestamp)` (Better Stack's
+  field), and measured on Vector 0.61.0, a scrubbed log reaches the sink with `dt` and no
+  `timestamp`, so `timestamp-field=timestamp` would date every log line by its arrival. A metric
+  keeps `timestamp`. A `url` with a path is used as-is, query included (measured), so its path
+  names the dataset, and the test holds each `dataset:` to it. `request.timeout_secs: 15` stops a hanging Axiom from holding
+  Vector's graceful shutdown for its full 60 seconds on every restart.
+- **The token is `AXIOM_INGEST_TOKEN`, from the environment** like Better Stack's, never from the file.
+  Its home on the box, and the box's guards, belong to the NOC. The unit must supply the variable before
+  this file reaches the box: with interpolation on, an unresolvable variable is a load error, which
+  means an outage of that box's telemetry. `tests/test_vector_unit.py` declares the variables each
+  host's unit carries (`UNIT_VARIABLES`) and validates each host's file with exactly those, so a file that
+  reads one its unit lacks fails offline. The First Install recipe below places and loads the Better
+  Stack token only. On `ubuntu-1` a hand validate must also load the Axiom token from wherever the NOC
+  placed it, exactly as the unit does, or it fails on `AXIOM_INGEST_TOKEN`.
 
 ### Hardening (ongoing; capital/NOC operates, router-AI authors the config)
 SSH hardening + `fail2ban`, `unattended-upgrades` (the install half is on; the **reboot half** is the
@@ -1838,7 +1878,7 @@ mirrors the proven, scrubbed config `basecradle-noc` already runs (basecradle-no
 **The config is version-controlled — `deploy/hosts/<fqdn>/vector.yaml` is each host's single source
 of truth** (for example [`deploy/hosts/ai.basecradle.com/vector.yaml`](hosts/ai.basecradle.com/vector.yaml)),
 not Better Stack's generated kitchen-sink. Every host's copy is the same config with only its two sink
-URIs differing (Part 2, *One router, many hosts*). It is tailored to a router box (a webhook daemon +
+URIs differing, plus `ubuntu-1`'s declared owner destination (Part 2, *One router, many hosts*). It is tailored to a router box (a webhook daemon +
 Caddy, no database) and has four load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
@@ -2040,7 +2080,7 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 > dollar sign in a comment can fail the NOC's pre-install validation (verified on Vector 0.56, and on
 > 0.61.0 with interpolation on: either form naming an unset variable, inside a comment, is
 > `Missing environment variable in config`) and the apply is refused. The two sink `token:` values are the
-> only dollar signs the file carries; write "dollar sign" in words anywhere else.
+> only dollar signs the file carries (on `ubuntu-1`, its owner destination's two besides, #442); write "dollar sign" in words anywhere else.
 
 > **Division of labor (issue #116, basecradle-noc#202, basecradle-noc#677).** The router seat authors the
 > version-controlled config here (this repo, merged to `main`). The **first install** below — the Vector
