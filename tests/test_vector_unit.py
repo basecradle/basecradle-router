@@ -119,6 +119,17 @@ def test_the_readme_recipe_switches_interpolation_on_as_the_unit_does() -> None:
         assert f"{INTERPOLATION}=true vector validate" in line, line
 
 
+def test_the_readme_recipe_verifies_the_package_and_lets_vector_read_the_journal() -> None:
+    # Two first-install steps that fail silently when missing (provision-server §5): an
+    # unverified .deb installs whatever the download returned, and a `vector` user outside
+    # `systemd-journal` reads an empty journal while validate passes and health stays green.
+    # (The group is Vector's, never the router daemon's.)
+    recipe = README.read_text()
+    assert "| sha256sum -c -" in recipe
+    assert recipe.index("sha256sum -c -") < recipe.index("sudo apt-get install -y")
+    assert "\nsudo usermod -aG systemd-journal vector\n" in recipe
+
+
 def _validate(
     vector: str, host: str, variables: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
