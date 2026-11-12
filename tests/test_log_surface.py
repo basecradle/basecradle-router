@@ -408,14 +408,8 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
 
 
-def test_the_only_dollar_signs_in_vector_yaml_are_the_sink_tokens() -> None:
-    # Vector interpolates environment variables across the WHOLE file before it parses the
-    # YAML — comments and the VRL source included — so a dollar sign anywhere else is never
-    # literal: a `$1` back-reference in a replacement, or a regex end anchor, becomes an
-    # environment lookup and can fail the NOC's pre-install validation, refusing the apply.
-    # The header promises the two sink tokens are the only ones; this holds it to that.
-    carriers = [line.strip() for line in VECTOR.read_text().splitlines() if "$" in line]
-    assert carriers == ['token: "${BETTERSTACK_AI_SOURCE_TOKEN}"'] * 2
+# The only dollar signs in a host's vector.yaml are its sink tokens: pinned for every host,
+# owner destinations included, by tests/test_per_host_deploy.py.
 
 
 def test_the_process_command_line_is_never_shipped() -> None:

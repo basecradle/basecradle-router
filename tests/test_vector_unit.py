@@ -52,9 +52,36 @@ HOSTS = sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir())
 #: `/etc/systemd/system/vector.service.d/20-env-interpolation.conf`.
 INTERPOLATION = "VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION"
 
-#: A fabricated value for every variable a shipped vector.yaml names. None leaves the process:
+#: A fabricated value for every variable a shipped vector.yaml names: every host's Better Stack
+#: token, and the Axiom token of ubuntu-1's owner destination (#442). None leaves the process:
 #: neither `vector test` nor `vector validate --no-environment` builds a sink.
-SINK_TOKENS = {"BETTERSTACK_AI_SOURCE_TOKEN": "fabricated-test-token"}
+SINK_TOKENS = {
+    "AXIOM_INGEST_TOKEN": "fabricated-axiom-token",
+    "BETTERSTACK_AI_SOURCE_TOKEN": "fabricated-test-token",
+}
+
+
+#: The variables each host's unit supplies, declared here rather than read off the file under
+#: test: a host's file that starts reading a variable its unit does not carry fails to load on the
+#: box, so it must fail here until this contract (and the box) says the unit carries it. Every
+#: host's unit carries its Better Stack token; ubuntu-1's also carries its owner's Axiom token,
+#: which the NOC places on that box before #442's config may reach it.
+UNIT_VARIABLES = {
+    "ai.basecradle.com": ["BETTERSTACK_AI_SOURCE_TOKEN"],
+    "red.basecradle.com": ["BETTERSTACK_AI_SOURCE_TOKEN"],
+    "ubuntu-1.landfill.click": ["AXIOM_INGEST_TOKEN", "BETTERSTACK_AI_SOURCE_TOKEN"],
+}
+
+
+def _named(host: str) -> list[str]:
+    """The variables a host's vector.yaml reads."""
+    text = (HOSTS_DIR / host / "vector.yaml").read_text()
+    return sorted(set(re.findall(r"\$\{(\w+)\}", text)))
+
+
+def _tokens(host: str) -> dict[str, str]:
+    """The variables the host's unit carries, each with its fabricated value."""
+    return {name: SINK_TOKENS[name] for name in UNIT_VARIABLES[host]}
 
 
 def _env(variables: dict[str, str]) -> dict[str, str]:
@@ -144,18 +171,32 @@ def _validate(
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_a_hosts_config_loads_as_the_unit_loads_it(host: str) -> None:
-    got = _validate(_vector(), host, SINK_TOKENS)
+    got = _validate(_vector(), host, _tokens(host))
     assert got.returncode == 0, got.stdout + got.stderr
     assert "Validated" in got.stdout, got.stdout + got.stderr
 
 
+def test_every_host_declares_its_units_variables() -> None:
+    assert set(UNIT_VARIABLES) == set(HOSTS)
+    declared = {name for names in UNIT_VARIABLES.values() for name in names}
+    assert declared == set(SINK_TOKENS), "SINK_TOKENS must fabricate exactly the declared variables"
+
+
 @pytest.mark.parametrize("host", HOSTS)
-@pytest.mark.parametrize("withheld", sorted(SINK_TOKENS))
+def test_a_hosts_file_reads_exactly_what_its_unit_carries(host: str) -> None:
+    # Offline, before Vector: one the file reads and the unit lacks is a load failure on the box;
+    # one the unit carries and the file never reads is a stale contract.
+    assert _named(host) == UNIT_VARIABLES[host]
+
+
+@pytest.mark.parametrize(
+    ("host", "withheld"), [(host, name) for host in HOSTS for name in UNIT_VARIABLES[host]]
+)
 def test_interpolation_is_live_in_every_run(host: str, withheld: str) -> None:
     # With interpolation off, a withheld variable loads as its placeholder's text and validates
     # (measured on 0.61.0, #441); so only a refusal here proves the switch above is really on,
     # and that the host's file reads the variable the unit supplies.
-    variables = {name: value for name, value in SINK_TOKENS.items() if name != withheld}
+    variables = {name: value for name, value in _tokens(host).items() if name != withheld}
     got = _validate(_vector(), host, variables)
     assert got.returncode != 0, got.stdout + got.stderr
     assert f'Missing environment variable in config. name = "{withheld}"' in got.stdout + got.stderr
@@ -170,7 +211,7 @@ def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path) -> None
         capture_output=True,
         text=True,
         check=False,
-        env=_env(SINK_TOKENS),
+        env=_env(_tokens(host)),
     )
     report = got.stdout + got.stderr
     assert got.returncode == 0, report

@@ -673,6 +673,40 @@ sinks:
       token: "${BETTERSTACK_AI_SOURCE_TOKEN}"
     inputs: ["ai_host_metrics"]
 
+  # THE OWNER'S OWN COPY (basecradle-router#442), ON THIS HOST ALONE. By founder order (2026-11-11)
+  # the scrubbed logs and host metrics this host ships to Better Stack also go to its owner's own
+  # Axiom account, which receives the owner's box and nothing else: tests/test_per_host_deploy.py
+  # declares these two sinks for this host and refuses them on any other. Axiom is a best-effort
+  # copy, and `when_full: "drop_newest"` is the whole safety of it: with the default (block) a
+  # hanging Axiom froze the Better Stack sink. Logs take `ai_scrub`, never a raw source, and are
+  # dated by `dt`, the field the scrub moves an event's time to; metrics keep `timestamp`. These two
+  # token values and Better Stack's two are this file's only dollar signs.
+  axiom_logs:
+    type: "axiom"
+    inputs: ["ai_scrub"]
+    token: "${AXIOM_INGEST_TOKEN}"
+    dataset: "fleet-servers-logs"
+    url: "https://us-east-1.aws.edge.axiom.co/v1/ingest/fleet-servers-logs?timestamp-field=dt"
+    request:
+      timeout_secs: 15
+    buffer:
+      type: "disk"
+      max_size: 268435488
+      when_full: "drop_newest"
+
+  axiom_metrics:
+    type: "axiom"
+    inputs: ["ai_host_metrics"]
+    token: "${AXIOM_INGEST_TOKEN}"
+    dataset: "fleet-servers-metrics"
+    url: "https://us-east-1.aws.edge.axiom.co/v1/ingest/fleet-servers-metrics?timestamp-field=timestamp"
+    request:
+      timeout_secs: 15
+    buffer:
+      type: "disk"
+      max_size: 268435488
+      when_full: "drop_newest"
+
   # Vector's health counters, exposed for the NOC to READ OFF THE BOX (basecradle-noc#215).
   #
   # DELIBERATELY NOT SHIPPED TO BETTER STACK. A Vector whose SINK is broken cannot ship the metric
