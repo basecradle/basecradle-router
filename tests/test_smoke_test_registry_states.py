@@ -29,7 +29,6 @@ AI). Secrets are correctly-shaped fakes; the uuid is a well-formed UUIDv7.
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 import textwrap
@@ -38,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX, SHARED_FALLBACK_VAR
+from caddy_edge import edge_headers
 
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 SMOKE_TEST = DEPLOY / "smoke-test.sh"
@@ -136,9 +136,8 @@ FAKE_CURL = textwrap.dedent(
 
 
 def _edge_headers(tmp_path: Path) -> Path:
-    """The header block a correct edge sends for HOST: each `header` its Caddyfile sets."""
-    caddyfile = (DEPLOY / "hosts" / HOST / "Caddyfile").read_text()
-    lines = re.findall(r'(?m)^\s*header\s+(\S+)\s+"([^"]*)"\s*$', caddyfile)
+    """The header block a correct edge sends on HOST's /up: each `header` its Caddyfile sets."""
+    lines = edge_headers((DEPLOY / "hosts" / HOST / "Caddyfile").read_text(), "/up")
     path = tmp_path / "edge-headers.txt"
     path.write_text("".join(f"{name}: {value}\r\n" for name, value in lines))
     return path
