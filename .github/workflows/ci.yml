@@ -45,8 +45,9 @@ jobs:
       - name: Shell Lint
         run: .github/scripts/lint-shell.sh
 
-      # PINNED TO THE BOX'S uv (#297). ai.basecradle.com runs uv 0.11.19, and the
-      # deploy's lock gate (`uv sync --locked` as `router`) runs under THAT resolver.
+      # PINNED TO THE BOX'S uv (#297, #447). Every router host runs uv 0.13.7 (the
+      # NOC's `ROUTER_UV_VERSION`, basecradle-noc#1411), and the deploy's lock gate
+      # (`uv sync --locked` as `router`) runs under THAT resolver.
       # Unpinned, this step installs whatever uv is newest, so CI could green a lock
       # the box's uv disagrees with — and the disagreement would surface as a failed
       # deploy on the fleet's only wake path instead of a red check here. Read the
@@ -56,7 +57,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          version: "0.11.19"
+          version: "0.13.7"
 
       - name: Set Up Python
         run: uv python install 3.10
