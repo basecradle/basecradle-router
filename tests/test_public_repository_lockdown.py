@@ -258,9 +258,9 @@ def test_a_repository_with_two_reminders_is_a_gap_and_neither_is_moved() -> None
 
 
 def test_an_unreadable_limit_is_never_a_pass() -> None:
-    github = FakeGitHub(limits={HOME: lockdown.GitHubError("HTTP 403: Resource not accessible")})
+    github = FakeGitHub(limits={HOME: lockdown.GitHubError("gh: HTTP 503: Service Unavailable")})
     result = _assert_gap(github, HOME, "limit-unreadable")
-    assert "HTTP 403" in result.found[HOME][0].detail
+    assert "HTTP 503" in result.found[HOME][0].detail
 
 
 @pytest.mark.parametrize(
@@ -282,11 +282,22 @@ def test_unreadable_reminders_are_never_a_pass() -> None:
 
 def test_a_refused_renewal_is_a_gap_even_while_the_old_limit_stands() -> None:
     github = FakeGitHub(refuse={"basecradle/.github"})
-    result = _assert_gap(github, "basecradle/.github", "renewal-refused")
-    assert "not accessible by personal access token" in created(github)[3]
+    result = _assert_gap(github, "basecradle/.github", "renewal-forbidden")
+    assert "the token was refused the renewal (HTTP 403)" in created(github)[3]
     # The others were still renewed: one refusal never stops the rest.
     assert ("renew", HOME) in github.writes
     assert result.result()["repositories"]["basecradle/.github"]["renewed"] is False
+
+
+def test_a_renewal_that_fails_without_a_refusal_says_what_github_said() -> None:
+    class Outage(FakeGitHub):
+        def renew(self, repository: str) -> None:
+            if repository == HOME:
+                raise lockdown.GitHubError("gh: HTTP 502: Bad Gateway")
+            super().renew(repository)
+
+    result = _assert_gap(Outage(), HOME, "renewal-refused")
+    assert "HTTP 502: Bad Gateway" in result.found[HOME][0].detail
 
 
 def test_a_reminder_that_cannot_be_moved_is_a_gap() -> None:
@@ -630,7 +641,7 @@ def _rate_limit(expiry: str | None) -> tuple[int, str, str]:
 def test_the_credential_line_names_only_the_kind_far_from_expiry() -> None:
     run = Recorder([_rate_limit("2027-06-07 05:20:00 UTC")])
     kind, warning = lockdown.GitHub("github_pat_SECRET", run=run).credential(NOW)
-    assert kind == "a fine-grained personal access token"
+    assert kind == "fine-grained"
     # The log is public: no date to plan around, and no owner.
     assert warning is None
     assert [c["command"][-1] for c in run.calls] == ["rate_limit"]
@@ -646,12 +657,9 @@ def test_the_credential_warns_in_days_near_its_expiry_and_never_says_the_date() 
 
 def test_the_credential_line_never_fails_the_run() -> None:
     run = Recorder([(1, "", "HTTP 401")])
-    assert lockdown.GitHub("ghs_x", run=run).credential(NOW) == (
-        "a GitHub App installation token",
-        None,
-    )
+    assert lockdown.GitHub("ghs_x", run=run).credential(NOW) == ("app", None)
     run = Recorder([_rate_limit(None)])
-    assert lockdown.GitHub("weird", run=run).credential(NOW) == ("a token of unknown kind", None)
+    assert lockdown.GitHub("weird", run=run).credential(NOW) == ("unknown", None)
 
 
 # --- main ---------------------------------------------------------------------------------
@@ -776,3 +784,176 @@ def test_a_failed_app_token_mint_never_stops_the_renewal_step() -> None:
     assert "continue-on-error: true" in mint
     renew = text.split("- name: Renew, Read Back, and Record", 1)[1].split("- name:", 1)[0]
     assert "if:" not in renew
+
+
+# --- the gap issue names the credential it needs (the first real run, #452) -------------
+
+_REFUSED = lockdown.GitHubError("gh: Resource not accessible by personal access token (HTTP 403)")
+_REJECTED = lockdown.GitHubError("gh: Bad credentials (HTTP 401)")
+
+
+class RefusingGitHub(FakeGitHub):
+    """A token GitHub refuses on some repositories, with the status a real refusal carries."""
+
+    def __init__(self, refusals: dict[str, lockdown.GitHubError], **kwargs: Any) -> None:
+        super().__init__(limits=dict(refusals), **kwargs)
+        self.refusals = refusals
+
+    def renew(self, repository: str) -> None:
+        self.writes.append(("renew", repository))
+        if repository in self.refusals:
+            raise self.refusals[repository]
+
+
+def _refused_run(
+    credential: str = "fine-grained",
+    refusals: dict[str, lockdown.GitHubError] | None = None,
+    **kwargs: Any,
+) -> RefusingGitHub:
+    github = RefusingGitHub(refusals or {"basecradle/.github": _REFUSED}, **kwargs)
+    lockdown.run_audit(
+        github,  # type: ignore[arg-type]
+        github.repositories,
+        dry_run=False,
+        now=NOW,
+        run_url=RUN_URL,
+        sleep=lambda _: None,
+        credential=credential,
+    )
+    return github
+
+
+def _section(body: str) -> str:
+    return body.split("## The Credential It Needs", 1)[1].split("## What Happens Next", 1)[0]
+
+
+def test_a_refusal_names_the_permission_and_every_repository_it_must_reach() -> None:
+    body = created(_refused_run())[3]
+    section = _section(body)
+    assert (
+        "`FLEET_ADMIN_TOKEN` was refused (HTTP 403) on `basecradle/.github`: it does not reach "
+        "that repository, or lacks the permission there."
+    ) in section
+    assert "**Administration: Read and write**" in section
+    for repository in FLEET:
+        assert f"`{repository}`" in section
+    assert "*Only select repositories*" in section
+    assert "never organization administration, and no issue permission" in section
+    assert "`@origin`'s to change" in section
+
+
+def test_a_refusal_is_its_own_finding_never_an_unreadable_limit() -> None:
+    github = _refused_run()
+    body = created(github)[3]
+    assert "the token was refused the read (HTTP 403)" in body
+    assert "lacks Administration: read on it" in body
+    assert lockdown._state_in(created(github)[3]) == {
+        "basecradle/.github": ["limit-forbidden", "renewal-forbidden"]
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "says", "never"),
+    [
+        ("fine-grained", "*Only select repositories*", "classic"),
+        ("classic", "GitHub documents no scope", "*Only select repositories*"),
+        ("app", "must be installed on each repository above", "*Only select repositories*"),
+        ("unknown", "**Administration: Read and write**", "This run read it as"),
+    ],
+)
+def test_the_guidance_is_in_the_words_of_the_kind_of_token(
+    kind: str, says: str, never: str
+) -> None:
+    section = _section(created(_refused_run(credential=kind))[3])
+    assert says in section
+    assert never not in section
+
+
+def test_an_expired_or_revoked_token_is_said_as_such_not_as_a_missing_permission() -> None:
+    github = _refused_run(refusals={r: _REJECTED for r in FLEET})
+    body = created(github)[3]
+    assert "rejected as invalid (HTTP 401)" in _section(body)
+    assert "it has expired or been revoked" in body
+    assert "refused (HTTP 403)" not in body
+    assert set(lockdown._state_in(body)["basecradle/.github"]) == {"token-rejected"}
+
+
+def test_a_failure_that_is_not_a_refusal_names_no_credential() -> None:
+    github = FakeGitHub(limits={HOME: lockdown.GitHubError("gh: HTTP 502: Bad Gateway")})
+    audit(github)
+    body = created(github)[3]
+    assert "## The Credential It Needs" not in body
+    assert "limit-unreadable" in body
+
+
+def test_a_gap_with_no_refusal_names_no_credential() -> None:
+    github = FakeGitHub(issues={"basecradle/.github": []})
+    audit(github)
+    assert "## The Credential It Needs" not in created(github)[3]
+
+
+def test_a_token_that_can_read_but_not_renew_is_named_too() -> None:
+    # Administration: Read-only reads the limit and is refused the renewal.
+    github = FakeGitHub(refuse={"basecradle/.github"})
+    audit(github)
+    body = created(github)[3]
+    assert "`FLEET_ADMIN_TOKEN` was refused (HTTP 403) on `basecradle/.github`" in body
+    assert "lacks Administration: write on it" in body
+
+
+def _open_gap(body: str) -> list[dict[str, Any]]:
+    gap = {
+        "number": 452,
+        "title": lockdown.GAP_TITLE,
+        "body": body,
+        "user": {"login": CAPITAL},
+        "labels": [{"name": "needs-capital"}],
+    }
+    return [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), gap]
+
+
+def test_the_open_452_is_told_the_credential_in_a_comment() -> None:
+    # #452 as the first run filed it, under the codes that run used.
+    old = "## What Was Found\n\nold body\n\n" + lockdown._marker(
+        {"basecradle/.github": ["limit-unreadable", "renewal-refused"]}
+    )
+    again = _refused_run(issues={HOME: _open_gap(old)})
+    on_issue = [w for w in again.writes if len(w) > 2 and w[2] == "452"]
+    assert [w[0] for w in on_issue] == ["comment", "unlabel", "label", "edit"]
+    comment = on_issue[0][3]
+    assert "## The Credential It Needs" in comment
+    assert "**Administration: Read and write**" in comment
+    assert "## The Credential It Needs" in json.loads(on_issue[3][3])["body"]
+    assert "create" not in again.kinds()
+
+
+def test_a_standing_refusal_seen_by_a_later_run_is_said_once() -> None:
+    body = created(_refused_run())[3]
+    again = _refused_run(issues={HOME: _open_gap(body)})
+    assert not [w for w in again.writes if len(w) > 2 and w[2] == "452"]
+
+
+def test_the_status_survives_a_hint_line_after_it() -> None:
+    stderr = (
+        "gh: Resource not accessible by personal access token (HTTP 403)\n"
+        "This API operation needs the admin:org scope.\n"
+    )
+    run = Recorder([(1, "", stderr)])
+    with pytest.raises(lockdown.GitHubError) as raised:
+        lockdown.GitHub("github_pat_x", "ghs_y", run=run).read_limit(HOME)
+    assert raised.value.status == 403
+    assert "(HTTP 403)" in str(raised.value)
+
+
+def test_an_error_with_no_status_is_an_outage() -> None:
+    assert lockdown.GitHubError("gh: connection reset").status is None
+    assert lockdown.GitHubError("gh: Bad credentials (HTTP 401)").status == 401
+
+
+def test_two_refusals_are_said_in_the_plural() -> None:
+    both = {"basecradle/.github": _REFUSED, "basecradle/basecradle-python": _REFUSED}
+    section = _section(created(_refused_run(refusals=both))[3])
+    assert (
+        "on `basecradle/.github`, `basecradle/basecradle-python`: it does not reach those "
+        in section
+    )
