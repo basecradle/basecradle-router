@@ -288,6 +288,7 @@ uv run pytest            # tests (offline — the default)
 uv run ruff check .      # lint (Python)
 uv run ruff format .     # format
 .github/scripts/lint-shell.sh   # lint (shell) — shellcheck over every tracked script
+.github/scripts/lint-workflows.sh   # lint (workflows) — actionlint over .github/workflows
 ```
 
-`lint-shell.sh` runs as a step in the `CI` job, so shell is gated the same way Python is; run it locally before opening a PR that touches any `.sh` or `deploy/bin/` script (`brew install shellcheck`).
+`lint-shell.sh` runs as a step in the `CI` job, so shell is gated the same way Python is; run it locally before opening a PR that touches any `.sh` or `deploy/bin/` script (`brew install shellcheck`). `lint-workflows.sh` is the `Workflow Lint` step: a workflow GitHub cannot parse has no triggers and never runs, with every other check green (#449). Run it before opening a PR that touches `.github/workflows/` (`brew install actionlint`); where actionlint cannot run, parse the file with a real YAML parser (`ruby -ryaml -e 'YAML.load_file(ARGV[0])' <file>`) and never ship it unparsed.
