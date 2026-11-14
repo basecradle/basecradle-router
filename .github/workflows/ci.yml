@@ -24,6 +24,27 @@ jobs:
       - name: Injection-Marker Guard
         run: .github/scripts/injection-guard.sh
 
+      # A workflow GitHub cannot parse has no triggers and never runs, and nothing else here
+      # reads one: the Public Repository Lockdown merged as invalid YAML with this job green
+      # (#449). actionlint parses every workflow, checks it against GitHub's schema, and
+      # shellchecks its `run:` scripts. Pinned by version AND checksum (the release's own
+      # actionlint_<version>_checksums.txt, which matches GitHub's asset digest), like Vector
+      # below. Dependabot does not see a download, so a bump is by hand. A STEP, so the
+      # required status context stays the single `CI`.
+      - name: Workflow Lint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL --retry 3 --max-time 120 -o "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $archive" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+          PATH="$RUNNER_TEMP/actionlint:$PATH" .github/scripts/lint-workflows.sh
+
       # Fleet Bot Identity: a commit authored by this repo's bot carries no
       # Co-Authored-By trailer (#354). A STEP in this job, like Shell Lint below, so
       # the required context stays the single `CI`. Gated on the event because only
