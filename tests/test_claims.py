@@ -21,6 +21,7 @@ this file passes just as happily with an unarmable pointer (basecradle-noc#417).
 """
 
 import re
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 import pytest
@@ -736,3 +737,30 @@ def test_the_probe_command_follows_a_non_standard_deploy_tree(tmp_path) -> None:
 
     claim = _claim(_subject(manifests, "box:ai.basecradle.com"), "freeze-surface:readable")
     assert claim["prove"]["cmd"] == "/srv/router/admin selftest freeze --json"
+
+
+def test_the_wake_edge_detail_publishes_what_is_running(tmp_path) -> None:
+    # basecradle-router#456: the census is how a peer reads this agent, so the in-flight
+    # group must reach the agent-wide claim's detail, set while a wake runs and null after.
+    evidence = EvidenceStore(None)
+    launched = datetime(2026, 11, 11, 14, 0, tzinfo=timezone.utc)
+    evidence.record_wake_started(
+        NOVA.harness_key, "delivery-1", at=launched, route="github", synthetic=False
+    )
+
+    def running() -> tuple:
+        manifest = _subject(_build(tmp_path, evidence=evidence), f"agent:{NOVA.harness_key}")
+        detail = _claim(manifest, "wake-edge:webhook-route")["detail"]
+        return tuple(
+            detail[key]
+            for key in (
+                "wake_started_at",
+                "wake_started_delivery",
+                "wake_started_route",
+                "wake_started_synthetic",
+            )
+        )
+
+    assert running() == ("2026-11-11T14:00:00+00:00", "delivery-1", "github", False)
+    evidence.record_wake_ok(NOVA.harness_key, "delivery-1", route="github", synthetic=False)
+    assert running() == (None, None, None, None)

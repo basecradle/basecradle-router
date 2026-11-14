@@ -773,7 +773,14 @@ class Pipeline:
         reading everything before its start: re-dispatching those deliveries would
         re-run the work the operator stopped. It records **no** wake evidence — a stop
         is neither the edge failing nor a gate refusing, and it never learned whether
-        the wake would have succeeded, so it is no ``ok`` either.
+        the wake would have succeeded, so it is no ``ok`` either. It does clear the
+        in-flight marker, which is a live reading rather than evidence.
+
+        **Every attempt is marked in flight in the evidence document as it launches,
+        and every way out of this method clears the mark** (basecradle-router#456): an
+        ``ok`` or a ``failed`` in the same update as its outcome, and the ``finally``
+        for everything else. Without it, the document moved only when a wake ended, so
+        from outside the journal a long wake and a wedged lane read the same.
 
         Each attempt is timed, and ``duration`` is always *the last attempt's*
         wall-clock — the wake subprocess's own, never the retry backoff's — so the
@@ -828,6 +835,16 @@ class Pipeline:
         def attempt() -> WakeResult:
             nonlocal last_duration, last_started_at
             last_started_at = self.now()
+            # What is running, durably, for a reader that cannot see this journal (#456):
+            # stamped with the very instant coverage is drawn at, and cleared on every way
+            # out of this method (see the `finally` below).
+            self.evidence.record_wake_started(
+                agent.harness_key,
+                event.delivery_id,
+                at=last_started_at,
+                route=event.source,
+                synthetic=event.synthetic,
+            )
             started = self.clock()
             try:
                 return self.waker.wake(agent, event)
@@ -912,7 +929,14 @@ class Pipeline:
                     "duration": _seconds(last_duration),
                     "error": "unexpected: the wake path raised",
                 }
-            self._bookend(event, who, "wake_end", **verdict)
+            try:
+                # The net under every exit path for the in-flight marker (#456). A success
+                # or a failure has already cleared it in the same update as its outcome,
+                # so this writes nothing then; a stop (which records no outcome) and an
+                # unexpected error are what it exists for.
+                self.evidence.record_wake_ended(agent.harness_key)
+            finally:
+                self._bookend(event, who, "wake_end", **verdict)
 
     def _bookend(self, event: Event, who: dict[str, object], phase: str, **verdict: object) -> None:
         """Emit one half of the wake lifecycle bracket — ``wake_start`` or ``wake_end``.
