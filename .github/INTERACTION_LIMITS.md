@@ -22,34 +22,57 @@ limit just shrinks who can write into a thread in the first place.
 
 GitHub interaction limits are **temporary — max 6 months, no permanent option.**
 Left alone they silently expire and the repo reopens to drive-by writes. So renewal
-is automated and audited:
+is automated, read back, and watched (#449):
 
-- **`.github/scripts/interaction-limit-renewal.sh`** re-applies the limit and runs
-  a read-only sweep of every public repo in the org, flagging any that is missing
-  its limit *or* its open renewal-reminder issue. A gap exits non-zero.
-- **`.github/workflows/interaction-limit-renewal.yml`** runs it monthly (cron), so
-  the 6-month clock is reset with months of margin and a gap surfaces as a failed
-  run, not a months-later surprise.
+- **`.github/workflows/interaction-limit-renewal.yml`** (*Public Repository
+  Lockdown*) runs weekly. It renews `collaborators_only` on **every** public
+  repository in the organization, reads each limit back, and moves each
+  repository's one renewal reminder to the date GitHub reports, so the reminder
+  is a record and never the mechanism.
+- **`.github/scripts/public_repository_lockdown.py`** holds the decisions, with
+  tests (`tests/test_public_repository_lockdown.py`).
+- **The `Public Repository Lockdown` heartbeat** (Better Stack, group
+  `github.com`) is pinged only when every public repository reads an active
+  `collaborators_only` limit with more than 30 days left and exactly one open
+  reminder. A gap, an unreadable answer, or a run that dies withholds the ping,
+  and the miss pages. A gap also files or updates one `needs-capital` issue here,
+  *Public Repository Lockdown Found a Gap*, which the run that finds none closes.
 
-### Credential
+A reminder counts only when its title is exactly
+`⏰ Renew interaction limit before <YYYY-MM-DD> (public-repo write-lockdown)` and
+it was written by `@basecradle-ai` or `@origin`: these repositories are public,
+so anyone can open an issue with any title.
 
-Setting an interaction limit needs a token with repo **`Administration: write`**.
-The built-in Actions `GITHUB_TOKEN` **cannot** do this — `administration` is not a
-grantable `GITHUB_TOKEN` permission, so it 403s. The workflow reads
-**`FLEET_ADMIN_TOKEN`** from repo secrets: a fleet App installation token or
-fine-grained PAT with repo `Administration: write` (least privilege — **not**
-org-admin), scoped to the org's public repos. Until that secret is provisioned the
-workflow no-ops with a notice.
+### Credentials
+
+Two, each for its own half:
+
+- **`FLEET_ADMIN_TOKEN`** renews and reads the limits. Setting an interaction
+  limit needs repository **`Administration: write`**, which the built-in Actions
+  `GITHUB_TOKEN` can never be granted, so this is a standing secret, provisioned
+  by `@origin` (least privilege — **not** org-admin) and covering every public
+  repository. It never writes an issue: anything it posted would carry its
+  owner's name. Unset, the run fails; it never skips quietly. The run's log is
+  public, so it names only the token's kind, and warns of its expiry only in the
+  last 60 days.
+- **The `basecradle-ai` App token**, minted per run with `issues: write` and
+  scoped to exactly the public repositories, reads and moves the reminders and
+  files the gap issue.
+- **`PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL`** is the heartbeat's write-only ping URL.
+  Unset, the run fails after its renewals, so a missing monitor never stops the
+  guard itself.
 
 ## New public repo checklist
 
-When a new public fleet repo is stood up, two steps keep it consistent:
+When a new public fleet repo is stood up (the capital's new-repository recipe):
 
 1. Apply the limit once:
    `gh api -X PUT /repos/basecradle/<repo>/interaction-limits -f limit=collaborators_only -f expiry=six_months`
-2. Open its renewal-reminder issue ("Renew interaction limit before <date>") and
-   add `<repo>` to the renewal workflow's coverage (the audit already sweeps all
-   public repos, so usually nothing more is needed).
+2. Open its one renewal-reminder issue, titled as above.
+3. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-ai` App reach it. The audit
+   finds every public repository on its own: one it cannot renew or read is a gap
+   within the week, and one the App cannot reach fails the run (every other
+   repository is still renewed), so the heartbeat pages either way.
 
 ## Capital-owned (handed off, not enacted here)
 

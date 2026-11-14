@@ -1,41 +1,124 @@
-name: Interaction-Limit Renewal
+name: Public Repository Lockdown
 
-# Keep this repo's public write-surface locked to org members, durably
-# (basecradle-router#60, workstream 3). GitHub interaction limits expire after at
-# most 6 months; this re-applies collaborators_only on a schedule and audits the
-# whole fleet for gaps, so a limit can never silently lapse (the surface the #60
-# injection came through).
+# Every public repository in the organization keeps its issues, comments and pull requests
+# members-only (basecradle-router#60, #449). GitHub interaction limits last six months at most,
+# so this renews `collaborators_only` on every public repository each week, reads each one
+# back, keeps each repository's one renewal reminder dated to what GitHub reports, and pings
+# the `Public Repository Lockdown` heartbeat (Better Stack, group `github.com`) only when all of
+# them are locked down with margin. A gap withholds the ping, files or updates one
+# needs-capital issue here, and turns the run red; a run that dies withholds the ping too, and
+# the miss pages. Its monthly predecessor renewed one repository of five and failed four
+# months running with nobody told (#449).
 #
-# CREDENTIAL: setting an interaction limit needs a token with repo
-# Administration:write. The built-in GITHUB_TOKEN CANNOT do this (administration is
-# not a grantable GITHUB_TOKEN permission → 403), so this reads FLEET_ADMIN_TOKEN
-# from repo secrets: a fleet App installation token / fine-grained PAT with repo
-# Administration:write (least privilege — NOT org-admin), scoped to the org's
-# public repos. Until that secret exists the job no-ops with a clear notice rather
-# than failing red every month.
+# The decisions live in .github/scripts/public_repository_lockdown.py, with tests
+# (tests/test_public_repository_lockdown.py). This file supplies the credentials and pings.
+#
+# Two credentials, each for its own half:
+# - FLEET_ADMIN_TOKEN renews and reads the limits. Repository Administration is not a
+#   permission GITHUB_TOKEN can be granted, so it is a standing secret, provisioned by @origin.
+#   It never writes an issue: anything it posted would carry its owner's name.
+# - The basecradle-ai App token, minted per run with issues: write and scoped to exactly the
+#   public repositories, reads and edits the reminders and files the gap issue.
+#
+# It reads repository secrets, so it never runs on a pull request.
 
 on:
   schedule:
-    # 06:00 UTC on the 1st of each month — monthly cadence keeps every public
-    # repo's 6-month clock comfortably reset, with months of margin before expiry.
-    - cron: "0 6 1 * *"
-  workflow_dispatch: {}
+    # Mondays, 09:17 UTC. GitHub starts this repository's scheduled runs late: up to 7h06m on
+    # this workflow and 8h41m on the dependency scan (measured 2026-11-14), so the heartbeat's
+    # grace covers a day.
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Read and report only: renew nothing, edit nothing, ping nothing"
+        type: boolean
+        default: false
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: public-repository-lockdown
+  cancel-in-progress: false
 
 jobs:
-  renew:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
+  lockdown:
+    # Pinned like ci.yml, so the runner's own python3, which runs the script, does not move
+    # under it with the image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
-      - name: Renew + Audit Interaction Limits
+    env:
+      DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      # Never a quiet skip: an unset credential is how a guard stops guarding unread.
+      - name: Require the Admin Token
         env:
-          GH_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
+          ADMIN_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
+        run: test -n "$ADMIN_TOKEN" || { echo "::error::FLEET_ADMIN_TOKEN is not set: nothing can be renewed" >&2; exit 1; }
+
+      - name: List the Public Repositories
+        id: repositories
+        env:
+          ADMIN_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
+          ORG: ${{ github.repository_owner }}
         run: |
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::notice::FLEET_ADMIN_TOKEN not set — skipping. Provision a token" \
-                 "with repo Administration:write to activate renewal (see #60)."
+          set -euo pipefail
+          python3 .github/scripts/public_repository_lockdown.py repositories --org "$ORG" --out "$RUNNER_TEMP/repositories.txt"
+          echo "names=$(sed 's|.*/||' "$RUNNER_TEMP/repositories.txt" | paste -sd, -)" >> "$GITHUB_OUTPUT"
+
+      # The reminders and the gap issue are written by the basecradle-ai App, never by
+      # FLEET_ADMIN_TOKEN and never by GITHUB_TOKEN (which cannot reach the other repositories,
+      # and whose label events start no workflow). Scoped to the repositories just listed.
+      # Allowed to fail, so a repository the App is not installed on never stops a renewal:
+      # the audit still renews everything, then dies at the gap issue, and nothing is pinged.
+      - name: Mint the basecradle-ai App Token
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}
+          private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.repositories.outputs.names }}
+          permission-issues: write
+
+      - name: Renew, Read Back, and Record
+        env:
+          ADMIN_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
+          ISSUES_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          args=(audit --repositories "$RUNNER_TEMP/repositories.txt" --result "$RUNNER_TEMP/result.json")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 .github/scripts/public_repository_lockdown.py "${args[@]}"
+
+      # Pinged only when the script says so: every public repository locked down with margin
+      # and exactly one reminder, in a run that renewed. A gap, an unreadable answer, a dry run,
+      # or a run that died before writing its result pings nothing. The URL is write-only and
+      # never printed; unset, the run fails here, after the renewals, so a missing monitor
+      # never stops the guard itself.
+      - name: Ping the Public Repository Lockdown Heartbeat
+        env:
+          HEARTBEAT_URL: ${{ secrets.PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL }}
+        run: |
+          set -euo pipefail
+          heartbeat="$(jq -er '.heartbeat' "$RUNNER_TEMP/result.json")"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "a dry run never pings the heartbeat"
             exit 0
           fi
-          .github/scripts/interaction-limit-renewal.sh
+          test -n "$HEARTBEAT_URL" || { echo "::error::PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL is not set" >&2; exit 1; }
+          if [ "$heartbeat" = "ping" ]; then
+            curl -fsS --retry 3 --max-time 15 -o /dev/null "$HEARTBEAT_URL"
+          else
+            echo "the lockdown has a gap: the heartbeat is withheld"
+          fi
+
+      - name: Fail Unless Every Public Repository Is Locked Down
+        run: test "$(jq -er '.verdict' "$RUNNER_TEMP/result.json")" = "clean"
