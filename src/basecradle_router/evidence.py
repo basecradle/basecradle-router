@@ -77,10 +77,10 @@ same agent. So the wake proof is also kept at **(agent, route)** granularity
 - *It must survive a restart.* ``/var/lib``, not ``/run``: the whole point is an
   age-of-proof that spans reboots. The daemon reloads the document at startup and
   keeps it in memory, so a restart never resets a counter to zero and never makes
-  a proven capability read as never-proven. The one field that does *not* survive
-  is ``queued``, because it is not evidence: it is a live reading of the scheduler
-  that wrote it, and that scheduler is gone after a restart
-  (:meth:`EvidenceStore._discard_stale_queue_depths`).
+  a proven capability read as never-proven. The fields that do *not* survive are
+  ``queued`` and the ``wake_started_*`` group, because neither is evidence: each is a
+  live reading of the process that wrote it, and that process is gone after a restart
+  (:meth:`EvidenceStore._discard_stale_live_readings`).
 - *It must never break a wake.* Every write is best-effort: an unwritable state
   dir (a laptop, a test, a botched deploy) degrades to in-memory only, with **one**
   warning per process rather than a line per delivery. Recording evidence is an
@@ -274,6 +274,27 @@ class AgentWakeEvidence:
     one field here that is not history: it describes the process that wrote it, so the
     daemon zeroes it when it loads the document at boot (basecradle-router#264).
 
+    ``wake_started_at`` is the other live reading: the instant the wake attempt now
+    running for this agent launched, or ``None`` when none is (basecradle-router#456).
+    It exists because every other field moves only when a wake *ends*, so an ageing
+    ``last_ok_at`` says only that nothing has *finished* — a wake of half an hour on a
+    slow model and a wedged lane read identically from this document, and a peer that
+    cannot read this agent's journal cannot tell them apart. ``queued`` cannot settle it
+    either: it counts a wake in flight and a wake waiting behind it alike, and says
+    nothing of when either began. ``wake_started_delivery`` joins the wake to both
+    halves of its journal, and ``wake_started_route``/``wake_started_synthetic`` carry
+    provenance for the reason every ``last_*`` group does, so a probe in flight never
+    reads as real work.
+
+    The group is set as each attempt launches (a retry re-stamps it, so across a retry's
+    backoff it still names the attempt that just failed — the wake has not ended) and
+    cleared on every way out of the wake: in the same update as the ``ok`` or ``failed``
+    it ends in, by :meth:`EvidenceStore.record_wake_ended` for a stopped wake or an
+    unexpected error, and at boot for a wake the previous process never finished. A
+    marker a dead wake left behind would turn *slow* into *running forever*, which is
+    worse than having no marker at all. One agent runs at most one wake at a time (the
+    scheduler and the per-agent lock), so one group per agent is the whole of it.
+
     Each ``last_*`` trio carries **which route** produced it and **whether it was
     synthetic** (basecradle-router#208). ``last_ok_route`` alone was enough while every
     route was real; it stopped being enough the moment the router could wake an agent
@@ -304,7 +325,38 @@ class AgentWakeEvidence:
     last_deduped_route: str | None = None
     last_deduped_synthetic: bool | None = None
     queued: int = 0
+    wake_started_at: str | None = None
+    wake_started_delivery: str | None = None
+    wake_started_route: str | None = None
+    wake_started_synthetic: bool | None = None
     by_route: dict[str, RouteWakeEvidence] = field(default_factory=dict)
+
+    def clear_wake_started(self) -> bool:
+        """Clear the in-flight group; ``True`` iff any part of it was set.
+
+        Any part, not only the timestamp: a group the tolerant loader rebuilt half-set
+        (a hand-edited or partly written file) is still a group, and leaving its
+        remainder behind would publish a fragment of a wake that is not running.
+        """
+        if not self.has_wake_started():
+            return False
+        self.wake_started_at = None
+        self.wake_started_delivery = None
+        self.wake_started_route = None
+        self.wake_started_synthetic = None
+        return True
+
+    def has_wake_started(self) -> bool:
+        """Whether any field of the in-flight group is set."""
+        return any(
+            value is not None
+            for value in (
+                self.wake_started_at,
+                self.wake_started_delivery,
+                self.wake_started_route,
+                self.wake_started_synthetic,
+            )
+        )
 
 
 @dataclass
@@ -524,7 +576,7 @@ class EvidenceStore:
         # broken state dir must be visible exactly once, never a flood that buries
         # the wake lines an operator is actually reading.
         self._write_failed = False
-        self._discard_stale_queue_depths()
+        self._discard_stale_live_readings()
 
     @staticmethod
     def _remove_orphaned_temps(path: str) -> None:
@@ -582,11 +634,13 @@ class EvidenceStore:
                 log_fields(dir=directory, removed=",".join(removed)),
             )
 
-    def _discard_stale_queue_depths(self) -> None:
-        """Zero every ``queued`` loaded from disk, because no scheduler in this process owns it.
+    def _discard_stale_live_readings(self) -> None:
+        """Reset every live reading loaded from disk, because nothing in this process owns it.
 
         Every other field in the document is history (a count, a timestamp, a proof), and
-        history survives a restart. ``queued`` is a live reading of one process's
+        history survives a restart. Two live readings do not, ``queued`` and the
+        ``wake_started_*`` group; this paragraph and the next three are about ``queued``,
+        and the last is about the group. ``queued`` is a live reading of one process's
         scheduler, and that scheduler ended with its process. A graceful stop publishes
         ``pending=0`` for every agent before it exits, because the drain waits for the
         observer (:meth:`~basecradle_router.scheduler.WakeScheduler.wait_idle`). So a
@@ -609,9 +663,22 @@ class EvidenceStore:
         corrects nothing it can see. A clean boot finds nothing to change and writes
         nothing. Each discard is logged, never silent: a stale depth is the only trace that
         a wake queued or in flight under the previous process may never have completed.
+
+        **The ``wake_started_*`` group is the second live reading** (basecradle-router#456),
+        and it goes stale the same way: a wake in flight when the previous daemon was
+        killed never reached the ``finally`` that clears it. Left on disk it would say that
+        wake is *still running* — forever, since nothing in this process will ever end it —
+        which turns the one field that tells *slow* from *stuck* into a permanent *slow*.
+        Cleared here for the reason ``queued`` is, and logged with the delivery id so the
+        wake that never finished can be followed into the agent's journal.
         """
         stale = {agent: wake.queued for agent, wake in self._doc.agent_wakes.items() if wake.queued}
-        if not stale:
+        running = {
+            agent: (wake.wake_started_delivery, wake.wake_started_at)
+            for agent, wake in self._doc.agent_wakes.items()
+            if wake.has_wake_started()
+        }
+        if not stale and not running:
             return
         for agent, pending in sorted(stale.items()):
             logger.warning(
@@ -620,9 +687,18 @@ class EvidenceStore:
                 "owns that work)",
                 log_fields(agent=agent, pending=pending),
             )
+        for agent, (delivery, started_at) in sorted(running.items()):
+            logger.warning(
+                "event=evidence_stale_wake_cleared %s "
+                "(the previous daemon stopped with this wake in flight; nothing in this "
+                "process is running it)",
+                log_fields(agent=agent, delivery=delivery, started_at=started_at),
+            )
         with self._lock:
             for agent in stale:
                 self._doc.agent_wakes[agent].queued = 0
+            for agent in running:
+                self._doc.agent_wakes[agent].clear_wake_started()
             self._flush_locked()
 
     def snapshot(self) -> EvidenceDocument:
@@ -667,6 +743,43 @@ class EvidenceStore:
 
     # --- agent wake evidence (instance 4: parked with nothing to re-wake it) ---
 
+    def record_wake_started(
+        self, agent: str, delivery: str, *, at: datetime, route: str, synthetic: bool
+    ) -> None:
+        """A wake attempt for ``agent`` launched at ``at`` — what is running, not a proof.
+
+        ``at`` is the pipeline's own instant for the attempt, the one stream coverage is
+        drawn at, so this document and the coalesce gate can never disagree about when a
+        session began reading. A retry calls this again and re-stamps the group. Cleared
+        by whichever of :meth:`record_wake_ok`, :meth:`record_wake_failed`, or
+        :meth:`record_wake_ended` the wake ends in (basecradle-router#456).
+
+        ``route`` and ``synthetic`` are required and keyword-only for the reasons
+        :meth:`record_wake_ok` gives: a probe in flight must never read as real work.
+        """
+        with self._lock:
+            wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
+            wake.wake_started_at = _iso(at)
+            wake.wake_started_delivery = delivery
+            wake.wake_started_route = route
+            wake.wake_started_synthetic = synthetic
+            self._flush_locked()
+
+    def record_wake_ended(self, agent: str) -> None:
+        """The wake for ``agent`` is over, however it ended — clear what was running.
+
+        The pipeline calls this from the ``finally`` around every wake, so it is the
+        net under every exit path. A success or a failure has already cleared the group
+        in its own update, and then this writes nothing; what it catches is a stopped
+        wake (which records no outcome) and an unexpected error on the way out. It
+        never creates an entry: an agent with no record has nothing running to clear.
+        """
+        with self._lock:
+            wake = self._doc.agent_wakes.get(agent)
+            if wake is None or not wake.clear_wake_started():
+                return  # nothing in flight — skip the write entirely
+            self._flush_locked()
+
     def record_wake_ok(self, agent: str, delivery: str, *, route: str, synthetic: bool) -> None:
         """The proof that matters: this agent's wake edge fired and succeeded.
 
@@ -684,11 +797,14 @@ class EvidenceStore:
         traffic is the one thing a synthetic must never be able to do.
 
         Both granularities are written here, in one update under one lock, so the
-        scalars and ``by_route`` can never disagree about the same wake.
+        scalars and ``by_route`` can never disagree about the same wake. The in-flight
+        group is cleared in that same update, so no reader ever sees the wake both
+        finished and still running, or neither (basecradle-router#456).
         """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
             at = _iso(self._now())
+            wake.clear_wake_started()
             wake.ok += 1
             wake.last_ok_at = at
             wake.last_ok_delivery = delivery
@@ -705,11 +821,13 @@ class EvidenceStore:
 
         Route- and provenance-tagged for the same reasons :meth:`record_wake_ok` is: an
         untagged failure counter would let a probe's refusal read as a production
-        outage, and a production outage read as a probe's.
+        outage, and a production outage read as a probe's. Clears the in-flight group in
+        the same update, as :meth:`record_wake_ok` does.
         """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
             at = _iso(self._now())
+            wake.clear_wake_started()
             wake.failed += 1
             wake.last_failed_at = at
             wake.last_failed_reason = _reason(reason)

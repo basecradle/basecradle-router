@@ -524,6 +524,12 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
     beside ``edge_count: 0`` is not a contradiction — it is the exact reading a parked
     builder should produce: the terminus answers, and nothing in the world will ever
     address it (basecradle-router#208).
+
+    The ``wake_started_*`` group is what is running right now, beside ``queued``
+    (basecradle-router#456): it is set while a wake is in flight and ``null`` otherwise,
+    so an ageing ``last_ok_at`` beside a set ``wake_started_at`` is a long wake, and
+    beside a null one, a wake that is not running. It proves nothing and arms nothing;
+    it is published so a reader of the census can tell *slow* from *stuck*.
     """
     return {
         "ok": wake.ok,
@@ -546,6 +552,10 @@ def _wake_scalars(wake: AgentWakeEvidence) -> dict:
         "last_deduped_at": wake.last_deduped_at,
         "last_deduped_route": wake.last_deduped_route,
         "last_deduped_synthetic": wake.last_deduped_synthetic,
+        "wake_started_at": wake.wake_started_at,
+        "wake_started_delivery": wake.wake_started_delivery,
+        "wake_started_route": wake.wake_started_route,
+        "wake_started_synthetic": wake.wake_started_synthetic,
         "by_route": {route: _route_scalars(p) for route, p in sorted(wake.by_route.items())},
     }
 

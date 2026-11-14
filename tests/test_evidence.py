@@ -468,6 +468,113 @@ def test_the_read_side_keeps_the_live_depth(tmp_path) -> None:
     assert read_evidence(path).agent_wakes[NOVA].queued == 2  # reading changes nothing
 
 
+# --- the in-flight marker: what is running (basecradle-router#456) -----------------
+
+LAUNCHED = datetime.fromisoformat("2026-11-11T14:00:00+00:00")
+IN_FLIGHT = ("2026-11-11T14:00:00+00:00", "delivery-1", "github", False)
+
+
+def _in_flight(wake) -> tuple:
+    return (
+        wake.wake_started_at,
+        wake.wake_started_delivery,
+        wake.wake_started_route,
+        wake.wake_started_synthetic,
+    )
+
+
+def test_a_wake_in_flight_is_on_disk_for_another_process(tmp_path) -> None:
+    path = str(tmp_path / "evidence.json")
+    store = EvidenceStore(path, now=_Clock())
+    store.record_wake_started(NOVA, "delivery-1", at=LAUNCHED, route="github", synthetic=False)
+
+    # The read side a peer uses — the file, never the daemon's memory.
+    assert _in_flight(read_evidence(path).agent_wakes[NOVA]) == IN_FLIGHT
+    on_disk = json.loads((tmp_path / "evidence.json").read_text())["agent_wakes"][NOVA]
+    assert on_disk["wake_started_at"] == "2026-11-11T14:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "end",
+    [
+        lambda s: s.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False),
+        lambda s: s.record_wake_failed(NOVA, "claude exited 1", route="github", synthetic=False),
+        lambda s: s.record_wake_ended(NOVA),
+    ],
+    ids=["ok", "failed", "ended"],
+)
+def test_every_way_a_wake_ends_clears_the_whole_group(tmp_path, end) -> None:
+    path = str(tmp_path / "evidence.json")
+    store = EvidenceStore(path, now=_Clock())
+    store.record_wake_started(NOVA, "delivery-1", at=LAUNCHED, route="github", synthetic=False)
+
+    end(store)
+
+    assert _in_flight(read_evidence(path).agent_wakes[NOVA]) == (None, None, None, None)
+
+
+def test_an_ended_wake_with_nothing_in_flight_writes_nothing(tmp_path, monkeypatch) -> None:
+    # The pipeline calls record_wake_ended after every wake, and an ok or a failure has
+    # already cleared the group, so the common case must cost no write — and must never
+    # create an entry for an agent the store has no record of.
+    store = _store(tmp_path)
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+    writes: list[str] = []
+    monkeypatch.setattr(evidence_module, "_atomic_write", lambda p, text: writes.append(p))
+
+    store.record_wake_ended(NOVA)
+    store.record_wake_ended(JOHN)
+
+    assert writes == []
+    assert JOHN not in store.snapshot().agent_wakes
+
+
+def test_a_restart_with_a_wake_in_flight_clears_the_marker_and_says_so(tmp_path, caplog) -> None:
+    # A daemon killed mid-wake never reached the finally that clears the group. Reloaded
+    # as-is it would say that wake is still running, forever — so boot clears it, on disk.
+    path = str(tmp_path / "evidence.json")
+    killed = EvidenceStore(path, now=_Clock())
+    killed.record_wake_ok(NOVA, "delivery-0", route="github", synthetic=False)
+    killed.record_wake_started(NOVA, "delivery-1", at=LAUNCHED, route="github", synthetic=False)
+
+    with caplog.at_level("WARNING", logger="basecradle_router.evidence"):
+        EvidenceStore(path, now=_Clock("2026-11-11T15:00:00+00:00"))
+
+    wake = read_evidence(path).agent_wakes[NOVA]
+    assert _in_flight(wake) == (None, None, None, None)
+    assert (wake.ok, wake.last_ok_delivery) == (1, "delivery-0")  # the history survives
+    assert caplog.text.count("event=evidence_stale_wake_cleared") == 1
+    assert "agent=nova delivery=delivery-1 started_at=2026-11-11T14:00:00+00:00" in caplog.text
+
+
+def test_the_read_side_keeps_a_live_wake_in_flight(tmp_path) -> None:
+    path = str(tmp_path / "evidence.json")
+    EvidenceStore(path, now=_Clock()).record_wake_started(
+        NOVA, "delivery-1", at=LAUNCHED, route="github", synthetic=False
+    )
+
+    assert _in_flight(read_evidence(path).agent_wakes[NOVA]) == IN_FLIGHT
+    assert _in_flight(read_evidence(path).agent_wakes[NOVA]) == IN_FLIGHT
+
+
+def test_a_document_written_before_the_marker_loads_with_nothing_in_flight(tmp_path) -> None:
+    # Additive: a document from a build that never wrote the group reads as "nothing
+    # running", every existing field unchanged — no version bump, no reset of proof.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {NOVA: {"ok": 3, "last_ok_at": "2026-11-10T09:00:00+00:00"}},
+            }
+        )
+    )
+
+    wake = read_evidence(str(path)).agent_wakes[NOVA]
+    assert (wake.ok, wake.last_ok_at) == (3, "2026-11-10T09:00:00+00:00")
+    assert _in_flight(wake) == (None, None, None, None)
+
+
 def test_the_document_on_disk_is_the_documented_shape(tmp_path) -> None:
     store = _store(tmp_path)
     store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
@@ -685,3 +792,23 @@ def test_an_in_memory_store_never_touches_the_filesystem(tmp_path, monkeypatch) 
 
 def test_read_evidence_with_persistence_disabled_is_an_empty_document() -> None:
     assert read_evidence(None) == EvidenceDocument()
+
+
+def test_a_half_set_group_on_disk_is_still_cleared_at_boot(tmp_path) -> None:
+    # The loader is tolerant, so a partly written or hand-edited file can carry a group
+    # with no timestamp. Any part set is a group, and boot clears all of it.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {
+                    NOVA: {"wake_started_route": "probe", "wake_started_synthetic": True}
+                },
+            }
+        )
+    )
+
+    EvidenceStore(str(path), now=_Clock())
+
+    assert _in_flight(read_evidence(str(path)).agent_wakes[NOVA]) == (None, None, None, None)

@@ -17,7 +17,7 @@ from types import MappingProxyType
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
-from basecradle_router.evidence import EvidenceStore
+from basecradle_router.evidence import AgentWakeEvidence, EvidenceStore
 from basecradle_router.logfmt import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
@@ -1432,9 +1432,10 @@ def test_a_stopped_wake_is_never_retried_and_never_failed(caplog) -> None:
     # The NOC's *Wake Failed* alert extracts `outcome=failed`; a stop never writes it.
     assert not any("outcome=failed" in line for line in lines)
     # A stop is neither the edge failing nor a gate refusing — and never an ok — so it
-    # writes nothing about the agent at all: no counter, no timestamp, no reason.
-    assert NOVA.harness_key not in evidence.snapshot().agent_wakes
-    assert evidence.snapshot().agent_wakes == {}
+    # writes no outcome about the agent at all: no counter, no timestamp, no reason. The
+    # entry exists only because the wake was marked in flight while it ran (#456), and
+    # that mark is cleared, so the entry is exactly an empty record.
+    assert evidence.snapshot().agent_wakes == {NOVA.harness_key: AgentWakeEvidence()}
 
 
 def test_a_stopped_wake_writes_one_wake_stopped_warning_naming_the_signal(caplog) -> None:

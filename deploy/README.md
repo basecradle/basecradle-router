@@ -1120,13 +1120,26 @@ The unit's `StateDirectory=basecradle-router` creates the parent owned by `route
 starts. **Only the daemon writes it**: the CLI is strictly read-only, so a probe run under the wrong
 identity can never take ownership of the daemon's own state file away from it.
 
-Everything in it survives a restart **except `agent_wakes.<agent>.queued`**, the live pending-wake depth
-the NOC's deploy idle-gate reads. It describes the scheduler of the process that wrote it, so the daemon
-zeroes it when it loads the file at boot. A graceful stop has already drained it to `0`. A non-zero value
+Everything in it survives a restart **except two live readings**: the `wake_started_*` group (below)
+and **`agent_wakes.<agent>.queued`**, the live pending-wake depth the NOC's deploy idle-gate reads.
+`queued` describes the scheduler of the process that wrote it, so the daemon zeroes it when it loads
+the file at boot. A graceful stop has already drained it to `0`. A non-zero value
 at boot means the previous daemon stopped *without* draining (SIGKILLed at `TimeoutStopSec`, OOM-killed,
 or crashed), and the daemon logs one `WARNING event=evidence_stale_queue_cleared agent=<slug>
 pending=<n>` per agent before it writes the zero. Without the reset, that stale value held every deploy
 deferred until the agent was next woken (#264).
+
+**An ageing `last_ok_at` means nothing has finished, not that nothing is running.** Every counter and
+`last_*` field records an outcome, so none moves while a wake is still running, and a long wake on a
+slow model and a wedged lane read the same from them. What is running is
+`agent_wakes.<agent>.wake_started_at` (with `wake_started_delivery`, `wake_started_route` and
+`wake_started_synthetic` beside it): the instant the wake attempt now in flight launched, re-stamped
+by a retry, and `null` whenever none is (#456). It is cleared on every way a wake
+ends: in the same write as its `ok` or `failed`, after a `stop-wake`, after an unexpected error, and, like
+`queued`, at boot for a wake the previous daemon never finished, with one `WARNING
+event=evidence_stale_wake_cleared agent=<slug> delivery=<id> started_at=<instant>`. So an old `last_ok_at`
+beside a set `wake_started_at` is a slow wake, and beside a null one with `queued: 0`, an agent with
+nothing running at all. The agent-wide wake-edge claim's `detail` carries the same four fields.
 
 **Nothing else in the state dir outlives its purpose (#281).** A flush writes `.evidence-*.tmp` beside the
 document and renames it over `evidence.json`. A failed write removes its own temp, but a daemon killed
