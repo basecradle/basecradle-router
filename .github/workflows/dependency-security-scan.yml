@@ -70,7 +70,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}
+          client-id: ${{ secrets.BASECRADLE_AI_CLIENT_ID }}
           private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
           permission-issues: write
 
