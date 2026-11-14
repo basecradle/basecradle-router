@@ -60,7 +60,8 @@ jobs:
       - name: Require the Admin Token
         env:
           ADMIN_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
-        run: test -n "$ADMIN_TOKEN" || { echo "::error::FLEET_ADMIN_TOKEN is not set: nothing can be renewed" >&2; exit 1; }
+        run: |
+          test -n "$ADMIN_TOKEN" || { echo "::error::FLEET_ADMIN_TOKEN is not set: nothing can be renewed" >&2; exit 1; }
 
       - name: List the Public Repositories
         id: repositories
