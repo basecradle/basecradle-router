@@ -52,7 +52,10 @@ Two, each for its own half:
   `GITHUB_TOKEN` can never be granted, so this is a standing secret, provisioned
   by `@origin` (least privilege — **not** org-admin) and covering every public
   repository. It never writes an issue: anything it posted would carry its
-  owner's name. Unset, the run fails; it never skips quietly. The run's log is
+  owner's name. Unset, the run fails; it never skips quietly. When GitHub refuses
+  it (HTTP 403) or rejects it as expired or revoked (HTTP 401), the gap issue
+  says so, names every repository it must reach and the permission it needs
+  (*Administration: Read and write*), in the words of the kind of token it is. The run's log is
   public, so it names only the token's kind, and warns of its expiry only in the
   last 60 days.
 - **The `basecradle-ai` App token**, minted per run with `issues: write` and

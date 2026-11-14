@@ -78,6 +78,40 @@ LOCKDOWN = (
     f"the lockdown: an active `{LIMIT}` interaction limit with more than {MARGIN.days} days "
     "left, and exactly one open renewal reminder"
 )
+# What the admin token needs, per GitHub's documented permissions for these endpoints:
+# repository Administration, write to renew and read to read back, and owner or admin access.
+CREDENTIAL_NEED = (
+    "To set an interaction limit, GitHub requires **Administration: Read and write** on the "
+    "repository for a fine-grained token or a GitHub App, and owner or admin access for the "
+    "token's owner."
+)
+CREDENTIAL_HOW = {
+    "fine-grained": (
+        "This run read it as a fine-grained personal access token. Its repository access is a "
+        "fixed list that never grows by itself, so a repository made public after it was "
+        "minted is outside it until someone adds it. In the token's settings: **Resource "
+        "owner** `basecradle`; **Repository access** either *All repositories* or *Only select "
+        "repositories* listing each repository above; **Repository permissions → "
+        "Administration** *Read and write* (GitHub adds *Metadata: Read-only* with it)."
+    ),
+    "classic": (
+        "This run read it as a classic personal access token. GitHub documents no scope for "
+        "these endpoints, only that the token's owner must have owner or admin access on each "
+        "repository above. A fine-grained token with *Administration: Read and write* on those "
+        "repositories is the least-privilege replacement."
+    ),
+    "app": (
+        "This run read it as a GitHub App installation token. The App needs the repository "
+        "permission *Administration: Read and write* and must be installed on each repository "
+        "above."
+    ),
+}
+CREDENTIAL_LIMITS = (
+    "Nothing broader is needed: never organization administration, and no issue permission, "
+    "because the `basecradle-ai` App writes the reminders and this issue. A newly minted token "
+    "is stored as the `FLEET_ADMIN_TOKEN` secret on `basecradle/basecradle-router`. The token "
+    "is `@origin`'s to change, and the first clean run after that closes this issue."
+)
 GAP_NEXT = (
     "Every run renews every public repository's limit, so a limit that was only missing is "
     "usually back by the next run. A reminder that is missing or doubled is the capital's to "
@@ -88,12 +122,16 @@ GAP_NEXT = (
 )
 
 
-# How the admin token's kind is told from its prefix, for the log line only.
+# How the admin token's kind is told from its prefix: an identifier the issue's guidance keys
+# on, and the words the log line uses.
 TOKEN_KINDS = (
-    ("github_pat_", "a fine-grained personal access token"),
-    ("ghp_", "a classic personal access token"),
-    ("ghs_", "a GitHub App installation token"),
+    ("github_pat_", "fine-grained", "a fine-grained personal access token"),
+    ("ghp_", "classic", "a classic personal access token"),
+    ("ghs_", "app", "a GitHub App installation token"),
 )
+KIND_WORDS = {kind: words for _, kind, words in TOKEN_KINDS} | {
+    "unknown": "a token of unknown kind"
+}
 
 # The log is public (this repository is), so the admin token's expiry is said only as a
 # warning this close to it, never as a date an outsider could plan around.
@@ -101,7 +139,19 @@ EXPIRY_WARNING = timedelta(days=60)
 
 
 class GitHubError(Exception):
-    """A ``gh api`` call that did not answer. Never reads as a pass."""
+    """A ``gh api`` call that did not answer. Never reads as a pass. ``status`` is GitHub's
+    HTTP status when its answer carried one, so a refusal is told from an outage by a field,
+    never by matching words."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        if status is None:
+            found = HTTP_STATUS.search(message)
+            status = int(found.group(1)) if found else None
+        self.status = status
+
+
+HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 
 
 # --- what one repository looks like ------------------------------------------------------
@@ -123,8 +173,10 @@ class Observation:
     repository: str
     renewal: str | None = None  # "renewed", or None when not attempted
     renewal_error: str | None = None
+    renewal_status: int | None = None
     limit: dict[str, Any] | None = None
     limit_error: str | None = None
+    limit_status: int | None = None
     reminders: list[Reminder] | None = None
     reminders_error: str | None = None
     reminder_moved: tuple[int, str, str] | None = None  # (number, from, to)
@@ -181,13 +233,13 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
     found = []
     if observation.renewal_error is not None:
         found.append(
-            Finding(
-                "renewal-refused", f"the renewal was refused: {_foreign(observation.renewal_error)}"
-            )
+            _admin_refusal("renewal", observation.renewal_status, observation.renewal_error)
         )
 
     limit = observation.limit
-    if observation.limit_error is not None or limit is None:
+    if observation.limit_error is not None and observation.limit_status in REFUSALS:
+        found.append(_admin_refusal("read", observation.limit_status, observation.limit_error))
+    elif observation.limit_error is not None or limit is None:
         reason = _foreign(observation.limit_error or "no answer")
         found.append(Finding("limit-unreadable", f"its limit could not be read: {reason}"))
     elif not limit.get("limit"):
@@ -240,6 +292,26 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
     return found
 
 
+# A refusal by GitHub is the credential's fault, said as such; anything else is an outage.
+REFUSALS = frozenset({401, 403})
+
+
+def _admin_refusal(call: str, status: int | None, error: str) -> Finding:
+    if status == 401:
+        return Finding(
+            "token-rejected",
+            "the token was rejected as invalid (HTTP 401): it has expired or been revoked",
+        )
+    if status == 403:
+        need = "write" if call == "renewal" else "read"
+        return Finding(
+            f"{'renewal' if call == 'renewal' else 'limit'}-forbidden",
+            f"the token was refused the {call} (HTTP 403): it does not reach this repository, "
+            f"or lacks Administration: {need} on it",
+        )
+    return Finding("renewal-refused", f"the renewal was refused: {_foreign(error)}")
+
+
 def reminder_move(observation: Observation) -> tuple[Reminder, str, str, str] | None:
     """The one reminder's new title and body, when its date is not the limit's.
 
@@ -267,6 +339,7 @@ class Audit:
     now: datetime
     dry_run: bool
     run_url: str
+    credential: str = "unknown"  # the admin token's kind, from GitHub.credential
     found: dict[str, list[Finding]] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -372,6 +445,43 @@ class Audit:
             return {"action": "none", "extras": extras}
         return None
 
+    def _statuses(self, status: int) -> list[str]:
+        return [
+            o.repository
+            for o in sorted(self.observations, key=lambda o: o.repository)
+            if status in (o.renewal_status, o.limit_status)
+        ]
+
+    def _credential(self) -> str:
+        """What the admin token needs, when GitHub refused it: which repositories, which
+        permission, and how to give it, in the words of the kind of token it is."""
+        rejected, forbidden = self._statuses(401), self._statuses(403)
+        if not rejected and not forbidden:
+            return ""
+        said = []
+        if rejected:
+            said.append(
+                f"`FLEET_ADMIN_TOKEN` was rejected as invalid (HTTP 401) on {_listed(rejected)}: "
+                "it has expired or been revoked, and a new one is needed."
+            )
+        if forbidden:
+            said.append(
+                f"`FLEET_ADMIN_TOKEN` was refused (HTTP 403) on {_listed(forbidden)}: it does not "
+                f"reach {_plural(len(forbidden), 'that repository', 'those repositories')}, or "
+                "lacks the permission there."
+            )
+        how = CREDENTIAL_HOW.get(self.credential)
+        return f"""## The Credential It Needs
+
+{" ".join(said)}
+
+{CREDENTIAL_NEED} The token must reach every public repository in the organization; this run \
+audited {_listed(list(self.found))}.
+
+{f"{how}{chr(10)}{chr(10)}" if how else ""}{CREDENTIAL_LIMITS}
+
+"""
+
     def _body(self) -> str:
         rows = "\n".join(
             f"| `{repository}` | {'<br>'.join(f.detail for f in found)} |"
@@ -390,7 +500,7 @@ short of {LOCKDOWN}.
 - **When:** {self.now:%Y-%m-%d %H:%MZ}, by the workflow, not by a session: {self.run_url}
 - **Heartbeat:** `Public Repository Lockdown` was not pinged; it pages when its grace passes.
 
-## What Happens Next
+{self._credential()}## What Happens Next
 
 {GAP_NEXT}
 
@@ -410,10 +520,16 @@ short of {LOCKDOWN}.
             parts.append(f"**Changed Since the Last Run:**\n\n{listed}")
         if cleared:
             parts.append("**Now Clean:** " + ", ".join(f"`{r}`" for r in cleared))
+        if self._credential():
+            parts.append(self._credential().rstrip())
         if new:
             parts.append(f"`{GAP_LABEL}` applied for what is new here.")
         parts.append(f"Run: {self.run_url}")
         return "\n\n".join(parts)
+
+
+def _listed(repositories: list[str]) -> str:
+    return ", ".join(f"`{repository}`" for repository in repositories)
 
 
 def _labels_of(issue: dict[str, Any]) -> list[str]:
@@ -517,8 +633,11 @@ class GitHub:
             check=False,
         )
         if process.returncode != 0:
+            # gh can print a hint after the line that carries the status; keep that line.
             lines = (process.stderr or "").strip().splitlines()
-            raise GitHubError(lines[-1] if lines else f"gh exited {process.returncode}")
+            carrying = [line for line in lines if HTTP_STATUS.search(line)]
+            message = (carrying or lines or [f"gh exited {process.returncode}"])[-1]
+            raise GitHubError(message)
         return process.stdout
 
     def _json(self, token: str, path: str, **options: Any) -> Any:
@@ -606,8 +725,8 @@ class GitHub:
         without a byte of the token, its owner, or its expiry date in either. Never fatal:
         the audit's own calls are what prove the token works."""
         kind = next(
-            (name for prefix, name in TOKEN_KINDS if self._admin.startswith(prefix)),
-            "a token of unknown kind",
+            (kind for prefix, kind, _ in TOKEN_KINDS if self._admin.startswith(prefix)),
+            "unknown",
         )
         try:
             raw = self._api(self._admin, "rate_limit", include=True)
@@ -646,11 +765,13 @@ def renew_and_read(github: GitHub, repository: str, dry_run: bool) -> Observatio
             observation.renewal = "renewed"
         except GitHubError as error:
             observation.renewal_error = str(error)
+            observation.renewal_status = error.status
     # Read back after the write, never trusted from it.
     try:
         observation.limit = github.read_limit(repository)
     except GitHubError as error:
         observation.limit_error = str(error)
+        observation.limit_status = error.status
     return observation
 
 
@@ -726,6 +847,7 @@ def run_audit(
     now: datetime,
     run_url: str,
     sleep: Callable[[float], None] = time.sleep,
+    credential: str = "unknown",
 ) -> Audit:
     # Every renewal first, so a failure on the issues side (an App token that could not be
     # minted, an issue listing that errors) never costs a repository its renewal.
@@ -735,7 +857,13 @@ def run_audit(
         issues = read_and_move_reminder(github, observation, dry_run)
         if observation.repository == HOME_REPOSITORY:
             home_issues = issues
-    audit = Audit(observations=observations, now=now, dry_run=dry_run, run_url=run_url)
+    audit = Audit(
+        observations=observations,
+        now=now,
+        dry_run=dry_run,
+        run_url=run_url,
+        credential=credential,
+    )
     for observation in observations:
         print(_log_line(observation, dry_run))
     for repository, found in audit.gaps.items():
@@ -823,7 +951,7 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
     github = GitHub(admin, issues, run=run)
     now = datetime.now(timezone.utc)
     kind, warning = github.credential(now)
-    print(f"credential: FLEET_ADMIN_TOKEN is {kind}")
+    print(f"credential: FLEET_ADMIN_TOKEN is {KIND_WORDS[kind]}")
     if warning:
         print(f"::warning::{warning}")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
@@ -837,6 +965,7 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
         dry_run=options.dry_run,
         now=now,
         run_url=run_url,
+        credential=kind,
     )
     # Written last: a run that dies before here leaves no result, so nothing is pinged.
     options.result.write_text(json.dumps(result.result(), indent=2) + "\n")
