@@ -60,10 +60,13 @@ MARGIN = timedelta(days=30)
 
 # A reminder is an open issue with this title written by one of these. The repositories are
 # public, so anyone can open an issue with any title; one nobody on the allow-list wrote is
-# never the record. The title is matched exactly, not searched: GitHub's search read #449's
-# own title ("... Interaction-Limit ... Renew ...") as a second reminder on this repository.
+# never the record. The whole title is matched exactly, not searched: GitHub's search read
+# #449's own title ("... Interaction-Limit ... Renew ...") as a second reminder here.
 REMINDER_AUTHORS = frozenset({"basecradle-ai[bot]", "drawkkwast"})
-REMINDER_TITLE = re.compile(r"^\W*Renew interaction limit before (\d{4}-\d{2}-\d{2})(?!\d)")
+REMINDER_FORMAT = "⏰ Renew interaction limit before {date} (public-repo write-lockdown)"
+REMINDER_TITLE = re.compile(
+    "^" + re.escape(REMINDER_FORMAT).replace(re.escape("{date}"), r"(\d{4}-\d{2}-\d{2})") + "$"
+)
 REMINDER_BODY_DATE = re.compile(r"expires `(\d{4}-\d{2}-\d{2})`")
 
 GAP_TITLE = "Public Repository Lockdown Found a Gap"
@@ -78,8 +81,9 @@ LOCKDOWN = (
 GAP_NEXT = (
     "Every run renews every public repository's limit, so a limit that was only missing is "
     "usually back by the next run. A reminder that is missing or doubled is the capital's to "
-    "fix by hand: one open reminder per public repository, titled `⏰ Renew interaction limit "
-    "before <date> (public-repo write-lockdown)` and written by `@basecradle-ai` or `@origin`. "
+    "fix by hand: one open reminder per public repository, titled exactly `⏰ Renew interaction "
+    "limit before <YYYY-MM-DD> (public-repo write-lockdown)` and written by `@basecradle-ai` "
+    "or `@origin`. "
     "This issue is updated in place while a gap stands, and the run that finds none closes it."
 )
 
@@ -90,6 +94,10 @@ TOKEN_KINDS = (
     ("ghp_", "a classic personal access token"),
     ("ghs_", "a GitHub App installation token"),
 )
+
+# The log is public (this repository is), so the admin token's expiry is said only as a
+# warning this close to it, never as a date an outsider could plan around.
+EXPIRY_WARNING = timedelta(days=60)
 
 
 class GitHubError(Exception):
@@ -173,12 +181,14 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
     found = []
     if observation.renewal_error is not None:
         found.append(
-            Finding("renewal-refused", f"the renewal was refused: {observation.renewal_error}")
+            Finding(
+                "renewal-refused", f"the renewal was refused: {_foreign(observation.renewal_error)}"
+            )
         )
 
     limit = observation.limit
     if observation.limit_error is not None or limit is None:
-        reason = observation.limit_error or "no answer"
+        reason = _foreign(observation.limit_error or "no answer")
         found.append(Finding("limit-unreadable", f"its limit could not be read: {reason}"))
     elif not limit.get("limit"):
         found.append(
@@ -186,7 +196,7 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
         )
     elif limit.get("limit") != LIMIT:
         found.append(
-            Finding("limit-wrong", f"its limit is `{_code(limit.get('limit'))}`, not `{LIMIT}`")
+            Finding("limit-wrong", f"its limit is `{_foreign(limit.get('limit'))}`, not `{LIMIT}`")
         )
     else:
         expires = expiry_of(limit)
@@ -204,7 +214,7 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
 
     reminders = observation.reminders
     if observation.reminders_error is not None or reminders is None:
-        reason = observation.reminders_error or "no answer"
+        reason = _foreign(observation.reminders_error or "no answer")
         found.append(
             Finding("reminders-unreadable", f"its open issues could not be read: {reason}")
         )
@@ -224,7 +234,7 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
             Finding(
                 "reminder-not-moved",
                 "its reminder could not be moved to the limit's date: "
-                f"{observation.reminder_error}",
+                f"{_foreign(observation.reminder_error)}",
             )
         )
     return found
@@ -243,9 +253,7 @@ def reminder_move(observation: Observation) -> tuple[Reminder, str, str, str] | 
     date = f"{expires:%Y-%m-%d}"
     if reminder.date == date:
         return None
-    title = REMINDER_TITLE.sub(
-        lambda match: match.group(0).replace(match.group(1), date), reminder.title, count=1
-    )
+    title = REMINDER_FORMAT.format(date=date)
     body = REMINDER_BODY_DATE.sub(f"expires `{date}`", reminder.body)
     return reminder, date, title, body
 
@@ -308,18 +316,20 @@ class Audit:
 
     def gap_plan(self, open_issues: list[dict[str, Any]]) -> dict[str, Any] | None:
         """What to do with this repository's one gap issue: create it, update it, close it,
-        or nothing. ``open_issues`` is the home repository's REST open-issues list."""
-        own = [
-            issue
-            for issue in open_issues
-            if "pull_request" not in issue
-            and issue.get("title") == GAP_TITLE
-            and _login(issue) == GAP_AUTHOR
-        ]
-        existing = min(own, key=lambda issue: issue["number"]) if own else None
+        or nothing. ``open_issues`` is the home repository's REST open-issues list. A second
+        copy of its own (a create GitHub accepted after the call timed out) is closed as one."""
+        own = sorted(
+            (
+                issue
+                for issue in open_issues
+                if "pull_request" not in issue
+                and issue.get("title") == GAP_TITLE
+                and _login(issue) == GAP_AUTHOR
+            ),
+            key=lambda issue: issue["number"],
+        )
         state = self.state
-
-        if existing is None:
+        if not own:
             if not state:
                 return None
             return {
@@ -327,33 +337,44 @@ class Audit:
                 "title": GAP_TITLE,
                 "body": self._body(),
                 "labels": [GAP_LABEL],
+                "extras": [],
             }
+        existing, extras = own[0], [_extra(issue, own[0]["number"]) for issue in own[1:]]
         number = existing["number"]
+        labelled = GAP_LABEL in _labels_of(existing)
+        before = _state_in(existing.get("body"))
         if not state:
+            removed = f" `{GAP_LABEL}` removed." if labelled else ""
             return {
                 "action": "close",
                 "number": number,
                 "comment": (
-                    "Every public repository now reads an active `collaborators_only` limit "
-                    f"with more than {MARGIN.days} days left and exactly one open reminder. "
-                    f"Closed by that run, which is the verification: {self.run_url}"
+                    f"Every public repository now meets {LOCKDOWN}.{removed} Closed by that "
+                    f"run, which is the verification: {self.run_url}"
                 ),
+                "unlabel": [GAP_LABEL] if labelled else [],
+                "extras": extras,
             }
-        if state != _state_in(existing.get("body")):
-            labels = [label.get("name") for label in existing.get("labels") or []]
+        if state != before:
+            # Only what is new pages the capital again; a repository that became clean is
+            # said, never re-labelled for.
+            new = any(before.get(repository) != codes for repository, codes in state.items())
             return {
                 "action": "update",
                 "number": number,
                 "body": self._body(),
-                "comment": self._change_comment(_state_in(existing.get("body"))),
-                "relabel": GAP_LABEL in labels,
-                "labels": [GAP_LABEL],
+                "comment": self._change_comment(before),
+                "relabel": labelled,
+                "labels": [GAP_LABEL] if new else [],
+                "extras": extras,
             }
+        if extras:
+            return {"action": "none", "extras": extras}
         return None
 
     def _body(self) -> str:
         rows = "\n".join(
-            f"| `{repository}` | {'<br>'.join(_cell(f.detail) for f in found)} |"
+            f"| `{repository}` | {'<br>'.join(f.detail for f in found)} |"
             for repository, found in self.gaps.items()
         )
         count = len(self.gaps)
@@ -383,14 +404,29 @@ short of {LOCKDOWN}.
         cleared = sorted(r for r in before if r not in now)
         if new:
             listed = "\n".join(
-                f"- `{repository}`: {'; '.join(_cell(f.detail) for f in self.gaps[repository])}"
+                f"- `{repository}`: {'; '.join(f.detail for f in self.gaps[repository])}"
                 for repository in sorted(new)
             )
             parts.append(f"**Changed Since the Last Run:**\n\n{listed}")
         if cleared:
             parts.append("**Now Clean:** " + ", ".join(f"`{r}`" for r in cleared))
-        parts.append(f"`{GAP_LABEL}` applied for the change. Run: {self.run_url}")
+        if new:
+            parts.append(f"`{GAP_LABEL}` applied for what is new here.")
+        parts.append(f"Run: {self.run_url}")
         return "\n\n".join(parts)
+
+
+def _labels_of(issue: dict[str, Any]) -> list[str]:
+    labels = issue.get("labels") or []
+    return [label.get("name") for label in labels if isinstance(label, dict)]
+
+
+def _extra(issue: dict[str, Any], kept: int) -> dict[str, Any]:
+    return {
+        "number": issue["number"],
+        "comment": f"A second copy of #{kept}, which is the record. Closed by the lockdown audit.",
+        "unlabel": [GAP_LABEL] if GAP_LABEL in _labels_of(issue) else [],
+    }
 
 
 def _login(issue: dict[str, Any]) -> str | None:
@@ -426,15 +462,14 @@ def _plural(count: int, one: str, many: str) -> str:
     return one if count == 1 else many
 
 
-# Text from GitHub's errors, made safe for a table cell: a pipe splits the row, a "<" could
-# open a comment that reads as the marker, and GitHub reads a bare @name as a mention.
-def _cell(text: Any) -> str:
-    text = re.sub(r"\s+", " ", str(text)).replace("|", "\\|").replace("<", "&lt;")
-    return re.sub(r"@[\w\-/.]+", lambda match: f"`{match.group(0)}`", text.replace("`", "'"))
-
-
-def _code(text: Any) -> str:
-    return re.sub(r"\s+", " ", str(text)).replace("`", "'").replace("|", "\\|").replace("<", "&lt;")
+# Text GitHub gave us (an error, a limit value), made safe where it is interpolated into
+# the issue: a pipe splits a table row, a "<" could open a comment that reads as the marker,
+# a backtick could unpair a code span, and GitHub reads a bare @name as a mention. The
+# script's own markdown never passes through here.
+def _foreign(text: Any) -> str:
+    text = re.sub(r"\s+", " ", str(text)).replace("`", "'")
+    text = text.replace("|", "\\|").replace("<", "&lt;")
+    return re.sub(r"@[\w\-/.]+", lambda match: f"`{match.group(0)}`", text)
 
 
 # --- the one boundary --------------------------------------------------------------------
@@ -566,40 +601,44 @@ class GitHub:
             payload={"labels": [label]},
         )
 
-    def credential(self) -> str:
-        """What the admin token is, for the log, without a byte of the token in it. Never
-        fatal: the audit's own calls are what prove the token works."""
+    def credential(self, now: datetime) -> tuple[str, str | None]:
+        """The admin token's kind, and a warning when it expires within ``EXPIRY_WARNING``,
+        without a byte of the token, its owner, or its expiry date in either. Never fatal:
+        the audit's own calls are what prove the token works."""
         kind = next(
             (name for prefix, name in TOKEN_KINDS if self._admin.startswith(prefix)),
             "a token of unknown kind",
         )
-        parts = [kind]
         try:
             raw = self._api(self._admin, "rate_limit", include=True)
-            head = re.split(r"\r?\n\r?\n", raw, maxsplit=1)[0]
-            headers = {}
-            for line in head.splitlines()[1:]:
-                name, _, value = line.partition(":")
-                headers[name.strip().lower()] = value.strip()
-            expiry = headers.get("github-authentication-token-expiration")
-            parts.append(f"expiring {expiry}" if expiry else "with no expiry reported")
-            if "x-oauth-scopes" in headers:
-                parts.append(f"scopes [{headers['x-oauth-scopes']}]")
-        except GitHubError as error:
-            parts.append(f"its headers unread ({error})")
+        except GitHubError:
+            return kind, None
+        head = re.split(r"\r?\n\r?\n", raw, maxsplit=1)[0]
+        expiry = None
+        for line in head.splitlines()[1:]:
+            name, _, value = line.partition(":")
+            if name.strip().lower() == "github-authentication-token-expiration":
+                expiry = value.strip()
+        if not expiry:
+            return kind, None
         try:
-            login = self._json(self._admin, "user").get("login")
-        except (GitHubError, AttributeError):
-            login = None
-        if isinstance(login, str):
-            parts.append(f"acting as {login}")
-        return ", ".join(parts)
+            expires = datetime.strptime(expiry.replace(" UTC", " +0000"), "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            return kind, "FLEET_ADMIN_TOKEN reports an expiry this audit cannot read"
+        left = expires - now
+        if left > EXPIRY_WARNING:
+            return kind, None
+        return kind, (
+            f"FLEET_ADMIN_TOKEN expires in {max(left.days, 0)} days: when it does, nothing is "
+            "renewed. Rotating it is @origin's."
+        )
 
 
 # --- the run -----------------------------------------------------------------------------
 
 
-def observe(github: GitHub, repository: str, dry_run: bool) -> Observation:
+def renew_and_read(github: GitHub, repository: str, dry_run: bool) -> Observation:
+    """The guard's own half, under the admin token alone: nothing about issues can stop it."""
     observation = Observation(repository=repository)
     if not dry_run:
         try:
@@ -612,11 +651,20 @@ def observe(github: GitHub, repository: str, dry_run: bool) -> Observation:
         observation.limit = github.read_limit(repository)
     except GitHubError as error:
         observation.limit_error = str(error)
+    return observation
+
+
+def read_and_move_reminder(
+    github: GitHub, observation: Observation, dry_run: bool
+) -> list[dict[str, Any]] | None:
+    """The record's half, under the issues token. Returns the open issues it read."""
+    repository = observation.repository
     try:
-        observation.reminders = reminders_in(github.open_issues(repository))
+        issues = github.open_issues(repository)
     except GitHubError as error:
         observation.reminders_error = str(error)
-
+        return None
+    observation.reminders = reminders_in(issues)
     move = reminder_move(observation)
     if move is not None:
         reminder, date, title, body = move
@@ -628,7 +676,15 @@ def observe(github: GitHub, repository: str, dry_run: bool) -> Observation:
                 observation.reminder_moved = (reminder.number, reminder.date, date)
             except GitHubError as error:
                 observation.reminder_error = str(error)
-    return observation
+    return issues
+
+
+def _close(github: GitHub, number: int, comment: str, unlabel: list[str], reason: str) -> None:
+    # The comment first, so the label change and the close ride it.
+    github.comment(HOME_REPOSITORY, number, comment)
+    for label in unlabel:
+        github.remove_label(HOME_REPOSITORY, number, label)
+    github.edit_issue(HOME_REPOSITORY, number, {"state": "closed", "state_reason": reason})
 
 
 def apply_gap_plan(github: GitHub, plan: dict[str, Any], sleep: Callable[[float], None]) -> None:
@@ -639,10 +695,7 @@ def apply_gap_plan(github: GitHub, plan: dict[str, Any], sleep: Callable[[float]
     if action == "create":
         github.create_issue(HOME_REPOSITORY, plan["title"], plan["body"], plan["labels"])
     elif action == "close":
-        github.comment(HOME_REPOSITORY, plan["number"], plan["comment"])
-        github.edit_issue(
-            HOME_REPOSITORY, plan["number"], {"state": "closed", "state_reason": "completed"}
-        )
+        _close(github, plan["number"], plan["comment"], plan["unlabel"], "completed")
     elif action == "update":
         number = plan["number"]
         github.comment(HOME_REPOSITORY, number, plan["comment"])
@@ -659,8 +712,10 @@ def apply_gap_plan(github: GitHub, plan: dict[str, Any], sleep: Callable[[float]
                         raise
                     sleep(10)
         github.edit_issue(HOME_REPOSITORY, number, {"body": plan["body"]})
-    else:
+    elif action != "none":
         raise ValueError(f"unknown plan action: {action}")
+    for extra in plan["extras"]:
+        _close(github, extra["number"], extra["comment"], extra["unlabel"], "not_planned")
 
 
 def run_audit(
@@ -672,31 +727,43 @@ def run_audit(
     run_url: str,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Audit:
-    observations = []
-    for repository in repositories:
-        observation = observe(github, repository, dry_run)
-        observations.append(observation)
-        row = Audit([observation], now, dry_run, run_url)._row(observation)
-        print(
-            f"  {repository:<34} renewed={'dry-run' if dry_run else row['renewed']} "
-            f"limit={row['limit'] if observation.limit is not None else 'UNREADABLE'} "
-            f"expires={row['expires_at']} "
-            f"reminders={row['reminders'] if observation.reminders is not None else 'UNREADABLE'}"
-        )
+    # Every renewal first, so a failure on the issues side (an App token that could not be
+    # minted, an issue listing that errors) never costs a repository its renewal.
+    observations = [renew_and_read(github, repository, dry_run) for repository in repositories]
+    home_issues = None
+    for observation in observations:
+        issues = read_and_move_reminder(github, observation, dry_run)
+        if observation.repository == HOME_REPOSITORY:
+            home_issues = issues
     audit = Audit(observations=observations, now=now, dry_run=dry_run, run_url=run_url)
+    for observation in observations:
+        print(_log_line(observation, dry_run))
     for repository, found in audit.gaps.items():
         for finding in found:
             print(f"::error::{repository}: {finding.detail}")
 
     # Reading the home repository's issues fails the run rather than skip the filing: a gap
-    # nobody is told about is the failure this audit exists to end.
-    plan = audit.gap_plan(github.open_issues(HOME_REPOSITORY))
+    # nobody is told about is the failure this audit exists to end. The renewals are done.
+    if home_issues is None:
+        home_issues = github.open_issues(HOME_REPOSITORY)
+    plan = audit.gap_plan(home_issues)
     if plan is not None:
         if dry_run:
-            print(f"DRY-RUN: would {plan['action']} the gap issue in {HOME_REPOSITORY}")
+            print(f"DRY-RUN: would apply {plan['action']} to the gap issue in {HOME_REPOSITORY}")
         else:
             apply_gap_plan(github, plan, sleep)
     return audit
+
+
+def _log_line(o: Observation, dry_run: bool) -> str:
+    limit = o.limit.get("limit") if o.limit is not None else "UNREADABLE"
+    expires = o.limit.get("expires_at") if o.limit is not None else None
+    reminders = [r.number for r in o.reminders] if o.reminders is not None else "UNREADABLE"
+    renewed = "dry-run" if dry_run else o.renewal == "renewed"
+    return (
+        f"  {o.repository:<34} renewed={renewed} limit={limit} expires={expires} "
+        f"reminders={reminders} moved={list(o.reminder_moved) if o.reminder_moved else None}"
+    )
 
 
 def read_repositories(path: Path) -> list[str]:
@@ -743,17 +810,22 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
         print(f"{len(names)} public repositories: {', '.join(names)}")
         return 0
 
+    # Empty when the App token could not be minted. The renewals still run; every reminder
+    # then reads as unreadable and the run dies at the gap issue, so nothing is pinged.
     issues = os.environ.get("ISSUES_TOKEN", "")
     if not issues:
-        print("public-repository-lockdown: ISSUES_TOKEN is empty.", file=sys.stderr)
-        return 2
+        print("::error::ISSUES_TOKEN is empty: renewing, but no reminder or issue can be read")
     repositories = read_repositories(options.repositories)
     if not repositories:
         print("public-repository-lockdown: the repository list is empty.", file=sys.stderr)
         return 1
 
     github = GitHub(admin, issues, run=run)
-    print(f"credential: {github.credential()}")
+    now = datetime.now(timezone.utc)
+    kind, warning = github.credential(now)
+    print(f"credential: FLEET_ADMIN_TOKEN is {kind}")
+    if warning:
+        print(f"::warning::{warning}")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     run_url = (
         f"{server}/{os.environ.get('GITHUB_REPOSITORY', HOME_REPOSITORY)}"
@@ -763,7 +835,7 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
         github,
         repositories,
         dry_run=options.dry_run,
-        now=datetime.now(timezone.utc),
+        now=now,
         run_url=run_url,
     )
     # Written last: a run that dies before here leaves no result, so nothing is pinged.

@@ -75,8 +75,11 @@ jobs:
       # The reminders and the gap issue are written by the basecradle-ai App, never by
       # FLEET_ADMIN_TOKEN and never by GITHUB_TOKEN (which cannot reach the other repositories,
       # and whose label events start no workflow). Scoped to the repositories just listed.
+      # Allowed to fail, so a repository the App is not installed on never stops a renewal:
+      # the audit still renews everything, then dies at the gap issue, and nothing is pinged.
       - name: Mint the basecradle-ai App Token
         id: app-token
+        continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}

@@ -52,7 +52,9 @@ Two, each for its own half:
   `GITHUB_TOKEN` can never be granted, so this is a standing secret, provisioned
   by `@origin` (least privilege — **not** org-admin) and covering every public
   repository. It never writes an issue: anything it posted would carry its
-  owner's name. Unset, the run fails; it never skips quietly.
+  owner's name. Unset, the run fails; it never skips quietly. The run's log is
+  public, so it names only the token's kind, and warns of its expiry only in the
+  last 60 days.
 - **The `basecradle-ai` App token**, minted per run with `issues: write` and
   scoped to exactly the public repositories, reads and moves the reminders and
   files the gap issue.
@@ -68,8 +70,9 @@ When a new public fleet repo is stood up (the capital's new-repository recipe):
    `gh api -X PUT /repos/basecradle/<repo>/interaction-limits -f limit=collaborators_only -f expiry=six_months`
 2. Open its one renewal-reminder issue, titled as above.
 3. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-ai` App reach it. The audit
-   finds every public repository on its own; one it cannot renew or read is a gap
-   within the week.
+   finds every public repository on its own: one it cannot renew or read is a gap
+   within the week, and one the App cannot reach fails the run (every other
+   repository is still renewed), so the heartbeat pages either way.
 
 ## Capital-owned (handed off, not enacted here)
 

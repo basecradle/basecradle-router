@@ -65,7 +65,6 @@ class FakeGitHub:
         limits: dict[str, Any] | None = None,
         issues: dict[str, Any] | None = None,
         refuse: set[str] | None = None,
-        unreadable_home: bool = False,
     ) -> None:
         self.repositories = list(FLEET if repositories is None else repositories)
         self.limits: dict[str, Any] = {
@@ -79,9 +78,8 @@ class FakeGitHub:
         }
         self.issues.update(issues or {})
         self.refuse = refuse or set()
-        self.unreadable_home = unreadable_home
         self.writes: list[tuple[str, ...]] = []
-        self._home_reads = 0
+        self.home_reads = 0
 
     def public_repositories(self, org: str) -> list[str]:
         return sorted(self.repositories)
@@ -105,10 +103,7 @@ class FakeGitHub:
 
     def open_issues(self, repository: str) -> list[dict[str, Any]]:
         if repository == HOME:
-            self._home_reads += 1
-            # The second read of the home repository is the gap issue's.
-            if self.unreadable_home and self._home_reads > 1:
-                raise lockdown.GitHubError("HTTP 502")
+            self.home_reads += 1
         answer = self.issues[repository]
         if isinstance(answer, Exception):
             raise answer
@@ -309,9 +304,46 @@ def test_no_repositories_is_never_clean() -> None:
 
 
 def test_a_run_that_cannot_read_its_own_issues_dies_rather_than_skip_the_filing() -> None:
-    github = FakeGitHub(issues={"basecradle/.github": []}, unreadable_home=True)
+    github = FakeGitHub(issues={HOME: lockdown.GitHubError("HTTP 502")})
     with pytest.raises(lockdown.GitHubError):
         audit(github)
+    # But only after every repository was renewed.
+    assert sorted(w[1] for w in github.writes if w[0] == "renew") == sorted(FLEET)
+
+
+def test_an_app_token_that_could_not_be_minted_never_costs_a_renewal() -> None:
+    # The mint step may fail (a public repository the App is not installed on); the issues
+    # token is then empty and every issue call refuses. Every limit is still renewed.
+    class NoIssuesToken(FakeGitHub):
+        def open_issues(self, repository: str) -> list[dict[str, Any]]:
+            raise lockdown.GitHubError(f"no token for GET repos/{repository}/issues")
+
+    github = NoIssuesToken()
+    with pytest.raises(lockdown.GitHubError, match="no token"):
+        audit(github)
+    assert sorted(w[1] for w in github.writes if w[0] == "renew") == sorted(FLEET)
+
+
+def test_every_renewal_happens_before_any_issue_is_read() -> None:
+    order: list[str] = []
+
+    class Ordered(FakeGitHub):
+        def renew(self, repository: str) -> None:
+            order.append("renew")
+            super().renew(repository)
+
+        def open_issues(self, repository: str) -> list[dict[str, Any]]:
+            order.append("issues")
+            return super().open_issues(repository)
+
+    audit(Ordered())
+    assert order == ["renew"] * len(FLEET) + ["issues"] * len(FLEET)
+
+
+def test_the_home_repositorys_issues_are_read_once() -> None:
+    github = FakeGitHub()
+    audit(github)
+    assert github.home_reads == 1
 
 
 # --- what counts as a reminder -----------------------------------------------------------
@@ -338,6 +370,20 @@ def test_a_strangers_issue_with_the_reminders_title_is_not_a_reminder() -> None:
     issues = [reminder_issue(70, "2027-05-14", author="john"), reminder_issue(10, "2027-05-14")]
     assert [r.number for r in lockdown.reminders_in(issues)] == [10]
     assert lockdown.reminders_in([reminder_issue(70, "2027-05-14", author="john")]) == []
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "⏰ Renew interaction limit before 2027-05-14 (public-repo write-lockdown) — draft",
+        "Renew interaction limit before 2027-05-14 (public-repo write-lockdown)",
+        "⏰ Renew interaction limit before 2027-05-140 (public-repo write-lockdown)",
+    ],
+)
+def test_only_the_exact_reminder_title_counts(title: str) -> None:
+    issue = reminder_issue(10, "2027-05-14")
+    issue["title"] = title
+    assert lockdown.reminders_in([issue]) == []
 
 
 def test_origins_own_reminder_counts_and_a_pull_request_never_does() -> None:
@@ -407,6 +453,17 @@ def test_a_changed_gap_comments_then_relabels_then_rewrites_the_body() -> None:
     assert "basecradle-python" in json.loads(home[3][3])["body"]
 
 
+def test_a_repository_that_became_clean_is_said_without_paging_again() -> None:
+    first = FakeGitHub(issues={"basecradle/.github": [], "basecradle/basecradle-python": []})
+    audit(first)
+    again = _second_run({"basecradle/.github": []}, _gap_issue(first))
+    audit(again)
+    home = [w for w in again.writes if w[0] != "renew" and w[1] == HOME and w[2] == "500"]
+    assert [w[0] for w in home] == ["comment", "edit"]
+    assert "**Now Clean:** `basecradle/basecradle-python`" in home[0][3]
+    assert "needs-capital" not in home[0][3]
+
+
 def test_a_changed_gap_whose_label_was_cleared_only_adds_it_back() -> None:
     first = FakeGitHub(issues={"basecradle/.github": []})
     audit(first)
@@ -427,7 +484,26 @@ def test_the_run_that_finds_no_gap_closes_the_issue() -> None:
     home = [w for w in again.writes if w[0] in {"comment", "edit"} and w[2] == "500"]
     assert [w[0] for w in home] == ["comment", "edit"]
     assert RUN_URL in home[0][3]
+    assert "`needs-capital` removed" in home[0][3]
     assert json.loads(home[1][3]) == {"state": "closed", "state_reason": "completed"}
+    # The routing label goes with the close, after the comment that says so.
+    kinds = [w[0] for w in again.writes if w[0] != "renew" and len(w) > 2 and w[2] == "500"]
+    assert kinds == ["comment", "unlabel", "edit"]
+
+
+def test_a_second_copy_of_the_gap_issue_is_closed_as_one() -> None:
+    first = FakeGitHub(issues={"basecradle/.github": []})
+    audit(first)
+    gap = _gap_issue(first)
+    copy = {**gap, "number": 501}
+    home = [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), gap, copy]
+    again = FakeGitHub(issues={"basecradle/.github": [], HOME: home})
+    audit(again)
+    on_copy = [w for w in again.writes if len(w) > 2 and w[2] == "501"]
+    assert [w[0] for w in on_copy] == ["comment", "unlabel", "edit"]
+    assert "#500, which is the record" in on_copy[0][3]
+    assert json.loads(on_copy[2][3])["state"] == "closed"
+    assert not [w for w in again.writes if len(w) > 2 and w[2] == "500"]
 
 
 def test_a_strangers_issue_with_the_gap_title_is_never_touched() -> None:
@@ -452,6 +528,15 @@ def test_nothing_from_github_can_pose_as_the_marker_or_mention_a_stranger() -> N
     assert body.count("<!-- public-repository-lockdown") == 1
     assert "`@john`" in body and " @john" not in body.replace("`@john`", "")
     assert lockdown._state_in(body) == {HOME: ["limit-unreadable"]}
+
+
+def test_the_issues_own_code_spans_survive_and_a_foreign_backtick_does_not() -> None:
+    weaker = {"limit": "existing`users", "expires_at": _iso(NOW + timedelta(days=170))}
+    github = FakeGitHub(limits={HOME: weaker}, refuse={HOME})
+    audit(github)
+    body = created(github)[3]
+    assert "its limit is `existing'users`, not `collaborators_only`" in body
+    assert "`collaborators_only` interaction limit" in body
 
 
 def test_a_marker_edited_by_hand_is_read_for_what_it_still_says() -> None:
@@ -537,23 +622,36 @@ def test_the_listing_keeps_public_unarchived_repositories_only() -> None:
     assert names == ["basecradle/.github", "basecradle/basecradle-router"]
 
 
-def test_the_credential_line_names_the_kind_and_expiry_never_the_token() -> None:
-    head = (
-        "HTTP/2.0 200 OK\r\nGithub-Authentication-Token-Expiration: 2027-06-07 05:20:00 UTC\r\n"
-        "\r\n{}"
-    )
-    run = Recorder([(0, head, ""), (0, '{"login": "john"}', "")])
-    line = lockdown.GitHub("github_pat_SECRET", run=run).credential()
-    assert line == (
-        "a fine-grained personal access token, expiring 2027-06-07 05:20:00 UTC, acting as john"
-    )
-    assert "SECRET" not in line
+def _rate_limit(expiry: str | None) -> tuple[int, str, str]:
+    header = f"Github-Authentication-Token-Expiration: {expiry}\r\n" if expiry else ""
+    return (0, f"HTTP/2.0 200 OK\r\n{header}\r\n{{}}", "")
+
+
+def test_the_credential_line_names_only_the_kind_far_from_expiry() -> None:
+    run = Recorder([_rate_limit("2027-06-07 05:20:00 UTC")])
+    kind, warning = lockdown.GitHub("github_pat_SECRET", run=run).credential(NOW)
+    assert kind == "a fine-grained personal access token"
+    # The log is public: no date to plan around, and no owner.
+    assert warning is None
+    assert [c["command"][-1] for c in run.calls] == ["rate_limit"]
+
+
+def test_the_credential_warns_in_days_near_its_expiry_and_never_says_the_date() -> None:
+    soon = NOW + timedelta(days=20, hours=1)
+    run = Recorder([_rate_limit(soon.strftime("%Y-%m-%d %H:%M:%S UTC"))])
+    kind, warning = lockdown.GitHub("github_pat_SECRET", run=run).credential(NOW)
+    assert warning is not None and "expires in 20 days" in warning
+    assert f"{soon:%Y-%m-%d}" not in warning and "SECRET" not in warning + kind
 
 
 def test_the_credential_line_never_fails_the_run() -> None:
-    run = Recorder([(1, "", "HTTP 401"), (1, "", "HTTP 401")])
-    line = lockdown.GitHub("ghs_x", run=run).credential()
-    assert line.startswith("a GitHub App installation token")
+    run = Recorder([(1, "", "HTTP 401")])
+    assert lockdown.GitHub("ghs_x", run=run).credential(NOW) == (
+        "a GitHub App installation token",
+        None,
+    )
+    run = Recorder([_rate_limit(None)])
+    assert lockdown.GitHub("weird", run=run).credential(NOW) == ("a token of unknown kind", None)
 
 
 # --- main ---------------------------------------------------------------------------------
@@ -609,10 +707,8 @@ def test_main_dry_run_writes_a_withheld_result(
     run = Recorder(
         [
             (0, "HTTP/2.0 200 OK\n\n{}", ""),  # credential: rate_limit
-            (0, "{}", ""),  # credential: user
             (0, json.dumps({"limit": "collaborators_only", "expires_at": expires}), ""),
-            (0, issues, ""),  # reminders
-            (0, issues, ""),  # the gap issue's read
+            (0, issues, ""),  # reminders, and the gap issue's read
         ]
     )
     code = lockdown.main(
@@ -672,3 +768,11 @@ def test_the_admin_token_never_reaches_an_issue_write() -> None:
     assert "ISSUES_TOKEN: ${{ steps.app-token.outputs.token }}" in text
     assert "GH_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}" not in text
     assert "secrets.GITHUB_TOKEN" not in text and "github.token" not in text
+
+
+def test_a_failed_app_token_mint_never_stops_the_renewal_step() -> None:
+    text = _workflow()
+    mint = text.split("- name: Mint the basecradle-ai App Token", 1)[1].split("- name:", 1)[0]
+    assert "continue-on-error: true" in mint
+    renew = text.split("- name: Renew, Read Back, and Record", 1)[1].split("- name:", 1)[0]
+    assert "if:" not in renew
