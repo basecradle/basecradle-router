@@ -15,6 +15,7 @@ No network or Caddy binary is involved. This test reads files off disk.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
 
@@ -492,3 +493,42 @@ def test_the_proxy_line_keeps_the_shape_the_capitals_fleet_audit_reads(
     # router Caddyfile from the bootstrap responder by grepping `^\s*reverse_proxy
     # 127.0.0.1:8000`, so a reshaped proxy line would read as a box with no router front end.
     assert any(re.match(r"\s*reverse_proxy 127\.0\.0\.1:8000", line) for line in _site(caddyfile))
+
+
+#: The one matcher that withholds an access line (#476): the TCP peer is a loopback address.
+LOOPBACK_MATCHER = "@loopback remote_ip 127.0.0.0/8 ::1"
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_only_a_request_whose_tcp_peer_is_loopback_skips_the_access_log(caddyfile: Path) -> None:
+    # #476. The deploy smoke test reaches Caddy from the box itself, and its access lines were
+    # the last synthetic ones a `source=probe` filter could not hide. The condition must be
+    # the TCP peer, which nobody outside the box can make loopback. `client_ip` follows
+    # forwarded headers, and a header, a path or the #461 mark is the caller's to choose, so
+    # any of them would let a request from the internet hide its own access line.
+    site = _depth_one(_site(caddyfile))
+    (matcher,) = [line for line in site if line.startswith("@loopback ")]
+    assert matcher == LOOPBACK_MATCHER
+    # Read off the file: one matcher type, the peer, and only loopback ranges, the whole of it.
+    _, kind, *ranges = matcher.split()
+    assert kind == "remote_ip"
+    networks = [ipaddress.ip_network(r) for r in ranges]
+    assert all(n.is_loopback for n in networks)
+    assert networks == [ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128")]
+    # Skipped by that matcher and nothing else: a bare `log_skip` (or the pre-2.8 spelling)
+    # anywhere would drop every request's line, the internet's included.
+    skips = [
+        line for line in _directive_lines(caddyfile) if line.split()[0] in {"log_skip", "skip_log"}
+    ]
+    assert skips == ["log_skip @loopback"]
+    assert "log_skip @loopback" in site
+
+
+@pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
+def test_every_other_request_still_writes_its_access_line(caddyfile: Path) -> None:
+    # #476: the skip removes the box's own lines and nothing more. The site's access log stays
+    # on, to the journal the log source reads.
+    site = _site(caddyfile)
+    start = site.index("log {")
+    assert site[start] in _depth_one(site)
+    assert _block_at(site, start)[0] == ["output stderr", "format console"]
