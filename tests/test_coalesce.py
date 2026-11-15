@@ -7,7 +7,7 @@ at the boundary mocked, nothing on the network — with payloads shaped the way 
 sends them (the platform's the way it sends them too):
 
 - deliveries that queued behind a wake collapse into **at most one** follow-up;
-- a queued delivery whose issue closed (or lost ``handoff``, or gained ``Do Not Work``)
+- a queued delivery whose issue closed (or lost ``handoff``, or gained the do-not-work brake)
   while it waited launches nothing;
 - the ``opened`` and ``labeled`` of one create wake the agent **once**, for both ways a
   create is labeled, in either arrival order;
@@ -498,16 +498,20 @@ def test_a_reopened_issue_wakes_again() -> None:
 
 
 @pytest.mark.parametrize(
-    ("labels", "reason"),
-    [((), "handoff_removed"), (("handoff", "Do Not Work"), "do_not_work")],
-    ids=["handoff-removed", "do-not-work"],
+    ("action", "label", "labels", "reason"),
+    [
+        ("unlabeled", "handoff", (), "handoff_removed"),
+        ("labeled", "Do Not Work", ("handoff", "Do Not Work"), "do_not_work"),
+        ("labeled", "do-not-work", ("handoff", "do-not-work"), "do_not_work"),
+    ],
+    ids=["handoff-removed", "do-not-work-old-spelling", "do-not-work-new-spelling"],
 )
-def test_a_queued_wake_honours_a_label_change_made_while_it_waited(labels, reason, caplog):
+def test_a_queued_wake_honours_a_label_change_made_while_it_waited(
+    action, label, labels, reason, caplog
+):
     pipeline, waker, _ = _pipeline()
     queue = _Queue(pipeline)
     delivery = queue.arrive(_comment(_issue(updated="03:20:00"), at="03:20:00"))
-    action = "unlabeled" if not labels else "labeled"
-    label = "handoff" if not labels else "Do Not Work"
     queue.arrive(_issues(action, _issue(labels=labels, updated="03:21:00"), label=label))
     with caplog.at_level("INFO", logger="basecradle_router"):
         queue.drain()
