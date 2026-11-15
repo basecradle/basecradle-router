@@ -41,6 +41,7 @@ SMOKE_TEST = DEPLOY / "smoke-test.sh"
 HOSTS = sorted(p.name for p in (DEPLOY / "hosts").iterdir() if p.is_dir())
 AI = "ai.basecradle.com"
 LOOPBACK = "http://127.0.0.1:8000/webhooks/probe"
+ARGV_LOG = "argv.log"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None,
@@ -68,6 +69,9 @@ def _fake_bin(tmp_path: Path, log: Path) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     record = f'for a in "$@"; do case "$a" in http*) printf \'%s\\n\' "$a" >>"{log}";; esac; done\n'
+    # Each invocation's whole argv too, as unit-separated fields in one record (#476): a
+    # request body may carry newlines, so neither separator is a newline.
+    record += f"{{ printf '%s\\037' \"$@\"; printf '\\036'; }} >>\"{log.parent / ARGV_LOG}\"\n"
     fakes = {
         "curl": record + "printf 404\n",
         "journalctl": "exit 0\n",
@@ -81,11 +85,13 @@ def _fake_bin(tmp_path: Path, log: Path) -> Path:
     return bindir
 
 
-def _run_smoke(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+def _run_smoke(
+    tmp_path: Path, *args: str, router_env: str = ROUTER_ENV
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     log = tmp_path / "urls.log"
     log.touch()
     env_file = tmp_path / "router.env"
-    env_file.write_text(ROUTER_ENV)
+    env_file.write_text(router_env)
     bindir = _fake_bin(tmp_path, log)
     result = subprocess.run(
         ["bash", str(SMOKE_TEST), *args],
@@ -269,3 +275,36 @@ def test_smoke_host_refuses_an_empty_host_even_where_ai_is_carried(tmp_path: Pat
     assert result.returncode == 1
     assert result.stdout == ""
     assert "no <fqdn> given" in result.stderr
+
+
+def _invocations(tmp_path: Path) -> list[list[str]]:
+    """Every argv the fake `curl` was run with, in order."""
+    log = tmp_path / ARGV_LOG
+    records = log.read_text().split("\x1e")[:-1] if log.exists() else []
+    return [record.split("\x1f")[:-1] for record in records]
+
+
+#: The probe route enabled, so the gate arms the synthetic mark and takes marked_curl's other
+#: branch (#461).
+ARMED_ROUTER_ENV = ROUTER_ENV + "BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe\n"
+
+
+@pytest.mark.parametrize("armed", [False, True], ids=["unmarked", "marked"])
+@pytest.mark.parametrize("host", HOSTS)
+def test_every_request_to_the_edge_connects_to_this_boxs_own_loopback(
+    host: str, armed: bool, tmp_path: Path
+) -> None:
+    # #476: Caddy writes no access line for a loopback peer, so the smoke run's requests must
+    # reach the edge from loopback on every box, whatever the box resolves its own name to.
+    env = ARMED_ROUTER_ENV if armed else ROUTER_ENV
+    result, _ = _run_smoke(tmp_path, host, router_env=env)
+    assert ("synthetic mark: armed" in result.stdout) is armed, result.stdout
+    to_edge = [
+        argv
+        for argv in _invocations(tmp_path)
+        if any(a.startswith(f"https://{host}/") for a in argv)
+    ]
+    assert len(to_edge) >= 4, result.stderr
+    for argv in to_edge:
+        pins = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--resolve"]
+        assert pins == [f"{host}:443:127.0.0.1"], argv

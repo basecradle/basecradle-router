@@ -168,6 +168,13 @@ smoke_host() {
 SMOKE_HOST="$(smoke_host "${1-}")" || exit 1
 SMOKE_BASE="https://${SMOKE_HOST}/webhooks"
 SMOKE_URL="${SMOKE_BASE}/github"
+# Every request to the edge connects to this box's own loopback (#476). Caddy writes no
+# access line for a loopback peer, so the run leaves none of its own in the log source. The
+# pin is here, not left to how a box resolves its own name (an /etc/hosts line on one, its
+# public address on another), and it changes nothing else: the URL, the SNI and the Host stay
+# <fqdn>, so the same site answers. curl applies it to <fqdn>:443 alone, never to the daemon's
+# own 127.0.0.1:8000.
+EDGE_PIN="${SMOKE_HOST}:443:127.0.0.1"
 # The daemon's own listener, bypassing Caddy: where a github-less box proves it serves no
 # github route (the unit binds uvicorn to 127.0.0.1:8000, as the probe's loopback case uses).
 GITHUB_LOCAL_URL="http://127.0.0.1:8000/webhooks/github"
@@ -580,12 +587,12 @@ mint_mark() {
 # the case reads an empty status and fails rather than going out with a stale mark.
 marked_curl() {
 	if [[ -z "$mark_secret" ]]; then
-		curl "$@"
+		curl --resolve "$EDGE_PIN" "$@"
 		return
 	fi
 	rm -f "$workdir/mark.header"
 	mint_mark "$workdir/mark.header" || return 1
-	curl -H "@$workdir/mark.header" "$@"
+	curl --resolve "$EDGE_PIN" -H "@$workdir/mark.header" "$@"
 }
 
 # How the daemon spells route $1's source on this run's lines: tagged when marking is armed.
@@ -1413,7 +1420,7 @@ assert_edge_headers() {
 	local i j want got count
 	# Emptied first, so a curl that wrote nothing can never be read as an earlier answer.
 	: >"$dump"
-	if ! curl -sS -D "$dump" -o /dev/null --max-time 15 "$flag" "$url" 2>"$err"; then
+	if ! curl --resolve "$EDGE_PIN" -sS -D "$dump" -o /dev/null --max-time 15 "$flag" "$url" 2>"$err"; then
 		red "  FAIL  edge headers over ${proto}: GET ${url} failed: $(<"$err")"
 		rc=1
 		return 0

@@ -339,7 +339,8 @@ under `requested=`. Its access line is dropped, as a probe's is.
   `synthetic`, still counts. A mark that does not verify counts in full, like any stranger's delivery.
 - **Only the fleet can make one, and each works once.** A mark is honoured once, within 120 s of the daemon's
   clock, and only if it was stamped after the daemon started. The edge's access log carries request headers,
-  so every mark reaches the journal, but only after its request has spent it. A restart forgets which nonces
+  so a mark sent from off the box reaches the journal, but only after its request has spent it; a request
+  the box sends itself over loopback writes no edge access line (#476, below). A restart forgets which nonces
   were spent, so a mark stamped before the restart is refused. A mark that
   does not verify (`forged`, `stale`, `replayed`, `malformed`, or `unarmed` on a box with no synthetic
   route) leaves the request logged in full, after one `WARNING event=synthetic_mark_refused source=<the
@@ -425,6 +426,16 @@ routes are synthetic is the registry's answer (`Route.synthetic`), so the server
 other access line is kept, a `GET` to the same path included (answered `404` before the pipeline logs a
 word, so its access line is its only trace). If uvicorn ever changes its access-record shape the filter
 *keeps* the record — the fail-direction for a log filter is to log too much, never to silently swallow.
+
+**Nor, at the edge, is a request from the box itself** (#476). Caddy writes no access line for a request
+whose TCP peer is a loopback address (`log_skip` on `remote_ip 127.0.0.0/8 ::1`, in each host's
+`Caddyfile`). Today the only such request is the smoke test's, which pins every request to the edge to
+`127.0.0.1` (`--resolve`) rather than trust how a box resolves its own name; its Caddy lines were the last
+synthetic ones a `source=probe` filter could not hide. Any other local process loses nothing: it can reach
+the daemon on `127.0.0.1:8000` without passing the edge at all. The condition is the peer, which nobody
+off the box can make loopback, and never a header, a path, the mark or `client_ip`, which a caller
+controls; so a request from anywhere else keeps its edge access line, whatever it carries. The daemon's own
+lines are untouched.
 
 **`router.env`** holds only the daemon's own non-agent config:
 ```

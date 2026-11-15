@@ -59,7 +59,9 @@ def _run(snippet: str, tmp_path: Path, *, path: str | None = None) -> subprocess
         'green() { printf "%s\\n" "$*"; }\n'
         'red() { printf "%s\\n" "$*"; }\n'
         "rc=0\n"
-        f"workdir={workdir}\n" + _body() + snippet
+        f"workdir={workdir}\n"
+        # The script derives it from its <fqdn> before any case runs (#476).
+        f"EDGE_PIN={SITE}:443:127.0.0.1\n" + _body() + snippet
     )
     env = {"PATH": f"{path}:/usr/bin:/bin" if path else "/usr/bin:/bin", "HOME": str(tmp_path)}
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
@@ -304,6 +306,8 @@ def test_the_full_set_passes_one_line_per_header(
     ], result.stderr
     argv = (tmp_path / "argv.log").read_text()
     assert flag in argv and f"https://{SITE}/up" in argv
+    # Over this box's own loopback, so Caddy writes no access line for it (#476).
+    assert f"--resolve {SITE}:443:127.0.0.1 " in argv
 
 
 @pytest.mark.parametrize(

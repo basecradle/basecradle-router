@@ -128,6 +128,20 @@ ai.basecradle.com {
 	}
 
 	# Access log to the journal; Caddy logs TLS/ACME there too.
+	#
+	# A request whose TCP peer is a loopback address writes no access line (#476). Only a
+	# process on this box can be that peer, and today the only one is the deploy's smoke test
+	# (`deploy/smoke-test.sh`, which pins its requests to loopback for this), whose access
+	# lines were the last synthetic ones the `source=probe` filter could not hide. Any other
+	# local process loses nothing it had: it can reach the daemon on 127.0.0.1:8000 without
+	# passing through here at all, so this log was never the record of the box's own traffic.
+	# The condition is the peer (`remote_ip`) and never anything a caller sends: a header and
+	# a path are the caller's to choose, the #461 mark among them (Caddy cannot verify it), and
+	# `client_ip` follows forwarded headers once trusted proxies are set. So a request from
+	# anywhere else keeps its access line, whatever it carries. The match is the whole loopback
+	# range, so it never depends on which loopback address a local client happens to use.
+	@loopback remote_ip 127.0.0.0/8 ::1
+	log_skip @loopback
 	log {
 		output stderr
 		format console
