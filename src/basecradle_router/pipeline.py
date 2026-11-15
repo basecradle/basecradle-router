@@ -122,6 +122,7 @@ from basecradle_router.logfmt import active_synthetic_origin, log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
+    UNROUTED,
     DeliveryDecision,
     InboundRequest,
     PayloadError,
@@ -387,6 +388,23 @@ class Pipeline:
             self.execute(agent, event, accepted.result)
         return accepted.result
 
+    def _named(self, source: str) -> dict[str, str]:
+        """The fields naming the path's ``source`` on a line written before it is admitted.
+
+        ``source=`` is the key the fleet filters its synthetic traffic on, and its value set
+        is closed: the enabled route names, and :data:`~basecradle_router.routes.UNROUTED`
+        (#462). A registered route's name is its own ``source=``. Anything else is only the
+        caller's segment, so it gets the fixed token there and the segment, bounded, under
+        ``requested=``, and a path such as ``/webhooks/probes`` or
+        ``/webhooks/x%20source=probe`` never logs as the probe route. Every line written
+        before admission names its source through this, the last-resort ones included, so a
+        registered route that hit a bug still reads as itself. The test is a dict
+        membership, which cannot be what raised.
+        """
+        if source in self.registry:
+            return {"source": source}
+        return {"source": UNROUTED, "requested": _shown_source(source)}
+
     def mark_origin(self, source: str, mark: str | None) -> str | None:
         """The synthetic route a request's ``mark`` proves it came from, or ``None``; never raises.
 
@@ -408,15 +426,13 @@ class Pipeline:
         except Exception as exc:  # last-resort: a mark must never stop a request being served
             logger.error(
                 "event=synthetic_mark_refused %s",
-                log_fields(
-                    source=_shown_source(source), reason="error", error=f"unexpected: {exc}"
-                ),
+                log_fields(**self._named(source), reason="error", error=f"unexpected: {exc}"),
             )
             return None
         if verdict.refused is not None:
             logger.warning(
                 "event=synthetic_mark_refused %s",
-                log_fields(source=_shown_source(source), reason=verdict.refused),
+                log_fields(**self._named(source), reason=verdict.refused),
             )
         return verdict.source
 
@@ -434,14 +450,15 @@ class Pipeline:
         try:
             route: Route | None = self.registry.get(source)
         except UnknownRouteError:
-            # The name is the caller's, so it is shown bounded, and the registry's own
+            # The name is the caller's, so it never fills `source=`, whose value set is
+            # closed (#462): it is shown bounded under `requested=`, and the registry's own
             # message — which repeats it whole — is not logged (#427). The registered
             # routes are, because they are what points at a source a box forgot to enable.
             self._record(
                 result,
                 Stage.ROUTE,
                 Outcome.REJECTED,
-                source=_shown_source(source),
+                **self._named(source),
                 known=",".join(sorted(self.registry.names())) or "(none)",
                 error="no route registered for this source",
             )
@@ -451,7 +468,7 @@ class Pipeline:
                 result,
                 Stage.ROUTE,
                 Outcome.FAILED,
-                source=_shown_source(source),
+                **self._named(source),
                 error=f"unexpected: {exc}",
             )
             route = None

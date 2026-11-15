@@ -22,7 +22,7 @@ from basecradle_router.routes.basecradle import (
 )
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.probe import ProbeRoute
-from basecradle_router.routes.registry import RouteRegistry, UnknownRouteError
+from basecradle_router.routes.registry import UNROUTED, RouteRegistry, UnknownRouteError
 
 __all__ = [
     "BasecradleRoute",
@@ -36,6 +36,7 @@ __all__ = [
     "RouteError",
     "RouteRegistry",
     "SignatureError",
+    "UNROUTED",
     "UnknownRouteError",
     "UntrustedSenderError",
     "load_recipient_keyring",
