@@ -353,7 +353,7 @@ def test_port_80_refuses_every_name_but_its_own_and_never_reflects_a_host(
 
 #: Where the Caddyfile sends the probe path. The daemon must answer it as an unknown source,
 #: so it must name no route the daemon can register.
-PROBE_MASK_TARGET = "/webhooks/probe-masked"
+PROBE_MASK_TARGET = "/webhooks/masked-probe"
 
 
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)
@@ -379,17 +379,14 @@ def test_the_probe_path_is_rewritten_to_a_path_the_daemon_answers_as_unknown(
     )
 
 
-def test_the_probe_mask_target_names_no_route_the_daemon_can_register(tmp_path) -> None:
-    # Asked of the daemon's own composition root, with every route enabled AND the target's
-    # own name enabled with a secret: if any code path could register a route by that name,
-    # it would be in this registry, and the public probe path would reach it.
+def _every_route_registry(tmp_path, *extra: str):
+    """The daemon's own composition root with every route enabled, plus ``extra`` names
+    enabled with a secret, as ``(config, registry)``."""
     import json
 
     from basecradle_router.app import build_registry
     from basecradle_router.config import load_config, route_secret_var
 
-    source = PROBE_MASK_TARGET.removeprefix("/webhooks/")
-    assert source and "/" not in source, "the target must be one segment, as a source is"
     agents = tmp_path / "agents.json"
     agents.write_text(
         json.dumps(
@@ -405,16 +402,83 @@ def test_the_probe_mask_target_names_no_route_the_daemon_can_register(tmp_path) 
     secret = "fake-webhook-secret-" + "0" * 32
     env = {
         "BASECRADLE_ROUTER_AGENTS": str(agents),
-        "BASECRADLE_ROUTER_ENABLED_ROUTES": f"github,basecradle,probe,{source}",
+        "BASECRADLE_ROUTER_ENABLED_ROUTES": ",".join(("github", "basecradle", "probe", *extra)),
         "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": "john",
         "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET": secret,
         "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET": secret,
         "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET": secret,
-        route_secret_var(source): secret,
+        **{route_secret_var(name): secret for name in extra},
     }
-    registry = build_registry(load_config(env), env)
+    config = load_config(env)
+    registry = build_registry(config, env)
     assert {"github", "basecradle", "probe"} <= registry.names()
+    return config, registry
+
+
+def _mask_source() -> str:
+    source = PROBE_MASK_TARGET.removeprefix("/webhooks/")
+    assert source and "/" not in source, "the target must be one segment, as a source is"
+    return source
+
+
+def test_the_probe_mask_target_names_no_route_the_daemon_can_register(tmp_path) -> None:
+    # Asked of the daemon's own composition root, with every route enabled AND the target's
+    # own name enabled with a secret: if any code path could register a route by that name,
+    # it would be in this registry, and the public probe path would reach it.
+    source = _mask_source()
+    _config, registry = _every_route_registry(tmp_path, source)
     assert source not in registry
+
+
+def test_the_probe_mask_targets_line_cannot_match_any_routes_tag_as_a_substring(
+    tmp_path, caplog
+) -> None:
+    # #461. The daemon logs the mask target as the rejected request's `source=`, and the
+    # operator hides the fleet's own traffic with a SUBSTRING filter on `source=probe` (the
+    # Live Tail default). The old target, `probe-masked`, logged `source=probe-masked`,
+    # which that filter hid, and with it every real internet request to the probe path:
+    # the very traffic the mask exists to show. So the target must begin with no route's
+    # name. Read off the line the daemon really writes for it, never a re-rendering, so
+    # a change to how the route-rejection line spells its source is caught here too.
+    import logging
+
+    from basecradle_router.pipeline import Outcome, Pipeline, Stage
+
+    source = _mask_source()
+    config, registry = _every_route_registry(tmp_path)
+    pipeline = Pipeline(registry=registry, config=config, waker=None)
+    with caplog.at_level(logging.INFO, logger="basecradle_router"):
+        admission = pipeline.admit(source)
+    assert admission.route is None
+    assert admission.result.stages == [(Stage.ROUTE, Outcome.REJECTED)]
+    (line,) = [r.getMessage() for r in caplog.records if "stage=route" in r.getMessage()]
+    assert f"source={source}" in line, line
+    # Every route the package defines, not only the ones this env enables, so a route
+    # added later is checked on arrival, and a test env that forgot to enable it fails.
+    names = _every_route_name()
+    assert registry.names() == names, "enable every route in _every_route_registry"
+    for name in sorted(names):
+        assert f"source={name}" not in line, (name, line)
+
+
+def _every_route_name() -> set[str]:
+    """The ``name`` of every route class the routes package defines."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    import basecradle_router.routes as routes
+
+    names = set()
+    for module in pkgutil.iter_modules(routes.__path__):
+        loaded = importlib.import_module(f"{routes.__name__}.{module.name}")
+        for _, cls in inspect.getmembers(loaded, inspect.isclass):
+            if cls.__module__ == loaded.__name__ and all(
+                hasattr(cls, attr) for attr in ("name", "recipient_kind", "verify", "normalize")
+            ):
+                names.add(cls.name)
+    assert {"github", "basecradle", "probe"} <= names
+    return names
 
 
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=lambda p: p.parent.name)

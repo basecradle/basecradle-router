@@ -274,7 +274,7 @@ def test_the_filter_drops_only_a_post_to_a_synthetic_route(daemon_logging, tmp_p
     # pipeline never logs (answered 404 before it), whose access line is its only trace.
     for method, path in (
         ("POST", "/webhooks/github"),
-        ("POST", "/webhooks/probe-masked"),
+        ("POST", "/webhooks/masked-probe"),
         ("POST", "/webhooks/probe/below"),
         ("POST", "/probe"),
         ("GET", "/webhooks/probe"),
