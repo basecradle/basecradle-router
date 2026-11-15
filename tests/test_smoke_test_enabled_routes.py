@@ -24,8 +24,11 @@ AI). Secrets are correctly-shaped fakes; the uuid is a well-formed UUIDv7.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -39,8 +42,8 @@ SMOKE_TEST = DEPLOY / "smoke-test.sh"
 HOST = "red.basecradle.com"
 
 pytestmark = pytest.mark.skipif(
-    any(shutil.which(tool) is None for tool in ("bash", "openssl", "jq")),
-    reason="bash, openssl and jq are required to run the shipped smoke test",
+    any(shutil.which(tool) is None for tool in ("bash", "jq")),
+    reason="bash and jq are required to run the shipped smoke test",
 )
 
 NOVA_UUID = "01980a3c-6f2e-7c41-9d3a-5b8e2f1c4a07"
@@ -167,9 +170,29 @@ def _run(
         "nsenter": "echo hidden\n",
         "sleep": "exit 0\n",
     }
+    # Every system program the script names, the signer's python3 and openssl included, is
+    # the real one behind a recording shim, so a signer that went back to openssl still
+    # signs and is caught by what it put on its command line, and so is any key handed to
+    # jq, awk or grep. Every shim records its own argv first, so
+    # test_no_secret_is_ever_on_a_command_line reads every command line the gate produced.
+    # python3 is the interpreter running this test, the gate's trusted PATH is bindir, and
+    # nothing a shim execs is looked up again.
+    fakes["python3"] = f'exec "{sys.executable}" "$@"\n'
+    # Exact names only: on a case-insensitive filesystem `Bash` from a comment would find
+    # /bin/bash and its shim would shadow the shell every shim runs under.
+    system = {name: f"{d}/{name}" for d in ("/bin", "/usr/bin") for name in os.listdir(d)}
+    for word in sorted(set(re.findall(r"[a-z][a-z0-9_.-]*", SMOKE_TEST.read_text()))):
+        if word in system and word not in fakes and word not in ("bash", "sh", "env"):
+            fakes[word] = f'exec "{system[word]}" "$@"\n'
+    if "openssl" not in fakes:
+        fakes["openssl"] = "exit 127\n"
+    argv_log = tmp_path / "argv.log"
+    argv_log.touch()
+    # Pure bash: a shim that ran a program to record itself would run that program's shim.
+    record = f'printf "%s\\n" "${{0##*/}} $*" >>"{argv_log}"\n'
     for name, body in fakes.items():
         fake = bindir / name
-        fake.write_text("#!/usr/bin/env bash\n" + body)
+        fake.write_text("#!/usr/bin/env bash\n" + record + body)
         fake.chmod(0o755)
     result = subprocess.run(
         ["bash", str(SMOKE_TEST), HOST],
@@ -177,6 +200,7 @@ def _run(
         text=True,
         env={
             "PATH": f"{bindir}:/usr/bin:/bin",
+            "SMOKE_TRUSTED_PATH": str(bindir),
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),
@@ -287,3 +311,24 @@ def test_an_enabled_routes_list_naming_no_route_dies(raw: str, tmp_path: Path) -
     assert result.returncode == 1
     assert "lists no routes" in result.stderr
     assert requests == []
+
+
+def test_no_secret_is_ever_on_a_command_line(tmp_path: Path) -> None:
+    """A program's argv is readable by every account on the box, so no key may ride it.
+
+    The gate signed every delivery with `openssl dgst -hmac <key>` until #461 found it, so
+    each route's secret sat in a world-readable argv on every deploy. Run here over a box
+    with the github secret and a basecradle signing key in play, recording the argv of
+    every system program the gate runs: python3 (the signer) must have run, openssl must
+    not, and no key's bytes may appear on any recorded command line.
+    """
+    result, requests = _run(tmp_path, env_lines=GITHUB_VARS, github_served=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _route(requests, "github") == ["401", "400", "200"]
+    assert _route(requests, "basecradle") == BASECRADLE_CODES
+    argv = (tmp_path / "argv.log").read_text().splitlines()
+    assert any(line.startswith("python3 ") for line in argv), argv
+    assert not [line for line in argv if line.startswith("openssl")], argv
+    assert any(line.startswith("jq ") for line in argv), "the recorder must reach jq too"
+    for secret in (GITHUB_SECRET, NOVA_KEY):
+        assert not [line for line in argv if secret in line], secret

@@ -1729,7 +1729,9 @@ the trusted-actor list, and the registry path from `router.env` (`router:router 
 `EnvironmentFile=` hands them to the daemon (#419) — the parser `router-admin` carries, which
 `tests/test_router_env_parse.py` pins to systemd 255's own parse — so it runs on the box
 (the `deploy-router` op runs it as root post-restart; or `sudo deploy/smoke-test.sh <fqdn>` by hand); the
-basecradle cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`.
+basecradle cases additionally need `jq`, which the box already requires for `deploy/bin/wake-runner`. Every
+signature is taken by `python3`, found on the box's trusted PATH (wake-runner's), with the key in its
+environment and never on a command line, and checked to be 64 hex digits before it is sent.
 
 **It targets the host it is given (#334).** `<fqdn>` is the router host the box *is* — the same token the
 NOC's per-host ops take — and must name a `deploy/hosts/<fqdn>/` directory in the tree, or the test refuses

@@ -43,8 +43,10 @@ import hmac
 import json
 import logging
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -666,3 +668,68 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
     assert len(patterns) == 2, f"expected the verify_key + decision patterns, got {patterns}"
     for pattern in patterns:
         assert any(re.search(pattern, line) for line in rendered), (pattern, rendered)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "ghs-fake-0000000000000000000000000000",
+        "with spaces and $dollar `tick` \\back 'single' \"double\"",
+        "-starts-with-a-dash",
+        "ünïcödé-fake-key",
+    ],
+    ids=["plain", "shell-metacharacters", "leading-dash", "non-ascii"],
+)
+def test_the_signer_is_hmac_sha256_over_the_body_under_the_key(key: str, tmp_path: Path) -> None:
+    # The EXACT shipped hmac_sha256 (#461), against Python's own hmac over the same bytes,
+    # for keys a shell would mangle if it ever re-parsed them: the key must reach the
+    # signer byte for byte, through the environment, never through a command line.
+    import hashlib
+    import hmac
+
+    body_file = tmp_path / "body.json"
+    body = b'{"action":"labeled","sender":{"login":"john"}}\n'
+    body_file.write_bytes(body)
+    script = tmp_path / "sign.sh"
+    script.write_text(
+        f"set -euo pipefail\nsmoke_python={shlex.quote(sys.executable)}\n"
+        + _extract("hmac_sha256")
+        + 'hmac_sha256 "$1" "$2"\n'
+    )
+    result = subprocess.run(
+        ["bash", str(script), str(body_file), key],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LC_ALL": "C.UTF-8"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == hmac.new(key.encode(), body, hashlib.sha256).hexdigest() + "\n"
+
+
+@pytest.mark.parametrize(
+    "interpreter",
+    ["#!/bin/sh\nexit 1\n", "#!/bin/sh\necho 'Install the command line developer tools'\n"],
+    ids=["fails", "prints-something-else"],
+)
+def test_a_signer_that_fails_returns_nonzero_and_no_digest(interpreter: str, tmp_path) -> None:
+    # A broken python3 must never yield an empty `sha256=` signature: a case that expects
+    # 401 would read that as a pass while testing nothing. The gate takes every signature
+    # in a plain assignment, so this status is what stops it.
+    fake = tmp_path / "python3"
+    fake.write_text(interpreter)
+    fake.chmod(0o755)
+    body_file = tmp_path / "body.json"
+    body_file.write_text("{}")
+    script = tmp_path / "sign.sh"
+    script.write_text(
+        f"set -euo pipefail\nsmoke_python={shlex.quote(str(fake))}\n"
+        + _extract("hmac_sha256")
+        + 'sig="$(hmac_sha256 "$1" "$2")" || { echo refused; exit 3; }\necho "signed $sig"\n'
+    )
+    result = subprocess.run(
+        ["bash", str(script), str(body_file), "fake-key"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert (result.returncode, result.stdout) == (3, "refused\n")
