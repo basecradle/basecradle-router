@@ -501,10 +501,9 @@ def test_a_reopened_issue_wakes_again() -> None:
     ("action", "label", "labels", "reason"),
     [
         ("unlabeled", "handoff", (), "handoff_removed"),
-        ("labeled", "Do Not Work", ("handoff", "Do Not Work"), "do_not_work"),
         ("labeled", "do-not-work", ("handoff", "do-not-work"), "do_not_work"),
     ],
-    ids=["handoff-removed", "do-not-work-old-spelling", "do-not-work-new-spelling"],
+    ids=["handoff-removed", "do-not-work"],
 )
 def test_a_queued_wake_honours_a_label_change_made_while_it_waited(
     action, label, labels, reason, caplog

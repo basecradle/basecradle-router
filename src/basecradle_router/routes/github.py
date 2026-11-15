@@ -24,9 +24,7 @@ Both paths also honor the fleet-wide **do-not-work** brake: an issue carrying
 that label never wakes an agent, even when ``handoff`` is also present — the brake
 wins, so a stale or accidental handoff on a parked issue can't trigger a wake
 (basecradle-router#146). The skip is logged with the issue URL, never silent. The
-label is being renamed fleet-wide from ``Do Not Work`` to ``do-not-work``
-(basecradle/basecradle#848), so during the rename either name holds the brake
-(:data:`DO_NOT_WORK_LABELS`).
+label is :data:`DO_NOT_WORK_LABEL`, matched exactly.
 
 As defense-in-depth both paths gate on the webhook ``sender``: a wake only fires
 if a **trusted fleet actor** triggered it (the label applier, or the commenter) —
@@ -152,15 +150,10 @@ HANDOFF_LABEL = "handoff"
 # stale or accidental handoff on a parked issue can never trigger a wake
 # (basecradle-router#146).
 #
-# The one place the brake's names are defined; every brake path reads it. The label
-# is being renamed fleet-wide from `Do Not Work` to `do-not-work` (identifiers are
-# slugs, basecradle/basecradle#848). #848 renames no label until this pair runs on
-# every fleet server and is proven live there, so that no moment exists in which a held
-# issue is released. Each name is matched exactly — GitHub label names are
-# case-sensitive — never folded or fuzzed. On an issue carrying both, the first name
-# here is the one reported. The old name is dropped in its own later change (step 5
-# of #848).
-DO_NOT_WORK_LABELS = ("Do Not Work", "do-not-work")
+# The one place the brake's name is defined; every brake path reads it. A label is an
+# identifier, so it is a lowercase slug (basecradle/basecradle#848). It is matched
+# exactly — GitHub label names are case-sensitive — never folded or fuzzed.
+DO_NOT_WORK_LABEL = "do-not-work"
 _ACTIONABLE_ACTIONS = frozenset({"opened", "labeled"})
 # Only a newly *created* comment re-wakes; an ``edited``/``deleted`` comment does
 # not (the re-wake re-reads the whole thread anyway, so an edit adds nothing).
@@ -404,9 +397,9 @@ class IssueLedger:
         """Why a queued wake for the issue at ``url`` should not run, or ``None`` to run it.
 
         Closed first — a closed issue is over, whatever its labels say — then the
-        do-not-work brake (#146: an issue carrying either of :data:`DO_NOT_WORK_LABELS`
-        never wakes an agent, and that must hold for a wake queued before the brake went
-        on), then a ``handoff`` label that has since been removed.
+        do-not-work brake (#146: an issue carrying :data:`DO_NOT_WORK_LABEL` never wakes
+        an agent, and that must hold for a wake queued before the brake went on), then a
+        ``handoff`` label that has since been removed.
         """
         with self._lock:
             known = self._issues.get(url)
@@ -414,20 +407,20 @@ class IssueLedger:
             return None
         if not known.open:
             return ISSUE_CLOSED
-        if _do_not_work_label(known.labels) is not None:
+        if DO_NOT_WORK_LABEL in known.labels:
             return DO_NOT_WORK
         if HANDOFF_LABEL not in known.labels:
             return HANDOFF_REMOVED
         return None
 
-    def do_not_work_label(self, url: str) -> str | None:
-        """Which of :data:`DO_NOT_WORK_LABELS` the issue at ``url`` carries, or ``None``.
+    def is_parked(self, url: str) -> bool:
+        """Whether the issue at ``url`` carries :data:`DO_NOT_WORK_LABEL`.
 
-        ``None`` too for an issue the ledger has no record of.
+        ``False`` for an issue the ledger has no record of.
         """
         with self._lock:
             known = self._issues.get(url)
-        return None if known is None else _do_not_work_label(known.labels)
+        return known is not None and DO_NOT_WORK_LABEL in known.labels
 
     def open_handoffs(self, repo: str) -> list[IssueRef]:
         """The issues in ``repo`` the ledger holds as open and still labeled ``handoff``.
@@ -779,8 +772,8 @@ class GithubRoute:
         # The do-not-work brake wins over `handoff`: a parked issue never wakes an agent,
         # even with a (stale or accidental) handoff label. Checked before the
         # trust gate so a parked issue is a clean *skip*, not a sender rejection.
-        if (brake := _payload_do_not_work_label(issue)) is not None:
-            return self._skip_do_not_work(brake, issue.get("html_url"), event_type, delivery)
+        if _has_do_not_work_label(issue):
+            return self._skip_do_not_work(issue.get("html_url"), event_type, delivery)
 
         # Defense-in-depth: the label says "handoff", but only a trusted fleet
         # actor may actually trigger a wake. This runs after verify(), so the
@@ -828,8 +821,8 @@ class GithubRoute:
 
         # The do-not-work brake wins over `handoff` on the re-wake path too: a reply on a
         # parked handoff issue re-wakes no one while the brake label remains.
-        if (brake := _payload_do_not_work_label(issue)) is not None:
-            return self._skip_do_not_work(brake, issue.get("html_url"), event_type, delivery)
+        if _has_do_not_work_label(issue):
+            return self._skip_do_not_work(issue.get("html_url"), event_type, delivery)
 
         # Infinite-loop guard, *before* the trust gate: the agent commenting on its
         # own handoff issue (a progress note, the completion report) fires
@@ -981,8 +974,8 @@ class GithubRoute:
         target, reason = _merge_target(self._ledger.open_handoffs(repo), named)
         if target is None:
             return self._skip_pull_wake(skip_line, reason, event_type, delivery)
-        if (brake := self._ledger.do_not_work_label(target.url)) is not None:
-            return self._skip_do_not_work(brake, target.url, event_type, delivery)
+        if self._ledger.is_parked(target.url):
+            return self._skip_do_not_work(target.url, event_type, delivery)
         if actor is None or not self._is_captain_bot(repo, actor):
             self._require_trusted_login(actor)
         wake_arg = _HANDOFF_TRIGGER.format(url=target.url) + note
@@ -1076,10 +1069,8 @@ class GithubRoute:
         log_delivery_decision(self.name, event_type, DeliveryDecision.IGNORED, delivery=delivery)
         return None
 
-    def _skip_do_not_work(
-        self, label: str, url: object, event_type: str | None, delivery: str | None
-    ) -> None:
-        """Refuse a wake on an issue parked under ``label`` — the do-not-work brake (#146).
+    def _skip_do_not_work(self, url: object, event_type: str | None, delivery: str | None) -> None:
+        """Refuse a wake on an issue parked under the do-not-work brake (#146).
 
         Logged loudly with the issue URL and the reason *before* the structured
         ignore, so the skip is observable (never a silent drop) and an operator
@@ -1087,8 +1078,6 @@ class GithubRoute:
         then recorded as the same ``IGNORED`` decision every other quiet outcome
         emits — a parked issue is deliberately-not-actionable, not an error.
         ``url`` is the payload's ``html_url`` as delivered, so it may be anything.
-        ``label`` is the one of :data:`DO_NOT_WORK_LABELS` the issue carries, so the
-        line names the spelling that held the brake.
         """
         logger.info(
             "event=do_not_work_skip %s",
@@ -1096,7 +1085,7 @@ class GithubRoute:
                 source=self.name,
                 issue=url if isinstance(url, str) and url else "<unknown>",
                 delivery=delivery or "<unknown>",
-                reason=f"{label} wins over {HANDOFF_LABEL}",
+                reason=f"{DO_NOT_WORK_LABEL} wins over {HANDOFF_LABEL}",
             ),
         )
         return self._ignore(event_type, delivery)
@@ -1386,34 +1375,17 @@ def _has_handoff_label(issue: dict[str, Any]) -> bool:
     return _has_label(issue, HANDOFF_LABEL)
 
 
-def _payload_do_not_work_label(issue: dict[str, Any]) -> str | None:
-    """Which of :data:`DO_NOT_WORK_LABELS` the issue currently carries, or ``None``.
+def _has_do_not_work_label(issue: dict[str, Any]) -> bool:
+    """Whether the issue currently carries the :data:`DO_NOT_WORK_LABEL` brake label.
 
     Read from the webhook payload's ``labels`` array — the router holds no
     GitHub credential by design, and the payload's issue object already carries
     the issue's *current* labels (post-label state for ``issues.labeled``,
     comment-time state for ``issue_comment``), so it is the authoritative,
-    self-contained source. Label names are case-sensitive on GitHub, so each
-    name matches only its exact casing.
+    self-contained source. Label names are case-sensitive on GitHub, so this
+    matches only the exact casing.
     """
-    labels = issue.get("labels")
-    if not isinstance(labels, list):
-        return None
-    return _do_not_work_label(
-        frozenset(
-            label["name"]
-            for label in labels
-            if isinstance(label, dict) and isinstance(label.get("name"), str)
-        )
-    )
-
-
-def _do_not_work_label(labels: frozenset[str]) -> str | None:
-    """Which of :data:`DO_NOT_WORK_LABELS` is among ``labels``, or ``None``.
-
-    The one brake match, read by the payload paths and the ledger alike. Exact match.
-    """
-    return next((name for name in DO_NOT_WORK_LABELS if name in labels), None)
+    return _has_label(issue, DO_NOT_WORK_LABEL)
 
 
 def _has_label(issue: dict[str, Any], name: str) -> bool:

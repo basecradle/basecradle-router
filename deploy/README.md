@@ -543,11 +543,10 @@ sends it, and nothing on the router's side can tell):
   repo the PR's title or body names (`#N`, `owner/name#N`, or the issue's URL) — never another, when it
   names any issue in its repo — or, when it names none, the repo's **only** open handoff issue. None, or several with none named, is an `event=merge_wake_skip` line with
   `reason=no_open_handoff`/`ambiguous_handoff` and no wake; a parked target is the do-not-work brake's
-  usual skip, an `event=do_not_work_skip` line naming the label that held it. While the label is renamed
-  fleet-wide (basecradle/basecradle#848) the brake holds under **either** name, `Do Not Work` or
-  `do-not-work`, each matched exactly as GitHub matches label names (case-sensitive); every brake path
-  reads the same pair, and an issue carrying both is reported under `Do Not Work`. A queued wake the
-  brake drops logs `reason=do_not_work` whichever name held it. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
+  usual skip, an `event=do_not_work_skip` line naming the label that held it. The brake is the label
+  `do-not-work` (a slug, basecradle/basecradle#848), matched exactly as GitHub matches label names
+  (case-sensitive), and every brake path reads that one name; the retired `Do Not Work` holds nothing. A queued wake the brake drops logs
+  `reason=do_not_work`. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
   number and URL (never its author-written text): `Wake reason: your pull request #N (<url>) merged;
   finish the issue.` A merge stamps the event with `merged_at`, so it coalesces like any delivery: a
   successful wake on the issue that started after the merge already covers it. The record is memory, so
@@ -616,8 +615,7 @@ the probe passes both untouched:
   issue *as GitHub's own deliveries report it* — `closed`, `reopened` and `unlabeled` included, which
   the App subscription always sent and the router used to ignore — ordered by the payload's `updated_at`
   so a late, older report never rolls it back. A queued wake for an issue that has since **closed**, lost
-  its **`handoff`** label, or gained the do-not-work brake (**`Do Not Work`** or **`do-not-work`**,
-  basecradle/basecradle#848) is dropped. Nothing is fetched: the router still
+  its **`handoff`** label, or gained the **`do-not-work`** brake is dropped. Nothing is fetched: the router still
   holds no GitHub credential. Reopening an issue wakes nothing by itself — re-engage it with a comment or
   by re-applying `handoff` once it is open.
 
