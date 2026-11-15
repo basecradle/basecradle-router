@@ -60,6 +60,7 @@ from basecradle_router.config import (
     load_config,
     route_secret_var,
 )
+from basecradle_router.logfmt import synthetic_origin
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RecipientKeyring
 from basecradle_router.routes.basecradle import (
     _ACTIONABLE_EVENTS,
@@ -74,6 +75,7 @@ from basecradle_router.routes.basecradle import (
     _slug_suffix,
 )
 from basecradle_router.secret import Secret
+from basecradle_router.synthetic import MARK_HEADER, SyntheticMarks
 
 SMOKE_TEST = Path(__file__).resolve().parents[1] / "deploy" / "smoke-test.sh"
 
@@ -595,16 +597,38 @@ def test_the_smoke_test_reads_the_variables_the_daemon_actually_uses() -> None:
 _SHELL_VAR = re.compile(r"\$\{(\w+)\}")
 
 
-def _basecradle_journal_patterns(key_path: str) -> list[str]:
+_SHOWN_SOURCE = re.compile(r"\$\(shown_source (\w+)\)")
+
+
+def _shown_source(route: str, *, marked: bool) -> str:
+    """What the EXACT shipped `shown_source` prints for ``route``, marking armed or not."""
+    script = _extract("shown_source") + 'shown_source "$1"\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", route],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "mark_secret": "fake-probe-secret" if marked else ""},
+        check=True,
+    )
+    return result.stdout
+
+
+def _basecradle_journal_patterns(key_path: str, *, marked: bool = False) -> list[str]:
     """The gate's basecradle journal regexes, with its own shell variables resolved."""
     text = SMOKE_TEST.read_text()
-    patterns = re.findall(r'"(event=[^"\n]*source=basecradle[^"\n]*)"', text)
+    patterns = re.findall(r'"(event=[^"\n]*\$\(shown_source basecradle\)[^"\n]*)"', text)
     values = {
         "BC_DELIVERY": _smoke_literal("BC_DELIVERY"),
         "BC_IGNORED_EVENT": _smoke_literal("BC_IGNORED_EVENT"),
         "bc_case_key_path": key_path,
     }
-    return [_SHELL_VAR.sub(lambda m: values[m.group(1)], pattern) for pattern in patterns]
+    return [
+        _SHOWN_SOURCE.sub(
+            lambda m: re.escape(_shown_source(m.group(1), marked=marked)),
+            _SHELL_VAR.sub(lambda m: values[m.group(1)], pattern),
+        )
+        for pattern in patterns
+    ]
 
 
 #: The route-wide secret the core would pass in; the fallback-path case signs with it.
@@ -623,8 +647,9 @@ ROUTE_WIDE_FALLBACK = Secret("bc_isk_fakeroutewidefallbackkey00000001")
         (KEY_PATH_FALLBACK, RecipientKeyring()),
     ],
 )
+@pytest.mark.parametrize("marked", [False, True], ids=["unmarked", "marked"])
 def test_the_gates_journal_patterns_match_what_the_route_really_renders(
-    key_path: str, keyring: RecipientKeyring, caplog: pytest.LogCaptureFixture
+    key_path: str, keyring: RecipientKeyring, marked: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Both basecradle assertions, run against the daemon's own bytes — no second renderer.
 
@@ -659,12 +684,17 @@ def test_the_gates_journal_patterns_match_what_the_route_really_renders(
     )
 
     route = BasecradleRoute(keyring)
-    with caplog.at_level(logging.INFO, logger="basecradle_router"):
+    # Marked, the lines are rendered as the daemon renders a request whose synthetic mark
+    # verified (#461), so the gate's `shown_source` is held to the daemon's renderer too.
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_router"),
+        synthetic_origin("probe" if marked else None),
+    ):
         route.verify(request, ROUTE_WIDE_FALLBACK)
         assert route.normalize(request) is None  # non-actionable => no wake, ever
 
     rendered = [record.getMessage() for record in caplog.records]
-    patterns = _basecradle_journal_patterns(key_path)
+    patterns = _basecradle_journal_patterns(key_path, marked=marked)
     assert len(patterns) == 2, f"expected the verify_key + decision patterns, got {patterns}"
     for pattern in patterns:
         assert any(re.search(pattern, line) for line in rendered), (pattern, rendered)
@@ -733,3 +763,31 @@ def test_a_signer_that_fails_returns_nonzero_and_no_digest(interpreter: str, tmp
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
     )
     assert (result.returncode, result.stdout) == (3, "refused\n")
+
+
+def test_the_gates_mark_is_one_the_daemon_honours_once_each(tmp_path: Path) -> None:
+    # The EXACT shipped mint_mark (#461), verified by the daemon's own SyntheticMarks: the
+    # header line curl reads from the file names the daemon's header, each run mints a
+    # fresh nonce, and each mark is honoured, once.
+    key = "probe-fake-000000000000000000000000000"
+    script = tmp_path / "mint.sh"
+    script.write_text(
+        f"set -euo pipefail\nsmoke_python={shlex.quote(sys.executable)}\n"
+        + _extract("synthetic_mark")
+        + 'mint_mark "$1"\n'
+    )
+    marks = SyntheticMarks(not_before=0)
+    seen = []
+    for n in range(3):
+        out = tmp_path / f"mark-{n}.header"
+        subprocess.run(
+            ["bash", str(script), str(out)],
+            check=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "mark_secret": key},
+        )
+        name, _, value = out.read_text().rstrip("\n").partition(": ")
+        assert name == MARK_HEADER
+        assert marks.verify(value, {"probe": Secret(key)}).source == "probe"
+        assert marks.verify(value, {"probe": Secret(key)}).refused == "replayed"
+        seen.append(value)
+    assert len(set(seen)) == 3

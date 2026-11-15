@@ -1416,7 +1416,8 @@ def test_ci_on_a_pr_the_route_never_saw_is_a_visible_skip(caplog) -> None:
         assert route.normalize(_run_request(_run_payload())) is None
     skip = next(r.getMessage() for r in caplog.records if "event=ci_wake_skip" in r.getMessage())
     assert skip == (
-        f"event=ci_wake_skip workflow_run={RUN_URL} delivery={DELIVERY} reason=unknown_pull_request"
+        f"event=ci_wake_skip workflow_run={RUN_URL} source=github delivery={DELIVERY} "
+        "reason=unknown_pull_request"
     )
 
 
@@ -1425,7 +1426,10 @@ def test_ci_on_the_captains_closed_pr_is_a_visible_skip(caplog) -> None:
     _open_pull(route, action="closed", state="closed", updated="2026-09-19T03:45:00Z")
     with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
         assert route.normalize(_run_request(_run_payload())) is None
-    assert f"workflow_run={RUN_URL} delivery={DELIVERY} reason=closed_pull_request" in caplog.text
+    assert (
+        f"workflow_run={RUN_URL} source=github delivery={DELIVERY} reason=closed_pull_request"
+        in caplog.text
+    )
 
 
 def test_a_pr_the_route_never_saw_beside_the_captains_is_never_guessed_past(caplog) -> None:
@@ -1462,7 +1466,10 @@ def test_ci_with_no_open_handoff_is_a_visible_skip(caplog) -> None:
     _open_pull(route)
     with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
         assert route.normalize(_run_request(_run_payload())) is None
-    assert f"workflow_run={RUN_URL} delivery={DELIVERY} reason=no_open_handoff" in caplog.text
+    assert (
+        f"workflow_run={RUN_URL} source=github delivery={DELIVERY} reason=no_open_handoff"
+        in caplog.text
+    )
 
 
 def test_ci_wakes_on_the_issue_the_pr_names_among_two_open_handoffs() -> None:

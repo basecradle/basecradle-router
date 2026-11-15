@@ -65,6 +65,7 @@ not have; without the second, anyone who drains and then reads gets a torn view.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 from collections import deque
@@ -108,6 +109,10 @@ class _Job:
     agent: Agent
     event: Event
     result: PipelineResult
+    #: The submitting request's context, which the wake runs in, so every line the wake
+    #: writes reads as the request's lines do: a request whose synthetic mark verified
+    #: (#461) stays ``source=<synthetic>`` on the thread that runs its wake.
+    context: contextvars.Context
 
 
 class WakeScheduler:
@@ -206,7 +211,8 @@ class WakeScheduler:
         """
         key = agent.harness_key
         with self._cv:
-            self._queues.setdefault(key, deque()).append(_Job(agent, event, result))
+            job = _Job(agent, event, result, contextvars.copy_context())
+            self._queues.setdefault(key, deque()).append(job)
             # Newly schedulable iff it has work, is not already running, and is not
             # already queued to run — otherwise it is left where it is (FIFO order and
             # the single-in-flight rule both preserved).
@@ -249,11 +255,13 @@ class WakeScheduler:
         lane, re-queues the agent if it has more work, and re-pumps.
         """
         try:
-            self._run(job.agent, job.event, job.result)
+            job.context.run(self._run, job.agent, job.event, job.result)
         except Exception:  # noqa: BLE001 — pipeline.execute never raises; guard a defect
             logger.exception(
                 "wake run raised for %s (lane freed regardless)",
-                log_fields(agent=key, delivery=job.event.delivery_id, source=job.event.source),
+                job.context.run(
+                    log_fields, agent=key, delivery=job.event.delivery_id, source=job.event.source
+                ),
             )
         finally:
             with self._cv:

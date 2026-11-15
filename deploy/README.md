@@ -304,6 +304,29 @@ wake`, fired on the NOC's schedule — a cadence that repo owns); every other va
 delivery a source outside the fleet actually sent. There is no absence: a pipeline line carrying no
 `source=` is a defect.
 
+**A request carrying a verified synthetic mark reads `source=probe via=<route>`** (#461). The deploy
+smoke test exists to prove the *real* routes' boundaries, so its requests must go through the github and
+basecradle routes' own verify path, and most are built to be rejected. Each carries
+`X-BaseCradle-Synthetic: BCSYN1 <unix-seconds> <nonce> <hmac>`, an HMAC over `BCSYN1 <unix-seconds>
+<nonce>` under a key derived from the secret of a registered **synthetic** route (`Route.synthetic`; today
+the probe route's `BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET`), so a mark is never a valid probe signature. The
+daemon verifies it itself
+(`src/basecradle_router/synthetic.py`). When it verifies, every `source=<route>` the daemon writes for
+that request, from any layer and on the wake's own thread, renders `source=probe via=<route>`. So the one
+filter hides it, the NOC's `source` column (the first `source=`) reads `probe`, and `via=` keeps the route
+it exercised readable. Its access line is dropped, as a probe's is.
+
+- **It changes what is logged, never how the request is judged.** Status, stages, evidence and wake are
+  identical with and without a mark.
+- **Only the fleet can make one, and each works once.** A mark is honoured once, within 120 s of the daemon's
+  clock, and only if it was stamped after the daemon started. The edge's access log carries request headers,
+  so every mark reaches the journal, but only after its request has spent it. A restart forgets which nonces
+  were spent, so a mark stamped before the restart is refused. A mark that
+  does not verify (`forged`, `stale`, `replayed`, `malformed`, or `unarmed` on a box with no synthetic
+  route) leaves the request logged in full, after one `WARNING event=synthetic_mark_refused source=<the
+  request's source> reason=<why>` line. Nothing depends on the edge stripping the header, so no caller on
+  the internet can hide a request by claiming to be a test.
+
 **Why it exists.** The router's probe traverses the real path on purpose, so a probe wake lands on the
 same `stage=wake` line a real handoff does — and that line is what a log-metric extractor lifts
 `wake_duration_s` (and every wake-rate counter) from. Extraction lifts only *low-cardinality* labels, so
@@ -373,6 +396,8 @@ and the probe now mints a bare `<32-hex>` rather than `probe-<32-hex>`.
 **`GET /up` is not logged.** Better Stack's uptime monitor probes it about once a minute, forever; those
 access lines were the largest single source of volume in the journal and in Live Tail, and pure noise. A
 filter on uvicorn's access logger drops exactly that path (`/upload` still logs).
+
+**Nor is a request carrying a verified synthetic mark** (#461, above), for the same reason.
 
 **Nor is a `POST` to a synthetic route's webhook** (`/webhooks/probe`, #459). uvicorn's access line has a
 fixed shape that cannot carry `source=probe`, so it was the one synthetic line a `source=probe` filter
@@ -1722,6 +1747,17 @@ other `header` line by line number rather than guessing. Each header is
 one `PASS`/`FAIL` line per protocol, and the HTTP/2 run fails if the answer came back over anything but
 HTTP/2. Asserted unconditionally, like cases 7 and 9. `tests/test_edge_headers.py` runs the shipped bodies
 offline against every host's Caddyfile and a fake `curl`.
+
+**Every request to the daemon carries a synthetic mark** wherever the daemon enables the probe route
+and holds its secret (#461; *`source=<route>`* above has the scheme). A deploy used to leave a burst of
+red rejections in the operator's view, every one the fleet testing itself. Now each reads `source=probe
+via=<route>`, and the journal assertions above expect that spelling (`shown_source`). Where the probe route
+is not served, nothing is marked, every line is logged in full, and the assertions expect that instead. The
+run says which (`synthetic mark: armed` / `not armed`). The statuses asserted are the same either way.
+Neither the mark nor any key rides a command line. A key reaches `python3 -I` through its environment
+(`hmac_sha256`, `mint_mark`), which `/proc/<pid>/environ` shows to root alone, and a mark reaches curl from
+a file in the run's `0700` `mktemp -d` (`-H @file`). `tests/test_smoke_test_enabled_routes.py` records the
+argv of every command the gate runs and fails on a key or a mark found there.
 
 Case 3 targets a repo that is never in the registry, so it exercises the whole accept path past the gate
 **without waking any real agent** — safe to run against production at any time. It reads the signing secrets,
