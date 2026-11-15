@@ -531,8 +531,12 @@ sends it, and nothing on the router's side can tell):
   found in the route's record of handoff issues (the recheck ledger below): the open handoff issue in that
   repo the PR's title or body names (`#N`, `owner/name#N`, or the issue's URL) — never another, when it
   names any issue in its repo — or, when it names none, the repo's **only** open handoff issue. None, or several with none named, is an `event=merge_wake_skip` line with
-  `reason=no_open_handoff`/`ambiguous_handoff` and no wake; a target under `Do Not Work` is the brake's
-  usual skip. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
+  `reason=no_open_handoff`/`ambiguous_handoff` and no wake; a parked target is the do-not-work brake's
+  usual skip, an `event=do_not_work_skip` line naming the label that held it. While the label is renamed
+  fleet-wide (basecradle/basecradle#848) the brake holds under **either** name, `Do Not Work` or
+  `do-not-work`, each matched exactly as GitHub matches label names (case-sensitive); every brake path
+  reads the same pair, and an issue carrying both is reported under `Do Not Work`. A queued wake the
+  brake drops logs `reason=do_not_work` whichever name held it. The trigger is the issues path's, verbatim, followed by one line naming the merged PR by
   number and URL (never its author-written text): `Wake reason: your pull request #N (<url>) merged;
   finish the issue.` A merge stamps the event with `merged_at`, so it coalesces like any delivery: a
   successful wake on the issue that started after the merge already covers it. The record is memory, so
@@ -556,7 +560,7 @@ sends it, and nothing on the router's side can tell):
   never merge (basecradle-python#286 sat with red CI and no one awake). It passes the same gates as the merge:
   a PR **authored by the repo's captain bot**, an open handoff issue in the same repo found the same way
   (the one the PR names, else the repo's only one; otherwise `event=ci_wake_skip
-  workflow_run=<run url> … reason=no_open_handoff`/`ambiguous_handoff`), the `Do Not Work` brake, and an
+  workflow_run=<run url> … reason=no_open_handoff`/`ambiguous_handoff`), the do-not-work brake, and an
   actor that is that captain bot or a trusted actor. The actor is the run's own **`triggering_actor`**
   (who pushed the commit, or re-ran the run), never the delivery's `sender`, because GitHub documents no
   mapping from a run to its `sender`. A run lists its PRs by number only, with no author, title or body,
@@ -601,7 +605,8 @@ the probe passes both untouched:
   issue *as GitHub's own deliveries report it* — `closed`, `reopened` and `unlabeled` included, which
   the App subscription always sent and the router used to ignore — ordered by the payload's `updated_at`
   so a late, older report never rolls it back. A queued wake for an issue that has since **closed**, lost
-  its **`handoff`** label, or gained **`Do Not Work`** is dropped. Nothing is fetched: the router still
+  its **`handoff`** label, or gained the do-not-work brake (**`Do Not Work`** or **`do-not-work`**,
+  basecradle/basecradle#848) is dropped. Nothing is fetched: the router still
   holds no GitHub credential. Reopening an issue wakes nothing by itself — re-engage it with a comment or
   by re-applying `handoff` once it is open.
 

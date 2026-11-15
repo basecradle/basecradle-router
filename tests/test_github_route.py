@@ -26,6 +26,7 @@ from basecradle_router.routes import (
 )
 from basecradle_router.routes.github import (
     DELIVERY_HEADER,
+    DO_NOT_WORK_LABELS,
     EVENT_HEADER,
     SIGNATURE_HEADER,
     IssueLedger,
@@ -366,66 +367,85 @@ def test_normalize_checks_sender_only_for_handoffs() -> None:
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
-# --- the `Do Not Work` brake (defense-in-depth, #146) ----------------------
+# --- the do-not-work brake (defense-in-depth, #146) ------------------------
 #
-# `Do Not Work` is the fleet-wide do-not-pick-this-up signal and wins over
+# The do-not-work label is the fleet-wide do-not-pick-this-up signal and wins over
 # `handoff`: a parked issue must never wake an agent, even with a stale handoff
 # label. The skip is observable (logged with the issue URL), never silent.
+#
+# The label is being renamed `Do Not Work` → `do-not-work` (basecradle/basecradle#848),
+# and the brake must hold under either name throughout, so every brake path is pinned
+# under both. The parametrized cases write the names out rather than reading the route's
+# list, so a change to that list cannot quietly change what they demand; only the
+# inventory pin below reads it, to hold the list to exactly these two.
 
-DO_NOT_WORK = "Do Not Work"
+OLD_DO_NOT_WORK = "Do Not Work"
+NEW_DO_NOT_WORK = "do-not-work"
+DO_NOT_WORK_SPELLINGS = pytest.mark.parametrize(
+    "brake", [OLD_DO_NOT_WORK, NEW_DO_NOT_WORK], ids=["old-spelling", "new-spelling"]
+)
 
 
-def test_normalize_opened_skips_a_do_not_work_handoff() -> None:
-    # Both `handoff` and `Do Not Work` present on an opened issue → no wake.
-    payload = _issues_payload(action="opened", labels=("handoff", DO_NOT_WORK))
+def test_the_brake_accepts_exactly_the_old_and_the_new_spelling() -> None:
+    assert set(DO_NOT_WORK_LABELS) == {OLD_DO_NOT_WORK, NEW_DO_NOT_WORK}
+
+
+@DO_NOT_WORK_SPELLINGS
+def test_normalize_opened_skips_a_do_not_work_handoff(brake: str) -> None:
+    # Both `handoff` and the brake present on an opened issue → no wake.
+    payload = _issues_payload(action="opened", labels=("handoff", brake))
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
-def test_normalize_labeled_handoff_skips_when_do_not_work_present() -> None:
-    # The `handoff` label is the one just added, but `Do Not Work` already sits on
+@DO_NOT_WORK_SPELLINGS
+def test_normalize_labeled_handoff_skips_when_do_not_work_present(brake: str) -> None:
+    # The `handoff` label is the one just added, but the brake already sits on
     # the issue — applying handoff to a parked issue still wakes no one.
-    payload = _issues_payload(
-        action="labeled", labels=("handoff", DO_NOT_WORK), added_label="handoff"
-    )
+    payload = _issues_payload(action="labeled", labels=("handoff", brake), added_label="handoff")
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
-def test_normalize_do_not_work_skip_beats_an_untrusted_sender() -> None:
+@DO_NOT_WORK_SPELLINGS
+def test_normalize_do_not_work_skip_beats_an_untrusted_sender(brake: str) -> None:
     # The brake is checked before the trust gate, so a parked issue is a clean
     # *skip* (ignore), not a sender rejection — no exception is raised.
-    payload = _issues_payload(
-        action="labeled", labels=("handoff", DO_NOT_WORK), sender=UNTRUSTED_ACTOR
-    )
+    payload = _issues_payload(action="labeled", labels=("handoff", brake), sender=UNTRUSTED_ACTOR)
     assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
 
 
 def test_normalize_wakes_once_do_not_work_is_removed() -> None:
-    # Removing `Do Not Work` (the payload no longer carries it) re-enables the wake.
+    # An issue carrying neither spelling (the brake removed) is woken.
     payload = _issues_payload(action="opened", labels=("handoff",))
     event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
     assert event is not None
     assert event.kind is EventKind.HANDOFF
 
 
-def test_normalize_do_not_work_label_is_case_sensitive() -> None:
-    # GitHub label names are case-sensitive; only the exact canonical casing is the
-    # brake, so a differently-cased lookalike does not suppress a real handoff.
-    payload = _issues_payload(action="opened", labels=("handoff", "do not work"))
+@pytest.mark.parametrize(
+    "lookalike", ["do not work", "DO NOT WORK", "Do-Not-Work", "DO-NOT-WORK", "do_not_work"]
+)
+def test_normalize_do_not_work_label_is_case_sensitive(lookalike: str) -> None:
+    # GitHub label names are case-sensitive; only the two exact names are the brake,
+    # so a differently-cased or differently-joined lookalike does not suppress a real
+    # handoff — the match is exact, never folded or fuzzy.
+    payload = _issues_payload(action="opened", labels=("handoff", lookalike))
     event = GithubRoute(TRUSTED).normalize(_issues_request(payload))
     assert event is not None
     assert event.kind is EventKind.HANDOFF
 
 
-def test_normalize_logs_the_do_not_work_skip_with_the_issue_url(caplog) -> None:
-    # The skip is observable: a line names the parked issue's URL and the reason,
-    # and the structured decision is the visible IGNORED (never a silent drop).
-    payload = _issues_payload(action="opened", labels=("handoff", DO_NOT_WORK))
+@DO_NOT_WORK_SPELLINGS
+def test_normalize_logs_the_do_not_work_skip_with_the_issue_url(brake: str, caplog) -> None:
+    # The skip is observable: a line names the parked issue's URL and the reason —
+    # the spelling that held the brake — and the structured decision is the visible
+    # IGNORED (never a silent drop).
+    payload = _issues_payload(action="opened", labels=("handoff", brake))
     with caplog.at_level("INFO", logger="basecradle_router.routes"):
         assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
     messages = [r.getMessage() for r in caplog.records]
     skip_line = next(m for m in messages if "event=do_not_work_skip" in m)
     assert f"issue={ISSUE_URL}" in skip_line
-    assert DO_NOT_WORK in skip_line
+    assert f"{brake} wins over handoff" in skip_line
     assert f"delivery={DELIVERY}" in skip_line
     decision_line = next(m for m in messages if "event=delivery_decision" in m)
     assert f"decision={DeliveryDecision.IGNORED.value}" in decision_line
@@ -555,10 +575,20 @@ def test_normalize_ignores_a_comment_on_a_non_handoff_issue() -> None:
     assert _comment_route().normalize(_comment_request(payload)) is None
 
 
-def test_normalize_comment_skips_when_do_not_work_present() -> None:
+def test_an_issue_carrying_both_spellings_is_braked_and_reported_under_the_old(caplog) -> None:
+    # Mid-rename an issue can carry both labels: it is braked, and the line names the
+    # first of the route's pair, as deploy/README.md documents.
+    payload = _issues_payload(action="opened", labels=("handoff", NEW_DO_NOT_WORK, OLD_DO_NOT_WORK))
+    with caplog.at_level("INFO", logger="basecradle_router.routes"):
+        assert GithubRoute(TRUSTED).normalize(_issues_request(payload)) is None
+    assert f"{OLD_DO_NOT_WORK} wins over handoff" in caplog.text
+
+
+@DO_NOT_WORK_SPELLINGS
+def test_normalize_comment_skips_when_do_not_work_present(brake: str) -> None:
     # The brake applies to the re-wake path too: a reply on a parked handoff issue
-    # wakes no one while `Do Not Work` remains — even from a trusted peer.
-    payload = _comment_payload(labels=("handoff", DO_NOT_WORK), sender=PEER_BOT)
+    # wakes no one while the brake remains — even from a trusted peer.
+    payload = _comment_payload(labels=("handoff", brake), sender=PEER_BOT)
     assert _comment_route().normalize(_comment_request(payload)) is None
 
 
@@ -745,12 +775,11 @@ def test_recheck_drops_a_wake_once_handoff_is_removed() -> None:
     assert route.recheck(event) == "handoff_removed"
 
 
-def test_recheck_drops_a_wake_once_do_not_work_goes_on() -> None:
+@DO_NOT_WORK_SPELLINGS
+def test_recheck_drops_a_wake_once_do_not_work_goes_on(brake: str) -> None:
     route = GithubRoute(TRUSTED)
     event = _handoff_event(route)
-    payload = _issues_payload(
-        action="labeled", labels=("handoff", "Do Not Work"), added_label="Do Not Work"
-    )
+    payload = _issues_payload(action="labeled", labels=("handoff", brake), added_label=brake)
     payload["issue"].update({"state": "open", "updated_at": "2026-09-19T03:26:07Z"})
     assert route.normalize(_issues_request(payload)) is None  # the brake's own skip
     assert route.recheck(event) == "do_not_work"
@@ -1092,13 +1121,16 @@ def test_a_handoff_in_another_repo_is_not_a_merge_target() -> None:
     assert route.normalize(_merge_request(payload)) is None
 
 
-def test_a_parked_handoff_takes_the_do_not_work_brake(caplog) -> None:
+@DO_NOT_WORK_SPELLINGS
+def test_a_parked_handoff_takes_the_do_not_work_brake(brake: str, caplog) -> None:
     route = _comment_route()
-    _open_handoff(route, labels=("handoff", "Do Not Work"))
+    _open_handoff(route, labels=("handoff", brake))
     with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
         assert route.normalize(_merge_request(_merge_payload())) is None
     assert any(
-        "event=do_not_work_skip" in r.getMessage() and ISSUE_URL in r.getMessage()
+        "event=do_not_work_skip" in r.getMessage()
+        and ISSUE_URL in r.getMessage()
+        and f"{brake} wins over handoff" in r.getMessage()
         for r in caplog.records
     )
 
@@ -1523,13 +1555,15 @@ def test_a_run_on_the_captains_pr_and_another_wakes_on_the_captains() -> None:
     assert f"pull request #{PR_NUMBER} " in event.wake_arg
 
 
-def test_a_parked_handoff_takes_the_do_not_work_brake_on_ci(caplog) -> None:
+@DO_NOT_WORK_SPELLINGS
+def test_a_parked_handoff_takes_the_do_not_work_brake_on_ci(brake: str, caplog) -> None:
     route = _comment_route()
-    _open_handoff(route, labels=("handoff", "Do Not Work"))
+    _open_handoff(route, labels=("handoff", brake))
     _open_pull(route)
     with caplog.at_level("INFO", logger="basecradle_router.routes.github"):
         assert route.normalize(_run_request(_run_payload())) is None
     assert "event=do_not_work_skip" in caplog.text and ISSUE_URL in caplog.text
+    assert f"{brake} wins over handoff" in caplog.text
 
 
 def test_the_captains_own_push_wakes_it_though_its_bot_is_not_trusted() -> None:
