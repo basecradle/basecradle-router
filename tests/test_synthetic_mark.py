@@ -11,8 +11,9 @@ each against the real ASGI app and pipeline, reading every record any logger emi
    and in a wake that runs on the scheduler's thread, and its access line is dropped.
 2. **A forged, stale, replayed, malformed or missing mark is logged in full**, with one
    ``event=synthetic_mark_refused`` line naming why, and its access line kept.
-3. **A mark never changes how a request is judged**: the status, the stages and the
-   evidence are identical with and without one.
+3. **A mark never changes how a request is judged**: the status, the stages, the wake and
+   its evidence are identical with and without one. Only a real route's delivery sink
+   differs, on purpose (#464, ``tests/test_smoke_sink_evidence.py``).
 4. **A box with no synthetic route honours no mark**, so the mark is only ever the fleet's.
 
 No network, no model, no live agent. Fabricated cast: John Doe (``john``) is the trusted
@@ -499,8 +500,15 @@ def test_a_mark_never_changes_how_a_request_is_judged(
     assert marked[0] == plain[0] == SCENARIOS[name][1]
     # The stage verdicts, in order, are the same...
     assert _verdicts(marked[1]) == _verdicts(plain[1])
-    # ...and so is everything the router recorded as evidence.
-    assert _evidence(marked[2]) == _evidence(plain[2])
+    # ...and so is everything the router recorded as evidence, but for the one difference
+    # #464 made on purpose: a real route's delivery sink never counts the fleet's own
+    # traffic (tests/test_smoke_sink_evidence.py). A synthetic route's sink still does.
+    synthetic = marked[2].synthetic_sources()
+    expected = _evidence(plain[2])
+    expected["delivery_sinks"] = {
+        route: sink for route, sink in expected["delivery_sinks"].items() if route in synthetic
+    }
+    assert _evidence(marked[2]) == expected
     assert len(marked[2].pipeline.waker.woken) == len(plain[2].pipeline.waker.woken)
 
 

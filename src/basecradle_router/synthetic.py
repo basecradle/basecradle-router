@@ -8,10 +8,15 @@ Most of them are built to be rejected. Without a mark, every deploy left a burst
 ``stage=verify outcome=rejected source=github`` lines in the operator's view, each one
 the fleet testing itself and indistinguishable from an attack (#461).
 
-**A mark changes what is logged about a request, never how it is judged.** A request
+**A mark changes what is logged about a request, and keeps it off a real route's delivery
+sink, never how it is judged.** A request
 carrying a mark that verifies is routed, verified, normalized, resolved and woken
-exactly as it would be without one. Its response is the same and so is its evidence.
-What changes is how its lines read: each ``source=<route>`` the daemon writes for it
+exactly as it would be without one, and its response is the same. Two things change.
+The first is what a real route's delivery sink records: nothing (#464). A sink's
+``accepted`` is evidence that the *source's* secret matches this box's, and the fleet's
+own traffic is signed from this box's own ``router.env``, so it is evidence about no
+one (:meth:`~basecradle_router.pipeline.Pipeline._counts_on_sink`). The second is how
+its lines read: each ``source=<route>`` the daemon writes for it
 reads ``source=<synthetic> via=<route>``. ``<synthetic>`` is the synthetic route whose
 secret verified the mark, so the fleet's one filter (``source=probe`` hidden) hides it.
 Its access line is dropped, as a probe's is. A ``via=`` key keeps the route it
