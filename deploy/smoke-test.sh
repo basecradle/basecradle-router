@@ -484,6 +484,14 @@ if [[ "$github_enabled" == "true" ]]; then
 	[[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
 fi
 
+# The interpreter every key is handed to, found once on the box's trusted PATH (wake-runner's,
+# for the same reason) rather than on whatever PATH this root-run gate inherited: a python3
+# earlier on that PATH would receive every route secret. Overridable like ROUTER_ENV_FILE,
+# by the same caller, for the offline tests. python3 is a box dependency (wake-runner's
+# probe mode requires it too), so its absence is a death even on a run that signs nothing.
+SMOKE_TRUSTED_PATH="${SMOKE_TRUSTED_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+smoke_python="$(PATH="$SMOKE_TRUSTED_PATH" command -v python3)" ||
+	die "python3 not found on $SMOKE_TRUSTED_PATH; it signs the smoke deliveries"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
@@ -502,7 +510,31 @@ payload() {
 	JSON
 }
 
-sign() { openssl dgst -sha256 -hmac "$secret" "$1" | awk '{print $NF}'; }
+# HMAC-SHA256 of the body file $1 under the key $2, as lowercase hex, with the key on no
+# command line. A program's argv is readable by every account on the box (`ps`,
+# /proc/<pid>/cmdline) for as long as it runs, and `openssl dgst -hmac <key>` takes the key
+# there: this gate signed with every route secret that way on every deploy (#461). The key
+# rides python3's ENVIRONMENT instead, which /proc/<pid>/environ shows to the process's own
+# account and to root alone. Only the body's path and the program text are argv. python3 is
+# $smoke_python, found on the trusted PATH above; -I keeps the environment and the working
+# directory from steering which code it imports. The digest is checked before it is used:
+# a signer that failed or printed anything else returns non-zero, so a delivery is never
+# sent with an empty signature, which a case expecting 401 would read as a pass. Every
+# signature is therefore taken in a plain assignment, where `set -e` sees that status.
+# The markers let tests/test_smoke_test_assertions.py run this EXACT body offline.
+# >>> hmac_sha256 >>>
+HMAC_SHA256_PY='import hashlib, hmac, os, sys
+with open(sys.argv[1], "rb") as body:
+    print(hmac.new(os.environb[b"SMOKE_HMAC_KEY"], body.read(), hashlib.sha256).hexdigest())'
+hmac_sha256() {
+	local digest
+	digest="$(SMOKE_HMAC_KEY="$2" "$smoke_python" -I -c "$HMAC_SHA256_PY" "$1")" || return 1
+	[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$digest"
+}
+# <<< hmac_sha256 <<<
+
+sign() { hmac_sha256 "$1" "$secret"; }
 
 # POST a body file with a given signature header, to $SMOKE_URL unless a third argument
 # names another URL; echo the HTTP status code.
@@ -593,12 +625,14 @@ if [[ "$github_enabled" == "true" ]]; then
 
 	# Case 2 — valid signature, UNTRUSTED sender. The #52 gate must reject (no wake).
 	payload "$UNTRUSTED_LOGIN" "$UNREGISTERED_REPO" >"$workdir/c2.json"
-	check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$(sign "$workdir/c2.json")")"
+	sig="$(sign "$workdir/c2.json")" || die "could not sign case 2"
+	check "untrusted sender rejected (#52 gate)" 400 "$(post "$workdir/c2.json" "$sig")"
 
 	# Case 3 — valid signature, TRUSTED sender, unregistered repo. Gate admits it;
 	# resolve finds no agent, so it is accepted-and-logged with NO wake.
 	payload "$trusted_login" "$UNREGISTERED_REPO" >"$workdir/c3.json"
-	check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$(sign "$workdir/c3.json")")"
+	sig="$(sign "$workdir/c3.json")" || die "could not sign case 3"
+	check "trusted sender admitted, no agent => no wake" 200 "$(post "$workdir/c3.json" "$sig")"
 
 	# Case 3 also drove a verified handoff through normalize, which logs a WOKE
 	# decision line (recipient = the unregistered repo) before resolve drops it. Assert
@@ -705,7 +739,7 @@ bc_payload() {
 
 # Sign a body with an EXPLICIT key — the whole point of the per-recipient keyring is that
 # there is no longer one route secret, so the key is an argument and never an ambient.
-bc_sign() { openssl dgst -sha256 -hmac "$2" "$1" | awk '{print $NF}'; }
+bc_sign() { hmac_sha256 "$1" "$2"; }
 
 bc_post() {
 	local body_file=$1 signature=$2 delivery=$3
@@ -840,8 +874,9 @@ else
 
 			# Case 5 — the same body, correctly signed. Verify admits it; the event is not in
 			# the actionable set, so normalize records a deliberate ignore and NOTHING wakes.
+			sig="$(bc_sign "$workdir/bc.json" "$bc_case_secret")" || die "could not sign case 5"
 			check "basecradle valid sig, non-actionable event => no wake" 200 \
-				"$(bc_post "$workdir/bc.json" "$(bc_sign "$workdir/bc.json" "$bc_case_secret")" "$BC_DELIVERY")"
+				"$(bc_post "$workdir/bc.json" "$sig" "$BC_DELIVERY")"
 
 			# ...and it verified under the key we expected it to. This is the live proof that
 			# the per-recipient keyring is in force on the box: the status code alone cannot
@@ -867,12 +902,15 @@ else
 			# to refuse. The route probe above already sent this exact unregistered
 			# recipient and asserted the 401, so a second send would prove nothing new.
 			log "basecradle shared fallback: retired and $BC_SECRET_VAR is not set — nothing to refuse; the route probe already asserted an unknown recipient is rejected"
-		elif [[ "$bc_fallback" == "true" ]]; then
-			check "basecradle shared fallback armed, unknown recipient => no wake" 200 \
-				"$(bc_post "$workdir/bc-unregistered.json" "$(bc_sign "$workdir/bc-unregistered.json" "$bc_secret")" "$BC_FALLBACK_DELIVERY")"
 		else
-			check "basecradle retired shared fallback refuses an unknown recipient" 401 \
-				"$(bc_post "$workdir/bc-unregistered.json" "$(bc_sign "$workdir/bc-unregistered.json" "$bc_secret")" "$BC_FALLBACK_DELIVERY")"
+			sig="$(bc_sign "$workdir/bc-unregistered.json" "$bc_secret")" || die "could not sign case 6"
+			if [[ "$bc_fallback" == "true" ]]; then
+				check "basecradle shared fallback armed, unknown recipient => no wake" 200 \
+					"$(bc_post "$workdir/bc-unregistered.json" "$sig" "$BC_FALLBACK_DELIVERY")"
+			else
+				check "basecradle retired shared fallback refuses an unknown recipient" 401 \
+					"$(bc_post "$workdir/bc-unregistered.json" "$sig" "$BC_FALLBACK_DELIVERY")"
+			fi
 		fi
 	fi
 fi

@@ -406,7 +406,7 @@ def test_scanner_allows_full_reading_consumers(tmp_path: Path) -> None:
     """`awk '{print $NF}'`, `cut`, `tr`, `sort` read to EOF — they are safe downstream."""
     assert not _scan_text(
         "set -euo pipefail\n"
-        'sig="$(openssl dgst -sha256 -hmac "$secret" "$1" | awk \'{print $NF}\')"\n'
+        'sum="$(sha256sum "$1" | awk \'{print $1}\')"\n'
         "n=\"$(printf '%s' \"$x\" | tr ',' '\\n' | sort | wc -l)\"\n",
         tmp_path,
     )

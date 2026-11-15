@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -44,8 +45,8 @@ SMOKE_TEST = DEPLOY / "smoke-test.sh"
 HOST = "ubuntu-1.landfill.click"
 
 pytestmark = pytest.mark.skipif(
-    any(shutil.which(tool) is None for tool in ("bash", "openssl", "jq")),
-    reason="bash, openssl and jq are required to run the shipped smoke test",
+    any(shutil.which(tool) is None for tool in ("bash", "jq")),
+    reason="bash and jq are required to run the shipped smoke test",
 )
 
 NOVA_UUID = "01980a3c-6f2e-7c41-9d3a-5b8e2f1c4a07"
@@ -204,6 +205,7 @@ def _run(
         text=True,
         env={
             "PATH": f"{bindir}:/usr/bin:/bin",
+            "SMOKE_TRUSTED_PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),

@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -42,8 +43,8 @@ AI = "ai.basecradle.com"
 LOOPBACK = "http://127.0.0.1:8000/webhooks/probe"
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("openssl") is None,
-    reason="bash and openssl are required to run the shipped smoke test",
+    shutil.which("bash") is None,
+    reason="bash is required to run the shipped smoke test",
 )
 
 #: Every route's secret set, so every public URL the gate can send to is exercised.
@@ -92,6 +93,7 @@ def _run_smoke(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess[
         text=True,
         env={
             "PATH": f"{bindir}:/usr/bin:/bin",
+            "SMOKE_TRUSTED_PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),
