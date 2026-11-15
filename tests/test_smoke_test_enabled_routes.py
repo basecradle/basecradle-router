@@ -24,8 +24,6 @@ AI). Secrets are correctly-shaped fakes; the uuid is a well-formed UUIDv7.
 from __future__ import annotations
 
 import json
-import os
-import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from argv_recorder import ArgvRecorder, leaks_in, recorded
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX, SHARED_FALLBACK_VAR
 from caddy_edge import edge_headers
 
@@ -134,6 +133,8 @@ def _run(
     env_lines: list[str],
     github_served: bool,
     journal_lines: list[str] | None = None,
+    script: Path = SMOKE_TEST,
+    recorder: ArgvRecorder | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[tuple[str, str, str]]]:
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps(REGISTRY))
@@ -158,8 +159,7 @@ def _run(
         journal_lines = (GITHUB_JOURNAL if github_served else []) + BASECRADLE_JOURNAL
     journal.write_text("\n".join(journal_lines))
     (tmp_path / "marks.log").touch()
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
+    recorder = recorder or ArgvRecorder(tmp_path)
     fakes = {
         "curl": FAKE_CURL.replace('"ZERO"', f'"{ZERO_SIG}"')
         .replace('"CASE6"', f'"{CASE_6_DELIVERY}"')
@@ -180,36 +180,25 @@ def _run(
         "sleep": "exit 0\n",
     }
     # Every system program the script names, the signer's python3 and openssl included, is
-    # the real one behind a recording shim, so a signer that went back to openssl still
-    # signs and is caught by what it put on its command line, and so is any key handed to
-    # jq, awk or grep. Every shim records its own argv first, so
-    # test_no_secret_is_ever_on_a_command_line reads every command line the gate produced.
-    # python3 is the interpreter running this test, the gate's trusted PATH is bindir, and
-    # nothing a shim execs is looked up again.
+    # the real one behind a recording shim (tests/argv_recorder.py), so a signer that went
+    # back to openssl still signs and is caught by what it put on its command line, and so
+    # is any key handed to jq, awk or grep. tests/test_no_secret_on_a_command_line.py reads
+    # every command line the gate produced. python3 is the interpreter running this test,
+    # the gate's trusted PATH is the recorder's, and nothing a shim execs is looked up again.
     fakes["python3"] = f'exec "{sys.executable}" "$@"\n'
-    # Exact names only: on a case-insensitive filesystem `Bash` from a comment would find
-    # /bin/bash and its shim would shadow the shell every shim runs under.
-    system = {name: f"{d}/{name}" for d in ("/bin", "/usr/bin") for name in os.listdir(d)}
-    for word in sorted(set(re.findall(r"[a-z][a-z0-9_.-]*", SMOKE_TEST.read_text()))):
-        if word in system and word not in fakes and word not in ("bash", "sh", "env"):
-            fakes[word] = f'exec "{system[word]}" "$@"\n'
-    if "openssl" not in fakes:
-        fakes["openssl"] = "exit 127\n"
-    argv_log = tmp_path / "argv.log"
-    argv_log.touch()
-    # Pure bash: a shim that ran a program to record itself would run that program's shim.
-    record = f'printf "%s\\n" "${{0##*/}} $*" >>"{argv_log}"\n'
     for name, body in fakes.items():
-        fake = bindir / name
-        fake.write_text("#!/usr/bin/env bash\n" + record + body)
-        fake.chmod(0o755)
+        recorder.fake(name, body)
+    recorder.passthrough(script.read_text())
+    if not recorder.has("openssl"):
+        recorder.fake("openssl", "exit 127\n")  # recorded even where no openssl is installed
+    bindir = recorder.install()
     result = subprocess.run(
-        ["bash", str(SMOKE_TEST), HOST],
+        ["bash", str(script), HOST],
         capture_output=True,
         text=True,
         env={
             "PATH": f"{bindir}:/usr/bin:/bin",
-            "SMOKE_TRUSTED_PATH": str(bindir),
+            "SMOKE_TRUSTED_PATH": bindir,
             "HOME": str(tmp_path),
             "TMPDIR": str(tmp_path),
             "ROUTER_ENV_FILE": str(env_file),
@@ -322,27 +311,6 @@ def test_an_enabled_routes_list_naming_no_route_dies(raw: str, tmp_path: Path) -
     assert requests == []
 
 
-def test_no_secret_is_ever_on_a_command_line(tmp_path: Path) -> None:
-    """A program's argv is readable by every account on the box, so no key may ride it.
-
-    The gate signed every delivery with `openssl dgst -hmac <key>` until #461 found it, so
-    each route's secret sat in a world-readable argv on every deploy. Run here over a box
-    with the github secret and a basecradle signing key in play, recording the argv of
-    every system program the gate runs: python3 (the signer) must have run, openssl must
-    not, and no key's bytes may appear on any recorded command line.
-    """
-    result, requests = _run(tmp_path, env_lines=GITHUB_VARS, github_served=True)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert _route(requests, "github") == ["401", "400", "200"]
-    assert _route(requests, "basecradle") == BASECRADLE_CODES
-    argv = (tmp_path / "argv.log").read_text().splitlines()
-    assert any(line.startswith("python3 ") for line in argv), argv
-    assert not [line for line in argv if line.startswith("openssl")], argv
-    assert any(line.startswith("jq ") for line in argv), "the recorder must reach jq too"
-    for secret in (GITHUB_SECRET, NOVA_KEY):
-        assert not [line for line in argv if secret in line], secret
-
-
 PROBE_SECRET = "probe-fake-000000000000000000000000000"
 ARMED = [
     *GITHUB_VARS,
@@ -382,12 +350,12 @@ def test_where_the_daemon_serves_the_probe_route_every_request_carries_a_mark(
         name, _, value = line.partition(": ")
         assert name == MARK_HEADER
         assert verifier.verify(value, {"probe": Secret(PROBE_SECRET)}).source == "probe"
-    # Neither the key nor a mark ever rode a command line.
-    argv = (tmp_path / "argv.log").read_text()
-    assert PROBE_SECRET not in argv
+    # Neither the key nor a mark ever rode a command line, raw or encoded.
+    argv = recorded(tmp_path)
+    assert leaks_in(argv, [PROBE_SECRET]) == []
     for line in marks:
-        assert line.partition(": ")[2] not in argv
-        assert line.rsplit(" ", 1)[1] not in argv  # nor its HMAC alone
+        value = line.partition(": ")[2]
+        assert leaks_in(argv, [value, value.rsplit(" ", 1)[1]]) == []  # nor its HMAC alone
 
 
 def test_an_armed_gate_fails_a_daemon_that_does_not_tag_its_lines(tmp_path: Path) -> None:
