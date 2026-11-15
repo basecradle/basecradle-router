@@ -40,7 +40,9 @@ Live Tail whichever daemon emitted the line.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import MappingProxyType
 
 #: The record envelope every router line is formatted with — ``asctime level name
@@ -171,12 +173,58 @@ def log_fields(**pairs: object) -> str:
 
     It renders *values*, never colour: a painted token is assembled by :func:`paint` at
     the call site, so no field's value can smuggle an escape into the middle of a token.
+
+    **Inside a marked request, ``source=`` names the synthetic route that vouched for it**
+    (:func:`synthetic_origin`, #461): ``source=github`` renders ``source=probe
+    via=github``, so every line the daemon writes for the fleet's own test traffic carries
+    the fleet's one synthetic tag, from whichever layer writes it. A ``source`` that
+    already is the synthetic route renders unchanged.
     """
+    origin = _SYNTHETIC_ORIGIN.get()
     parts = []
     for key, value in pairs.items():
         if value is None:
             continue
         text = _render_value(value)
-        if text:
+        if not text:
+            continue
+        if key == "source" and origin is not None and text != origin:
+            parts.append(f"source={origin}")
+            parts.append(f"via={text}")
+        else:
             parts.append(f"{key}={text}")
     return " ".join(parts)
+
+
+#: The synthetic route that vouched for the request being served, or ``None``. Set only by
+#: :func:`synthetic_origin`, around one request, after its mark has verified.
+_SYNTHETIC_ORIGIN: ContextVar[str | None] = ContextVar(
+    "basecradle_router_synthetic_origin", default=None
+)
+
+
+@contextmanager
+def synthetic_origin(source: str | None) -> Iterator[None]:
+    """Render every ``source=`` logged in this context as ``source``'s, ``via`` its own.
+
+    ``source`` is the synthetic route whose secret verified the request's mark
+    (:mod:`basecradle_router.synthetic`); ``None``, for a request with no verified mark,
+    changes nothing. A context variable rather than a parameter because the lines about one
+    request are written by the server, the pipeline, every route, the wake-lock guard and
+    the breaker, and a parameter threaded through all of them is one a new line forgets:
+    here a line written later carries the tag by construction. It holds for the request's
+    task, and the wake scheduler carries it onto the thread that runs the request's wake.
+    """
+    if source is None:
+        yield
+        return
+    token = _SYNTHETIC_ORIGIN.set(source)
+    try:
+        yield
+    finally:
+        _SYNTHETIC_ORIGIN.reset(token)
+
+
+def active_synthetic_origin() -> str | None:
+    """The synthetic route vouching for the request being served, or ``None``."""
+    return _SYNTHETIC_ORIGIN.get()

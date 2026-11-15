@@ -52,13 +52,19 @@ import sys
 
 from basecradle_router import __version__
 from basecradle_router.config import DEFAULT_WAKE_LANES
-from basecradle_router.logfmt import LOG_FORMAT, log_fields
+from basecradle_router.logfmt import (
+    LOG_FORMAT,
+    active_synthetic_origin,
+    log_fields,
+    synthetic_origin,
+)
 from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import InboundRequest
 from basecradle_router.routes.base import route_boot_summary, route_warm
 from basecradle_router.scheduler import WakeScheduler
 from basecradle_router.selftest import log_freeze_selftest, run_freeze_selftest
+from basecradle_router.synthetic import MARK_HEADER
 
 WEBHOOK_PREFIX = "/webhooks/"
 
@@ -122,6 +128,12 @@ class _SuppressAccessLog(logging.Filter):
     only ``POST`` is dropped: any other method is answered ``404`` before the pipeline
     logs a word about it, so its access line is the only trace and stays.
 
+    **A request carrying a verified synthetic mark** (#461) is the fleet's own test
+    traffic, every pipeline line for it reads ``source=<synthetic> via=<route>``, and its
+    access line could carry neither, so it is dropped for the same reason. uvicorn writes
+    the line from inside the app's own ``send``, in the request's context, so the filter
+    reads the verdict the server set there (:func:`~basecradle_router.logfmt.synthetic_origin`).
+
     Every *other* access line is kept. uvicorn logs access as ``('%s - "%s %s
     HTTP/%s" %d', client, method, path, ver, status)``, so the method is ``args[1]`` and
     the path ``args[2]``. If that shape ever changes the filter **keeps the record**
@@ -137,6 +149,8 @@ class _SuppressAccessLog(logging.Filter):
         self.prefix = prefix
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if active_synthetic_origin() is not None:
+            return False
         args = record.args
         if not isinstance(args, tuple) or len(args) < 3 or not isinstance(args[2], str):
             return True
@@ -259,12 +273,28 @@ class WebhookServer:
             await self._send(send, 404, {"error": "not found"})
             return
 
+        # The fleet's own test traffic says so with a mark only the fleet can make (#461).
+        # Checked first, from the headers alone, for every webhook POST, because some are
+        # answered from the path alone and their lines must read as what they are too, and
+        # a mark that rode a request is spent whatever the answer. A mark changes what is
+        # logged about the request and nothing else: everything after runs exactly as it
+        # would without one.
         source = _source_of(scope["path"], self.prefix)
+        headers = self._headers(scope)
+        mark = InboundRequest(headers=headers, body=b"").header(MARK_HEADER)
+        origin = self.pipeline.mark_origin(source, mark)
+        with synthetic_origin(origin):
+            await self._serve_webhook(receive, send, scope, source, headers)
+
+    async def _serve_webhook(
+        self, receive, send, scope: dict, source: str, headers: dict[str, str]
+    ) -> None:
+        """Admit, read, accept and answer one ``POST`` for ``source``, spawning its wake."""
         if not source or "/" in source:
             await self._send(send, 404, {"error": "no route in path"})
             return
 
-        # Everything above and this admission is decided from the path alone. The body is
+        # Everything before this and this admission is decided from the path alone. The body is
         # the one thing an unauthenticated caller can make the daemon hold, so nothing
         # reads it until the path has named a registered route, and then no more of it
         # than that route can legitimately send (#427). The edge's own cap stays the
@@ -289,7 +319,7 @@ class WebhookServer:
             self.pipeline.refuse_body(admission, declared=declared)
             await self._send(send, _status_for(admission.result), _summary(admission.result))
             return
-        request = InboundRequest(headers=self._headers(scope), body=body)
+        request = InboundRequest(headers=headers, body=body)
 
         # Fast-ack: the accept half (HMAC verify + JSON normalize + a dict lookup)
         # is microseconds, so run it inline and answer at once; hand only the

@@ -971,7 +971,11 @@ class GithubRoute:
         self, skip_line: str, reason: str | None, event_type: str, delivery: str | None
     ) -> None:
         """Log why the captain's own PR woke no one, then the usual ``IGNORED`` decision."""
-        logger.info("%s %s", skip_line, log_fields(delivery=delivery or "<unknown>", reason=reason))
+        logger.info(
+            "%s %s",
+            skip_line,
+            log_fields(source=self.name, delivery=delivery or "<unknown>", reason=reason),
+        )
         return self._ignore(event_type, delivery)
 
     def _wake_event(
@@ -1064,6 +1068,7 @@ class GithubRoute:
         logger.info(
             "event=do_not_work_skip %s",
             log_fields(
+                source=self.name,
                 issue=url if isinstance(url, str) and url else "<unknown>",
                 delivery=delivery or "<unknown>",
                 reason=f"{DO_NOT_WORK_LABEL} wins over {HANDOFF_LABEL}",

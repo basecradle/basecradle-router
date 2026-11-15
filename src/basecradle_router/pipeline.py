@@ -135,6 +135,7 @@ from basecradle_router.routes import (
     route_requires_secret,
 )
 from basecradle_router.secret import Secret
+from basecradle_router.synthetic import SyntheticMarks
 from basecradle_router.wake import WakeError, Waker, WakeResult, WakeStopped
 from basecradle_router.wakelock import WakeLockGuard
 
@@ -353,6 +354,8 @@ class Pipeline:
     # follow-up (#272, #311).
     coverage: WakeCoverage = field(default_factory=WakeCoverage)
     wake_lock: WakeLockGuard = field(default_factory=WakeLockGuard)
+    # Which marks have verified, so each is honoured once (#461).
+    marks: SyntheticMarks = field(default_factory=SyntheticMarks)
     # Durable proof of what this router has actually done, for the NOC's
     # claims-vs-evidence ledger (basecradle/basecradle#460). Defaults to an
     # in-memory store so a bare Pipeline stays constructible offline and no test
@@ -383,6 +386,39 @@ class Pipeline:
             agent, event = accepted.pending
             self.execute(agent, event, accepted.result)
         return accepted.result
+
+    def mark_origin(self, source: str, mark: str | None) -> str | None:
+        """The synthetic route a request's ``mark`` proves it came from, or ``None``; never raises.
+
+        Called by the server before :meth:`admit`, because a request for an unknown source
+        is answered from its path alone and its lines need the verdict too (#461). The mark
+        verifies under the secret of a registered route that declares itself
+        :attr:`~basecradle_router.routes.base.Route.synthetic`, the registry's answer, so the
+        core names no source. A mark that is present and does not verify is refused with
+        one line saying why, and the request is then served exactly as if it carried none.
+        """
+        try:
+            secrets = {
+                route.name: secret
+                for route in self.registry.routes()
+                if route.synthetic
+                and (secret := self.config.webhook_secrets.get(route.name)) is not None
+            }
+            verdict = self.marks.verify(mark, secrets)
+        except Exception as exc:  # last-resort: a mark must never stop a request being served
+            logger.error(
+                "event=synthetic_mark_refused %s",
+                log_fields(
+                    source=_shown_source(source), reason="error", error=f"unexpected: {exc}"
+                ),
+            )
+            return None
+        if verdict.refused is not None:
+            logger.warning(
+                "event=synthetic_mark_refused %s",
+                log_fields(source=_shown_source(source), reason=verdict.refused),
+            )
+        return verdict.source
 
     def admit(self, source: str) -> Admission:
         """The route stage alone, decided from the path before any body is read; never raises.
@@ -573,10 +609,15 @@ class Pipeline:
                 # :meth:`~basecradle_router.evidence.EvidenceStore.record_wake_refused`.
                 # The ledger's `route` and the journal's `source=` (via `_who`) are the
                 # same string read from the same event, so the two surfaces cannot
-                # disagree about where a wake came from. The evidence document keeps its
-                # own `synthetic` flag beside it because it is read long after the fact,
-                # when the registry can no longer be asked which routes were manufactured
-                # — a log line is read in place and needs no such snapshot.
+                # disagree about which route a wake came in on. One case is on purpose:
+                # a request whose synthetic mark verified (#461) logs `source=<synthetic>
+                # via=<route>`, while the ledger still records `route` and `synthetic` as
+                # the route judged it, because a mark changes what is logged and never
+                # the evidence (where marked deliveries belong is #464). The evidence
+                # document keeps its own `synthetic` flag beside it because it is read
+                # long after the fact, when the registry can no longer be asked which
+                # routes were manufactured — a log line is read in place and needs no
+                # such snapshot.
                 provenance = {"route": event.source, "synthetic": event.synthetic}
                 if self.deduper.seen(event.dedup_key):
                     # A duplicate delivery of an event we already woke for — a

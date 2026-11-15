@@ -90,6 +90,7 @@ FAKE_CURL = textwrap.dedent(
         -H) case "$2" in
               X-Hub-Signature-256:*|X-BaseCradle-Signature:*) sig="${2#*: }" ;;
               X-GitHub-Delivery:*|X-BaseCradle-Delivery:*) delivery="${2#*: }" ;;
+              @*) cat "${2#@}" >>"MARKS" ;;
             esac; shift ;;
         --data-binary) body="$2"; shift ;;
         http*) url="$1" ;;
@@ -128,7 +129,11 @@ def _edge_headers(tmp_path: Path) -> Path:
 
 
 def _run(
-    tmp_path: Path, *, env_lines: list[str], github_served: bool
+    tmp_path: Path,
+    *,
+    env_lines: list[str],
+    github_served: bool,
+    journal_lines: list[str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[tuple[str, str, str]]]:
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps(REGISTRY))
@@ -149,13 +154,17 @@ def _run(
     journal = tmp_path / "journal.txt"
     # The github lines are in the journal only where a daemon serving github wrote them,
     # so a github-less run that still asserted them would fail here.
-    journal.write_text("\n".join((GITHUB_JOURNAL if github_served else []) + BASECRADLE_JOURNAL))
+    if journal_lines is None:
+        journal_lines = (GITHUB_JOURNAL if github_served else []) + BASECRADLE_JOURNAL
+    journal.write_text("\n".join(journal_lines))
+    (tmp_path / "marks.log").touch()
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fakes = {
         "curl": FAKE_CURL.replace('"ZERO"', f'"{ZERO_SIG}"')
         .replace('"CASE6"', f'"{CASE_6_DELIVERY}"')
         .replace('"LOG"', f'"{log}"')
+        .replace('"MARKS"', f'"{tmp_path / "marks.log"}"')
         .replace('"EDGE"', f'"{_edge_headers(tmp_path)}"')
         .replace('"GITHUB_SERVED"', '"1"' if github_served else '"0"'),
         "journalctl": f'cat "{journal}"\n',
@@ -332,3 +341,74 @@ def test_no_secret_is_ever_on_a_command_line(tmp_path: Path) -> None:
     assert any(line.startswith("jq ") for line in argv), "the recorder must reach jq too"
     for secret in (GITHUB_SECRET, NOVA_KEY):
         assert not [line for line in argv if secret in line], secret
+
+
+PROBE_SECRET = "probe-fake-000000000000000000000000000"
+ARMED = [
+    *GITHUB_VARS,
+    "BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe",
+    f"BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET={PROBE_SECRET}",
+]
+
+
+def _tagged(lines: list[str]) -> list[str]:
+    """``lines`` as the daemon writes them for a request whose mark verified (#461)."""
+    return [
+        line.replace("source=github", "source=probe via=github").replace(
+            "source=basecradle", "source=probe via=basecradle"
+        )
+        for line in lines
+    ]
+
+
+def test_where_the_daemon_serves_the_probe_route_every_request_carries_a_mark(
+    tmp_path: Path,
+) -> None:
+    from basecradle_router.secret import Secret
+    from basecradle_router.synthetic import MARK_HEADER, SyntheticMarks
+
+    journal = _tagged(GITHUB_JOURNAL + BASECRADLE_JOURNAL)
+    result, requests = _run(tmp_path, env_lines=ARMED, github_served=True, journal_lines=journal)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "synthetic mark: armed" in result.stdout
+    # The same statuses as an unmarked run: a mark changes what is logged, never a verdict.
+    assert _route(requests, "github") == ["401", "400", "200"]
+    assert _route(requests, "basecradle") == BASECRADLE_CODES
+    # One mark per request to the daemon, each the daemon's own verifier honours once.
+    marks = (tmp_path / "marks.log").read_text().splitlines()
+    assert len(marks) == len(requests), (marks, requests)
+    verifier = SyntheticMarks(not_before=0)  # a daemon that was up before the run began
+    for line in marks:
+        name, _, value = line.partition(": ")
+        assert name == MARK_HEADER
+        assert verifier.verify(value, {"probe": Secret(PROBE_SECRET)}).source == "probe"
+    # Neither the key nor a mark ever rode a command line.
+    argv = (tmp_path / "argv.log").read_text()
+    assert PROBE_SECRET not in argv
+    for line in marks:
+        assert line.partition(": ")[2] not in argv
+        assert line.rsplit(" ", 1)[1] not in argv  # nor its HMAC alone
+
+
+def test_an_armed_gate_fails_a_daemon_that_does_not_tag_its_lines(tmp_path: Path) -> None:
+    # Armed, the decision lines must read source=probe via=<route>: a daemon that logged
+    # them in full has stopped honouring the mark, and the gate says so.
+    result, _ = _run(tmp_path, env_lines=ARMED, github_served=True)
+    assert result.returncode == 1
+    assert "FAIL  github decision line emitted (#91)" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [*GITHUB_VARS, f"BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET={PROBE_SECRET}"],
+        [*GITHUB_VARS, "BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe"],
+    ],
+    ids=["route-not-enabled", "no-secret"],
+)
+def test_a_gate_that_cannot_mark_sends_no_mark(lines: list[str], tmp_path: Path) -> None:
+    result, requests = _run(tmp_path, env_lines=lines, github_served=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "synthetic mark: not armed" in result.stdout
+    assert requests
+    assert (tmp_path / "marks.log").read_text() == ""

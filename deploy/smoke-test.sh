@@ -94,6 +94,12 @@
 #   ROUTER_ENV_FILE   path to the daemon env file   (default /etc/basecradle-router/router.env)
 #   CADDYFILE         path to the installed Caddyfile (default /etc/caddy/Caddyfile)
 #
+# Every request it sends to the daemon carries a synthetic mark where the daemon serves the
+# probe route with a secret (#461), so the burst of rejections it provokes on every deploy
+# reads `source=probe via=<route>` and the fleet's one filter hides it. The mark changes
+# what the daemon logs about a request, never how it judges one, so every status asserted
+# below is the same with it or without it.
+#
 # It never waits on a wake and never touches a real agent, so it is safe to run
 # against production at any time.
 #
@@ -484,6 +490,22 @@ if [[ "$github_enabled" == "true" ]]; then
 	[[ -n "$trusted_login" ]] || die "trusted-actor list is empty after parsing"
 fi
 
+# The synthetic mark (#461). Every request this gate sends to the daemon is the fleet testing
+# itself, and most are built to be rejected, so each carries `X-BaseCradle-Synthetic`: an HMAC
+# under the probe route's own secret, which the daemon verifies itself. A request whose mark
+# verifies is judged exactly as before, and every line the daemon writes for it reads
+# `source=probe via=<route>`, so the fleet's one filter hides the burst a deploy used to leave.
+# A mark only the probe route can verify is armed only where the daemon enables that route
+# and holds its secret: anywhere else the requests go unmarked and are logged in full, and the
+# journal assertions below expect them that way.
+# The probe route's secret, read once: case 8 below needs it as well.
+probe_secret="$(env_value BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET)"
+probe_enabled="$(route_enabled probe)" || true
+mark_secret=""
+if [[ "$probe_enabled" == "true" ]]; then
+	mark_secret="$probe_secret"
+fi
+
 # The interpreter every key is handed to, found once on the box's trusted PATH (wake-runner's,
 # for the same reason) rather than on whatever PATH this root-run gate inherited: a python3
 # earlier on that PATH would receive every route secret. Overridable like ROUTER_ENV_FILE,
@@ -534,13 +556,58 @@ hmac_sha256() {
 }
 # <<< hmac_sha256 <<<
 
+# A fresh mark, as the header line curl reads from file $1 (`-H @file`), so the mark rides
+# no command line either; $workdir is mktemp's 0700 directory. Its key rides $smoke_python's
+# environment exactly as hmac_sha256's does. `BCSYN1 <unix-seconds> <nonce> <hmac>`, the HMAC
+# over `BCSYN1 <unix-seconds> <nonce>` under a key derived from the secret, so a mark is never
+# a probe signature: the daemon honours it once, within two minutes, and only if it was
+# stamped after the daemon started (src/basecradle_router/synthetic.py).
+# The markers let tests/test_smoke_test_assertions.py verify this EXACT body's output with
+# the daemon's own verifier.
+# >>> synthetic_mark >>>
+SYNTHETIC_MARK_PY='import hashlib, hmac, os, secrets, time
+key = hmac.new(os.environb[b"SMOKE_HMAC_KEY"], b"basecradle-router synthetic-mark key v1", hashlib.sha256).digest()
+message = "BCSYN1 %d %s" % (time.time(), secrets.token_hex(16))
+digest = hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+print("X-BaseCradle-Synthetic: %s %s" % (message, digest))'
+mint_mark() {
+	SMOKE_HMAC_KEY="$mark_secret" "$smoke_python" -I -c "$SYNTHETIC_MARK_PY" >"$1"
+}
+# <<< synthetic_mark <<<
+
+# curl, carrying a fresh mark when marking is armed: every request to the daemon goes
+# through here, each with its own nonce. A mark that could not be minted sends nothing, so
+# the case reads an empty status and fails rather than going out with a stale mark.
+marked_curl() {
+	if [[ -z "$mark_secret" ]]; then
+		curl "$@"
+		return
+	fi
+	rm -f "$workdir/mark.header"
+	mint_mark "$workdir/mark.header" || return 1
+	curl -H "@$workdir/mark.header" "$@"
+}
+
+# How the daemon spells route $1's source on this run's lines: tagged when marking is armed.
+# The markers let tests/test_smoke_test_assertions.py hold this EXACT body to the daemon's
+# own rendering of a marked and an unmarked line.
+# >>> shown_source >>>
+shown_source() {
+	if [[ -n "$mark_secret" ]]; then
+		printf 'source=probe via=%s' "$1"
+	else
+		printf 'source=%s' "$1"
+	fi
+}
+# <<< shown_source <<<
+
 sign() { hmac_sha256 "$1" "$secret"; }
 
 # POST a body file with a given signature header, to $SMOKE_URL unless a third argument
 # names another URL; echo the HTTP status code.
 post() {
 	local body_file=$1 signature=$2 url=${3:-$SMOKE_URL}
-	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+	marked_curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
 		-X POST "$url" \
 		-H 'Content-Type: application/json' \
 		-H 'X-GitHub-Event: issues' \
@@ -600,6 +667,11 @@ if [[ "$github_enabled" == "true" ]]; then
 else
 	log "Smoke-testing the live daemon on ${SMOKE_HOST} at ${SMOKE_BASE}"
 fi
+if [[ -n "$mark_secret" ]]; then
+	log "synthetic mark: armed — every request below carries one, and its lines read source=probe via=<route> (#461)"
+else
+	log "synthetic mark: not armed (the daemon does not serve the probe route with a secret) — every request below is logged in full"
+fi
 
 # Journald boundary for the observability assertions below: capture it before any
 # POST so a decision line emitted by the cases that follow is guaranteed >= it.
@@ -638,14 +710,14 @@ if [[ "$github_enabled" == "true" ]]; then
 	# decision line (recipient = the unregistered repo) before resolve drops it. Assert
 	# that INFO line actually reached journald — the live observability check (#91).
 	assert_journal_has "github decision line emitted (#91)" \
-		"event=delivery_decision source=github .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
+		"event=delivery_decision $(shown_source github) .*decision=woke .*recipient=${UNREGISTERED_REPO}" "$obs_since"
 
 	# The same line must carry the DELIVERY ID (#170) — the key that joins this route
 	# decision to the core's stage lines and to the wake's own journal. Asserted against
 	# the exact id this smoke run POSTed, so a passing regex proves the id is threaded
 	# through from the header, not merely that some `delivery=` field exists.
 	assert_journal_has "delivery id threaded onto the decision line (#170)" \
-		"event=delivery_decision source=github .*delivery=smoke-00000000-0000-0000-0000-000000000000" \
+		"event=delivery_decision $(shown_source github) .*delivery=smoke-00000000-0000-0000-0000-000000000000" \
 		"$obs_since"
 else
 	log "github route not enabled; skipping cases 1-3 ($ENABLED_ROUTES_VAR omits github in $ROUTER_ENV_FILE)"
@@ -743,7 +815,7 @@ bc_sign() { hmac_sha256 "$1" "$2"; }
 
 bc_post() {
 	local body_file=$1 signature=$2 delivery=$3
-	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+	marked_curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
 		-X POST "$BC_URL" \
 		-H 'Content-Type: application/json' \
 		-H "X-BaseCradle-Event: ${BC_IGNORED_EVENT}" \
@@ -882,14 +954,14 @@ else
 			# the per-recipient keyring is in force on the box: the status code alone cannot
 			# tell `key_path=recipient` from `key_path=fallback`.
 			assert_journal_has "basecradle verified on key_path=${bc_case_key_path}" \
-				"event=verify_key source=basecradle .*key_path=${bc_case_key_path} .*delivery=${BC_DELIVERY}" \
+				"event=verify_key $(shown_source basecradle) .*key_path=${bc_case_key_path} .*delivery=${BC_DELIVERY}" \
 				"$obs_since"
 
 			# The route's INFO observability must reach journald too — this is the route the
 			# #91 silent drop was found on, and the decision here is an *ignore*, which is
 			# exactly the outcome that must never be indistinguishable from a silent drop.
 			assert_journal_has "basecradle decision line emitted (#91)" \
-				"event=delivery_decision source=basecradle event_type=${BC_IGNORED_EVENT} decision=ignored .*delivery=${BC_DELIVERY}" \
+				"event=delivery_decision $(shown_source basecradle) event_type=${BC_IGNORED_EVENT} decision=ignored .*delivery=${BC_DELIVERY}" \
 				"$obs_since"
 		fi
 
@@ -946,7 +1018,7 @@ PROBE_LOCAL_URL="${PROBE_LOCAL_URL:-http://127.0.0.1:8000/webhooks/probe}"
 
 probe_post() {
 	local url=$1
-	curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+	marked_curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
 		-X POST "$url" \
 		-H 'Content-Type: application/json' \
 		-H 'X-BaseCradle-Probe-Event: probe.wake' \
@@ -960,7 +1032,6 @@ probe_post() {
 # whether or not the route is enabled on the daemon behind it.
 check "probe injection point not reachable from the internet" 404 "$(probe_post "$PROBE_PUBLIC_URL")"
 
-probe_secret="$(env_value BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET)"
 if [[ -z "$probe_secret" ]]; then
 	log "probe route: secret not set in $ROUTER_ENV_FILE — not wired yet; skipping the loopback case"
 else
