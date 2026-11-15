@@ -40,4 +40,4 @@ unset HEARTBEAT_URL
 [[ "$url" != *[[:space:]]* ]] || refuse "contains whitespace"
 [[ "$url" != *[\"\\]* ]] || refuse "contains a double quote or a backslash"
 
-curl -q -fsS --retry 3 --max-time 15 -o /dev/null --config - <<<"url = \"$url\""
+curl -q -H "X-Heartbeat: $url" -fsS --retry 3 --max-time 15 -o /dev/null --config - <<<"url = \"$url\""
