@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from basecradle_router.routes.base import Route, RouteError
 
+#: The ``source=`` a line carries for a request whose path names no registered route
+#: (#462). ``source=``'s value set is closed: the enabled route names, and this. The
+#: caller's own path segment goes under ``requested=`` instead, so no caller chooses the
+#: value of the key the fleet filters its synthetic traffic on. It can never be a route's
+#: name, because :meth:`RouteRegistry.register` refuses it.
+UNROUTED = "unrouted"
+
 
 class UnknownRouteError(RouteError):
     """No route is registered for the requested source."""
@@ -24,6 +31,8 @@ class RouteRegistry:
         name = getattr(route, "name", "")
         if not name:
             raise ValueError("route must declare a non-empty name")
+        if name == UNROUTED:
+            raise ValueError(f"route name {UNROUTED!r} is reserved for an unrouted request")
         if not isinstance(route, Route):
             raise TypeError(f"route {name!r} does not implement verify/normalize")
         # The protocol check proves the member exists, never that it bounds anything: a

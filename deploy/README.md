@@ -206,7 +206,7 @@ The vocabulary, in the order one delivery produces it:
 | `event=delivery_decision …` | the route's ignore-vs-act call (#91): `source=`, `event_type=`, `decision=woke\|ignored`, `recipient=`, `delivery=`. A `woke` delivery gets **one more** decision line if it never launches a session of its own (#272), decided when it reaches the front of its agent's queue: `decision=coalesced into=<delivery>` (a successful wake that started after its event already read it) or `decision=dropped reason=issue_closed\|handoff_removed\|do_not_work` (its work ended while it waited). So `delivery=<id>` accounts for every delivery: `woke`, then at most one of these. |
 | `event=route_config …` | one INFO per route that has source-specific config, logged right after the banner: `source=`, then that route's own fields. The basecradle route states `recipient_keys=` and `shared_fallback=` (#236) — once every agent is keyed, an armed fallback and a retired one produce identical traffic, so nothing but this line distinguishes them. |
 | `event=verify_key …` | which signing key verified a basecradle delivery (#236): `source=`, `key_path=recipient\|fallback`, `recipient=`, `delivery=`. Emitted only *after* the signature checks out — before that the recipient is an unauthenticated claim. `key_path=` and not `key=`, which `event=breaker_tripped` already spends on its scope. |
-| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `coalesce`, `recheck`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. |
+| `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `coalesce`, `recheck`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. A `stage=route` line for a path that names no route carries `source=unrouted requested=<segment>` instead (#462). |
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
 | `event=wake_stopped …` | **WARNING**, once, when a wake was killed by SIGTERM or SIGKILL (#386): `signal=TERM\|KILL`, `exit=` (`-15`/`-9`: `sudo` died by the signal, which only a signal from outside the wake causes), `duration=`. A stop is never retried and never a failure: no `wake_retry`, no `outcome=failed`. See *Stopping a wake*, below. |
 | `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
@@ -299,10 +299,22 @@ coloured line in both the UI and ClickHouse.
 **The contract, in one line:** **every** log line the router emits — both halves of the pipeline, and the
 routes layer's own `event=delivery_decision` — carries the key **`source`**, whose value is the route the
 delivery arrived on. Its value set is closed and is exactly the router's **enabled route names**: today
-**`github`**, **`basecradle`**, and **`probe`**. `source=probe` is the fleet's own wake-edge lever (`probe
-wake`, fired on the NOC's schedule — a cadence that repo owns); every other value is real traffic, a
-delivery a source outside the fleet actually sent. There is no absence: a pipeline line carrying no
-`source=` is a defect.
+**`github`**, **`basecradle`**, and **`probe`**, plus **`unrouted`**. `source=probe` is the fleet's own
+wake-edge lever (`probe wake`, fired on the NOC's schedule — a cadence that repo owns); every other value
+is real traffic, a delivery a source outside the fleet actually sent. There is no absence: a pipeline line
+carrying no `source=` is a defect.
+
+**A request whose path names no registered route reads `source=unrouted requested=<segment>`** (#462):
+`stage=route outcome=rejected source=unrouted requested=probes known=basecradle,github,probe error="no
+route registered for this source"`. The segment is the caller's own, so it never fills `source=`; it is
+bounded to 64 characters under `requested=` and quoted like any value that holds a space, an `=` or a
+quote; a path with no segment at all (`POST /webhooks/`) carries no `requested=`. A registered route
+always reads as itself, a line from a last-resort branch included. Before #462 it was written into `source=` itself, so `POST /webhooks/probes` logged
+`source=probes` and `POST /webhooks/x%20source=probe` logged `source="x source=probe"`, and a substring
+filter on `source=probe` hid both. `unrouted` is reserved: `RouteRegistry.register` refuses it as a route
+name. The NOC's `source` column extracts it unchanged, and its block-list (`!= 'probe'`) keeps it visible.
+A substring filter can still match a caller's text inside a quoted value (`requested="x source=probe"`,
+an error message); the extracted `source` column, which reads outside every quoted value, cannot.
 
 **A request carrying a verified synthetic mark reads `source=probe via=<route>`** (#461). The deploy
 smoke test exists to prove the *real* routes' boundaries, so its requests must go through the github and
@@ -314,7 +326,9 @@ daemon verifies it itself
 (`src/basecradle_router/synthetic.py`). When it verifies, every `source=<route>` the daemon writes for
 that request, from any layer and on the wake's own thread, renders `source=probe via=<route>`. So the one
 filter hides it, the NOC's `source` column (the first `source=`) reads `probe`, and `via=` keeps the route
-it exercised readable. Its access line is dropped, as a probe's is.
+it exercised readable. A marked request to a path that names no route (the edge's mask) reads
+`source=probe via=unrouted requested=<segment>`: `via=` carries the closed set too, and the segment stays
+under `requested=`. Its access line is dropped, as a probe's is.
 
 - **It changes what is logged, never how the request is judged.** Status, stages and wake are identical
   with and without a mark.
@@ -329,7 +343,7 @@ it exercised readable. Its access line is dropped, as a probe's is.
   were spent, so a mark stamped before the restart is refused. A mark that
   does not verify (`forged`, `stale`, `replayed`, `malformed`, or `unarmed` on a box with no synthetic
   route) leaves the request logged in full, after one `WARNING event=synthetic_mark_refused source=<the
-  request's source> reason=<why>` line. Nothing depends on the edge stripping the header, so no caller on
+  request's source> reason=<why>` line (`source=unrouted requested=<segment>` when its path names no route). Nothing depends on the edge stripping the header, so no caller on
   the internet can hide a request by claiming to be a test.
 
 **Why it exists.** The router's probe traverses the real path on purpose, so a probe wake lands on the

@@ -93,12 +93,12 @@ ai.basecradle.com {
 	# `/webhooks/./probe` are answered as an unknown source where `/WEBHOOKS/FOO` and
 	# `/webhooks/./foo` get the daemon's not-found and no-route answers. That shows the mask
 	# is here, which this public file says anyway, and nothing about the route behind it.
-	# The daemon logs the target as the rejected request's `source=`, so the line it writes
-	# must not contain any route's `source=<name>` tag: `probe-masked` logged
+	# The target must not begin with any route's name: `probe-masked` logged
 	# `source=probe-masked`, which the substring filter that hides the fleet's own
 	# `source=probe` lines hid too, and with it the internet traffic this mask exists to
-	# show (#461). `tests/test_caddyfile.py` pins both: the target names no route the daemon
-	# can register, and the line the daemon writes for it carries no route's tag.
+	# show (#461). The daemon now logs the target as `requested=`, beside a fixed
+	# `source=unrouted` (#462). `tests/test_caddyfile.py` pins both: the target names no route
+	# the daemon can register, and the line the daemon writes for it carries no route's tag.
 	@probe path /webhooks/probe /webhooks/probe/
 	rewrite @probe /webhooks/masked-probe
 	@probe_below path /webhooks/probe/*

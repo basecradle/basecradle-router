@@ -433,13 +433,15 @@ def test_the_probe_mask_target_names_no_route_the_daemon_can_register(tmp_path) 
 def test_the_probe_mask_targets_line_cannot_match_any_routes_tag_as_a_substring(
     tmp_path, caplog
 ) -> None:
-    # #461. The daemon logs the mask target as the rejected request's `source=`, and the
-    # operator hides the fleet's own traffic with a SUBSTRING filter on `source=probe` (the
-    # Live Tail default). The old target, `probe-masked`, logged `source=probe-masked`,
-    # which that filter hid, and with it every real internet request to the probe path:
-    # the very traffic the mask exists to show. So the target must begin with no route's
-    # name. Read off the line the daemon really writes for it, never a re-rendering, so
-    # a change to how the route-rejection line spells its source is caught here too.
+    # #461. The operator hides the fleet's own traffic with a SUBSTRING filter on
+    # `source=probe` (the Live Tail default). The old target, `probe-masked`, logged
+    # `source=probe-masked`, which that filter hid, and with it every real internet request
+    # to the probe path: the very traffic the mask exists to show. Since #462 the daemon
+    # logs a rejected request's own segment under `requested=`, beside a fixed
+    # `source=unrouted`, so no target can forge the tag; this still holds the target to a
+    # name that begins with no route's. Read off the line the daemon really writes for it,
+    # never a re-rendering, so a change to how the route-rejection line spells its source is
+    # caught here too.
     import logging
 
     from basecradle_router.pipeline import Outcome, Pipeline, Stage
@@ -452,7 +454,8 @@ def test_the_probe_mask_targets_line_cannot_match_any_routes_tag_as_a_substring(
     assert admission.route is None
     assert admission.result.stages == [(Stage.ROUTE, Outcome.REJECTED)]
     (line,) = [r.getMessage() for r in caplog.records if "stage=route" in r.getMessage()]
-    assert f"source={source}" in line, line
+    assert "source=unrouted" in line, line
+    assert f"requested={source}" in line, line
     # Every route the package defines, not only the ones this env enables, so a route
     # added later is checked on arrival, and a test env that forgot to enable it fails.
     names = _every_route_name()

@@ -188,7 +188,7 @@ def test_a_long_unknown_source_name_is_logged_bounded(caplog) -> None:
     (line,) = [r.getMessage() for r in caplog.records if "stage=route" in r.getMessage()]
     assert "outcome=rejected" in line
     assert name not in line
-    assert f"source={'a' * 64}…(+{4000 - 64})" in line
+    assert f"source=unrouted requested={'a' * 64}…(+{4000 - 64})" in line
     # What it does carry is the registered routes: the pointer at a source a box forgot
     # to enable.
     assert "known=basecradle,github" in line

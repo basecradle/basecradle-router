@@ -419,7 +419,8 @@ def test_every_line_a_marked_request_produces_is_tagged(
     assert not [line for line in lines if "synthetic_mark_refused" in line]
     # The route it exercised stays readable, beside the tag, on every line of a real route.
     if not name.startswith("probe"):
-        exercised = "masked-probe" if name == "the edge's mask" else "github"
+        # The mask target names no route, so its lines read `unrouted` (#462).
+        exercised = "unrouted" if name == "the edge's mask" else "github"
         tagged = [line for line in lines if "source=probe" in line]
         assert all(f"source=probe via={exercised}" in line for line in tagged), (name, tagged)
     if name.endswith("woken"):
