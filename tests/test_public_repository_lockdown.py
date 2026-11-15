@@ -49,7 +49,7 @@ def reminder_issue(number: int, date: str, author: str = CAPITAL, **extra: Any) 
         "title": f"⏰ Renew interaction limit before {date} (public-repo write-lockdown)",
         "body": f"Standing reminder. This one **expires `{date}`**. Re-apply before then.",
         "user": {"login": author},
-        "labels": [{"name": "Do Not Work"}],
+        "labels": [{"name": "do-not-work"}],
         **extra,
     }
 
