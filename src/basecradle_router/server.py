@@ -66,8 +66,8 @@ WEBHOOK_PREFIX = "/webhooks/"
 # records and the routes' ignore-vs-act decision lines (#91) all log under it.
 _ROOT_LOGGER = "basecradle_router"
 
-#: uvicorn's HTTP access logger — the one we filter ``/up`` out of (see
-#: :class:`_SuppressLivenessAccessLog`). Not our package, so it is configured by
+#: uvicorn's HTTP access logger — the one we filter ``/up`` and the synthetic routes'
+#: webhooks out of (see :class:`_SuppressAccessLog`). Not our package, so it is configured by
 #: uvicorn and only *adjusted* here.
 _ACCESS_LOGGER = "uvicorn.access"
 
@@ -93,28 +93,68 @@ def deployed_sha(path: str = DEPLOYED_SHA_FILE) -> str:
         return "unknown"
 
 
-class _SuppressLivenessAccessLog(logging.Filter):
-    """Drop uvicorn's access line for ``GET /up`` — and only that one (#170).
+def _source_of(path: str, prefix: str) -> str:
+    """The source a webhook ``path`` under ``prefix`` names — the one reading of it.
 
-    Better Stack's uptime monitor probes ``/up`` about once a minute, forever, so its
-    access lines are the single largest source of volume in the journal and in Live
-    Tail — pure noise that buries the lines an operator actually reads. Every *other*
-    access line is kept.
-
-    uvicorn logs access as ``('%s - "%s %s HTTP/%s" %d', client, method, path, ver,
-    status)``, so the path is ``args[2]``. If that shape ever changes the filter
-    **keeps the record** rather than guessing — the fail-direction for a log filter is
-    to log too much, never to silently swallow.
+    Shared by the request path and the access-log filter, so the filter can never
+    disagree with the server about which source a request was for.
     """
+    return path[len(prefix) :].strip("/")
+
+
+class _SuppressAccessLog(logging.Filter):
+    """Drop uvicorn's access line for ``GET /up`` and for a synthetic route's ``POST``.
+
+    **``/up``** (#170): Better Stack's uptime monitor probes it about once a minute,
+    forever, so its access lines are the single largest source of volume in the journal
+    and in Live Tail — pure noise that buries the lines an operator actually reads.
+
+    **A synthetic route's webhook** (#459): every line the fleet's own instrumentation
+    manufactures carries ``source=probe``, so one filter hides all of it. uvicorn's
+    access line cannot carry the tag — its formatter renders a fixed shape from the
+    record's arguments — and it says nothing the pipeline's own lines for the same
+    request do not: every ``POST`` to a registered route is answered after
+    :meth:`~basecradle_router.pipeline.Pipeline.admit` has logged a ``stage=route`` line
+    naming its ``source=``, and every later stage says the rest. So it is dropped. Which
+    sources those are is the registry's answer (:attr:`Route.synthetic`), never a source
+    named here; the path is read to its source exactly as :class:`WebhookServer` reads
+    it, so no spelling the server routes to a synthetic source escapes the filter; and
+    only ``POST`` is dropped: any other method is answered ``404`` before the pipeline
+    logs a word about it, so its access line is the only trace and stays.
+
+    Every *other* access line is kept. uvicorn logs access as ``('%s - "%s %s
+    HTTP/%s" %d', client, method, path, ver, status)``, so the method is ``args[1]`` and
+    the path ``args[2]``. If that shape ever changes the filter **keeps the record**
+    rather than guessing — the fail-direction for a log filter is to log too much,
+    never to silently swallow.
+    """
+
+    def __init__(
+        self, synthetic_sources: frozenset[str] = frozenset(), *, prefix: str = WEBHOOK_PREFIX
+    ) -> None:
+        super().__init__()
+        self.synthetic_sources = synthetic_sources
+        self.prefix = prefix
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if not isinstance(args, tuple) or len(args) < 3 or not isinstance(args[2], str):
             return True
-        return args[2].split("?", 1)[0] != LIVENESS_PATH
+        path = args[2].split("?", 1)[0]
+        if path == LIVENESS_PATH:
+            return False
+        if args[1] != "POST" or not path.startswith(self.prefix):
+            return True
+        return _source_of(path, self.prefix) not in self.synthetic_sources
 
 
-def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
+def configure_logging(
+    level: int = logging.INFO,
+    *,
+    stream=None,
+    synthetic_sources: frozenset[str] = frozenset(),
+    prefix: str = WEBHOOK_PREFIX,
+) -> None:
     """Route the daemon's own loggers to stdout at ``level`` (systemd → journald).
 
     Without this the observability was *silent on the deployed box* (#91): uvicorn
@@ -126,7 +166,8 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
     the package logger at INFO is what makes those lines actually reach the
     operator's journal.
 
-    Also installs the ``/up`` access-log filter on uvicorn's access logger — done
+    Also installs the access-log filter on uvicorn's access logger (``/up``, and the
+    webhooks of the ``synthetic_sources`` the server names from its registry) — done
     here because this is the one function that runs inside the *live* daemon, after
     uvicorn has built its loggers, and never in a unit test.
 
@@ -136,7 +177,7 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
     a duplicate — and leaves ``propagate`` on, so a caplog-based test still sees
     records through the root.
     """
-    _suppress_liveness_access_log()
+    _suppress_access_log(synthetic_sources, prefix)
     pkg = logging.getLogger(_ROOT_LOGGER)
     pkg.setLevel(level)
     for existing in pkg.handlers:
@@ -150,17 +191,20 @@ def configure_logging(level: int = logging.INFO, *, stream=None) -> None:
     pkg.addHandler(handler)
 
 
-def _suppress_liveness_access_log() -> None:
-    """Attach :class:`_SuppressLivenessAccessLog` to uvicorn's access logger, once.
+def _suppress_access_log(synthetic_sources: frozenset[str], prefix: str) -> None:
+    """Attach :class:`_SuppressAccessLog` to uvicorn's access logger, once.
 
     Tagged and re-checked so a second lifespan startup does not stack a duplicate
-    filter, exactly as the stdout handler above is.
+    filter, exactly as the stdout handler above is; a filter already attached is handed
+    this startup's sources, so it always answers for the registry now serving.
     """
     access = logging.getLogger(_ACCESS_LOGGER)
     for existing in access.filters:
         if getattr(existing, "_basecradle_router", False):
+            existing.synthetic_sources = synthetic_sources
+            existing.prefix = prefix
             return
-    log_filter = _SuppressLivenessAccessLog()
+    log_filter = _SuppressAccessLog(synthetic_sources, prefix=prefix)
     log_filter._basecradle_router = True
     access.addFilter(log_filter)
 
@@ -215,7 +259,7 @@ class WebhookServer:
             await self._send(send, 404, {"error": "not found"})
             return
 
-        source = scope["path"][len(self.prefix) :].strip("/")
+        source = _source_of(scope["path"], self.prefix)
         if not source or "/" in source:
             await self._send(send, 404, {"error": "no route in path"})
             return
@@ -376,6 +420,15 @@ class WebhookServer:
         for route in self.pipeline.registry.routes():
             route_warm(route)
 
+    def synthetic_sources(self) -> frozenset[str]:
+        """Every registered route that declares itself synthetic, by name.
+
+        Whose webhook ``POST`` the access-log filter drops (see :class:`_SuppressAccessLog`).
+        Read from the registry, so the server names no source and a synthetic route
+        added later is covered on arrival.
+        """
+        return frozenset(route.name for route in self.pipeline.registry.routes() if route.synthetic)
+
     async def _lifespan(self, receive, send) -> None:
         while True:
             message = await receive()
@@ -384,7 +437,7 @@ class WebhookServer:
                 # so the running process emits its INFO observability to journald,
                 # without mutating global logging state during unit tests (which
                 # drive the HTTP path, never the lifespan protocol). See #91.
-                configure_logging()
+                configure_logging(synthetic_sources=self.synthetic_sources(), prefix=self.prefix)
                 # Strictly after configure_logging, or the banner would be the one
                 # line the daemon drops on the floor at the root's default WARNING.
                 self.log_startup_banner()

@@ -618,7 +618,7 @@ class Pipeline:
                     self._record(result, Stage.RECHECK, Outcome.IGNORED, **who, reason=gone)
                     self._decide(event, DeliveryDecision.DROPPED, reason=gone)
                     return
-                decision = self.wake_lock.check(agent.harness_key)
+                decision = self.wake_lock.check(agent.harness_key, source=event.source)
                 if not decision.should_wake:
                     # The NOC holds a converge wake-lock for this agent — a
                     # deliberate, visible drop (the guard already logged it loudly).
@@ -633,7 +633,9 @@ class Pipeline:
                         result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
                     )
                     return
-                outcome = self.breaker.admit(agent.harness_key, event.stream_key)
+                outcome = self.breaker.admit(
+                    agent.harness_key, event.stream_key, source=event.source
+                )
                 if not outcome.admitted:
                     # A trip/refusal is a deliberate, visible drop — recorded like the
                     # route's IGNORED decisions; the breaker already escalated loudly.

@@ -388,7 +388,7 @@ def _open_issue_42() -> dict:
 def test_a_merge_right_after_a_restart_wakes_on_the_issue_the_startup_warmed(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda **_: None)
     order: list[str] = []
 
     def reader(repo: str, timeout: float) -> list[dict]:
@@ -414,7 +414,7 @@ def test_ci_failing_right_after_a_restart_wakes_the_captain_through_the_composit
     # #371 end to end: the startup warms Nova's open handoff and its own open PR #57, and a
     # signed `workflow_run` failure on #57 wakes Nova. The allow-list stays the box's shape,
     # so Nova's own push is admitted by the registry's bot_slug, never by the list.
-    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda **_: None)
     failed = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     pull = {
         "number": 57,
@@ -461,7 +461,7 @@ def test_ci_failing_right_after_a_restart_wakes_the_captain_through_the_composit
 
 
 def test_a_warm_up_that_cannot_reach_github_never_stops_the_start(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda: None)
+    monkeypatch.setattr("basecradle_router.server.configure_logging", lambda **_: None)
 
     def reader(repo: str, timeout: float) -> list[dict]:
         raise OSError("network is unreachable")

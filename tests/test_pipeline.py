@@ -157,7 +157,7 @@ class _StubWakeLock:
         self.decisions = decisions or {}
         self.checked: list[str] = []
 
-    def check(self, slug: str):
+    def check(self, slug: str, *, source: str | None = None):
         from basecradle_router.wakelock import WakeLockDecision
 
         self.checked.append(slug)

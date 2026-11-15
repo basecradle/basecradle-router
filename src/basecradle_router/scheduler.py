@@ -253,7 +253,7 @@ class WakeScheduler:
         except Exception:  # noqa: BLE001 — pipeline.execute never raises; guard a defect
             logger.exception(
                 "wake run raised for %s (lane freed regardless)",
-                log_fields(agent=key, delivery=job.event.delivery_id),
+                log_fields(agent=key, delivery=job.event.delivery_id, source=job.event.source),
             )
         finally:
             with self._cv:

@@ -210,9 +210,9 @@ The vocabulary, in the order one delivery produces it:
 | `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
 | `event=wake_stopped …` | **WARNING**, once, when a wake was killed by SIGTERM or SIGKILL (#386): `signal=TERM\|KILL`, `exit=` (`-15`/`-9`: `sudo` died by the signal, which only a signal from outside the wake causes), `duration=`. A stop is never retried and never a failure: no `wake_retry`, no `outcome=failed`. See *Stopping a wake*, below. |
 | `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
-| `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. |
-| `event=breaker_tripped …` / `event=breaker_reset …` | the runaway-loop backstop firing (**ERROR**) and self-healing. `scope=`, `key=`, `agent=`, `count=`, `threshold=`, `window=`, `cooldown=`. |
-| `event=wake_lock_unreadable …` / `event=wake_lock_stale …` | the freeze surface could not be read (**ERROR** — fail-open, the wake still runs) / a lock outlived its `expires_at`. |
+| `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. Ends with the refused wake's **`source=`** (#459), so a refused probe says `source=probe`. |
+| `event=breaker_tripped …` / `event=breaker_reset …` | the runaway-loop backstop firing (**ERROR**) and self-healing. `scope=`, `key=`, `agent=`, `count=`, `threshold=`, `window=`, `cooldown=`. No `source=`, by design: a trip is the state of a scope every wake shares, so a probe that tipped a real runaway over the cap must never hide it from its alarm. |
+| `event=wake_lock_unreadable …` / `event=wake_lock_stale …` | the freeze surface could not be read (**ERROR** — fail-open, the wake still runs) / a lock outlived its `expires_at`. No `source=`, for the same reason: a fact about the box, true whichever wake read it. |
 
 **`delivery=<id>` is the join key.** Every line from `normalize` onward carries it (`route`/`verify` run
 before the route has read the source's delivery header — the deliberate exception), and the wake child is
@@ -258,7 +258,8 @@ event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github out
   put a start and an end around nothing and blur the very signal the pair exists to show.
 - **Field order: `delivery` → `agent` → `source`**, uniformly across every line the slow half emits
   (`wake_start`, `wake_end`, `wake_retry`, and each `stage=` line from `lock` on, gates included — the
-  guards' own `event=wake_refused` lines are handed a slug, never an event, so they carry neither key).
+  guards' own `event=wake_refused` lines are handed a slug and the wake's source, never the event, so
+  they carry `source=` alone, last).
   It is ordered for
   the person reading the line, not the query reading the key: a query addresses a key by *name*, and the
   delivery id is what a human copies to follow one wake through the router and on into the agent's own
@@ -371,9 +372,15 @@ and the probe now mints a bare `<32-hex>` rather than `probe-<32-hex>`.
 
 **`GET /up` is not logged.** Better Stack's uptime monitor probes it about once a minute, forever; those
 access lines were the largest single source of volume in the journal and in Live Tail, and pure noise. A
-filter on uvicorn's access logger drops exactly that path and nothing else (`/upload` still logs, and so
-does every webhook). If uvicorn ever changes its access-record shape the filter *keeps* the record — the
-fail-direction for a log filter is to log too much, never to silently swallow.
+filter on uvicorn's access logger drops exactly that path (`/upload` still logs).
+
+**Nor is a `POST` to a synthetic route's webhook** (`/webhooks/probe`, #459). uvicorn's access line has a
+fixed shape that cannot carry `source=probe`, so it was the one synthetic line a `source=probe` filter
+could not hide — and it says nothing the pipeline's own tagged lines for the same request do not. Which
+routes are synthetic is the registry's answer (`Route.synthetic`), so the server names no source; every
+other access line is kept, a `GET` to the same path included (answered `404` before the pipeline logs a
+word, so its access line is its only trace). If uvicorn ever changes its access-record shape the filter
+*keeps* the record — the fail-direction for a log filter is to log too much, never to silently swallow.
 
 **`router.env`** holds only the daemon's own non-agent config:
 ```

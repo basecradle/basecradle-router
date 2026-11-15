@@ -241,8 +241,11 @@ class WakeRateBreaker:
         # out of its own alarm), so there is deliberately no way to set half.
         self._synthetic_source = synthetic_source
         self._trip_level = logging.INFO if synthetic_source else logging.ERROR
-        # The reader's cue rides the same switch, so a line can never say `source=probe`
-        # at the end without saying PROBE at the front — or the reverse.
+        # The reader's cue rides the same switch, so a synthetic breaker's line can never
+        # say `source=probe` at the end without saying PROBE at the front — or the
+        # reverse. (A *real* breaker refusing a probe's wake says `source=probe` with no
+        # head, as every pipeline line about a probe's wake does: the breaker is not
+        # manufactured, the wake it refused was — see `admit`.)
         self._head = f"{PROBE_MARKER} " if synthetic_source else ""
         self._lock = threading.Lock()
         self._windows: dict[tuple, _Window] = {}
@@ -259,8 +262,19 @@ class WakeRateBreaker:
         """
         return self._config
 
-    def admit(self, agent_key: str, stream_key: str | None = None) -> BreakerOutcome:
+    def admit(
+        self, agent_key: str, stream_key: str | None = None, *, source: str | None = None
+    ) -> BreakerOutcome:
         """Record a wake for ``agent_key`` (and its ``stream_key``) and decide its fate.
+
+        ``source`` is the route the wake being decided arrived on, and it rides the
+        ``event=wake_refused`` line alone, for the reason the wake-lock guard's refusal
+        carries it: a refusal is a line about that wake, so a refused probe says
+        ``source=probe`` (#459). A synthetic breaker's own stamp wins over it — the
+        instance's one switch (see the class docstring) is never half-overridden by a
+        call. The trip and the reset never carry it: they state the breaker's state,
+        which every wake of the scope shares, and a probe that happened to tip a real
+        runaway over the cap must not hide that runaway from its own alarm.
 
         Returns an admitted :class:`BreakerOutcome` when every applicable scope is
         under threshold; otherwise the wake is refused — ``TRIPPED`` on the trip
@@ -306,7 +320,7 @@ class WakeRateBreaker:
                             agent=agent_key,
                             scope=scope,
                             key=display,
-                            source=self._synthetic_source,
+                            source=self._synthetic_source or source,
                         ),
                     )
                     return BreakerOutcome(BreakerState.OPEN, scope=scope, key=display)
