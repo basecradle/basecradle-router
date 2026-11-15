@@ -101,9 +101,10 @@ jobs:
 
       # Pinged only when the script says so: every public repository locked down with margin
       # and exactly one reminder, in a run that renewed. A gap, an unreadable answer, a dry run,
-      # or a run that died before writing its result pings nothing. The URL is write-only and
-      # never printed; unset, the run fails here, after the renewals, so a missing monitor
-      # never stops the guard itself.
+      # or a run that died before writing its result pings nothing. The URL is write-only,
+      # never printed, and never on a command line (ping-heartbeat.sh hands it to curl on
+      # stdin); unset, the run fails here, after the renewals, so a missing monitor never
+      # stops the guard itself.
       - name: Ping the Public Repository Lockdown Heartbeat
         env:
           HEARTBEAT_URL: ${{ secrets.PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL }}
@@ -116,7 +117,7 @@ jobs:
           fi
           test -n "$HEARTBEAT_URL" || { echo "::error::PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL is not set" >&2; exit 1; }
           if [ "$heartbeat" = "ping" ]; then
-            curl -fsS --retry 3 --max-time 15 -o /dev/null "$HEARTBEAT_URL"
+            .github/scripts/ping-heartbeat.sh
           else
             echo "the lockdown has a gap: the heartbeat is withheld"
           fi

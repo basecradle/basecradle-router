@@ -133,8 +133,8 @@ jobs:
       # verdict today? Pinged after the plan is applied, on a clean scan and on advisories
       # alike, and withheld when a scanner could not reach a verdict: a check that could not
       # answer never answers yes. A run that dies before this step pings nothing, and
-      # Better Stack pages when the day and the grace pass. The URL is write-only and never
-      # printed.
+      # Better Stack pages when the day and the grace pass. The URL is write-only, never
+      # printed, and never on a command line: ping-heartbeat.sh hands it to curl on stdin.
       - name: Ping the basecradle-router Dependency Scan Heartbeat
         env:
           HEARTBEAT_URL: ${{ secrets.DEPENDENCY_SCAN_HEARTBEAT_URL }}
@@ -144,7 +144,7 @@ jobs:
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/plan.json")" = "error" ]; then
             echo "a scanner reached no verdict: the heartbeat is withheld"
           else
-            curl -fsS --retry 3 --max-time 15 -o /dev/null "$HEARTBEAT_URL"
+            .github/scripts/ping-heartbeat.sh
           fi
 
       # A run that found something, or could not look, is red.
