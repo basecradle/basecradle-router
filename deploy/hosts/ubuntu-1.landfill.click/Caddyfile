@@ -93,11 +93,16 @@ ubuntu-1.landfill.click {
 	# `/webhooks/./probe` are answered as an unknown source where `/WEBHOOKS/FOO` and
 	# `/webhooks/./foo` get the daemon's not-found and no-route answers. That shows the mask
 	# is here, which this public file says anyway, and nothing about the route behind it.
-	# `tests/test_caddyfile.py` pins that the target names no route the daemon can register.
+	# The daemon logs the target as the rejected request's `source=`, so the line it writes
+	# must not contain any route's `source=<name>` tag: `probe-masked` logged
+	# `source=probe-masked`, which the substring filter that hides the fleet's own
+	# `source=probe` lines hid too, and with it the internet traffic this mask exists to
+	# show (#461). `tests/test_caddyfile.py` pins both: the target names no route the daemon
+	# can register, and the line the daemon writes for it carries no route's tag.
 	@probe path /webhooks/probe /webhooks/probe/
-	rewrite @probe /webhooks/probe-masked
+	rewrite @probe /webhooks/masked-probe
 	@probe_below path /webhooks/probe/*
-	rewrite @probe_below /webhooks/probe-masked/below
+	rewrite @probe_below /webhooks/masked-probe/below
 
 	reverse_proxy 127.0.0.1:8000 {
 		# Hold a request across a daemon restart instead of answering it 502 (#264). Every
