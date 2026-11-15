@@ -175,8 +175,17 @@ class WakeLockGuard:
         """
         return os.path.join(self.lock_dir, f"{slug}.lock")
 
-    def check(self, slug: str) -> WakeLockDecision:
+    def check(self, slug: str, *, source: str | None = None) -> WakeLockDecision:
         """Decide the wake's fate for ``slug``, logging the decision. The wake path.
+
+        ``source`` is the route the wake being decided arrived on. It rides the two
+        ``event=wake_refused`` lines, because a refusal is a line *about that wake*, and
+        every such line names the source that asked for it — so a refused probe says
+        ``source=probe`` and one filter hides it with the rest of the fleet's synthetic
+        traffic (#459). The ``wake_lock_unreadable`` and ``wake_lock_stale`` lines do
+        not carry it: they state a fact about the box's freeze surface, true whichever
+        wake happened to read it, and a tag there would let the synthetic filter hide
+        a genuine fault the first time a probe was the one to find it.
 
         :meth:`inspect` makes the decision; this adds the loud, filterable log line
         for every non-``ABSENT`` outcome (the happy path stays silent). The split
@@ -207,6 +216,7 @@ class WakeLockGuard:
                     agent=slug,
                     lock_reason=decision.lock_reason,
                     expires_at=decision.expires_at,
+                    source=source,
                 ),
             )
         elif state is WakeLockState.STALE:
@@ -219,7 +229,12 @@ class WakeLockGuard:
             logger.warning(
                 "%s %s",
                 paint("event=wake_refused"),
-                log_fields(reason="wake_lock_unparseable", agent=slug, detail=decision.reason),
+                log_fields(
+                    reason="wake_lock_unparseable",
+                    agent=slug,
+                    detail=decision.reason,
+                    source=source,
+                ),
             )
         return decision
 
