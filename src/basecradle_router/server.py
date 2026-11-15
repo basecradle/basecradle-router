@@ -277,8 +277,8 @@ class WebhookServer:
         # Checked first, from the headers alone, for every webhook POST, because some are
         # answered from the path alone and their lines must read as what they are too, and
         # a mark that rode a request is spent whatever the answer. A mark changes what is
-        # logged about the request and nothing else: everything after runs exactly as it
-        # would without one.
+        # logged about the request, and keeps it off a real route's delivery sink (#464),
+        # and nothing else: everything after runs exactly as it would without one.
         source = _source_of(scope["path"], self.prefix)
         headers = self._headers(scope)
         mark = InboundRequest(headers=headers, body=b"").header(MARK_HEADER)

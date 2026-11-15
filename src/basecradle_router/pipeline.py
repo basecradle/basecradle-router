@@ -118,7 +118,7 @@ from basecradle_router.concurrency import (
 from basecradle_router.config import Config, ConfigError
 from basecradle_router.dedup import DUPLICATE_DELIVERY, DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
-from basecradle_router.logfmt import log_fields, paint
+from basecradle_router.logfmt import active_synthetic_origin, log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
 from basecradle_router.routes import (
@@ -612,8 +612,8 @@ class Pipeline:
                 # disagree about which route a wake came in on. One case is on purpose:
                 # a request whose synthetic mark verified (#461) logs `source=<synthetic>
                 # via=<route>`, while the ledger still records `route` and `synthetic` as
-                # the route judged it, because a mark changes what is logged and never
-                # the evidence (where marked deliveries belong is #464). The evidence
+                # the route judged it: a mark keeps a delivery off a real route's sink
+                # (#464, `_counts_on_sink`) and never touches a wake's record. The evidence
                 # document keeps its own `synthetic` flag beside it because it is read
                 # long after the fact, when the registry can no longer be asked which
                 # routes were manufactured — a log line is read in place and needs no
@@ -717,17 +717,24 @@ class Pipeline:
         # recorded only for a *known* route, deliberately: the webhook path is
         # unauthenticated, and counting an unknown source would let anyone grow the
         # evidence document one bogus `/webhooks/<anything>` at a time.
+        #
+        # Nor is the fleet's own traffic counted on a real route's sink (#464): see
+        # `_counts_on_sink`. Every `if counted:` below is that one decision, taken once.
+        counted = self._counts_on_sink(route)
         try:
             route.verify(request, self._route_secret(route, source))
         except SignatureError as exc:
-            self.evidence.record_delivery_rejected(source, str(exc))
+            if counted:
+                self.evidence.record_delivery_rejected(source, str(exc))
             self._record(result, Stage.VERIFY, Outcome.REJECTED, source=source, error=str(exc))
             return None
         except ConfigError as exc:
-            self.evidence.record_delivery_rejected(source, f"no secret configured: {exc}")
+            if counted:
+                self.evidence.record_delivery_rejected(source, f"no secret configured: {exc}")
             self._record(result, Stage.VERIFY, Outcome.FAILED, source=source, error=str(exc))
             return None
-        self.evidence.record_delivery_accepted(source)
+        if counted:
+            self.evidence.record_delivery_accepted(source)
         self._record(result, Stage.VERIFY, Outcome.OK, source=source)
 
         # Normalize: payload → Event, or a clean ignore. A malformed payload or a
@@ -756,10 +763,12 @@ class Pipeline:
             )
             return None
         if event is None:
-            self.evidence.record_delivery_decision(source, woke=False)
+            if counted:
+                self.evidence.record_delivery_decision(source, woke=False)
             self._record(result, Stage.NORMALIZE, Outcome.IGNORED, source=source)
             return None
-        self.evidence.record_delivery_decision(source, woke=True)
+        if counted:
+            self.evidence.record_delivery_decision(source, woke=True)
         result.event = event
         self._record(
             result,
@@ -1046,6 +1055,33 @@ class Pipeline:
             delivery=event.delivery_id,
             **detail,
         )
+
+    @staticmethod
+    def _counts_on_sink(route: Route) -> bool:
+        """Whether the delivery being served is evidence on ``route``'s delivery sink (#464).
+
+        A real route's sink is evidence about the *source*: an ``accepted`` proves the
+        secret on this box matches the one the source signs with. A delivery whose
+        synthetic mark verified is the fleet's own traffic, signed from this box's own
+        ``router.env``, so it proves only that the file agrees with itself, and counting it
+        would refresh ``last_accepted_at`` on every deploy whether or not the source can
+        still reach us — the green-while-absent shape the sink exists to catch
+        (basecradle/basecradle#460, instance 5). Its rejections would blur the
+        ``accepted=0 rejected=N`` signal the same way. So it records nothing there: no
+        accept, no rejection, no decision. The smoke test asserts on its responses.
+
+        Three things are unchanged, on purpose. A request whose mark did **not** verify
+        carries no verdict (:meth:`mark_origin`), so it is the internet's and counts in
+        full. A *synthetic* route's own sink still counts a marked delivery, because it
+        is already the fleet's and says so (``detail.synthetic``). And the request is
+        judged exactly as before: only what the sink records changes.
+
+        The verdict is the one the server set around this request
+        (:func:`~basecradle_router.logfmt.synthetic_origin`), the same one every line
+        about it is rendered from, so the log and the evidence can never disagree about
+        which requests were the fleet's.
+        """
+        return route.synthetic or active_synthetic_origin() is None
 
     def _route_secret(self, route: Route, source: str) -> Secret | None:
         """The route-wide secret to hand ``route``'s verify, or ``None`` if it needs none.

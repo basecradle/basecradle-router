@@ -316,8 +316,13 @@ that request, from any layer and on the wake's own thread, renders `source=probe
 filter hides it, the NOC's `source` column (the first `source=`) reads `probe`, and `via=` keeps the route
 it exercised readable. Its access line is dropped, as a probe's is.
 
-- **It changes what is logged, never how the request is judged.** Status, stages, evidence and wake are
-  identical with and without a mark.
+- **It changes what is logged, never how the request is judged.** Status, stages and wake are identical
+  with and without a mark.
+- **It is never delivery-sink evidence on a real route** (#464). A marked delivery to the github or
+  basecradle route records nothing in `delivery_sinks.<route>`: no `accepted`, no `rejected`, no decision.
+  It is signed from this box's own `router.env`, so it proves only that the file agrees with itself (see
+  `delivery-sink:<route>` under "Proving what the router claims"). The probe route's own sink, already
+  `synthetic`, still counts. A mark that does not verify counts in full, like any stranger's delivery.
 - **Only the fleet can make one, and each works once.** A mark is honoured once, within 120 s of the daemon's
   clock, and only if it was stamped after the daemon started. The edge's access log carries request headers,
   so every mark reaches the journal, but only after its request has spent it. A restart forgets which nonces
@@ -980,7 +985,7 @@ this repo to do.
 | `wake-edge:synthetic:<route>` | `agent:<slug>` | `rare` / 168 h | **An evidence claim with no lever.** The two rows above go green only when something *happens*, and for a deliberately quiet agent nothing ever does. This row is the lever — the router's own synthetic wake — and it is proven by the *same* `last_ok_at` a real wake writes, never by the probe's own exit code. Emitted per **armed synthetic** route; deliberately **not** counted as a wake edge (see below). |
 | `freeze-surface:readable` | `box:<host>` | `rare` / 24 h | **The control that existed but could not be read.** A `probe` claim, not a pointer: readability is not a fact you look up, it is one you demonstrate with the daemon's own credentials. |
 | `log-grammar:breaker_tripped` | `box:<host>` | `rare` / 1 h | **An alarm whose grammar nobody can watch.** `breaker_tripped` is a **needle** column — every clause in its pattern is a whole line that exists only when a breaker trips — so nothing arrives on a healthy fleet for the NOC's extraction guard to read, and a rename takes the *Circuit Breaker Tripped* alarm silently to zero (`basecradle-noc#509`). This row fires one, through the daemon's own trip statement. Its reach is **rendered**, published as `detail.proves`: landing and extraction are the NOC's witness and guard (`#234`). |
-| `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's. `detail.synthetic` marks the probe's own sink, so the fleet probing itself never reads as an external integration being armed. |
+| `delivery-sink:<route>` | `box:<host>` | `rare` / 168 h | **An integration armed on paper.** `accepted=0 rejected=417` is a mismatched secret; `accepted=0 rejected=0` is a sink nobody has used. `accepted` counts *signature verification passing*, which is what proves the secret on this box matches the source's — so it counts only deliveries the source sent: the deploy smoke test's, signed from this box's own `router.env` and marked (#461), are kept off every real route's sink (#464), and a real sink's `last_accepted_at` ages unless the source itself delivers. `detail.synthetic` marks the probe's own sink, so the fleet probing itself never reads as an external integration being armed. |
 
 #### `probe log-grammar` — proving the alarm's needle line is still written (#232, #234)
 
