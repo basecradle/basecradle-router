@@ -459,6 +459,7 @@ NO_SECRET: dict[str, str] = {
     ".claude/session-guard.sh": "laptop leftovers check: Docker, ports, tabs",
     ".github/scripts/commit-trailers.sh": "CI lint over commit messages",
     ".github/scripts/injection-guard.sh": "CI check for contamination artifacts by filename",
+    ".github/scripts/lint-python-scripts.sh": "CI ruff over the extensionless Python helpers",
     ".github/scripts/lint-shell.sh": "CI shellcheck",
     ".github/scripts/lint-workflows.sh": "CI actionlint",
     ".github/scripts/dependency_security_scan.py": (

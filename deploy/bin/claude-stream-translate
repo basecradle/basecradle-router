@@ -37,9 +37,10 @@ because its reader went away. Writes go straight to the descriptor, never throug
 so a journal that went away cannot fail the exit either.
 
 WHAT IT READS BESIDES THE STREAM, at the close only: the subagent transcripts the builder's own
-`claude` wrote under the builder's own Claude Code home (`$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`),
-found by the run's session id, as data. They are the only record of a subagent call's usage. Reading
-them loads no code and needs no permission the builder does not already hold over its own files.
+`claude` wrote under the builder's own Claude Code home (`$CLAUDE_CONFIG_DIR`, else
+`$HOME/.claude`), found by the run's session id, as data. They are the only record of a subagent
+call's usage. Reading them loads no code and needs no permission the builder does not already hold
+over its own files.
 
 ITS ONE ARGUMENT is `claude`'s pid, the writer of its stream. The stream ends at EOF, which comes
 when the last holder of the pipe's write end closes it, and that is `claude` unless something it

@@ -97,6 +97,14 @@ jobs:
       - name: Format Check
         run: uv run ruff format --check .
 
+      # ruff finds Python by extension, so the two steps above never open the extensionless
+      # helpers under deploy/bin that the NOC installs root-owned on the box; CLAUDE.md's Stack
+      # holds all of this repo's Python to ruff, and these had drifted from it unseen (found in
+      # #484's review). This lints them, discovered by shebang
+      # (tests/test_lint_python_scripts_gate.py).
+      - name: Lint Python Scripts
+        run: uv run .github/scripts/lint-python-scripts.sh
+
       # THE BOXES' VECTOR (#380). tests/test_vector_unit.py runs the shipped vector.yaml's
       # VRL through `vector test`, so it must run on the release the boxes install
       # (deploy/README → VECTOR_VERSION, which that test holds this pin to). The same .deb the
