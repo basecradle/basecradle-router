@@ -262,6 +262,9 @@ class Translator:
     unreadable: int = 0
     result_seen: bool = False
     _calls: dict[str, _Call] = field(default_factory=dict)
+    #: The main-thread call the last ``message_start`` opened: the one a ``message_delta`` or
+    #: ``message_stop`` that names no message belongs to.
+    _open: str | None = None
     _request_ids: dict[str, str] = field(default_factory=dict)
     _requested_at: float | None = None
     _retries: int = 0
@@ -365,7 +368,10 @@ class Translator:
         if not isinstance(inner, Mapping):
             return
         kind = inner.get("type")
-        message_id = event.get("api_message_id")
+        # Claude Code names the message on every stream event only from 2.1.325 on; 2.1.286, the
+        # box's, names it on `message_start` alone. The main thread runs one call at a time, so
+        # an event that names none belongs to the call the last `message_start` opened.
+        message_id = event.get("api_message_id") or self._open
         if kind == "message_start":
             message = inner.get("message")
             if not isinstance(message, Mapping):
@@ -379,6 +385,7 @@ class Translator:
                 started = now - (ttft or 0) / 1000
             usage = message.get("usage")
             model = message.get("model")
+            self._open = message_id
             self._calls[message_id] = _Call(
                 model=model if isinstance(model, str) and model else (self.model or ""),
                 started=started,
@@ -396,6 +403,8 @@ class Translator:
                     call.stop_reason = delta["stop_reason"]
             elif kind == "message_stop":
                 del self._calls[message_id]
+                if self._open == message_id:
+                    self._open = None
                 call.request_id = call.request_id or self._request_ids.pop(message_id, None)
                 self._call_ended(call, now)
 

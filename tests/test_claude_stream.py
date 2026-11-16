@@ -501,3 +501,25 @@ def test_a_usage_field_of_the_wrong_shape_costs_no_line(details) -> None:
     calls = llm_lines(translate(rewrite("tools", odd)))
     assert len(calls) == 4
     assert all("tokens_reasoning" not in line and "cost" in line for line in calls)
+
+
+def _without_message_ids(name: str) -> list[str]:
+    """The fixture as Claude Code 2.1.286 writes it: no ``api_message_id`` on a stream event."""
+
+    def strip(event: dict[str, Any]) -> None:
+        event.pop("api_message_id", None)
+
+    return rewrite(name, strip)
+
+
+@pytest.mark.parametrize("name", ["tools", "subagent", "websearch", "max_turns"])
+def test_a_stream_that_names_no_message_on_its_events_renders_the_same_lines(name: str) -> None:
+    # The box's Claude Code (2.1.286) names a message on `message_start` only; the captures
+    # (2.1.325) name it on every stream event. The lines must not depend on which wrote them.
+    assert translate(_without_message_ids(name)) == run(name)
+
+
+def test_a_cut_call_without_message_ids_still_has_no_line() -> None:
+    assert translate(_without_message_ids("stopped"), stopped_by="TERM") == run(
+        "stopped", stopped_by="TERM"
+    )
