@@ -107,9 +107,7 @@ def paint(token: str) -> str:
     return f"{colour}{token}{RESET}" if colour else token
 
 
-#: One C0 or C1 control character, or DEL — Unicode's ``Cc`` category exactly, which is
-#: what the ``\\p{Cc}`` of the router's own ``detail=`` remap matches (``vector.yaml``,
-#: ``ai_otel_llm``), so the two renderers flatten the same bytes.
+#: One C0 or C1 control character, or DEL — Unicode's ``Cc`` category exactly.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
@@ -163,11 +161,10 @@ def bounded(value: object, limit: int = BOUND) -> str:
     """``value`` flattened and cut to at most ``limit`` characters, ending in ``…`` when cut.
 
     For foreign text only (a vendor's error, a tool's failure): the router's own values are never
-    bounded, which is why :func:`log_fields` does not call this. It is the cut the ``ai_otel_llm``
-    remap applies to ``detail=`` (``vector.yaml``, #385) and the harness's ``bounded``: the cut
-    backs off to the last character outside a ``[A-Za-z0-9_-]`` run, so a token is either whole,
-    and so redactable by the box's ``ai_scrub`` after it, or absent. A value that is one such run
-    past the bound is returned empty, and :func:`log_fields` then drops the field.
+    bounded, which is why :func:`log_fields` does not call this. It is the harness's ``bounded``
+    (#385): the cut backs off to the last character outside a ``[A-Za-z0-9_-]`` run, so a token
+    is either whole, and so redactable by the box's ``ai_scrub`` after it, or absent. A value that
+    is one such run past the bound is returned empty, and :func:`log_fields` then drops the field.
     """
     text = " ".join(_CONTROL.sub(" ", str(value)).split())
     if len(text) <= limit:

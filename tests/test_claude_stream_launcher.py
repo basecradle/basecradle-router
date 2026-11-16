@@ -206,11 +206,16 @@ def _translate(
         return code, out.read().decode().splitlines()
 
 
+def _is_llm(line: str) -> bool:
+    """An ``llm`` line, by its head: a prose line that mentions the word is not one."""
+    return line.startswith(("INFO llm ", "WARNING llm "))
+
+
 def test_it_translates_its_input_line_by_line(tree: Path) -> None:
     with open(FIXTURES / "tools.jsonl", "rb") as stream:
         code, lines = _translate(tree, stream.fileno())
     assert code == 0
-    assert lines[0].startswith("INFO llm shadow provider=anthropic ")
+    assert lines[0].startswith("INFO llm provider=anthropic ")
     assert "> Done: the work is finished." in lines
 
 
@@ -221,7 +226,7 @@ def test_the_builders_claude_home_reaches_the_translator(tree: Path) -> None:
     with open(FIXTURES / "background_subagents.jsonl", "rb") as stream:
         code, lines = _translate(tree, stream.fileno(), environ={"CLAUDE_CONFIG_DIR": str(home)})
     assert code == 0
-    subagent = [line for line in lines if " llm shadow " in line and " duration=" not in line]
+    subagent = [line for line in lines if _is_llm(line) and " duration=" not in line]
     assert len(subagent) == 6 and all(" cost=" in line for line in subagent)
     with open(FIXTURES / "background_subagents.jsonl", "rb") as stream:
         _, unread = _translate(tree, stream.fileno())
@@ -339,7 +344,7 @@ def test_a_stops_sigterm_is_recorded_and_the_stream_is_read_to_its_end(tree: Pat
     out = child.stdout.read().decode()
     assert child.wait(timeout=30) == 0, child.stderr.read()
     assert "> Done: the work is finished." in out
-    assert len([line for line in out.splitlines() if " llm shadow " in line]) == 4
+    assert len([line for line in out.splitlines() if _is_llm(line)]) == 4
 
 
 def test_a_stream_a_stop_cut_short_says_so(tree: Path) -> None:

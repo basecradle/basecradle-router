@@ -128,42 +128,11 @@ def test_the_value_rule_treats_apostrophes_newlines_and_backslashes_as_the_harne
 
 
 def test_a_control_character_in_a_value_is_a_space_never_a_raw_escape() -> None:
-    # The router's `detail=` remap turns every `\p{Cc}` into a space, so this renderer
-    # does too: an escape inside a value would paint a stretch of the line, and the
-    # token-integrity rule says colour reaches a line only through `paint`.
+    # The fleet's value rule turns every `\p{Cc}` into a space: an escape inside a value
+    # would paint a stretch of the line, and the token-integrity rule says colour reaches
+    # a line only through `paint`.
     assert log_fields(error="upstream\x1b[31m red\x00\x7f") == 'error="upstream [31m red"'
     assert "\x1b" not in log_fields(error="\x1b[32moutcome=ok\x1b[0m")
-
-
-def _vrl_string(literal: str) -> str:
-    """A VRL double-quoted string literal's text, its escapes resolved (``\\u{1b}`` included)."""
-
-    def resolve(match: re.Match[str]) -> str:
-        if match[1]:
-            return chr(int(match[1], 16))
-        return {"n": "\n", "t": "\t", "r": "\r"}.get(match[2], match[2])
-
-    return re.sub(r"\\(?:u\{([0-9A-Fa-f]+)\}|(.))", resolve, literal)
-
-
-def test_log_fields_and_the_detail_remap_render_the_same_bytes() -> None:
-    # Two renderers of one rule drift unless one test reads both. The remap's case runs
-    # through the shipped VRL in tests/test_vector_unit.py; this reads that case's
-    # input and expected `detail=` back out of the fixture and renders the input here.
-    fixture = (Path(__file__).parent / "vector" / "ai_otel_llm.yaml").read_text()
-    name = (
-        "a detail renders by the fleet's one value rule, byte for byte with the router's log_fields"
-    )
-    case = fixture.split(f'  - name: "{name}"', 1)[1].split("\n  - name: ", 1)[0]
-    error = re.search(r'"error": "((?:[^"\\]|\\.)*)"', case)
-    expected = re.search(r'assert_eq!\(\.message, "((?:[^"\\]|\\.)*)"\)', case)
-    assert error and expected, "the shared value-rule case is missing from the Vector fixture"
-    value = _vrl_string(error.group(1))
-    # Every class the rule treats specially is in the one shared input.
-    for char in ('"', "\\", "'", "\n", "\x1b", "\x85"):
-        assert char in value, repr(char)
-    detail = _vrl_string(expected.group(1)).split(" detail=", 1)[1]
-    assert log_fields(detail=value) == f"detail={detail}"
 
 
 def test_log_fields_renders_a_bool_lowercase_and_never_drops_false() -> None:
@@ -306,7 +275,7 @@ def test_bounded_cuts_to_the_bound_with_an_ellipsis() -> None:
 
 def test_bounded_never_cuts_inside_a_credential_shaped_run() -> None:
     # A key cut short of its rule's minimum would match no box redaction and ship as a prefix,
-    # so a run straddling the bound goes whole — as the `ai_otel_llm` remap's cut does (#385).
+    # so a run straddling the bound goes whole — as the harness's `bounded` does (#385).
     head = "a" * 230
     cut = bounded(f"{head} ghp_{'A' * 40}")
     assert cut == f"{head}…"

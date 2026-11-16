@@ -1,15 +1,14 @@
 r"""The shipped Vector config's VRL, run by `vector test` (#380, #398).
 
-`ai_otel_llm` and `ai_scrub` are VRL, and their output is the exact line Better Stack receives,
-so no Python reading of the YAML can prove it. This runs the real thing: `vector test` executes
-the transforms over the fabricated events in every suite under `tests/vector/` and asserts the
-bytes. It runs every suite against every host's shipped `vector.yaml`, on the Vector release the
-boxes run (deploy/README → `VECTOR_VERSION`), so a VRL behaviour that changed between releases
-cannot pass here and fail on a box.
+`ai_scrub` is VRL, and its output is the exact line Better Stack receives, so no Python reading of
+the YAML can prove it. This runs the real thing: `vector test` executes the transform over the
+fabricated events in every suite under `tests/vector/` and asserts the bytes. It runs every suite
+against every host's shipped `vector.yaml`, on the Vector release the boxes run (deploy/README →
+`VECTOR_VERSION`), so a VRL behaviour that changed between releases cannot pass here and fail on a
+box.
 
 The suites:
 
-* `ai_otel_llm.yaml` — a Claude Code model call rendered as the fleet's `llm` line (#380).
 * `ai_scrub.yaml` — the redaction every shipped line passes: the literal rules before the prefix
   rules, and the harness's word rule (#398). Python's `re` cannot stand in for it: it has no
   `\p{L}` classes, and the word rule is a closure, so the real engine is the only test.
@@ -119,7 +118,7 @@ def test_ci_installs_the_release_the_boxes_run() -> None:
 def test_every_suite_is_run() -> None:
     # The glob below is the whole list: a suite named here and missing from disk, or the scrub's
     # suite renamed out of the glob, would otherwise leave the redaction untested and green.
-    assert {suite.name for suite in SUITES} >= {"ai_otel_llm.yaml", "ai_scrub.yaml"}
+    assert {suite.name for suite in SUITES} >= {"ai_scrub.yaml"}
 
 
 def test_the_readme_recipe_switches_interpolation_on_as_the_unit_does() -> None:

@@ -21,7 +21,9 @@ import pytest
 from basecradle_router import claude_stream as cs
 from basecradle_router.claude_stream import (
     LLM_HEAD,
+    TOOL_HEAD,
     TRANSCRIPT_WAIT,
+    UNPRICED_HEAD,
     Translator,
     aimed_at,
     claude_home,
@@ -47,17 +49,11 @@ TOOL_FIELDS = {
     "error", "cost", "cost_basis", "cost_gap", "generation_id",
 }  # fmt: skip
 UNPRICED_FIELDS = {"provider", "model", "charge", "reason"}
-HEADS = {
-    LLM_HEAD: LLM_FIELDS,
-    "tool": TOOL_FIELDS,
-    "tool shadow": TOOL_FIELDS,
-    "cost unpriced shadow": UNPRICED_FIELDS,
-}
+HEADS = {LLM_HEAD: LLM_FIELDS, TOOL_HEAD: TOOL_FIELDS, UNPRICED_HEAD: UNPRICED_FIELDS}
+_HEAD = "|".join(re.escape(head) for head in HEADS)
 
 #: One structured line: severity, a head, then key=value fields (a value is bare or quoted).
-STRUCTURED = re.compile(
-    r"\A(INFO|WARNING) (llm shadow|tool shadow|tool|cost unpriced shadow) ([a-z_]+=.+)\Z"
-)
+STRUCTURED = re.compile(rf"\A(INFO|WARNING) ({_HEAD}) ([a-z_]+=.+)\Z")
 FIELD = re.compile(r'([a-z_]+)=("[^"]*"|[^ "]+)(?: |\Z)')
 
 
@@ -116,7 +112,12 @@ def fields(line: str) -> dict[str, str]:
 
 
 def llm_lines(lines: list[str]) -> list[dict[str, str]]:
-    return [fields(line) for line in lines if f" {LLM_HEAD} " in line]
+    return [fields(line) for line in lines if headed(line, LLM_HEAD)]
+
+
+def headed(line: str, head: str) -> bool:
+    """A structured line under ``head``, by its position: a prose line naming the head is not."""
+    return re.match(rf"\A(INFO|WARNING) {re.escape(head)} [a-z_]+=", line) is not None
 
 
 ALL = sorted(path.stem for path in FIXTURES.glob("*.jsonl"))
@@ -143,12 +144,13 @@ def test_every_structured_line_is_a_contract_head_with_contract_fields(name: str
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_no_line_is_read_by_a_noc_call_column(name: str) -> None:
-    # The comparison mark (#481): every column that counts, times or prices a call is gated on
-    # ` llm provider=`, so while the receiver still writes these calls, no line here may match.
+def test_every_call_and_fee_line_carries_the_bare_contract_head(name: str) -> None:
+    # These lines are the builder's record (#486): every NOC column that counts, times or prices
+    # a call or a fee is gated on the bare head, so a word between the head and its first field
+    # (the retired `shadow` mark) would leave the line counted by nothing.
     for line in run(name):
-        assert "llm provider=" not in line, line
-        assert "cost unpriced provider=" not in line, line
+        if re.match(rf"\A(INFO|WARNING|ERROR) ({_HEAD}) ", line):
+            assert STRUCTURED.match(line), line
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -210,7 +212,7 @@ def test_a_wakes_lines_add_up_to_claude_codes_stated_total_to_the_last_digit(nam
     dollars = sum(
         float(fields(line)["cost"])
         for line in out
-        if (f" {LLM_HEAD} " in line or line.startswith("INFO tool shadow ")) and " cost=" in line
+        if (headed(line, LLM_HEAD) or headed(line, TOOL_HEAD)) and " cost=" in line
     )
     assert dollars == pytest.approx(result["total_cost_usd"], abs=1e-9)
     for model, figures in result["modelUsage"].items():
@@ -225,12 +227,12 @@ def test_a_wakes_lines_add_up_to_claude_codes_stated_total_to_the_last_digit(nam
 
 def test_a_tool_run_renders_the_contract_lines() -> None:
     assert run("tools") == [
-        "INFO llm shadow provider=anthropic purpose=main residency=global model=claude-opus-5-5"
+        "INFO llm provider=anthropic purpose=main residency=global model=claude-opus-5-5"
         " duration=2.50s tokens_in=27040 tokens_out=74 tokens_total=27114 cached_tokens=11379"
         " cache_write_tokens=15659 tokens_reasoning=0 cost=0.1290358 cost_basis=computed"
         " outcome=ok generation_id=req_011FabNova01Call0001",
         "INFO tool name=Bash executor=harness duration=0.16s outcome=ok",
-        "INFO llm shadow provider=anthropic purpose=main residency=global model=claude-opus-5-5"
+        "INFO llm provider=anthropic purpose=main residency=global model=claude-opus-5-5"
         " duration=3.00s tokens_in=27160 tokens_out=85 tokens_total=27245 cached_tokens=27038"
         " cache_write_tokens=120 tokens_reasoning=0 cost=0.0080756 cost_basis=computed"
         " outcome=ok generation_id=req_011FabNova01Call0002",
@@ -238,11 +240,11 @@ def test_a_tool_run_renders_the_contract_lines() -> None:
         'WARNING tool name=Bash error="Exit code 2 ls: cannot access'
         " '/home/basecradle-nova-ai/clone/missing': No such file or directory\"",
         "INFO tool name=Write executor=harness duration=0.02s outcome=error reason=withheld",
-        "INFO llm shadow provider=anthropic purpose=main residency=global model=claude-opus-5-5"
+        "INFO llm provider=anthropic purpose=main residency=global model=claude-opus-5-5"
         " duration=5.50s tokens_in=27320 tokens_out=150 tokens_total=27470 cached_tokens=27158"
         " cache_write_tokens=160 tokens_reasoning=0 cost=0.0097196 cost_basis=computed"
         " outcome=ok generation_id=req_011FabNova01Call0003",
-        "INFO llm shadow provider=anthropic purpose=main residency=global model=claude-opus-5-5"
+        "INFO llm provider=anthropic purpose=main residency=global model=claude-opus-5-5"
         " duration=3.75s tokens_in=27624 tokens_out=156 tokens_total=27780 cached_tokens=27318"
         " cache_write_tokens=304 tokens_reasoning=151 cost=0.0110236 cost_basis=computed"
         " outcome=ok generation_id=req_011FabNova01Call0004",
@@ -266,11 +268,11 @@ def test_the_call_line_uses_the_final_usage_never_the_assistant_lines_placeholde
 
 def test_retries_are_their_own_lines_and_the_failure_names_its_attempts() -> None:
     assert run("retried") == [
-        "WARNING llm shadow provider=anthropic purpose=main model=claude-opus-5-5"
+        "WARNING llm provider=anthropic purpose=main model=claude-opus-5-5"
         " outcome=retrying attempt=1/3 reason=transport next_in=0.51s",
-        "WARNING llm shadow provider=anthropic purpose=main model=claude-opus-5-5"
+        "WARNING llm provider=anthropic purpose=main model=claude-opus-5-5"
         " outcome=retrying attempt=2/3 reason=transport next_in=1.04s",
-        "WARNING llm shadow provider=anthropic purpose=main model=claude-opus-5-5"
+        "WARNING llm provider=anthropic purpose=main model=claude-opus-5-5"
         ' duration=0.75s outcome=failed attempt=3/3 reason=transport detail="API Error:'
         ' Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)"',
         "> API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
@@ -352,12 +354,12 @@ def test_a_subagent_with_no_transcript_is_counted_its_dollars_in_the_closing_lin
         assert not {"tokens_in", "tokens_out", "tokens_total", "duration"} & set(line)
     gaps = [line for line in out if line.startswith("WARNING cost unpriced ")]
     assert gaps == [
-        "WARNING cost unpriced shadow provider=anthropic model=claude-opus-5-5 charge=tokens"
+        "WARNING cost unpriced provider=anthropic model=claude-opus-5-5 charge=tokens"
         " reason=not_reported"
     ]  # once per wake per gap
     closing = [line for line in llm_lines(out) if line["purpose"] == "helper"]
     assert closing == [fields(
-        "INFO llm shadow provider=anthropic purpose=helper model=claude-opus-5-5 tokens_in=42152"
+        "INFO llm provider=anthropic purpose=helper model=claude-opus-5-5 tokens_in=42152"
         " tokens_out=128 tokens_total=42280 cached_tokens=20668 cache_write_tokens=21480"
         " cost=0.1141096 cost_basis=computed outcome=ok"
     )]  # fmt: skip
@@ -388,7 +390,7 @@ def test_a_helper_model_the_stream_never_shows_is_the_closing_line() -> None:
     ] * 3
     (closing,) = [line for line in llm_lines(out) if line["purpose"] == "helper"]
     assert closing == fields(
-        "INFO llm shadow provider=anthropic purpose=helper model=claude-haiku-5-5 tokens_in=14249"
+        "INFO llm provider=anthropic purpose=helper model=claude-haiku-5-5 tokens_in=14249"
         " tokens_out=507 tokens_total=14756 cached_tokens=0 cost=0.0116784 cost_basis=computed"
         " outcome=ok"
     )
@@ -432,8 +434,8 @@ def test_an_unknown_model_is_unpriced_and_says_why_once() -> None:
     assert len(calls) == 4
     assert {line["cost_gap"] for line in calls} == {"unknown_model"}
     assert all("cost" not in line and "tokens_total" in line for line in calls)
-    assert [line for line in out if "cost unpriced" in line] == [
-        "WARNING cost unpriced shadow provider=anthropic model=claude-unknown-9 charge=tokens"
+    assert [line for line in out if headed(line, UNPRICED_HEAD)] == [
+        "WARNING cost unpriced provider=anthropic model=claude-unknown-9 charge=tokens"
         " reason=unknown_model"
     ]
 
@@ -452,9 +454,9 @@ def test_a_server_side_search_is_a_server_tool_line_with_its_fee() -> None:
             event["modelUsage"]["claude-opus-5-5"]["costUSD"] += 0.02
 
     out = translate(rewrite("max_turns", search))
-    call = out.index(next(line for line in out if f" {LLM_HEAD} " in line))
+    call = out.index(next(line for line in out if headed(line, LLM_HEAD)))
     assert out[call + 1] == (
-        "INFO tool shadow name=web_search executor=server provider=anthropic kind=search.web"
+        "INFO tool name=web_search executor=server provider=anthropic kind=search.web"
         " count=2"
         " outcome=ok cost=0.02 cost_basis=computed generation_id=req_011FabNova03Call0001"
     )
@@ -520,16 +522,15 @@ def test_money_is_plain_fixed_point(value: float, text: str) -> None:
     assert money(value) == text
 
 
-def test_a_server_tools_fee_is_marked_because_the_receivers_call_cost_holds_it() -> None:
-    # A harness or MCP tool line is a fact the receiver never had, so it stays bare.
+def test_a_server_tool_and_a_harness_tool_share_the_one_tool_head() -> None:
+    # A server-side tool's fee is its own fact (#486), on the head a harness or MCP tool uses.
     def search(event: dict[str, Any]) -> None:
         if event["type"] == "stream_event" and event["event"]["type"] == "message_delta":
             event["event"]["usage"]["server_tool_use"] = {"web_fetch_requests": 1}
 
     out = translate(rewrite("max_turns", search))
-    assert any(line.startswith("INFO tool shadow name=web_fetch executor=server") for line in out)
+    assert any(line.startswith("INFO tool name=web_fetch executor=server") for line in out)
     assert any(line.startswith("INFO tool name=Bash executor=harness") for line in out)
-    assert not any(" tool name=" in line and "executor=server" in line for line in out)
 
 
 def test_stream_json_cut_mid_line_is_counted_and_never_written() -> None:
@@ -1214,7 +1215,7 @@ def test_the_closing_line_carries_the_remainder_of_each_model() -> None:
     out = run("subagent_websearch")
     (closing,) = [line for line in llm_lines(out) if line["purpose"] == "helper"]
     assert closing == fields(
-        "INFO llm shadow provider=anthropic purpose=helper model=claude-haiku-5-5 tokens_in=14014"
+        "INFO llm provider=anthropic purpose=helper model=claude-haiku-5-5 tokens_in=14014"
         " tokens_out=781 tokens_total=14795 cached_tokens=0 tokens_reasoning=399 cost=0.0117919"
         " cost_basis=computed outcome=ok"
     )  # the helper's tokens and its search fee, as Claude Code billed them

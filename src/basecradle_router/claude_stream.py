@@ -8,7 +8,7 @@ written by the builder's own wake, into a journald stream root opened and named 
 through a port any local account can write to under any name (basecradle/basecradle#789).
 
 **The interface is "a runtime's own structured output in, contract lines out."** Claude Code is
-the first runtime; a second runtime is a second module like this one, never a second receiver.
+the first runtime; a second runtime is a second module like this one, never a port.
 The lines are the contract's (basecradle-harness ``docs/telemetry.md``), rendered by the router's
 one renderer, :func:`basecradle_router.logfmt.log_fields`, and the final reply is written as prose
 exactly where the reply went before, each line led by ``> ``.
@@ -61,13 +61,10 @@ the stream captured for #481, Claude Code 2.1.325):
   every finished subagent call its transcripts hold is still written, and a WARNING says what is
   missing.
 
-**The comparison mark.** While the ``ai_otel`` receiver still renders the same calls, every line
-that describes them carries ``shadow`` after its head: ``llm shadow provider=``, ``cost unpriced
-shadow``, and ``tool shadow`` for a server-side tool, whose fee the receiver's call cost already
-holds. Every NOC column that counts, times or prices a call or a tool fee is gated on the bare head
-(``llm provider=``, ``tool name=``), so no chart counts a fact twice, and the two records differ by
-one word. A harness or MCP ``tool`` line is a fact the receiver never had, so it is unmarked.
-Dropping the mark is the receiver's removal, and nothing else changes then.
+**These lines are a builder's record** (basecradle/basecradle#789, basecradle-router#486). Each
+fact is written once, under the contract's bare head: a call's ``llm`` line carries the price of
+its tokens, and a server-side tool's fee rides its own ``tool … executor=server`` line beside it,
+so a wake's ``llm`` and ``tool`` dollars together are Claude Code's stated total.
 
 **Model-written text never stands where a head does** (basecradle/basecradle#868, routed in
 basecradle-noc#1518). The reply, the run's ``errors`` and whatever ``claude`` printed to stdout are
@@ -113,13 +110,10 @@ from basecradle_router.logfmt import bounded, log_fields
 #: The vendor that bills every call a Claude Code builder makes.
 PROVIDER = "anthropic"
 
-#: The mark on every line that describes the model calls the ``ai_otel`` receiver also records
-#: (see the module docstring): the calls themselves, their price gaps, and a server-side tool's
-#: fee, which the receiver's call cost already holds. Dropping it is the whole cutover.
-SHADOW = "shadow"
-LLM_HEAD = f"llm {SHADOW}"
-UNPRICED_HEAD = f"cost unpriced {SHADOW}"
-SERVER_TOOL_HEAD = f"tool {SHADOW}"
+#: The contract's heads this translator writes (basecradle-harness ``docs/telemetry.md``).
+LLM_HEAD = "llm"
+UNPRICED_HEAD = "cost unpriced"
+TOOL_HEAD = "tool"
 
 #: The Claude Code versions whose stream shapes this translator reads: 2.1.325, from the streams
 #: captured for #481, and 2.1.286, the box's, whose one difference (a stream event names its
@@ -133,7 +127,7 @@ _VERSION = re.compile(r"[0-9][0-9A-Za-z.+-]{0,31}")
 #: The model id Claude Code gives the ``assistant`` line it writes when a call failed.
 SYNTHETIC_MODEL = "<synthetic>"
 
-#: An id the line may carry as ``generation_id``: the inert charset the ``ai_otel_llm`` remap pins.
+#: An id the line may carry as ``generation_id``: an inert charset, so no id can carry a field.
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 #: A model id as it may appear inside a prose line: a field-like token (``provider=``) never can.
@@ -442,7 +436,7 @@ def _by_model(billed: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def money(value: float) -> str:
-    """Fixed-point US dollars, at most eight decimals, as the ``ai_otel_llm`` remap writes them."""
+    """Fixed-point US dollars, at most eight decimals, never an exponent."""
     text = f"{round(value, 8):.8f}".rstrip("0").rstrip(".")
     return text or "0"
 
@@ -1077,7 +1071,7 @@ class Translator:
             else:
                 self._ledger_for(model).cost += price.cost
             self.write(
-                f"INFO {SERVER_TOOL_HEAD} "
+                f"INFO {TOOL_HEAD} "
                 + log_fields(
                     name="web_search",
                     executor="server",
@@ -1095,7 +1089,7 @@ class Translator:
         if fetches:
             # Web fetch carries "no additional charges beyond standard token costs".
             self.write(
-                f"INFO {SERVER_TOOL_HEAD} "
+                f"INFO {TOOL_HEAD} "
                 + log_fields(
                     name="web_fetch",
                     executor="server",
@@ -1262,7 +1256,7 @@ class Translator:
         else:
             outcome, reason = "ok", None
         self.write(
-            "INFO tool "
+            f"INFO {TOOL_HEAD} "
             + log_fields(
                 name=use.name,
                 executor=executor,
@@ -1274,7 +1268,7 @@ class Translator:
         if reason == "tool_error":
             error = bounded(_text(block.get("content")))
             if error:
-                self.write("WARNING tool " + log_fields(name=use.name, error=error))
+                self.write(f"WARNING {TOOL_HEAD} " + log_fields(name=use.name, error=error))
 
     # --- the end -------------------------------------------------------------------------------
 
