@@ -683,8 +683,8 @@ tests:
           . = {
             "SYSLOG_IDENTIFIER": "basecradle-router",
             "_UID": "999",
-            "message": join!(sent, " "),
-            "expected": "[basecradle-router] " + join!(expected, " "),
+            "message": join(sent, " "),
+            "expected": "[basecradle-router] " + join(expected, " "),
             "count": length(sent)
           }
     outputs:

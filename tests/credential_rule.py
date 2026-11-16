@@ -185,7 +185,7 @@ BLOCK = (
       . = scrubbed
       # A field whose own name is a credential's. One pattern over the record's names finds one,
       # so a record with none (nearly every record) never walks its fields a second time.
-      if match(join!(keys(.), "\\n"), r'{NAME}(?:\\n|\\z)') {{
+      if match(join(keys(.), "\\n"), r'{NAME}(?:\\n|\\z)') {{
           for_each(scrubbed) -> |field, value| {{
               if match(field, r'{NAME}\\z') {{
                   if is_array(value) {{

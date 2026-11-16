@@ -37,7 +37,8 @@ never performs. Each host's file is also validated as the unit loads it, and a r
 token withheld must fail, so the switch is shown to be live, never assumed.
 
 No network, model or agent: `vector test` runs transforms only, never a source or a sink, and
-`vector validate --no-environment` builds the topology without a component or health check.
+`vector validate --no-environment` builds the topology without a component or health check. The
+one running topology here (the no-warning start, #494) reads stdin and writes to a blackhole.
 """
 
 from __future__ import annotations
@@ -839,3 +840,44 @@ def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> N
     box = _scrub_lines(_vector(), tmp_path, lines)
     leaked = [(line, got) for line, got in zip(lines, box, strict=True) if secret in got]
     assert not leaked, leaked[:5]
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_the_shipped_scrub_compiles_without_a_warning(host: str, tmp_path: Path) -> None:
+    # A VRL compilation warning fails no check (`vector validate` and `vector test` print none),
+    # yet a running Vector logs it on every start, into the box's own journal: noise an operator
+    # learns to skim past (basecradle#414). The first deploy of #494 did exactly that with a dead
+    # `!` on an infallible call. So every shipped transform runs here as the box runs it, a stdin
+    # source in place of journald and a blackhole for the sinks, over one fabricated record, and
+    # must start with no warning of any kind. No network: neither component reaches one.
+    vector = _vector()
+    text = _under_test(host, tmp_path).read_text()
+    transforms = text[
+        text.index("\ntransforms:\n") + len("\ntransforms:") : text.index("\nsinks:\n")
+    ]
+    journald_input = 'inputs:\n      - "ai_journald"'
+    assert transforms.count(journald_input) == 1
+    config = tmp_path / "running.yaml"
+    config.write_text(
+        f'data_dir: "{tmp_path}"\n'
+        + text[text.index("enrichment_tables:") : text.index("\nsources:\n")]
+        + '\nsources:\n  stdin_in:\n    type: "stdin"\n    decoding:\n      codec: "json"\n'
+        + "transforms:"
+        + transforms.replace(journald_input, 'inputs:\n      - "stdin_in"')
+        + '\nsinks:\n  out:\n    type: "blackhole"\n    inputs: ["ai_scrub"]\n'
+        + "    print_interval_secs: 0\n"
+    )
+    record = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "started"}
+    got = subprocess.run(
+        [vector, "--config", str(config)],
+        input=json.dumps(record) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        env=_env({}),
+    )
+    report = got.stdout + got.stderr
+    assert got.returncode == 0, report
+    assert "Vector has started" in report, report
+    assert "warning[" not in report and " WARN " not in report, report

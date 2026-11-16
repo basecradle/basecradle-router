@@ -662,7 +662,7 @@ def test_the_credential_rule_runs_first_over_every_field_and_before_the_writer_c
     at = [source.index(statement) for statement in order]
     assert at == sorted(at), order
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    field_check = 'if match(join!(keys(.), "\\n"), r\''
+    field_check = 'if match(join(keys(.), "\\n"), r\''
     assert source.index(field_check) < source.index("for_each(scrubbed) -> |field, value| {")
     for statement in (_CREDENTIAL_PASS, ". = scrubbed", field_check):
         assert _statement_indent(source, statement) == top_level, statement

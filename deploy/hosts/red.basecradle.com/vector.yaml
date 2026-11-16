@@ -240,7 +240,7 @@ transforms:
       . = scrubbed
       # A field whose own name is a credential's. One pattern over the record's names finds one,
       # so a record with none (nearly every record) never walks its fields a second time.
-      if match(join!(keys(.), "\n"), r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(?:\n|\z)') {
+      if match(join(keys(.), "\n"), r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(?:\n|\z)') {
           for_each(scrubbed) -> |field, value| {
               if match(field, r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)\z') {
                   if is_array(value) {
