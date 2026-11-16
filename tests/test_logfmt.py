@@ -23,6 +23,7 @@ from basecradle_router.logfmt import (
     RED,
     RESET,
     YELLOW,
+    bounded,
     log_fields,
     paint,
 )
@@ -287,3 +288,35 @@ def test_a_hostile_delivery_header_cannot_forge_the_decision_line(caplog) -> Non
         'recipient=<unknown> delivery="x\' outcome=failed stage=wake"'
     )
     assert "outcome=failed" not in _outside_quotes(line)
+
+
+# --- the bound on foreign text (basecradle-router#481) ---------------------
+
+
+def test_bounded_leaves_text_within_the_bound_whole_but_flat() -> None:
+    assert bounded("Exit code 2\nls: missing") == "Exit code 2 ls: missing"
+    assert bounded("x" * 240) == "x" * 240
+
+
+def test_bounded_cuts_to_the_bound_with_an_ellipsis() -> None:
+    cut = bounded("word " * 100)
+    assert len(cut) <= 240 and cut.endswith("…")
+    assert not cut[:-1].endswith(" ")
+
+
+def test_bounded_never_cuts_inside_a_credential_shaped_run() -> None:
+    # A key cut short of its rule's minimum would match no box redaction and ship as a prefix,
+    # so a run straddling the bound goes whole — as the `ai_otel_llm` remap's cut does (#385).
+    head = "a" * 230
+    cut = bounded(f"{head} ghp_{'A' * 40}")
+    assert cut == f"{head}…"
+    assert "ghp_" not in cut
+
+
+def test_bounded_keeps_a_run_that_ends_exactly_at_the_cut() -> None:
+    assert bounded("x" * 239 + " more words") == "x" * 239 + "…"
+
+
+def test_bounded_omits_a_value_that_is_one_run_past_the_bound() -> None:
+    assert bounded("k" * 300) == ""
+    assert log_fields(error=bounded("k" * 300)) == ""

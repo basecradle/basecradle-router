@@ -61,6 +61,14 @@ def wake_command(agent: Agent, event: Event) -> tuple[str, ...]:
     server's wake-runner independently pins the binary against the registry, so a
     compromised router cannot substitute a different command here.
 
+    **A builder's command is exactly these three words, and the wrapper completes it**
+    (basecradle-router#481): wake-runner appends ``--output-format stream-json --verbose
+    --include-partial-messages`` and pipes the stream through the root-owned
+    ``claude-stream-translate``, which writes the telemetry contract's lines beside the reply.
+    The flags are root's, never assembled here, because they only work with the translator
+    and the one file that runs the translator is the one that names them; wake-runner refuses
+    a builder command with anything else in it.
+
     **A synthetic event has no command, and asking for one raises.** The fleet's one
     hard constraint is that nothing burns a token at rest, and a probe delivered to
     ``claude -p "<marker>"`` *is* a model call — the marker would be read as a prompt.

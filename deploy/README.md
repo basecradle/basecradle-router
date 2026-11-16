@@ -59,7 +59,9 @@ The daemon enforces least privilege around that wake:
   basecradle-<repo>-ai -- claude -p "<trigger>"` in that agent's clone — the `systemd-cat` wrap routes
   the wake's stdout+stderr into journald under a per-agent identifier (see *Reading a Wake's Ledger*
   below) while `exec`-ing straight through to `runuser`, so the privilege drop and exit-code
-  propagation are unchanged. **The wrapper is the privilege boundary** — deliberately not argv-matching
+  propagation are unchanged. A builder's `claude` writes its structured stream, which the root-owned
+  `claude-stream-translate` turns into the telemetry contract's lines, as the builder (see *A
+  Builder's Stream* below, #481). **The wrapper is the privilege boundary** — deliberately not argv-matching
   in `sudoers` (which is brittle and bypassable). This keeps the long-running webhook daemon fully
   unprivileged.
 - **The box's operator and its deployer** act on the box under their own identities, never as a fleet
@@ -90,6 +92,11 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   inside — and `bin/` is the path THIS repo's contract
                                    #   declares root-owned, so it does not depend on how the
                                    #   app tree happens to be owned.
+  bin/claude-stream-translate      # root-owned (root:root, 0755) builder stream translator (#481).
+                                   #   Runs AS the builder, on the read end of its `claude`'s pipe,
+                                   #   inside its environment, so it must not be agent- or
+                                   #   router-writable; it loads only three source files from
+                                   #   app/src, each verified root-owned from `/` down first.
   bin/reboot-if-required.sh        # root-owned (root:root, 0755) clean-reboot orchestrator (#297) —
                                    #   the one unit of ours that genuinely runs as root, so its
                                    #   ExecStart points here rather than into app/.
@@ -173,6 +180,50 @@ covered by `vector.yaml`'s `ai_scrub` redaction like every other log (Part 5) �
 extra scrubbing layer is added. The wake does gain one dependency: `systemd-cat` aborts (and the wake
 fails, retryably) if it cannot open the journal stream — negligible on a healthy box, where the journal
 socket survives a journald restart.
+
+#### A Builder's Stream
+
+A builder's wake is a pipe (#481), run as the builder after the drop:
+
+```text
+claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
+    | python3 -I /opt/basecradle-router/bin/claude-stream-translate
+```
+
+`claude-stream-translate` turns Claude Code's own structured output into the telemetry contract's
+lines (basecradle-harness `docs/telemetry.md`), rendered by the router's one renderer, `logfmt`, and
+writes them into the same journal stream, under `basecradle-wake-<os_user>`, with the reply as prose
+where it always went. The translation is `src/basecradle_router/claude_stream.py`, priced by
+`anthropic_rates.py`; how each line maps from the stream, and what the stream cannot itemize, is in
+that module's docstring.
+
+- **What lands.** One `llm` line per main-thread model call, headed **`llm shadow provider=`** while
+  the `ai_otel` receiver (Part 5) still renders the same calls: every NOC column that counts, times or
+  prices a call is gated on `llm provider=`, so nothing is counted twice, and the two records differ by
+  one word. One `tool` line per tool use (a `WARNING tool … error=` companion for a failed run), one
+  `cost unpriced` line per wake per gap, and prose: the reply, the turn count and why the run ended,
+  and, per model, what Claude Code billed that the stream did not itemize. **No `wake` line**: the
+  router's own `stage=wake` line is a builder wake's record.
+- **What it cannot see.** A subagent's calls arrive without their final usage, so each gets an `llm`
+  line with `cost_gap=not_reported` and no tokens; Claude Code's helper calls (the model a WebSearch
+  runs on) never appear one by one. Both are stated against Claude Code's own `modelUsage` on the
+  prose line at the end. A call a stop or a crash cut short has no line.
+- **A stop.** `stop-wake` signals the shell that runs the pipe (through `runuser`) and `claude` and the
+  translator directly. The translator records the SIGTERM and reads on until `claude` has exited, so
+  every line up to the stop lands, and it says the stream ended after a SIGTERM. The router still
+  reads the stop off `sudo`'s exit, unchanged.
+- **If the translator fails.** It never stops reading early, so `claude` never blocks on the pipe or
+  dies of SIGPIPE. If it exits non-zero (it could not load: exit 70, the reason on stderr; or it
+  crashed), `wake-runner` reads the rest of the stream itself: `jq` writes the reply from the final
+  `result` line, and `cat` drains whatever is left should `jq` fail too. The wake's exit status is
+  always `claude`'s. What is lost is that wake's telemetry from the failure on, and the reply only if
+  the `result` line was already in the translator's read buffer when it died.
+- **What it trusts.** It runs inside the builder's environment, credentials loaded, so it lives in
+  root-owned `bin/` (never the router-writable `.venv`), is started with `python3 -I` off the trusted
+  PATH, and loads exactly three files from `/opt/basecradle-router/app/src/basecradle_router/`
+  (`logfmt.py`, `anthropic_rates.py`, `claude_stream.py`), each only if every path component from `/`
+  down is root-owned, writable by no group or other, and no symlink. A missing translator refuses the
+  wake, as a missing `systemd-cat` does.
 
 #### Reading the Router's Own Log (basecradle-router#170)
 
@@ -1375,7 +1426,11 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   (`deploy/sudoers/basecradle-router`). The wrapper's runtime contract:
   `sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone_path> -- <wake command>`,
   where the wake command is `claude -p "<trigger>"` for a builder or `<wake_bin> --timeline "<uuid>"`
-  for a harness agent (#87) — the binary decided by the registry, never the caller's argv. The
+  for a harness agent (#87) — the binary decided by the registry, never the caller's argv. A
+  builder's command must be **exactly** those three words: the wrapper appends the stream flags
+  itself (`--output-format stream-json --verbose --include-partial-messages`) and pipes the stream
+  into `/opt/basecradle-router/bin/claude-stream-translate`, so the caller's whole say is the
+  trigger (#481). The
   `sudoers` rule is command-generic (it grants only the wrapper), so adding the harness kind needs no
   sudoers change: the registry entry for the new agent is what authorizes its wake.
   It enforces the boundary — root-only, target a registered agent login user (UID ≥ 1000, in the registry
