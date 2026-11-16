@@ -77,6 +77,14 @@ boundary journald starts a new record at (a newline, a NUL) and into pieces well
 48K ``LineMax``, past which journald would split the line into a record with no lead.
 ``wake-runner``'s ``jq`` fallback writes the reply by the same rule.
 
+**No line carries a credential-named assignment** (basecradle-router#491). A refused or failed
+command's text is quoted in its tool line's ``error=``, and almost every builder command opens by
+minting a token (``export GH_TOKEN="$(gh-app-token …)"``), so an error, a reply or a stdout line
+can carry the shape the NOC's log-store canary pages on whatever follows the ``=``. Every value
+the renderer writes, every bounded text, and every quoted line passes
+:func:`basecradle_router.logfmt.redact_credentials` first: the name stays and the value becomes
+``'<a redacted value>'``, by the canary's own definition of a credential's name.
+
 **No wake lines.** A builder has no wake in the contract's sense, and the router's own
 ``event=wake_start``, ``event=wake_end`` and ``stage=wake outcome=`` lines, observed by root from
 the exit status, are already its record (the capital's ruling on #481). The run's turn count and
@@ -105,7 +113,7 @@ from datetime import datetime
 from typing import Any
 
 from basecradle_router import anthropic_rates as rates
-from basecradle_router.logfmt import bounded, log_fields
+from basecradle_router.logfmt import RECORD_BREAKS, bounded, log_fields, redact_credentials
 
 #: The vendor that bills every call a Claude Code builder makes.
 PROVIDER = "anthropic"
@@ -161,9 +169,8 @@ QUOTE = "> "
 #: under the 48K bytes past which journald splits a line into a second record with no lead.
 QUOTED_PIECE = 8000
 
-#: Every place journald, or Python reading a line, starts a new record or line: a CRLF is one.
-#: ``wake-runner``'s ``jq`` fallback splits by this pattern, spelled for jq (pinned by a test).
-RECORD_BREAKS = "\r\n|[\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]"
+#: Every place journald, or Python reading a line, starts a new record or line (defined beside
+#: the redaction in :mod:`basecradle_router.logfmt`, which reads no run across one).
 _RECORD_BREAKS = re.compile(RECORD_BREAKS)
 
 #: Half a micro-dollar: two dollar figures closer than this are the same figure.
@@ -225,9 +232,11 @@ def quoted(text: str) -> list[str]:
 
     Cut at every record break (an empty line becomes a bare ``>``) and into pieces of at most
     :data:`QUOTED_PIECE` characters, each piece led again, so no record journald writes for it
-    begins with anything but the lead.
+    begins with anything but the lead. A credential-named assignment's value is redacted first,
+    on the whole text, so a quoted value that spans lines goes whole (#491).
     """
     lines = []
+    text = redact_credentials(text)
     for line in _RECORD_BREAKS.split(re.sub(f"(?:{RECORD_BREAKS})\\Z", "", text)):
         if not line:
             lines.append(QUOTE.rstrip())

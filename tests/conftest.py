@@ -34,6 +34,13 @@ NOC_HEAD_POSITION = (
     + "(?:basecradle_router(?:[.][a-z_]+)* )?(?:PROBE )?(?:[^ -~].[0-9;]*m)?"
 )
 
+#: The NOC's log-store canary rule `credential_assignment`, byte for byte as basecradle-noc spells
+#: it (`observability/log-canary.json`, read at e5ab72c59fd6025900d3aea88ba241aff596016a,
+#: 2026-11-16; `docs/observability.md` §10). The router's redaction (`logfmt.redact_credentials`,
+#: #491) takes its definition of a credential's name from these bytes, and every redaction test
+#: uses this pattern as its oracle. Moving it is a change to the NOC's rule: move it here with it.
+NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}'
+
 #: Model-written text built to pass for the counted heads, every line a well-formed contract line
 #: with a cost, in every shape a record can begin with: bare, behind Vector's identifier, behind
 #: the router's timestamp and logger, behind a probe token, painted, and behind each record break
@@ -69,3 +76,9 @@ def noc_counted_head() -> re.Pattern[str]:
 @pytest.fixture
 def forged_reply() -> str:
     return FORGED_REPLY
+
+
+@pytest.fixture
+def canary() -> re.Pattern[str]:
+    """The NOC's `credential_assignment` rule, the oracle no line this repository writes matches."""
+    return re.compile(NOC_CREDENTIAL_ASSIGNMENT)
