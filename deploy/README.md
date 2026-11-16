@@ -97,9 +97,13 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   inside its environment, so it must not be agent- or
                                    #   router-writable; it loads only three source files from
                                    #   app/src, each verified root-owned from `/` down first.
+  bin/fleet-writers                # root-owned (root:root, 0755) writer-map builder (#484), run as
+                                   #   root by basecradle-router-writers.service before every daemon
+                                   #   start; writes /etc/vector/fleet-writers.csv (Part 5).
   bin/reboot-if-required.sh        # root-owned (root:root, 0755) clean-reboot orchestrator (#297) —
-                                   #   the one unit of ours that genuinely runs as root, so its
-                                   #   ExecStart points here rather than into app/.
+                                   #   one of the two units of ours that genuinely run as root
+                                   #   (with the writer map's), so its ExecStart points here
+                                   #   rather than into app/.
 /etc/basecradle-router/
   router.env                       # daemon config (router:router, 0600) — see below
   agents.json                      # the registry (BASECRADLE_ROUTER_AGENTS); root-owned, router
@@ -1752,7 +1756,7 @@ never out of the mirrored tree), and they are this repo's to keep stable:
 | Contract | What the op does with it |
 |---|---|
 | `/opt/basecradle-router/app` | the **root-owned** daemon tree the op mirrors into (protecting its `.venv`, the one `router:router` path). Ownership is narrowed **before** the mirror and **read back after** it, and only then is anything root-owned installed (basecradle-noc#777). The op then runs **`uv sync --locked`** as `router`. The sync must land **before** the restart: the unit starts cache-less and `--no-sync`, so it neither rebuilds nor reaches the network — it runs exactly what the sync left (#280, #297). |
-| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), `stop-wake` (#386), `claude-stream-translate` (#481: `wake-runner` refuses every builder wake while it is missing), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
+| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), `stop-wake` (#386), `claude-stream-translate` (#481: `wake-runner` refuses every builder wake while it is missing), `fleet-writers` (#484: the writer map Vector cannot start without), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). **The reboot timer is not here**: it is per host (next row). |
 | `deploy/hosts/<fqdn>/basecradle-router-reboot.timer` | the host's **own** reboot window (#334), installed `0644` to `/etc/systemd/system/` and armed (`enable --now`) like the shared timers. There is deliberately no shared copy: a host whose directory lacks it gets no reboot timer, never another box's window. |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written `0644` — the drift source `drift-check.sh` reads. The file mode is world-readable but its directory is not: `/etc/basecradle-router` is `750 root:router` (it also holds `router.env`), so only root and the `router` group reach the stamp. That is by design — the drift unit runs `User=router` and traverses as a group member; any other reader (an operator account included) needs `sudo`. |
@@ -2041,7 +2045,8 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 | Unit | Role | Enable? |
 |---|---|---|
 | `basecradle-router-recovery.service` | post-boot health gate (services + `/up`) — runs `User=router`, unprivileged | **Enable** (`systemctl enable basecradle-router-recovery.service`). Read-only, observational; verifies recovery after *every* reboot — manual or automatic. |
-| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `/opt/basecradle-router/bin/reboot-if-required.sh`) — the one unit that runs as **root** | `static` (timer-driven). Install (`daemon-reload`). |
+| `basecradle-router-reboot.service` | the clean-reboot oneshot (drives `/opt/basecradle-router/bin/reboot-if-required.sh`) — runs as **root** | `static` (timer-driven). Install (`daemon-reload`). |
+| `basecradle-router-writers.service` | writes `/etc/vector/fleet-writers.csv`, the map Vector binds every fleet journal line to its writer by (Part 5, #484) — runs as **root**, from `/opt/basecradle-router/bin/fleet-writers` | **Never enabled.** `static`: `basecradle-router.service` `Wants=` it and starts `After=` it, so every start of the daemon runs it first, and `vector.service` does the same through the drop-in `deploy/systemd/vector.service.d/30-fleet-writers.conf` (Part 5), so every start of Vector does too. Install (`daemon-reload`). |
 | `basecradle-router-reboot.timer` (per host: `deploy/hosts/<fqdn>/`) | schedules the reboot check in the host's own low-traffic window | **Enable** (`systemctl enable --now basecradle-router-reboot.timer`) — this is what turns automatic reboots ON. |
 
 ### The reboot policy (decided: automatic)
@@ -2206,6 +2211,61 @@ Caddy, no database) and has three load-bearing properties:
    [`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`](systemd/vector.service.d/10-ai-betterstack-env.conf).
    The secret lives in exactly one place; a rotation is a one-line swap of that file + a restart.
 
+**Every line under a fleet identifier is bound to its writer** (basecradle-router#484,
+basecradle#868). journald's `SYSLOG_IDENTIFIER` is chosen by whoever writes the line: run as the login
+user, `systemd-cat --identifier=basecradle-wake-<agent>` writes a line journald stores and Vector ships
+under that agent's name, and a well-formed contract line written that way was counted under the agent
+like a real one (basecradle-noc#1518). The kernel vouches for `_UID`, so `ai_scrub` checks it:
+
+- **The fleet identifiers** are every `basecradle-wake-<agent>` and `basecradle-router`,
+  `basecradle-log-grammar` and `verify-recovery.sh`: the names a NOC column trusts to say who wrote a
+  line. Every other identifier is shipped as before.
+- **The writer map**, `/etc/vector/fleet-writers.csv` (root:vector 0640), lists which UIDs may write
+  under each: the agent's own account and root (the `runuser` messages) on its wake stream; every
+  registered agent for the grammar probe, which the NOC runs as each agent; the `router` account for
+  the daemon's own identifier and the recovery check's. These are exactly the writers the look-back
+  over everything the store holds found real.
+- **A line under a fleet identifier whose `_UID` the map does not list for it** (a login session, one
+  agent under another's name, root under the daemon's name, a line with no `_UID`) is **kept and
+  marked, never dropped and never counted**: `UNVERIFIED uid=<n> ` (`uid=none` when it carries none)
+  stands where the severity would, so no head is at its position and no column counts it, and the
+  identifier is renamed `unverified-<identifier>`, in the `SYSLOG_IDENTIFIER` field and the
+  `[identifier]` prefix alike, so nothing attributes it to the account it named. The marker is what the
+  NOC's `Unverified Log Writer` alarm reads (@origin, 2026-11-16). An identifier sent more than once
+  (the journal then holds a list) ships as its JSON text, one string that names no fleet program.
+- **The map is built on the box, never by hand**, by `deploy/bin/fleet-writers`, from the registry
+  `wake-runner` trusts (`/etc/basecradle-router/agents.json`) and the account database, because a UID
+  moves when an account is provisioned again. An account below `wake-runner`'s floor (`MIN_UID`,
+  1000) is never listed: nothing wakes it, so it writes for no agent. `basecradle-router-writers.service`
+  runs it as root before every start of the daemon, so a deploy, a reboot and the restart every
+  registry change already takes all rebuild it from the registry that start reads, and before every
+  start of Vector, through the drop-in `deploy/systemd/vector.service.d/30-fleet-writers.conf`. A run that changed the map queues
+  a Vector reload (`systemctl --no-block try-reload-or-restart vector.service`: Vector reads the map at
+  start and on a reload, never by watching it). Root is the map's only writer, as it is the registry's:
+  a map the `router` account could edit would let it write under any agent's name.
+- **Fail directions.** A writer the map does not list only ever has its lines marked, which is loud,
+  never counted. **At Vector's start the map must exist** (measured on 0.61.0, and `vector validate
+  --no-environment` passes without it), so no failure ever leaves a box with none: an unreadable
+  registry or a missing `router` account leaves the map in place, and where there is none it writes the
+  header alone, which loads and vouches for no one, so every fleet line is marked and the box keeps
+  shipping. An entry naming no account, or one below the floor, is left out and named. Each of these
+  fails the unit, which never holds the daemon or Vector (`Wants=`). A map whose bytes are current but
+  whose owner, group or mode is not is rewritten. On a reload, a missing or unreadable map keeps the
+  table Vector holds. The writer queues a reload only of a Vector that is running (`try-`), so it never
+  starts one someone stopped; a Vector that is down starts on a fresh map through the drop-in.
+- **An account whose UID moves without a registry change** keeps its old row until the daemon or
+  Vector next starts, and its lines are marked meanwhile; `systemctl start
+  basecradle-router-writers.service` rebuilds the map at once.
+- **The drop-in is installed on the box like the other two** (First Install below, and the NOC for a
+  box already running). Until it is, the daemon's own unit is what builds the map, and the NOC's tick
+  deploys the daemon before it applies `vector.yaml`, so the map is in place before the config that
+  reads it.
+
+`tests/vector/ai_writers.yaml` runs every writer the look-back found real, and each kind of impostor,
+through the shipped VRL against a map the real `fleet-writers` built from a fabricated box;
+`tests/test_fleet_writers.py` pins the map, the file's handling, and that the script, both units and
+every host's `vector.yaml` name the same identifiers and accounts.
+
 **No source listens** (basecradle#789, #486). Every source reads what the box itself attests: journald,
 whose records the kernel stamps with the sender's `_UID`, and the box's own metrics. A listening source
 takes whatever any local account sends, attributed as the sender claims, and no Vector source can verify
@@ -2316,6 +2376,13 @@ sudo systemctl daemon-reload
 # failure, and reads back.
 # <fqdn> is this box's own: never another host's file, whose sinks name another source.
 sudo install -o root -g vector -m 640 deploy/hosts/<fqdn>/vector.yaml /etc/vector/vector.yaml
+# the writer map (#484): the config reads /etc/vector/fleet-writers.csv, and Vector cannot start
+# without it. Its writer is the router's own, installed by the router's deploy (which comes first on a
+# new box); bind it to Vector with the third drop-in, then build the map once before validating.
+sudo install -D -o root -g root -m 644 \
+  deploy/systemd/vector.service.d/30-fleet-writers.conf \
+  /etc/systemd/system/vector.service.d/30-fleet-writers.conf
+sudo systemctl daemon-reload && sudo systemctl start basecradle-router-writers.service
 # validate with interpolation on, exactly as the unit will load it
 sudo bash -c 'set -a; . /etc/vector/betterstack.env; VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true vector validate /etc/vector/vector.yaml'
 sudo systemctl enable --now vector
@@ -2326,9 +2393,12 @@ sudo systemctl enable --now vector
 In **Better Stack → Live Tail** for **the host's own** source (**"AI"** for `ai.basecradle.com`): (a)
 system/journald logs flow, (b) the router's own daemon/unit logs flow, (c) host metrics populate the
 **"Host (Vector)"** dashboard (source = the host's) — and **zero secret values** anywhere (the scrub is the gate). To test the scrub
-offline, run the suite CI runs, `vector test deploy/hosts/<fqdn>/vector.yaml tests/vector/ai_scrub.yaml`
-(with `BETTERSTACK_AI_SOURCE_TOKEN` set to any fake value and `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`,
-as the unit runs it). For a one-off line, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`: a
+offline, run the suites CI runs, `uv run pytest tests/test_vector_unit.py` with `VECTOR_BIN` pointing at
+the pinned release: it runs `vector test` over every host's shipped file with only the writer map's
+path redirected to a map built from a fabricated box (the real path exists only on a box), as the unit
+runs it. For a one-off line, put the `ai_scrub` VRL in a file and run `vector vrl -i <event.json> -p scrub.vrl -o`,
+with the writer check's block taken out (`vector vrl` has no enrichment tables, so its lookup does not
+compile; `_without_the_writer_check` in that test does exactly this): a
 synthetic `{"SYSLOG_IDENTIFIER":"sudo",…}` event must come back `aborted`, and a message carrying a
 `ghs_…`/`…/heartbeat/…` token must come back `[REDACTED_…]`. Re-test after a reboot:
 `systemctl status vector` active and Live Tail resumes.

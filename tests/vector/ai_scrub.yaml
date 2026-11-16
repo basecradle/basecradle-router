@@ -10,6 +10,11 @@
 # the box's `sk-` run needs 16 characters where the harness's needs 8, so `task-specification`, whose
 # run is 13, never met the box's rule at all, and the long forms below are the ones that did.
 #
+# Each line carries the `_UID` its identifier's real writer has on the box (the router, 999; Nova,
+# 1001), so it passes the writer check unmarked and the bytes asserted are the redaction alone. The
+# writer check has its own suite, ai_writers.yaml, and the map both run against is the fabricated
+# one tests/test_vector_unit.py writes.
+#
 # Every key is a fabricated, correctly shaped fake. No dollar sign anywhere in this file: Vector
 # interpolates environment variables across a test file just as it does across a config.
 
@@ -21,7 +26,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: task-runner-pipeline-api-key=abc123secret rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: task-runner-pipeline-api-key=abc123secret rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -36,7 +41,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: sk-runner-pipeline-api-key=abc123secret rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: sk-runner-pipeline-api-key=abc123secret rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -49,7 +54,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: risk-model-pipeline_api_key=hunter2xyz rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: risk-model-pipeline_api_key=hunter2xyz rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -62,7 +67,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: weighs_requestauthorizationbearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: weighs_requestauthorizationbearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -75,7 +80,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: task-runner-bearer abcdefgh123 rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: task-runner-bearer abcdefgh123 rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -88,7 +93,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "failed: AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -103,7 +108,7 @@ tests:
         source: |
           # The bearer rule's token class takes a URL's `https`, so with bearer first the heartbeat
           # rule never matched and the secret shipped.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "token bearer https://uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 done"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "token bearer https://uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 done"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -118,7 +123,7 @@ tests:
         source: |
           # The harness anchors on the literal `/heartbeat/`; anchored on `https?://`, a URL logged
           # without its scheme matched nothing and shipped its secret. The host is not the secret.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "curl uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "curl uptime.betterstack.com/api/v1/heartbeat/SECRETabc123 failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -133,7 +138,7 @@ tests:
         source: |
           # Anchored on `/heartbeat/` alone, the rule would keep everything before it, the password
           # in the userinfo included. A URL with a scheme is taken from the scheme on.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://john:hunter2Secret@uptime.example.com/api/v1/heartbeat/SECRETabc123 failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://john:hunter2Secret@uptime.example.com/api/v1/heartbeat/SECRETabc123 failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -150,7 +155,7 @@ tests:
         source: |
           # The heartbeat match runs to the end of the space-free run, which ends in `Bearer`. Taken
           # with the URL, the word left its token in the next run, which no rule matched.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": s'{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}'}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": s'{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}'}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -163,7 +168,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/x?token=abc/heartbeat/K9&access_token=Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/x?token=abc/heartbeat/K9&access_token=Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -176,7 +181,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping uptime.example.com/heartbeat/K9&auth=BEARER eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping uptime.example.com/heartbeat/K9&auth=BEARER eyJhbGciOiJIUzI1NiJ9.e30 failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -191,7 +196,7 @@ tests:
         source: |
           # Glued to a letter or digit, the word is the secret's own tail, never a scheme word, so
           # it is never kept: a secret whose last letters merely spell it is redacted whole.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9xbearer failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9xbearer failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -204,7 +209,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30 failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -218,7 +223,7 @@ tests:
         type: "vrl"
         source: |
           # Nothing follows the word for the bearer rule to take, so the word is all that ships.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9&auth=Bearer"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -233,7 +238,7 @@ tests:
         source: |
           # Only a word that ENDS the run is put back. The run's last six characters here are a
           # secret, and a bearer word earlier in the run must never put them back.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ping https://h.example.com/heartbeat/K9?auth=bearer&sig=Zq7Sec failed"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9?auth=bearer&sig=Zq7Sec failed"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -248,7 +253,7 @@ tests:
         source: |
           # The bearer rule's token class takes `api_key` and its `=`, so with bearer first the
           # assignment rule never matched and the secret after `=` shipped.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Authorization: Bearer api_key=Zq7SecretFab1cated rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "Authorization: Bearer api_key=Zq7SecretFab1cated rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -262,7 +267,7 @@ tests:
         type: "vrl"
         source: |
           # A token stored with its scheme and sent with another reads `Bearer Bearer eyJ…`.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Authorization: Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc | AUTH_API_KEY=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig | GET /v1/models?api_key=Bearer\tbearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "Authorization: Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc | AUTH_API_KEY=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig | GET /v1/models?api_key=Bearer\tbearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -275,7 +280,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "GET https://example.com/v1?api_key=Bearer eyJhbGciOiJIUzI1NiJ9 rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "GET https://example.com/v1?api_key=Bearer eyJhbGciOiJIUzI1NiJ9 rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -291,7 +296,7 @@ tests:
         type: "vrl"
         source: |
           # Fabricated: the real keys are `ste-` + 99 alphanumerics, so this matches their length.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "connecting to wss://connect.steel.dev?sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b&apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "connecting to wss://connect.steel.dev?sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b&apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -304,7 +309,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "wss://connect.steel.dev?apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated&sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "wss://connect.steel.dev?apiKey=ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated&sessionId=0199a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -318,7 +323,7 @@ tests:
         type: "vrl"
         source: |
           # The header form carries no `apiKey=`, so only the `ste-` rule can catch it.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "POST https://api.steel.dev/v1/sessions steel-api-key: ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "POST https://api.steel.dev/v1/sessions steel-api-key: ste-Fab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1catedFab1cated"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -331,7 +336,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "GET /v1/tools?apiKey=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?api_key=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?API-KEY=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?apikey=novaOpaqueFabricatedValue0001 \"ok\""}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "GET /v1/tools?apiKey=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?api_key=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?API-KEY=novaOpaqueFabricatedValue0001 \"ok\" | GET /v1/tools?apikey=novaOpaqueFabricatedValue0001 \"ok\""}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -345,7 +350,7 @@ tests:
         type: "vrl"
         source: |
           # The name is normalised and the value never ships, even for a provider no prefix rule knows.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "STEEL_API_KEY=novaOpaqueFabricatedValue0001 ANTHROPIC_API_KEY=sk-ant-0000000000000000000000000000000000000000"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "STEEL_API_KEY=novaOpaqueFabricatedValue0001 ANTHROPIC_API_KEY=sk-ant-0000000000000000000000000000000000000000"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -360,7 +365,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "the task-specification-for-this-run is invalid: disk-quota-exceeded-for-org, risk-assessment-pending-review"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "the task-specification-for-this-run is invalid: disk-quota-exceeded-for-org, risk-assessment-pending-review"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -373,7 +378,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "task-specification failed: disk-quota-exceeded, risk-assessment"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "task-specification failed: disk-quota-exceeded, risk-assessment"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -386,7 +391,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "Rísk-assessment-pending-review; Gäste-registrierungssystem-voll"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "Rísk-assessment-pending-review; Gäste-registrierungssystem-voll"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -399,7 +404,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "laughs_happilyeverafterandafter abc_uat_unknown"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "laughs_happilyeverafterandafter abc_uat_unknown"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -413,7 +418,7 @@ tests:
         type: "vrl"
         source: |
           # `bc_def_` with a run of eight or more lowercase letters, glued to a letter, is a word.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "the abc_def_ghijklmnop table"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "the abc_def_ghijklmnop table"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -429,7 +434,7 @@ tests:
           # The harness's own words for its three newest prefixes (basecradle-router#421), and one for
           # `pplx-`, which it has none of. The `tk_` run takes `_`, so `gtk_window_…` is decided by the
           # word rule, never by where the run stops.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "tabl_partitionmaintenancewindow kabl_verbindungsueberwachungsdienst xpplx-abcdefghijklmnopqrstuvwxyz atk_objectgetaccessiblename gtk_window_set_default_size_request"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "tabl_partitionmaintenancewindow kabl_verbindungsueberwachungsdienst xpplx-abcdefghijklmnopqrstuvwxyz atk_objectgetaccessiblename gtk_window_set_default_size_request"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -442,7 +447,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "7sk-specificationsforall e\u{301}sk-specificationsforall 密sk-specificationsforall"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "7sk-specificationsforall e\u{301}sk-specificationsforall 密sk-specificationsforall"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -455,7 +460,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "xr8_abcdefghijklmnopqrstuvwx xAIzaabcdefghijklmnopqrstuvwx | r8_abcdefghijklmnopqrstuvwx"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "xr8_abcdefghijklmnopqrstuvwx xAIzaabcdefghijklmnopqrstuvwx | r8_abcdefghijklmnopqrstuvwx"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -470,7 +475,7 @@ tests:
         source: |
           # The `sk-` run takes `hf_…` whole and is kept as a word. One rule per pass would read the
           # `hf_` inside it again, after an underscore, and cut it.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "task-queue_hf_abcdefghijklmnopqrstuvwx drained"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "task-queue_hf_abcdefghijklmnopqrstuvwx drained"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -485,7 +490,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ask-specifications2026 7sk-specifications2026 ésk-Specificationsforall 密sk-Specificationsforall"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ask-specifications2026 7sk-specifications2026 ésk-Specificationsforall 密sk-Specificationsforall"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -498,7 +503,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "sk-abcdefghijklmnopqr key sk-abcdefghijklmnop x-hf_abcdefghijklmnopqrstuvwx"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "sk-abcdefghijklmnopqr key sk-abcdefghijklmnop x-hf_abcdefghijklmnopqrstuvwx"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -511,7 +516,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "push failed with github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "push failed with github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -526,7 +531,7 @@ tests:
         source: |
           # The harness's wide `bc_???_` run takes `_` and `-`, so the second key cannot be cut out
           # of the first: a narrower run stopped at `_isk_` and shipped `DEF123`.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "keys bc_uat_ABCbc_isk_DEF123 and bc_isk_Ab3Cd5Ef7Gh9_x-y bc_tok_Ab3Cd5Ef7Gh9 loaded"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "keys bc_uat_ABCbc_isk_DEF123 and bc_isk_Ab3Cd5Ef7Gh9_x-y bc_tok_Ab3Cd5Ef7Gh9 loaded"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -539,7 +544,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ghp_Ab3Cd5Ef7Gh9Ij1Kl3Mn rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ghp_Ab3Cd5Ef7Gh9Ij1Kl3Mn rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -556,7 +561,7 @@ tests:
         source: |
           # The samples are the harness's (tests/test_log_value_cut.py): a 52-character `abl_` key, the
           # vendor's shape, a `pplx-` key kept shorter than a real one's 48, and a 32-character `tk_`.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "stage=wake outcome=failed refuseless_key=abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3 perplexity_key=pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1 ntfy_token=tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "stage=wake outcome=failed refuseless_key=abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3 perplexity_key=pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1 ntfy_token=tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -569,7 +574,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "refuseless refused the key abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3, check AI_API_KEY; perplexity refused pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1. ntfy refused tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "refuseless refused the key abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3, check AI_API_KEY; perplexity refused pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1. ntfy refused tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -583,7 +588,7 @@ tests:
         type: "vrl"
         source: |
           # A vendor's quoted error body is the realistic carrier, the harness's case.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "upstream said \"{\"error\":{\"message\":\"Incorrect API key provided: abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3\",\"code\":401}}\" perplexity said 'pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1' ntfy said \"{\"token\":\"tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l\",\"code\":40101}\""}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "upstream said \"{\"error\":{\"message\":\"Incorrect API key provided: abl_Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3\",\"code\":401}}\" perplexity said 'pplx-Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1' ntfy said \"{\"token\":\"tk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l\",\"code\":40101}\""}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -598,7 +603,7 @@ tests:
         source: |
           # ntfy generates lowercase letters and digits, and its validator also admits capitals, `_` and
           # `-` in a token's 29 characters, so a provisioned token's `-` or `_` never cuts it short.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ntfy refused tk_q8m2zr5wk-xt7nb4pv9_hc3jd6fs0: unauthorized | ntfy refused tk_Q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ntfy refused tk_q8m2zr5wk-xt7nb4pv9_hc3jd6fs0: unauthorized | ntfy refused tk_Q8m2zr5wk1xt7nb4pv9hc3jd6fs0l: unauthorized"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -613,7 +618,7 @@ tests:
         source: |
           # The word rule keeps only a match glued to a letter, digit or mark, so after a `.` the run
           # is read as a token whatever its letters, the residual the harness states for every rule.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "self.tk_root_window_initialized ok"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "self.tk_root_window_initialized ok"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -670,6 +675,7 @@ tests:
           }
           . = {
             "SYSLOG_IDENTIFIER": "basecradle-router",
+            "_UID": "999",
             "message": join!(sent, " "),
             "expected": "[basecradle-router] " + join!(expected, " "),
             "count": length(sent)
@@ -694,7 +700,7 @@ tests:
           # letters of the second key's prefix and stopped at its `_` or `-`, and the rest shipped:
           # `_q8m…`, `_Zx8…`, `-ant-api03-…` and `-Fab1cated…` after the first label. The `xai-` run
           # was narrow then and is wide since basecradle-router#425; its reproducer stays here.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "a hf_Ab3Cd5Ef7Gh9Ij1Kl3Mntk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l b hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe c xai-Fab1catedXaiKey0001sk-ant-api03-Fab1catedKey0001xyz d github_pat_11ABCDEFG0Fab1catedPat_Fab1catedste-Fab1catedFab1catedFab1cated e"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "a hf_Ab3Cd5Ef7Gh9Ij1Kl3Mntk_q8m2zr5wk1xt7nb4pv9hc3jd6fs0l b hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe c xai-Fab1catedXaiKey0001sk-ant-api03-Fab1catedKey0001xyz d github_pat_11ABCDEFG0Fab1catedPat_Fab1catedste-Fab1catedFab1catedFab1cated e"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -709,7 +715,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "chain hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Feste-Fab1catedFab1catedFab1cated rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "chain hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Feste-Fab1catedFab1catedFab1cated rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -722,7 +728,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "ghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fehf_Ab3Cd5Ef7Gh9Ij1Kl3Mn | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fehf_Ab3Cd5Ef7Gh9Ij1Kl3Mn | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_Zx8Yw6Vu4Ts2Rq0Po9Nm7Lk5Ji3Hg1Fe"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -738,7 +744,7 @@ tests:
           # The harness's first-pass defect, caught in its review: glued to a letter and all lowercase,
           # the chain read as one word and was kept whole, the `-sk-…` key after it included, which
           # the scrub before the fix redacted on its own. The box's `sk-` run needs 16.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "see xhf_abcdefghijklmnopqrstuvwghp_abcdefghijklmnopqrstuvw-sk-cdefghijklmnopqrs end"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "see xhf_abcdefghijklmnopqrstuvwghp_abcdefghijklmnopqrstuvw-sk-cdefghijklmnopqrs end"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -753,7 +759,7 @@ tests:
         source: |
           # A word with no key glued on is still a word, and a glued remainder shorter than its own
           # rule's minimum is no key, so the run stops at the `_` as before.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "xhf_abcdefghijklmnopqrstuvw kept | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_short cut"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "xhf_abcdefghijklmnopqrstuvw kept | hf_Ab3Cd5Ef7Gh9Ij1Kl3Mnghp_short cut"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -772,7 +778,7 @@ tests:
           # then an 80-character run, 90 characters in all (fabricated). With an alphanumeric run the
           # rule matched none of it, because five characters is under the minimum and the run stopped
           # at the `_`, so the whole key shipped. The run takes the harness's class now.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "message": "XAI_MANAGEMENT_KEY=xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | balance lookup with xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 failed | xai said {\"error\":\"Incorrect API key provided: xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\\\"}\""}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "1001", "message": "XAI_MANAGEMENT_KEY=xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | balance lookup with xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 failed | xai said {\"error\":\"Incorrect API key provided: xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"xai-Fab1c-Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0\\\"}\""}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -788,7 +794,7 @@ tests:
           # Glued to a letter, a management key is still redacted: its run holds digits and capitals.
           # A lowercase word that holds `xai-` is still a word, now with its `_` and `-` read as part
           # of the run. A key glued after a wide run goes with it, as it does for `sk-`.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "KEYxai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | maxai-pipeline_stage-runner kept | xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0hf_Ab3Cd5Ef7Gh9Ij1Kl3Mn end"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "KEYxai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0 | maxai-pipeline_stage-runner kept | xai-Fab1c_Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0Fab1catedXaiMgmtKey0hf_Ab3Cd5Ef7Gh9Ij1Kl3Mn end"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -805,7 +811,7 @@ tests:
           # and a `-` is redacted, and one of 15 is under it and ships. A lowercase `xai-` name at a
           # word's start is now read as a key, as the harness reads it: the scrub errs toward
           # redaction.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "a xai-Ab3_Cd5-Ef7Gh9Ij b xai-Ab3_Cd5-Ef7Gh9I c using xai-compatible-endpoint-v2 now"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "a xai-Ab3_Cd5-Ef7Gh9Ij b xai-Ab3_Cd5-Ef7Gh9I c using xai-compatible-endpoint-v2 now"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -824,7 +830,7 @@ tests:
           # a header dump, JSON, JSON inside a JSON string, a Ruby hash either way, a Python header
           # tuple and its bytes form, any case, `_` for either hyphen. A `=>` glued to the name is the
           # case that needs this rule to run before the assignment rule, which would take it as `key=`.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "x-api-key: novaWiroFabricatedKey0001 | {\"x-api-key\": \"novaWiroFabricatedKey0001\"} | body=\"{\\\"x-api-key\\\":\\\"novaWiroFabricatedKey0001\\\"}\" | {\"x-api-key\"=>\"novaWiroFabricatedKey0001\"} | x-api-key => novaWiroFabricatedKey0001 | x-api-key=>novaWiroFabricatedKey0001 | ('x-api-key', 'novaWiroFabricatedKey0001') | (b'x-api-key', b'novaWiroFabricatedKey0001') | X-API-KEY: novaWiroFabricatedKey0001 | X_Api_Key: novaWiroFabricatedKey0001 | x-apikey: novaWiroFabricatedKey0001"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key: novaWiroFabricatedKey0001 | {\"x-api-key\": \"novaWiroFabricatedKey0001\"} | body=\"{\\\"x-api-key\\\":\\\"novaWiroFabricatedKey0001\\\"}\" | {\"x-api-key\"=>\"novaWiroFabricatedKey0001\"} | x-api-key => novaWiroFabricatedKey0001 | x-api-key=>novaWiroFabricatedKey0001 | ('x-api-key', 'novaWiroFabricatedKey0001') | (b'x-api-key', b'novaWiroFabricatedKey0001') | X-API-KEY: novaWiroFabricatedKey0001 | X_Api_Key: novaWiroFabricatedKey0001 | x-apikey: novaWiroFabricatedKey0001"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -838,7 +844,7 @@ tests:
         type: "vrl"
         source: |
           # A bearer header glued to the value would end it at the scheme word and leave the token.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "x-api-key: Bearer eyJhbGciOiJIUzI1NiJ9.e30 | x-api-key: KBearer eyJhbGciOiJIUzI1NiJ9.e30 | \"x-api-key\": \"Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30\""}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key: Bearer eyJhbGciOiJIUzI1NiJ9.e30 | x-api-key: KBearer eyJhbGciOiJIUzI1NiJ9.e30 | \"x-api-key\": \"Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30\""}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -851,7 +857,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "missing x-api-key header | set X-API-Key=novaWiroFabricatedKey0001 first"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "missing x-api-key header | set X-API-Key=novaWiroFabricatedKey0001 first"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -867,7 +873,7 @@ tests:
         type: "vrl"
         source: |
           # Before the fix the value could not start at the quote, so the rule matched nothing.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "loaded NOVA_API_KEY=\"novaOpaqueFabricatedValue0001\" from env"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "loaded NOVA_API_KEY=\"novaOpaqueFabricatedValue0001\" from env"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -882,7 +888,7 @@ tests:
         source: |
           # Before the fix the value ended at `KBearer`, and the token after the space shipped. The
           # box carries no `token=` query rule, so there the bearer rule takes the token alone.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "AUTH_API_KEY=KBearer eyJhbGciOiJIUzI1NiJ9.e30 | GET /v1?api_key=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1 | GET /v1?token=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "AUTH_API_KEY=KBearer eyJhbGciOiJIUzI1NiJ9.e30 | GET /v1?api_key=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1 | GET /v1?token=KBearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -897,7 +903,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "stage=ping url=\"https://uptime.example.com/api/v1/heartbeat/K9fab1catedSecret\" outcome=failed next=\"https://uptime.example.com/api/v1/heartbeat/K8fab1catedSecret\""}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "stage=ping url=\"https://uptime.example.com/api/v1/heartbeat/K9fab1catedSecret\" outcome=failed next=\"https://uptime.example.com/api/v1/heartbeat/K8fab1catedSecret\""}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -910,7 +916,7 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "\u{1b}[31murl=\"https://h.example.com/heartbeat/K9fab1cated\"\u{1b}[0m next=1 | url=\"https://h.example.com/heartbeat/K9fab1cated\" \u{1b}[32moutcome=ok | url=\"https://h.example.com/heartbeat/K9fab1cated\"\nsecond line"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "\u{1b}[31murl=\"https://h.example.com/heartbeat/K9fab1cated\"\u{1b}[0m next=1 | url=\"https://h.example.com/heartbeat/K9fab1cated\" \u{1b}[32moutcome=ok | url=\"https://h.example.com/heartbeat/K9fab1cated\"\nsecond line"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
@@ -926,7 +932,7 @@ tests:
           # A quote followed by prose is not a kv value's closing quote, so it goes with the URL as it
           # always did. A quoted URL with nothing after `/heartbeat/` is still redacted from the
           # scheme on (the harness keeps it), because that match is what keeps userinfo from shipping.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "message": "said \"https://h.example.com/heartbeat/K9fab1cated\" twice | url=\"https://john:hunter2@uptime.example.com/api/v1/heartbeat/\" next=1"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "said \"https://h.example.com/heartbeat/K9fab1cated\" twice | url=\"https://john:hunter2@uptime.example.com/api/v1/heartbeat/\" next=1"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:

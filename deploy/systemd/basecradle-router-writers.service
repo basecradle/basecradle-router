@@ -1,0 +1,64 @@
+# BaseCradle router — write the map Vector binds every fleet journal line to its writer by (#484).
+#
+# Runs deploy/bin/fleet-writers once: it builds /etc/vector/fleet-writers.csv from the router's
+# registry and the box's account database, and queues a Vector reload when the map changed. The
+# script's docstring carries the why; deploy/README.md Part 5 the contract.
+#
+# NOTHING ENABLES THIS UNIT, AND NOTHING NEEDS TO. Two units pull it in and start after it:
+#   * basecradle-router.service, so every start of the daemon runs it first: a deploy, a reboot, and
+#     the restart every registry change already takes (the daemon reads the registry only when it
+#     starts). The map therefore follows the registry it is built from. The NOC's deploy installs
+#     this unit like every other in deploy/systemd and enables nothing new.
+#   * vector.service, through the drop-in deploy/systemd/vector.service.d/30-fleet-writers.conf, so
+#     no start of Vector, a hand restart or a first install included, can find the map missing: Vector
+#     cannot start without it.
+#
+# A FAILURE NEVER HOLDS THE DAEMON: `Wants=` is the weak dependency, so the daemon starts whatever
+# this run did, and a failed run is a red unit in `systemctl --failed`. What a stale or incomplete
+# map costs is loud and never silent: a writer it does not list has its lines marked UNVERIFIED,
+# which the `Unverified Log Writer` alarm reads, and none of them is counted.
+
+[Unit]
+Description=BaseCradle router — write the fleet's journal-writer map for Vector
+Documentation=https://github.com/basecradle/basecradle-router
+Before=basecradle-router.service vector.service
+
+[Service]
+Type=oneshot
+# ROOT, DELIBERATELY — and therefore run from /opt/basecradle-router/bin/, never the app tree
+# (#297, the same rule and the same path as basecradle-router-reboot.service). Root is genuine: the
+# script reads the registry (root:router 0640, which the `vector` account cannot read and the daemon
+# must not be able to influence beyond reading) and writes into /etc/vector, and only root can.
+ExecStart=/opt/basecradle-router/bin/fleet-writers
+# Its own name in the journal, which is no fleet identifier: these lines are vetted by nothing and
+# counted by nothing.
+SyslogIdentifier=basecradle-router-writers
+# What it needs is to read /etc, write one directory, hand the file to the `vector` group (the one
+# capability it keeps, CAP_CHOWN: root owns everything else it touches), and ask systemd for one
+# reload over its private socket. Everything else is taken away.
+CapabilityBoundingSet=CAP_CHOWN
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/etc/vector
+# The sandbox gives this unit a procfs instance of its own; say what it is (#271).
+ProtectProc=invisible
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+TimeoutStartSec=60

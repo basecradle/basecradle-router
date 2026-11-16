@@ -467,6 +467,10 @@ NO_SECRET: dict[str, str] = {
     ),
     "deploy/drift-check.sh": "git ls-remote of the public repository, with no credential",
     "deploy/bin/reboot-if-required.sh": "stops the router and reboots; reads no credential",
+    "deploy/bin/fleet-writers": (
+        "reads the registry (no secrets) and the account database, and runs systemctl with a"
+        " constant argv; reads no credential"
+    ),
     "deploy/verify-recovery.sh": "systemctl and the loopback /up; reads no credential",
     "src/basecradle_router/wake.py": (
         "builds `sudo wake-runner …` from the registry and the event, with an empty"

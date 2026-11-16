@@ -16,6 +16,12 @@ Description=BaseCradle fleet router — webhook daemon that wakes the right agen
 Documentation=https://github.com/basecradle/basecradle-router
 After=network-online.target
 Wants=network-online.target
+# THE WRITER MAP (#484). Every start of the daemon first rewrites the map Vector binds each fleet
+# journal line to its writer by, from the registry this start is about to read, so the two never
+# disagree. `Wants=`, never `Requires=`: a map that could not be written never holds the daemon.
+# The unit says why in full.
+Wants=basecradle-router-writers.service
+After=basecradle-router-writers.service
 
 [Service]
 Type=simple
