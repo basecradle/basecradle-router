@@ -123,8 +123,9 @@ def scan_of(*advisories: Advisory, errors: dict[str, str] | None = None) -> Depe
     return DependencySecurityScan(advisories=advisories, errors=errors or {}, **context())
 
 
-# How `gh issue list --json author` names the basecradle-ai App's bot.
-SCAN_BOT = {"is_bot": True, "login": "app/basecradle-ai"}
+# How `gh issue list --json author` names this repository's own bot, which the scan runs as
+# (basecradle#870).
+SCAN_BOT = {"is_bot": True, "login": "app/basecradle-router-ai"}
 STRANGER = {"id": "U_kgDOC0ffee", "is_bot": False, "login": "john"}
 
 
@@ -620,6 +621,18 @@ def test_an_issue_the_scan_did_not_write_is_never_read_or_touched() -> None:
     assert [(p.action, p.number, p.labels) for p in plans] == [("create", None, ["needs-human"])]
 
 
+@pytest.mark.parametrize(
+    "login", ["app/basecradle-ai", "app/basecradle-ruby-ai"], ids=["capital-bot", "sibling-bot"]
+)
+def test_an_issue_another_fleet_bot_filed_is_not_the_scans(login: str) -> None:
+    # The scan is this repository's own bot's alone (basecradle#870): not the capital's,
+    # which ran it before, and not a sibling captain's.
+    advisory = pypi("httpx", "GHSA-1111-2222-3333", "critical")
+    issue = open_issue(sole(scan_of(advisory).plans([])), author={"is_bot": True, "login": login})
+
+    assert sole(scan_of(advisory).plans([issue])).action == "create"
+
+
 def test_an_issue_with_no_author_is_not_the_scans() -> None:
     advisory = pypi("httpx", "GHSA-1111-2222-3333", "critical")
     issue = open_issue(sole(scan_of(advisory).plans([])))
@@ -909,9 +922,10 @@ def test_the_workflow_reads_only_the_scans_own_issues_with_their_authors() -> No
     # Without `author`, every issue reads as a stranger's: a new issue and a page every day.
     assert "--json number,title,body,author" in read
     # The server-side filter keeps a flood of strangers' issues from pushing the scan's own
-    # past the limit; the script's own check (SCAN_AUTHOR) still stands behind it.
-    assert "--author 'basecradle-ai[bot]'" in read
-    assert scan_module.SCAN_AUTHOR == "app/basecradle-ai"
+    # past the limit; the script's own check (SCAN_AUTHOR) still stands behind it. The two
+    # name one bot, the one the mint step's FLEET_BOT_* secrets hold (basecradle#870).
+    assert "--author 'basecradle-router-ai[bot]'" in read
+    assert scan_module.SCAN_AUTHOR == "app/basecradle-router-ai"
 
 
 def test_a_repage_retries_its_add_so_no_issue_is_left_unlabelled() -> None:
@@ -923,13 +937,22 @@ def test_a_repage_retries_its_add_so_no_issue_is_left_unlabelled() -> None:
     assert "for attempt in 1 2 3" in filing
 
 
-def test_every_github_write_is_the_basecradle_ai_apps_never_github_token() -> None:
+def test_every_github_write_is_this_repositorys_bots_never_github_token() -> None:
     # A label GITHUB_TOKEN applies starts no workflow, so needs-human would page nobody.
     for name in ("Read the Open Issues", "File What the Scan Found"):
         assert "GH_TOKEN: ${{ steps.app-token.outputs.token }}" in _step(name), name
     text = WORKFLOW.read_text()
     assert "secrets.GITHUB_TOKEN" not in text and "github.token" not in text
-    assert "permission-issues: write" in _step("Mint the basecradle-ai App Token")
+    assert "permission-issues: write" in _step("Mint This Repository's Bot Token")
+
+
+def test_the_token_is_this_repositorys_own_bot_with_no_fallback() -> None:
+    # basecradle#870: FLEET_BOT_* hold this repository's captain's App; the capital's key
+    # is needed nowhere here, so nothing may fall back to it once its copies are deleted.
+    mint = _step("Mint This Repository's Bot Token")
+    assert "client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}\n" in mint
+    assert "private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}\n" in mint
+    assert "BASECRADLE_AI" not in WORKFLOW.read_text()
 
 
 def test_the_workflow_runs_on_its_clock_and_by_hand_never_on_a_pull_request() -> None:

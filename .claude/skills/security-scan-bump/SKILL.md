@@ -26,7 +26,7 @@ description: The response procedure for when the daily dependency scan files its
 
   Close the issue by hand once the fix is on `main`, a scan run is clean, and the box runs the fixed version (step 6).
 - **Closing the issue dismisses nothing.** While an advisory stands, the next scan files a new issue, and pages again if it is High or Critical.
-- **The scan files only as `basecradle-ai[bot]`, and reads only issues `basecradle-ai[bot]` wrote.** This repository is public, so an issue that copies the scan's title and marker but has any other author is ignored.
+- **The scan files only as this repository's own bot, `basecradle-router-ai[bot]`, and reads only issues that bot wrote** (basecradle#870; the capital's `basecradle-ai[bot]` ran it before, and left no scan issue open). This repository is public, so an issue that copies the scan's title and marker but has any other author is ignored.
 - **`Daily Dependency Security Scan Could Not Reach a Verdict` is the other issue it can file** (`needs-capital`). It means `osv-scanner` crashed, could not read `uv.lock`, or could not reach the OSV API. An unreachable API exits 127 with an empty report, which is why the scan checks the exit status. Read the run log, fix the cause, and re-run the workflow by hand. The run that reaches a verdict closes that issue itself. Until then the clock is stopped.
 - **A run that dies before it can file anything is only a red run in the Actions tab.** Examples: the App token will not mint, or the `osv-scanner` download fails its checksum. The `basecradle-router Dependency Scan` heartbeat then pages when a day and its grace pass with no ping.
 
