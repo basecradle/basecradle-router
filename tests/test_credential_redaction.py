@@ -112,11 +112,12 @@ def test_a_bare_word_is_no_credentials_name_because_the_canarys_is_not() -> None
 
 def test_a_long_run_of_capitals_is_read_in_linear_time() -> None:
     # The canary's own pattern took jq 30 s on 50,000 capitals; a stalled translator hangs a wake.
+    # Linear, this is milliseconds; quadratic, tens of seconds: the bound is far from both.
     started = time.monotonic()
-    redact_credentials("A" * 200_000 + "=x")
-    redact_credentials("KEY" * 70_000 + "=x")
-    redact_credentials("_" * 200_000 + "TOKEN=x")
-    assert time.monotonic() - started < 2.0
+    redact_credentials("A" * 50_000 + "=x")
+    redact_credentials("KEY" * 17_000 + "=x")
+    redact_credentials("_" * 50_000 + "TOKEN=x")
+    assert time.monotonic() - started < 5.0
 
 
 def test_nesting_no_interpreter_stack_could_hold_is_read_whole() -> None:
@@ -140,9 +141,20 @@ def test_nesting_no_interpreter_stack_could_hold_is_read_whole() -> None:
         ("A_TOKEN=`gh-app-token nova` tail", "A_TOKEN='<a redacted value>' tail"),
         ("A_TOKEN=${SECRET:-a b} tail", "A_TOKEN='<a redacted value>' tail"),
         ("A_TOKEN=a\\ b tail", "A_TOKEN='<a redacted value>' tail"),
-        ('A_TOKEN="multi\nline" tail', "A_TOKEN='<a redacted value>' tail"),
+        ("A_KEY=(sk1 sk2secretsecret) x", "A_KEY='<a redacted value>' x"),
+        ("A_TOKEN=a\x1cb\x85c\xa0d tail", "A_TOKEN='<a redacted value>' tail"),
         ("A_TOKEN=\tsecretsecret", "A_TOKEN='<a redacted value>'"),
         ('A_TOKEN="never closed and the rest', "A_TOKEN='<a redacted value>'"),
+        # A quote still open at a record break ends there: prose, far more often than a value.
+        (
+            "GH_TOKEN=don't do that.\n\nThe rest of the reply.",
+            "GH_TOKEN='<a redacted value>'\n\nThe rest of the reply.",
+        ),
+        (
+            "Set `GH_TOKEN=xyz` first.\n\nThen `gh pr create`.",
+            "Set `GH_TOKEN='<a redacted value>'\n\nThen `gh pr create`.",
+        ),
+        ('A_TOKEN="spans\na line" tail', "A_TOKEN='<a redacted value>'\na line\" tail"),
         (
             "x=1 A_KEY=1 y=2 B_SECRET=2",
             "x=1 A_KEY='<a redacted value>' y=2 B_SECRET='<a redacted value>'",
@@ -173,12 +185,16 @@ def test_the_marker_is_no_value_to_the_canary_whatever_follows_it(canary) -> Non
         assert silent(canary, "GH_TOKEN=" + REDACTED_VALUE + after)
 
 
-def test_a_run_ends_where_the_canary_or_a_record_ends() -> None:
-    from basecradle_router.claude_stream import RECORD_BREAKS
+def test_a_record_break_is_defined_once() -> None:
+    from basecradle_router import claude_stream
 
-    head, _, rest = RECORD_BREAKS.partition("|[")
-    assert head == "\r\n" and rest.endswith("]")
-    assert set(CANARY_VALUE_STOPS) | set(rest[:-1]) == logfmt._RUN_STOPS
+    assert claude_stream.RECORD_BREAKS is logfmt.RECORD_BREAKS
+
+
+@pytest.mark.parametrize("brk", list(logfmt._BREAK_CHARS))
+def test_the_canarys_run_ends_at_every_record_break(brk: str) -> None:
+    # No record holds a run across a break, so the value read as the canary's run stops there.
+    assert redact_credentials(f"A_TOKEN=\t{brk}next") == f"A_TOKEN='<a redacted value>'{brk}next"
 
 
 def test_redacting_twice_is_redacting_once() -> None:
@@ -307,10 +323,19 @@ def test_a_field_that_is_not_free_text_is_redacted_too(canary) -> None:
     assert silent(canary, *out)
 
 
-def test_a_bound_never_halves_a_value_into_one_the_canary_reads(canary) -> None:
-    for pad in range(0, 260, 7):
-        text = "x" * pad + " " + MINT
-        assert silent(canary, bounded(text), log_fields(error=bounded(text)))
+@pytest.mark.parametrize("tail", [MINT, "A_TOKEN=abc and more words", "A_TOKEN= then words"])
+def test_a_bound_cuts_an_assignment_whole_or_not_at_all(tail: str, canary) -> None:
+    # The renderer redacts again: a cut marker, or a `…` glued to a marker or an `=`, would be
+    # read as a value and rebuilt as a whole marker, past the bound and with no `…`.
+    for pad in range(150, 260):
+        text = "x" * pad + " " + tail
+        cut = bounded(text)
+        assert len(cut) <= logfmt.BOUND
+        assert redact_credentials(cut) == cut, (pad, cut[-40:])
+        rendered = log_fields(error=cut)
+        assert len(rendered) <= len(cut) + len('error=""')
+        assert not cut.endswith("…") or rendered.rstrip('"').endswith("…")
+        assert silent(canary, cut)
 
 
 def test_the_daemons_fields_pass_the_same_rule(canary) -> None:

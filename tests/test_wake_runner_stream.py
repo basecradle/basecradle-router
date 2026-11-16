@@ -304,6 +304,10 @@ _AGREED = "\n".join(
         "A_TOKEN=",
         "B_TOKEN=\tsecretsecret",
         "C_TOKEN='<a redacted value>' twice",
+        "A_KEY=(sk1 sk2secretsecret) x",
+        "GH_TOKEN=don't do that.",
+        "",
+        "The rest of the reply.",
     ]
 )
 

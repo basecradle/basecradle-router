@@ -585,8 +585,9 @@ AGENT_SCRIPT='
 	# credential-named assignment`s value becomes `<a redacted value>` in single quotes, the name kept
 	# (basecradle-router#491): the name by the translator`s own spelling of the NOC canary`s rule
 	# (`logfmt.CREDENTIAL_NAME`, linear in a backtracking engine), the value as the shell word after
-	# the `=` (quoted strings, `$(...)` and backquotes, one level deep: the degraded reading of the
-	# translator`s, which nests), then any canary-length run that word left. Should jq fail too,
+	# the `=` (quoted strings, `$(...)`, `(...)` and backquotes, one level deep and never across a
+	# record break: the degraded reading of the translator`s, which nests), then any canary-length
+	# run that word left. Should jq fail too,
 	# cat drains what is left. The wake runs on either way. What is lost is telemetry: the lines of
 	# whatever the translator had read and not yet written, and of every line after it stopped; and
 	# the reply too, only if the final `result` line was already in its read buffer when it died.
@@ -601,7 +602,7 @@ AGENT_SCRIPT='
 		exec "$@" > >(
 			"$python" -I "$translate" "$$" || {
 				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$?" >&2
-				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings | \"(?<![A-Z0-9_])[0-9_]*[A-Z][A-Z0-9_]*?(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=\" as \$n | \"\\u0027<a redacted value>\\u0027\" as \$r | gsub(\"(?<n>\" + \$n + \")(?:\\\"(?:[^\\\"\\\\\\\\]|\\\\\\\\.)*\\\"?|\\u0027[^\\u0027]*\\u0027?|\\\\\$\\\\([^)]*\\\\)?|\`[^\`]*\`?|\\\\\\\\.|[^\\\\s\\\"\\u0027\`\\\\\\\\])+\"; \"\\(.n)\\(\$r)\") | gsub(\"(?<n>\" + \$n + \")[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]{8,}\"; \"\\(.n)\\(\$r)\") | \"\\r\\n|[\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]\" as \$b | sub(\"(?:\" + \$b + \")\\\\z\"; \"\") | splits(\$b) | if . == \"\" then \">\" else . as \$l | range(0; length; 8000) as \$i | \"> \" + \$l[\$i:\$i+8000] end" ||
+				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings | \"(?<![A-Z0-9_])[0-9_]*[A-Z][A-Z0-9_]*?(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=\" as \$n | \"\\u0027<a redacted value>\\u0027\" as \$r | gsub(\"(?<n>\" + \$n + \")(?:\\\"(?:[^\\\"\\\\\\\\\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\\\\\.)*\\\"?|\\u0027[^\\u0027\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\u0027?|\\\\\$?\\\\([^)\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\\\)?|\`[^\`\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\`?|\\\\\\\\.|[^ \\t\\n\\\"\\u0027\`\\\\\\\\(])+\"; \"\\(.n)\\(\$r)\") | gsub(\"(?<n>\" + \$n + \")[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]{8,}\"; \"\\(.n)\\(\$r)\") | \"\\r\\n|[\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]\" as \$b | sub(\"(?:\" + \$b + \")\\\\z\"; \"\") | splits(\$b) | if . == \"\" then \">\" else . as \$l | range(0; length; 8000) as \$i | \"> \" + \$l[\$i:\$i+8000] end" ||
 					"$cat" >/dev/null
 			}
 		)

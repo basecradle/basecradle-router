@@ -152,28 +152,31 @@ _CREDENTIAL_NAME = re.compile(CREDENTIAL_NAME)
 #: so ``GH_TOKEN=<redacted>`` would be the finding it replaced.
 REDACTED_VALUE = "'<a redacted value>'"
 
-#: Where a run the canary reads ends in every record the text can be written into: at one of the
-#: canary's own stops, or at a character journald starts a new record at (the translator's
-#: ``RECORD_BREAKS``, pinned to these by a test), since no record holds a run across one.
-_RUN_STOPS = frozenset(CANARY_VALUE_STOPS + "\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+#: Every character journald, or Python reading a line, starts a new record or line at; a CRLF is
+#: one. The translator cuts model-written text at these (``claude_stream.quoted``), and
+#: ``wake-runner``'s ``jq`` fallback splits by this pattern, spelled for jq (pinned by a test).
+_BREAK_CHARS = "\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+RECORD_BREAKS = "\r\n|[" + _BREAK_CHARS + "]"
 
+#: The canary's value run, where it ends in every record the text can be written into: at one of
+#: the canary's own stops, or at a record break, since no record holds a run across one.
+_CANARY_RUN = re.compile("[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS) + "]*")
 
-def _canary_run_end(text: str, start: int) -> int:
-    """Where the canary's value run from ``start`` ends: at a :data:`_RUN_STOPS`, or the end."""
-    end = start
-    while end < len(text) and text[end] not in _RUN_STOPS:
-        end += 1
-    return end
+#: The characters that end an unquoted shell word: the shell's blanks and its newline.
+_SHELL_BLANKS = " \t\n"
 
 
 def _shell_word_end(text: str, start: int) -> int:
-    """Where the shell word from ``start`` ends: at whitespace outside every quote, or the end.
+    """Where the shell word from ``start`` ends: at a blank outside every quote, or the end.
 
     One word as the shell reads it, so a value is taken whole whatever surrounds it: a single- or
-    double-quoted string, an ANSI-C ``$'…'``, a ``$(…)`` or ``${…}`` (each nesting as the shell's
-    does, quotes inside included), a backquoted command, and a backslash escape. A quote or a
-    substitution the text never closes takes the rest of the text: the redaction errs toward
-    hiding. Iterative, with its own stack, so no depth of nesting can exhaust the interpreter's.
+    double-quoted string, an ANSI-C ``$'…'``, a ``$(…)``, ``${…}`` or ``(…)`` (each nesting as the
+    shell's does, quotes inside included), a backquoted command, and a backslash escape. Only a
+    space, a tab or a newline ends an unquoted word, as in the shell, so no other character can cut
+    a value short. A quote or a substitution still open at a record break ends there: it is prose
+    (an apostrophe, a markdown backquote) far more often than a value that spans lines, and read
+    on it would hide the rest of a reply. Iterative, with its own stack, so no depth of nesting can
+    exhaust the interpreter's.
     """
     stack: list[str] = []  # what closes each open context: ' " ` ) } and $' for ANSI-C
     i = start
@@ -181,6 +184,8 @@ def _shell_word_end(text: str, start: int) -> int:
     while i < n:
         c = text[i]
         top = stack[-1] if stack else ""
+        if top and c in _BREAK_CHARS:
+            return i
         if top == "'":
             if c == "'":
                 stack.pop()
@@ -209,8 +214,8 @@ def _shell_word_end(text: str, start: int) -> int:
                 if c == "`":
                     stack.append("`")
                 i += 1
-        else:  # outside every quote: the word itself, or inside a $( ) or ${ }
-            if not top and c.isspace():
+        else:  # outside every quote: the word itself, or inside a ( ), $( ) or ${ }
+            if not top and c in _SHELL_BLANKS:
                 break
             if top and c == top:
                 stack.pop()
@@ -224,23 +229,27 @@ def _shell_word_end(text: str, start: int) -> int:
             else:
                 if c in "'\"`":
                     stack.append(c)
-                elif c == "(" and top == ")":
-                    stack.append(")")  # a subshell or arithmetic inside a substitution
+                elif c == "(" and top != "}":
+                    stack.append(")")  # an array, a subshell, arithmetic
                 i += 1
     return min(i, n)
+
+
+def _value_end(text: str, start: int) -> int:
+    """Where a credential's value from ``start`` ends: the longer of the two readings."""
+    return max(_shell_word_end(text, start), _CANARY_RUN.match(text, start).end())
 
 
 def redact_credentials(text: str) -> str:
     """``text`` with every credential-named assignment's value replaced by :data:`REDACTED_VALUE`.
 
-    The name stays. The value is the longer of two readings from the character after the ``=``:
-    the shell word there (:func:`_shell_word_end`), so a quoted value or a ``"$(…)"`` goes whole,
-    and the canary's own run (:data:`CANARY_VALUE_STOPS`), so whatever the canary would read as
-    the value is gone in every context the text is written in, a prose line that keeps a tab
-    included. An empty value (the ``=`` ends the text, or whitespace follows it) has nothing to
-    hide and is left as it is. Linear in ``text``, and idempotent: the marker is redacted to
-    itself, so a value redacted where it is bounded and again where it is rendered stays one
-    marker.
+    The name stays. The value is the longer of two readings from the character after the ``=``
+    (:func:`_value_end`): the shell word there (:func:`_shell_word_end`), so a quoted value or a
+    ``"$(…)"`` goes whole, and the canary's own run, so whatever the canary would read as the value
+    is gone in every record the text is written into, a prose line that keeps a tab included. An
+    empty value (a space, a record break or the text's end follows the ``=``) has nothing to hide
+    and is left as it is. Linear in ``text``, and idempotent: the marker is redacted to itself, so
+    a value redacted where it is bounded and again where it is rendered stays one marker.
     """
     if "=" not in text:
         return text
@@ -248,7 +257,7 @@ def redact_credentials(text: str) -> str:
     pos = 0
     while (match := _CREDENTIAL_NAME.search(text, pos)) is not None:
         start = match.end()
-        end = max(_shell_word_end(text, start), _canary_run_end(text, start))
+        end = _value_end(text, start)
         out.append(text[pos:start])
         if end > start:
             out.append(REDACTED_VALUE)
@@ -320,6 +329,10 @@ def bounded(value: object, limit: int = BOUND) -> str:
     A credential-named assignment's value is redacted first (:func:`redact_credentials`, #491),
     so the bound is spent on what a reader may see, and a value the cut would have halved is gone
     whole. The harness's ``bounded`` scrubs in its caller, ``kv``, before the cut, to the same end.
+    An assignment is one token to the cut, too: one the cut would reach (a marker it would halve,
+    a marker or an ``=`` the ``…`` would be glued to) goes whole, name and all. Otherwise the
+    renderer, redacting again, reads the cut marker or the ``…`` as a value and writes a whole
+    marker in its place, past the bound and with no ``…`` to say the text was cut.
     """
     text = " ".join(_CONTROL.sub(" ", redact_credentials(str(value))).split())
     if len(text) <= limit:
@@ -328,7 +341,19 @@ def bounded(value: object, limit: int = BOUND) -> str:
     if _CREDENTIAL_CHAR.fullmatch(text[limit - 1]):
         head = _TRAILING_CREDENTIAL_RUN.sub("", head)
     head = head.strip()
+    while (name := _last_name(text, len(head))) is not None:
+        if _value_end(text, name.end()) < len(head):
+            break  # the last assignment before the cut ends before it: nothing reaches the cut
+        head = _TRAILING_CREDENTIAL_RUN.sub("", text[: name.start()]).strip()
     return f"{head}…" if head else ""
+
+
+def _last_name(text: str, end: int) -> re.Match[str] | None:
+    """The last credential name in ``text`` whose ``=`` lies before ``end``, or ``None``."""
+    last = None
+    for last in _CREDENTIAL_NAME.finditer(text, 0, end):  # noqa: B007 — the loop keeps the last
+        pass
+    return last
 
 
 def log_fields(**pairs: object) -> str:

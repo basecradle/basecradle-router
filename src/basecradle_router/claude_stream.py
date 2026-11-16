@@ -113,7 +113,7 @@ from datetime import datetime
 from typing import Any
 
 from basecradle_router import anthropic_rates as rates
-from basecradle_router.logfmt import bounded, log_fields, redact_credentials
+from basecradle_router.logfmt import RECORD_BREAKS, bounded, log_fields, redact_credentials
 
 #: The vendor that bills every call a Claude Code builder makes.
 PROVIDER = "anthropic"
@@ -169,9 +169,8 @@ QUOTE = "> "
 #: under the 48K bytes past which journald splits a line into a second record with no lead.
 QUOTED_PIECE = 8000
 
-#: Every place journald, or Python reading a line, starts a new record or line: a CRLF is one.
-#: ``wake-runner``'s ``jq`` fallback splits by this pattern, spelled for jq (pinned by a test).
-RECORD_BREAKS = "\r\n|[\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]"
+#: Every place journald, or Python reading a line, starts a new record or line (defined beside
+#: the redaction in :mod:`basecradle_router.logfmt`, which reads no run across one).
 _RECORD_BREAKS = re.compile(RECORD_BREAKS)
 
 #: Half a micro-dollar: two dollar figures closer than this are the same figure.
