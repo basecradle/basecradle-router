@@ -81,10 +81,13 @@ jobs:
       # the capital's key. Scoped to the repositories just listed. Allowed to fail, so a
       # repository the App is not installed on never stops a renewal: the audit still renews
       # everything, then dies at the gap issue, and nothing is pinged.
+      # Pinned to a full commit SHA, its version in the comment: this step holds this
+      # repository's App private key, so a moved tag would run someone else's code with it
+      # (Dependabot bumps a SHA pin with its comment).
       - name: Mint This Repository's Bot Token
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
           private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}

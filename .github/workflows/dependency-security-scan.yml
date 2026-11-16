@@ -70,9 +70,12 @@ jobs:
       # Whose token (basecradle#870): this repository's own bot, basecradle-router-ai[bot].
       # FLEET_BOT_CLIENT_ID and FLEET_BOT_APP_PRIVATE_KEY hold this repository's captain's
       # App, so the capital's key is needed nowhere here, and there is no fallback to it.
+      # Pinned to a full commit SHA, its version in the comment: this step holds this
+      # repository's App private key, so a moved tag would run someone else's code with it
+      # (Dependabot bumps a SHA pin with its comment).
       - name: Mint This Repository's Bot Token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
           private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}

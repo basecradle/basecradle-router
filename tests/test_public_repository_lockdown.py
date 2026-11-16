@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -821,6 +822,9 @@ def test_the_issues_token_is_this_repositorys_own_bot_with_no_fallback() -> None
     assert "client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}\n" in mint
     assert "private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}\n" in mint
     assert "BASECRADLE_AI" not in text
+    assert re.search(r"uses: actions/create-github-app-token@[0-9a-f]{40} # v\d", mint), (
+        "the step holding the App's private key runs a commit, never a tag that can move"
+    )
     assert lockdown.WRITER_BOT == lockdown.GAP_AUTHOR == OWN_BOT
 
 
