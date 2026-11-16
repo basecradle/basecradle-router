@@ -1,0 +1,291 @@
+#!/usr/bin/python3 -I
+"""claude-stream-translate — a builder's Claude Code stream in, the telemetry contract's lines out.
+
+Installed ROOT-OWNED at /opt/basecradle-router/bin/claude-stream-translate (root:root, 0755) by the
+NOC's deploy, like every `deploy/bin/*` helper. `wake-runner` runs it AS THE BUILDER, after the
+privilege drop, with the python3 it resolved off its trusted PATH, on the read end of the pipe the
+builder's `claude` writes its stream into (basecradle-router#481):
+
+    exec claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \\
+        > >(python3 -I /opt/basecradle-router/bin/claude-stream-translate <claude's pid>)
+
+Its stdout and stderr are the journal stream wake-runner opened for the builder
+(`basecradle-wake-<os_user>`), so its lines land under the builder's identity exactly as the
+builder's reply always has. The translation itself is `basecradle_router.claude_stream`; this file
+is only the part that must be root-owned: what it loads, and how it reads.
+
+WHAT IT LOADS, AND WHY IT VERIFIES IT. This program runs inside the builder's own environment, its
+API key and GitHub App key loaded, so whatever code it runs can read them. That is why it lives in
+root-owned `bin/` beside probe-ack, never in the router-writable `.venv`. The translator and the
+router's one renderer live in the daemon tree, `/opt/basecradle-router/app`, which is root-owned
+except for `.venv`; rather than lean on that, it checks before loading anything. Exactly three
+source files are read (`logfmt.py`, the renderer; `anthropic_rates.py`, the price table;
+`claude_stream.py`, the translation), and each is loaded only if every component of its path, from
+`/` down, is a real entry (never a symlink) owned by root and writable by no group or other. The
+file itself is opened with O_NOFOLLOW and judged by its own descriptor, so the bytes compiled are
+the bytes checked. They are compiled from source, so no cached bytecode is ever consulted, into a
+package with no search path, so nothing else of the package can be imported by accident. Python
+itself is started with `-I`, so no `PYTHON*` variable and no user site directory from the
+builder's environment reaches it.
+
+HOW IT READS. Line by line, as Claude Code writes them, so every line up to a crash or a stop is
+translated as it arrives. A stop's SIGTERM (stop-wake signals everything beneath runuser's child)
+does not end it: the signal is recorded and reading continues to the end of the stream, which comes
+when `claude` exits, so the lines a stop leaves behind still land. A journal that stops accepting
+writes stops the writing, never the reading: `claude` must never block or die on a full pipe
+because its reader went away. Writes go straight to the descriptor, never through a Python buffer,
+so a journal that went away cannot fail the exit either.
+
+ITS ONE ARGUMENT is `claude`'s pid, the writer of its stream. The stream ends at EOF, which comes
+when the last holder of the pipe's write end closes it, and that is `claude` unless something it
+started inherited its stdout and outlived it. So once that pid is gone and the pipe has been quiet
+for :data:`QUIET` seconds, the stream is over, and a leftover process can never keep this one
+reading forever. With no argument it reads to EOF.
+
+EXIT CODES
+    0   the stream was read to its end
+    70  EX_SOFTWARE: the translator could not be loaded (the reason is on stderr). wake-runner then
+        drains the rest of the stream itself and keeps the reply; see its `run_stream`.
+"""
+
+from __future__ import annotations
+
+import os
+import select
+import signal
+import stat
+import sys
+import time
+import types
+from collections.abc import Callable, Iterator, Mapping
+
+#: The daemon tree's source root, and the three files loaded from it, in load order.
+APP_SRC = "/opt/basecradle-router/app/src"
+PACKAGE = "basecradle_router"
+MODULES = ("logfmt", "anthropic_rates", "claude_stream")
+
+EXIT_UNLOADABLE = 70
+
+#: Seconds of silence on the pipe, with its writer gone, after which the stream is over.
+QUIET = 1.0
+
+#: The signals a stop or a closing session sends; each is recorded, and the stream is read on.
+_DRAIN_THROUGH = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+class Refused(Exception):
+    """A file this program will not load, naming what is wrong and where."""
+
+
+def _judge(path: str, info: os.stat_result, owner: int, *, directory: bool) -> None:
+    if stat.S_ISLNK(info.st_mode):
+        raise Refused(f"{path} is a symlink; nothing is loaded through a link")
+    if directory and not stat.S_ISDIR(info.st_mode):
+        raise Refused(f"{path} is not a directory")
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise Refused(f"{path} is not a regular file")
+    if info.st_uid != owner:
+        raise Refused(f"{path} is owned by uid {info.st_uid}, not {owner}")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Refused(f"{path} is writable by its group or by others")
+
+
+def read_trusted(path: str, *, anchor: str = "/", owner: int = 0) -> bytes:
+    """``path``'s bytes, if it and every directory from ``anchor`` down are ``owner``'s alone.
+
+    Walks the path one component at a time and resolves nothing, the rule wake-runner's
+    ``confined_path`` follows: a symlink anywhere is refused rather than followed, and so is a
+    ``.`` or ``..`` segment. The final file is opened with ``O_NOFOLLOW`` and judged by ``fstat`` on
+    the open descriptor, so no swap between the check and the read can change what is read.
+    """
+    if not path.startswith(anchor.rstrip("/") + "/"):
+        raise Refused(f"{path} is not under {anchor}")
+    rest = path[len(anchor.rstrip("/")) + 1 :].split("/")
+    if any(part in ("", ".", "..") for part in rest):
+        raise Refused(f"{path} is not a canonical path")
+    walked = anchor
+    _judge(walked, os.lstat(walked), owner, directory=True)
+    for part in rest[:-1]:
+        walked = os.path.join(walked, part)
+        _judge(walked, os.lstat(walked), owner, directory=True)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise Refused(f"{path} cannot be opened without following a link: {exc}") from exc
+    try:
+        _judge(path, os.fstat(fd), owner, directory=False)
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def load(src_root: str = APP_SRC, *, anchor: str = "/", owner: int = 0) -> types.ModuleType:
+    """The translation module, built from the three verified files and nothing else.
+
+    The package is built fresh: any module of that name already imported is dropped first, so
+    nothing but these three files can answer an import of it.
+    """
+    for loaded in [name for name in sys.modules if name.split(".")[0] == PACKAGE]:
+        del sys.modules[loaded]
+    package = types.ModuleType(PACKAGE)
+    package.__path__ = []  # no search path: a fourth module cannot be found, only refused
+    sys.modules[PACKAGE] = package
+    module = package
+    for name in MODULES:
+        path = f"{src_root}/{PACKAGE}/{name}.py"
+        code = compile(read_trusted(path, anchor=anchor, owner=owner), path, "exec")
+        module = types.ModuleType(f"{PACKAGE}.{name}")
+        module.__file__ = path
+        sys.modules[module.__name__] = module  # before exec: dataclasses read it back
+        exec(code, module.__dict__)
+        setattr(package, name, module)
+    return module
+
+
+def _lines(fd: int, writer_alive: Callable[[], bool] | None) -> Iterator[str]:
+    """The stream on ``fd``, one decoded line at a time, until EOF or its writer is gone.
+
+    ``writer_alive`` is asked only when the pipe has been quiet for :data:`QUIET` seconds; once it
+    answers no, whatever was read is the whole stream.
+    """
+    partial: list[bytes] = []  # a line still arriving: one large tool result is one line
+    while True:
+        if writer_alive is not None:
+            ready, _, _ = select.select([fd], [], [], QUIET)
+            if not ready:
+                if writer_alive():
+                    continue
+                break
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            break
+        start = 0
+        while (end := chunk.find(b"\n", start)) != -1:
+            partial.append(chunk[start:end])
+            yield b"".join(partial).decode("utf-8", "replace")
+            partial.clear()
+            start = end + 1
+        if start < len(chunk):
+            partial.append(chunk[start:])
+    if partial:
+        yield b"".join(partial).decode("utf-8", "replace")
+
+
+def _started(pid: int) -> str | None:
+    """``pid``'s start time (proc(5) field 22), or ``None`` where there is no /proc."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            stat_line = fh.read()
+    except OSError:
+        return None
+    fields = stat_line[stat_line.rfind(")") + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def pid_alive(pid: int) -> Callable[[], bool]:
+    """Whether ``pid`` is still the process it was when this was asked first: ``claude``.
+
+    A signal-0 probe signals nothing. ``claude`` runs as this program's own account, so a pid we
+    may not signal is no longer it, and where /proc exists the start time must match too, so a
+    reused pid is never mistaken for the writer.
+    """
+    started = _started(pid)
+
+    def alive() -> bool:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return started is None or _started(pid) == started
+
+    return alive
+
+
+class _Out:
+    """Writes lines to the journal's descriptor until it refuses one, then writes no more."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self.broken = False
+
+    def __call__(self, line: str) -> None:
+        if self.broken:
+            return
+        data = memoryview(line.encode("utf-8", "replace") + b"\n")
+        try:
+            while data:
+                data = data[os.write(self._fd, data) :]
+        except OSError:
+            self.broken = True
+
+
+def run(
+    translation: types.ModuleType,
+    read_fd: int,
+    write_fd: int,
+    *,
+    received: list[str],
+    environ: Mapping[str, str],
+    writer_alive: Callable[[], bool] | None = None,
+) -> int:
+    """Translate the stream on ``read_fd`` to ``write_fd`` until it ends; return the exit status.
+
+    ``received`` is the list :func:`drain_through_signals` appends each signal's name to; the
+    first one is what the stream is said to have ended after.
+    """
+    out = _Out(write_fd)
+    translator = translation.Translator(
+        write=out, clock=time.monotonic, base_url=translation.aimed_at(environ)
+    )
+    for line in _lines(read_fd, writer_alive):
+        translator.feed(line)
+    translator.finish(stopped_by=received[0] if received else None)
+    return 0
+
+
+def drain_through_signals() -> list[str]:
+    """Record each of :data:`_DRAIN_THROUGH` instead of dying of it; return where they land.
+
+    A handler, never ``SIG_IGN``: an ignored signal is inherited across ``exec``, and nothing this
+    program starts should inherit a deafness. A read interrupted by the signal is resumed after the
+    handler (PEP 475), so reading simply continues.
+    """
+    received: list[str] = []
+
+    def record(signum: int, _frame: object) -> None:
+        received.append(signal.Signals(signum).name.removeprefix("SIG"))
+
+    for signum in _DRAIN_THROUGH:
+        signal.signal(signum, record)
+    return received
+
+
+def main(argv: list[str]) -> int:
+    # First, before anything can take time: a stop's TERM during the load must not end us early.
+    received = drain_through_signals()
+    writer = int(argv[0]) if argv and argv[0].isdigit() and int(argv[0]) > 1 else None
+    try:
+        translation = load()
+    except (Refused, OSError, SyntaxError, ImportError, AttributeError) as exc:
+        print(
+            f"claude-stream-translate: not loading the translator: {exc}. This wake's model calls "
+            "and tool uses have no lines; the reply is kept.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_UNLOADABLE
+    return run(
+        translation,
+        sys.stdin.fileno(),
+        sys.stdout.fileno(),
+        received=received,
+        environ=os.environ,
+        writer_alive=pid_alive(writer) if writer is not None else None,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

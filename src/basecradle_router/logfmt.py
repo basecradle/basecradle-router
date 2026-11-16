@@ -138,14 +138,45 @@ def _render_value(value: object) -> str:
 
     A ``bool`` renders lowercase (see :func:`log_fields`). Two of the harness's ``kv``
     jobs are not this function's: bounding a value's length (240 characters there),
-    which is a separate job from quoting and one the router has never done, and
-    credential scrubbing, which is the box's ``ai_scrub``, run over every journald line.
+    which is a separate job from quoting and is :func:`bounded`'s, applied by the caller
+    to foreign text only (the router's own values are never bounded), and credential
+    scrubbing, which is the box's ``ai_scrub``, run over every journald line.
     """
     text = ("true" if value else "false") if isinstance(value, bool) else str(value)
     text = " ".join(_CONTROL.sub(" ", text).split())
     if " " in text or "=" in text or '"' in text:
         return '"' + text.replace('"', "'") + '"'
     return text
+
+
+#: The fleet's bound on a free-text value, in characters (basecradle-harness ``docs/telemetry.md`` →
+#: The Grammar), the ellipsis included.
+BOUND = 240
+
+#: One character of the run every length-gated credential rule on the box matches. A cut never falls
+#: inside such a run: a credential cut short of its rule's minimum would match no rule and ship.
+_CREDENTIAL_CHAR = re.compile(r"[A-Za-z0-9_-]")
+_TRAILING_CREDENTIAL_RUN = re.compile(r"[A-Za-z0-9_-]*\Z")
+
+
+def bounded(value: object, limit: int = BOUND) -> str:
+    """``value`` flattened and cut to at most ``limit`` characters, ending in ``…`` when cut.
+
+    For foreign text only (a vendor's error, a tool's failure): the router's own values are never
+    bounded, which is why :func:`log_fields` does not call this. It is the cut the ``ai_otel_llm``
+    remap applies to ``detail=`` (``vector.yaml``, #385) and the harness's ``bounded``: the cut
+    backs off to the last character outside a ``[A-Za-z0-9_-]`` run, so a token is either whole,
+    and so redactable by the box's ``ai_scrub`` after it, or absent. A value that is one such run
+    past the bound is returned empty, and :func:`log_fields` then drops the field.
+    """
+    text = " ".join(_CONTROL.sub(" ", str(value)).split())
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]
+    if _CREDENTIAL_CHAR.fullmatch(text[limit - 1]):
+        head = _TRAILING_CREDENTIAL_RUN.sub("", head)
+    head = head.strip()
+    return f"{head}…" if head else ""
 
 
 def log_fields(**pairs: object) -> str:

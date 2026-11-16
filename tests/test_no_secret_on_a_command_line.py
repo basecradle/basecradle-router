@@ -233,6 +233,9 @@ WAKE_RUNNER_BOX = {
         "TRUSTED_PATH={bindir}\n"
     ),
     "PROBE_ACK=/opt/basecradle-router/bin/probe-ack\n": "PROBE_ACK={probe_ack}\n",
+    "STREAM_TRANSLATE=/opt/basecradle-router/bin/claude-stream-translate\n": (
+        "STREAM_TRANSLATE={stream_translate}\n"
+    ),
 }
 
 
@@ -295,6 +298,7 @@ def _drive_wake_runner(mode: str) -> Driver:
                 registry=str(registry),
                 bindir=bindir,
                 probe_ack=str(REPO / "deploy" / "bin" / "probe-ack"),
+                stream_translate=str(REPO / "deploy" / "bin" / "claude-stream-translate"),
                 homes=str(homes),
             ),
         )
@@ -661,8 +665,13 @@ PLANTED: dict[tuple[str, str], tuple[str, str]] = {
             '\texec "$@"\n',
             '\texec env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@"\n',
         )
-        for mode in ("builder", "harness", "probe")
+        for mode in ("harness", "probe")
     },
+    # A builder's wake takes the stream's `exec` (#481): the plant goes on that command.
+    ("deploy/bin/wake-runner", "builder"): (
+        '\t\texec "$@" > >(\n',
+        '\t\texec env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@" > >(\n',
+    ),
     (".github/scripts/ping-heartbeat.sh", "ping"): (
         '--config - <<<"url = \\"$url\\""\n',
         '-H "X-Heartbeat: $url" --config - <<<"url = \\"$url\\""\n',

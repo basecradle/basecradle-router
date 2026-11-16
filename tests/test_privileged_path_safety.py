@@ -788,10 +788,19 @@ def test_the_root_owned_wrappers_resolve_no_path_themselves() -> None:
     assert not {name: at for name, at in offenders.items() if at}, offenders
 
 
+#: The one shape that names ``jq`` without running it: resolving it off the trusted PATH.
+RESOLVES_JQ = re.compile(r'[a-z_]+="\$\(PATH="\$TRUSTED_PATH" command -v jq\)" \|\| die "[^"$`]*"')
+
+
 def test_the_registrys_reader_is_only_ever_given_the_registry() -> None:
-    """``jq`` is outside ``PATH_VERBS``, so its file operand is pinned here instead."""
+    """``jq`` is outside ``PATH_VERBS``, so its file operand is pinned here instead.
+
+    A line that only resolves it (``command -v jq``) runs nothing and is given nothing: the
+    builder's stream fallback resolves it as root and runs it as the agent, on its own stream,
+    inside the agent script this scan erases (basecradle-router#481).
+    """
     for _, line in logical_lines(WAKE_RUNNER.read_text()):
-        if not re.search(r"\bjq\b", line):
+        if not re.search(r"\bjq\b", line) or RESOLVES_JQ.fullmatch(line.strip()):
             continue
         assert '"$REGISTRY"' in line or "jq >/dev/null" in line, line
 

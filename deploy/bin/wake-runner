@@ -17,6 +17,20 @@
 # character ($, backtick, $( ), spaces, quotes) is data and never code (#109).
 # This is the runtime contract the HomeServerWaker (#29) assembles against.
 #
+# A BUILDER'S WAKE IS A PIPE (basecradle-router#481). For a builder, the command after `--`
+# must be exactly `claude -p <trigger>`, and the wrapper completes it itself: as the agent it
+# runs
+#
+#   exec claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
+#       > >(python3 -I /opt/basecradle-router/bin/claude-stream-translate <claude's pid>)
+#
+# so Claude Code's own structured output is turned into the telemetry contract's lines, written
+# into the builder's journal stream beside its reply, under the builder's own identifier. The
+# flags and the translator are decided HERE, by root, never by the caller: the pair only works
+# together, so the one file that runs them is the one file that names them, and the caller's
+# whole say is the trigger. See `run_stream` below for what happens to the wake and its reply
+# if the translator fails.
+#
 # The optional --delivery <id> is exported to the agent as BASECRADLE_DELIVERY_ID,
 # so the woken harness can stamp its own lifecycle lines with the same delivery id
 # the router's stage lines carry — one `delivery=<id>` grep then spans both journal
@@ -114,6 +128,14 @@ PROBE_ACK=/opt/basecradle-router/bin/probe-ack
 # The contract's inconclusive sentinel — kept in lockstep with selftest.EXIT_UNPROVABLE
 # and router-admin's copy: "we never got an answer", as distinct from "the answer is no".
 EXIT_UNPROVABLE=75
+# The builder's stream translator, root-owned beside this wrapper, run AS THE AGENT on the read
+# end of the builder's pipe (#481). A CONSTANT, for PROBE_ACK's reason: it runs inside the
+# agent's environment after agent.env has loaded, so a caller who could choose it could read
+# the agent's secrets.
+STREAM_TRANSLATE=/opt/basecradle-router/bin/claude-stream-translate
+# The flags that make `claude -p` write the stream the translator reads. All three are needed:
+# without --include-partial-messages the stream never states a call's final output tokens.
+STREAM_FLAGS=(--output-format stream-json --verbose --include-partial-messages)
 
 die() {
 	printf 'wake-runner: %s\n' "$*" >&2
@@ -235,6 +257,11 @@ user=""
 cwd=""
 delivery=""
 probe=""
+# Set only for a builder's real wake (#481): empty means the agent script `exec`s its command.
+stream_python=""
+stream_translate=""
+stream_jq=""
+stream_cat=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--user)
@@ -345,7 +372,31 @@ github)
 	[[ -n $probe ]] ||
 		[[ "$1" == claude ]] ||
 		die "refusing: command must be the bare word 'claude', got '$1'"
+	# And nothing but `-p <trigger>` after it (#481). Before the pipe, the rest of the argv passed
+	# through uninspected; now the wrapper adds the stream flags itself, so the caller's whole say
+	# is the trigger, and a flag slipped in beside it is refused rather than run. So is a trigger
+	# that is itself an option: claude would parse `-p --mcp-config=<file>` as a flag, not a prompt.
+	[[ -n $probe ]] ||
+		[[ $# -eq 3 && "$2" == -p ]] ||
+		die "refusing: a builder's command must be exactly 'claude -p <trigger>' ($# words given)"
+	[[ -n $probe ]] ||
+		[[ "$3" != -* ]] ||
+		die "refusing: a builder's trigger may not begin with '-' (claude would read it as an option)"
 	launch_bin="$(PATH="$TRUSTED_PATH" command -v claude)" || die "claude not found on the trusted PATH"
+	if [[ -z $probe ]]; then
+		# The pipe's other end, resolved the same way: at a fixed root-owned path or off the trusted
+		# PATH, never from the caller or from the agent's own PATH, which agent.env may set. jq and
+		# cat are the fallback that keeps the reply should the translator die (`run_stream`).
+		[[ -x $STREAM_TRANSLATE ]] ||
+			die "stream translator is missing or not executable: $STREAM_TRANSLATE" \
+				"(install it root-owned: install -o root -g root -m 0755" \
+				"deploy/bin/claude-stream-translate /opt/basecradle-router/bin/)"
+		stream_python="$(PATH="$TRUSTED_PATH" command -v python3)" ||
+			die "python3 not found on the trusted PATH"
+		stream_jq="$(PATH="$TRUSTED_PATH" command -v jq)" || die "jq not found on the trusted PATH"
+		stream_cat="$(PATH="$TRUSTED_PATH" command -v cat)" || die "cat not found on the trusted PATH"
+		stream_translate=$STREAM_TRANSLATE
+	fi
 	;;
 harness)
 	# A harness agent's wake CLI lives in its OWN venv (agent-writable), so it
@@ -396,6 +447,8 @@ if [[ -n $probe ]]; then
 	set -- "$PROBE_ACK" "$probe" "$would_exec"
 else
 	shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
+	# A builder's stream flags, appended by root after the caller's `-p <trigger>` (#481).
+	[[ -z $stream_translate ]] || set -- "$@" "${STREAM_FLAGS[@]}"
 fi
 
 # Route the wake's stdout+stderr into journald under a PER-AGENT identifier, so the
@@ -434,9 +487,10 @@ fi
 
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
 # router never reads it), cd into the clone, export the delivery id, exec the
-# registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id
-# as $2, and the command (launch_bin + args) as $3..; root never interpolates the
-# trigger/timeline/delivery — each is passed as an inert positional argument.
+# registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2,
+# a builder's stream helpers as $3..$6 (python3, the translator, jq, cat: all empty unless this
+# is a builder's real wake), and the command (launch_bin + args) as $7..; root never
+# interpolates the trigger/timeline/delivery — each is passed as an inert positional argument.
 #
 # Held in a variable rather than written inline at the exec, so the two launch shapes
 # below (journald-wrapped for a real wake, direct for a probe) share ONE copy of the
@@ -509,11 +563,51 @@ AGENT_SCRIPT='
 		export BASECRADLE_DELIVERY_ID="$1"
 	fi
 	shift
-	exec "$@"
+	stream_python=$1 stream_translate=$2 stream_jq=$3 stream_cat=$4
+	shift 4
+	# >>> run_stream >>>
+	# A builder wake (#481): its claude, exec-ed as every wake is, its stdout a pipe into the stream
+	# translator, both as the agent. The exec is the point. runuser`s child is claude itself, so a
+	# stop is what it always was: runuser relays its TERM to claude, gives it 2 s, SIGKILLs it, and
+	# only then re-raises, so the router never reads a wake as over while its claude still runs.
+	# The exit status is claude`s, by construction, and the wake ends when claude ends: nothing
+	# that holds the pipe open afterwards can hold the wake.
+	#
+	# The translator is passed claude`s pid ($$, which the exec hands to claude), so when claude is
+	# gone and the pipe has gone quiet it finishes, rather than wait on a leftover process that
+	# still holds the write end. It never stops reading before then, so claude never blocks on a
+	# full pipe, or dies of SIGPIPE, because its reader went away. If it exits non-zero anyway (it
+	# could not load, or it crashed), the rest of the stream is still read: jq writes the reply
+	# from the final `result` line, exactly where the reply always went, and should jq fail too,
+	# cat drains what is left. The wake runs on either way. What is lost is telemetry: the lines of
+	# whatever the translator had read and not yet written, and of every line after it stopped; and
+	# the reply too, only if the final `result` line was already in its read buffer when it died.
+	# The reason is on stderr, in the same journal.
+	#
+	# Under a stop, stop-wake signals the translator directly (everything beneath runuser`s child
+	# gets its own TERM); it records the signal and reads on until claude has exited, so its last
+	# lines still land.
+	run_stream() {
+		local python=$1 translate=$2 jq=$3 cat=$4
+		shift 4
+		exec "$@" > >(
+			"$python" -I "$translate" "$$" || {
+				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$?" >&2
+				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings" ||
+					"$cat" >/dev/null
+			}
+		)
+	}
+	# <<< run_stream <<<
+	if [[ -z $stream_translate ]]; then
+		exec "$@"
+	fi
+	run_stream "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$@"
 '
 
 # The privilege drop itself, identical in both modes.
-drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery" "$launch_bin" "$@")
+drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery"
+	"$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
 
 if [[ -n $probe ]]; then
 	# A probe returns its verdict to the caller — see the systemd-cat block above.

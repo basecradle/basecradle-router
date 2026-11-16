@@ -17,7 +17,9 @@ model's tool subprocesses) outlive the kill as orphans. This finds exactly the w
 daemon launched, stops everything it is running, and records who stopped it.
 
 WHAT IT SIGNALS, AND WHY NOT A PROCESS GROUP. A wake runs as
-`router daemon -> sudo -> wake-runner -> systemd-cat -> runuser -> <binary> -> …`, and
+`router daemon -> sudo -> wake-runner -> systemd-cat -> runuser -> <binary> -> …` (for a
+builder, `<binary>` is claude, exec-ed with its stdout piped into claude-stream-translate,
+which runs beneath it and gets this op's own TERM, #481), and
 none of those links starts a process group: proven on Ubuntu 24.04, the whole wake shares
 the DAEMON'S group, so `kill -- -<pgid>` would stop the router itself. So a wake's
 members are found two ways:
