@@ -1,0 +1,234 @@
+#!/usr/bin/python3 -I
+"""fleet-writers — write the map Vector binds every fleet journal line to its writer by (#484).
+
+Installed ROOT-OWNED at /opt/basecradle-router/bin/fleet-writers (root:root, 0755) by the NOC's
+deploy, like every `deploy/bin/*` helper, and run AS ROOT by `basecradle-router-writers.service`,
+which both the daemon's unit and Vector's (through a drop-in) pull in and start after.
+
+WHY. journald's `SYSLOG_IDENTIFIER` is chosen by the caller: any local account can run
+`systemd-cat --identifier=basecradle-wake-<agent>`, and the line is stored and shipped under that
+agent's name (basecradle/basecradle#868). What the kernel vouches for is `_UID`. So `ai_scrub`, in
+each host's `vector.yaml`, keeps a line under a fleet identifier as it is only when its `_UID` is
+one this map lists for that identifier, and marks every other one `UNVERIFIED uid=<n>` under a
+renamed identifier, which no column counts. Only the box knows its accounts' UIDs, so the map is
+built here, on the box, from the box's own registry; it is never transcribed by hand, because a
+UID moves when an account is provisioned again (the router's own UID has already moved once on a fleet box, 999 -> 995).
+
+WHAT IT WRITES, one `identifier,uid` row per writer the look-back found real (basecradle-noc#1518):
+
+  * `basecradle-wake-<os_user>`, that agent's UID, for every entry in the registry (the harness,
+    a builder's `claude` and its stream translator, Steel, all as the agent);
+  * `basecradle-wake-<os_user>`, `0`: root, for the `runuser` messages on the wake's stream;
+  * `basecradle-log-grammar`, each registered agent's UID (the NOC's grammar probe);
+  * `basecradle-router` and `verify-recovery.sh`, the router's own account (`router`).
+
+THE INPUTS ARE THE BOX'S OWN. The registry is `/etc/basecradle-router/agents.json` (root-owned, the
+wake-runner's trusted allowlist; this reads it and never writes it), and each account's UID comes
+from the account database (`getpwnam`). The map is a trust allowlist like the registry, so its
+writer is root and the daemon cannot write it: a map the `router` account could edit would let it
+write lines under any agent's name.
+
+FAIL DIRECTIONS. A map that is missing a real writer only ever MARKS that writer's lines, which is
+loud (the `Unverified Log Writer` alarm), and never counts a forged one. A box with NO map is worse
+than either: Vector cannot start without the file, and every line stops shipping. So:
+
+  * an unreadable or malformed registry, or a missing router account, leaves the map in place as
+    it was and exits 1; when there is no map at all, it writes the header alone, which loads and
+    vouches for no one, so every fleet line is marked and the box keeps shipping;
+  * a registry entry whose `os_user` is malformed, has no account, or has a UID below wake-runner's
+    floor (`MIN_UID`: wake-runner never wakes such an account, so it is never a real writer) is left
+    out, the rest is written, and the run exits 1, naming the entry;
+  * the run exits 1 whenever anything was left out, so `systemctl --failed` shows it.
+
+Vector reads the map once at start, and again on a reload (SIGHUP), never by watching it. So a run
+that changed the map asks systemd to reload Vector, without waiting (`--no-block`): this unit is
+ordered before vector.service, and a reload it waited for would wait on this very unit. A run that
+changed nothing reloads nothing.
+
+THE FILE. `/etc/vector/fleet-writers.csv`, root:vector 0640, beside the config that reads it: Vector
+reads it through its group, as it reads `vector.yaml`. A map whose bytes are current but whose owner,
+group or mode is not is rewritten, because an allowlist another account can edit is no allowlist. It
+is replaced whole, by a rename from one
+fixed-name temp slot in the same directory (`.fleet-writers.csv.tmp`), which every run removes
+whether it succeeds or fails; a run killed in between leaves that one slot, and the next run
+replaces it.
+"""
+
+from __future__ import annotations
+
+import grp
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+from collections.abc import Callable, Iterable
+from pathlib import Path
+
+#: The registry wake-runner trusts, the same root-owned constant (pinned by
+#: tests/test_fleet_writers.py): the accounts it will wake are the accounts this map vouches for.
+REGISTRY = Path("/etc/basecradle-router/agents.json")
+MAP = Path("/etc/vector/fleet-writers.csv")
+TEMP = MAP.with_name(".fleet-writers.csv.tmp")
+
+#: The daemon's account, the one `User=` names in basecradle-router.service and
+#: basecradle-router-recovery.service (pinned by tests/test_fleet_writers.py).
+ROUTER_ACCOUNT = "router"
+#: The group Vector runs as, which reads the map.
+VECTOR_GROUP = "vector"
+VECTOR_SERVICE = "vector.service"
+
+#: The identifiers this map vouches for. `ai_scrub` vets exactly these (a wake identifier by its
+#: prefix), and tests/test_fleet_writers.py pins the two lists to each other.
+WAKE_PREFIX = "basecradle-wake-"
+LOG_GRAMMAR = "basecradle-log-grammar"
+ROUTER_IDENTIFIERS = ("basecradle-router", "verify-recovery.sh")
+
+#: Root: a writer on every wake stream (the `runuser` messages), and the map's owner.
+ROOT_UID = 0
+MAP_OWNER = ROOT_UID
+MAP_MODE = 0o640
+#: wake-runner's floor: it refuses to wake any account below it, so none is an agent's writer.
+MIN_UID = 1000
+
+#: An account name that can stand in an identifier and a CSV field as it is: no comma, quote,
+#: space or newline. Every account the fleet provisions has this shape.
+_ACCOUNT = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+
+HEADER = "identifier,uid\n"
+
+
+class MapError(Exception):
+    """Nothing can be written: the map in place is left as it was."""
+
+
+def rows(
+    registry: dict[str, object], uid_of: Callable[[str], int | None]
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """The map's rows, sorted and without duplicates, and every registry entry left out.
+
+    `uid_of` returns an account's UID, or None when the box has no such account.
+    """
+    router_uid = uid_of(ROUTER_ACCOUNT)
+    if router_uid is None:
+        raise MapError(f"the router's own account {ROUTER_ACCOUNT!r} does not exist")
+    found: set[tuple[str, int]] = {(identifier, router_uid) for identifier in ROUTER_IDENTIFIERS}
+    left_out: list[str] = []
+    for key, entry in registry.items():
+        os_user = entry.get("os_user") if isinstance(entry, dict) else None
+        if not isinstance(os_user, str) or not _ACCOUNT.fullmatch(os_user):
+            left_out.append(f"{key}: os_user {os_user!r} is not an account name")
+            continue
+        uid = uid_of(os_user)
+        if uid is None:
+            left_out.append(f"{key}: no account named {os_user!r}")
+            continue
+        if uid < MIN_UID:
+            left_out.append(f"{key}: {os_user!r} has uid {uid}, below the agent floor {MIN_UID}")
+            continue
+        found.add((WAKE_PREFIX + os_user, uid))
+        found.add((WAKE_PREFIX + os_user, ROOT_UID))
+        found.add((LOG_GRAMMAR, uid))
+    return sorted(found), left_out
+
+
+def render(found: Iterable[tuple[str, int]]) -> str:
+    return HEADER + "".join(f"{identifier},{uid}\n" for identifier, uid in found)
+
+
+def read_registry(path: Path) -> dict[str, object]:
+    try:
+        registry = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise MapError(f"could not read the registry {path}: {exc}") from exc
+    if not isinstance(registry, dict):
+        raise MapError(f"the registry {path} is not a JSON object")
+    return registry
+
+
+def account_uid(name: str) -> int | None:
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def _current(text: str, dest: Path, uid: int, gid: int) -> bool:
+    """Is `dest` already `text`, owned <uid>:<gid> with MAP_MODE? Read only when its owner and mode
+    are right, so a map widened to another account is never even trusted to be read."""
+    try:
+        st = os.lstat(dest)
+    except FileNotFoundError:
+        return False
+    if (st.st_uid, st.st_gid, st.st_mode) != (uid, gid, stat.S_IFREG | MAP_MODE):
+        return False
+    try:
+        return dest.read_text() == text
+    except OSError:
+        return False
+
+
+def install(text: str, dest: Path, temp: Path, uid: int, gid: int) -> bool:
+    """Put `text` at `dest` (<uid>:<gid> 0640) by a rename from `temp`. False when it was there."""
+    if _current(text, dest, uid, gid):
+        return False
+    try:
+        temp.unlink(missing_ok=True)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, MAP_MODE)
+        with os.fdopen(fd, "w") as out:
+            os.fchown(out.fileno(), uid, gid)
+            os.fchmod(out.fileno(), MAP_MODE)
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.rename(temp, dest)
+    finally:
+        temp.unlink(missing_ok=True)
+    return True
+
+
+def reload_vector() -> bool:
+    got = subprocess.run(
+        ["systemctl", "--no-block", "try-reload-or-restart", VECTOR_SERVICE],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return got.returncode == 0
+
+
+def main() -> int:
+    try:
+        gid = grp.getgrnam(VECTOR_GROUP).gr_gid
+    except KeyError:
+        print(f"fleet-writers: no {VECTOR_GROUP!r} group on this box; nothing written")
+        return 1
+    try:
+        found, left_out = rows(read_registry(REGISTRY), account_uid)
+    except MapError as exc:
+        if os.path.lexists(MAP):
+            print(f"fleet-writers: {exc}; nothing written, the map in place is unchanged")
+        else:
+            # No map at all would keep Vector from starting. One that vouches for no one loads, and
+            # marks every fleet line, which is loud and counts nothing.
+            install(HEADER, MAP, TEMP, MAP_OWNER, gid)
+            print(f"fleet-writers: {exc}; wrote an empty map: every fleet line is marked UNVERIFIED")
+        return 1
+    for entry in left_out:
+        print(f"fleet-writers: left out {entry}; its lines will be marked UNVERIFIED")
+    changed = install(render(found), MAP, TEMP, MAP_OWNER, gid)
+    agents = sum(1 for identifier, uid in found if identifier == LOG_GRAMMAR)
+    if not changed:
+        print(f"fleet-writers: {MAP} is current ({len(found)} rows, {agents} agents)")
+    elif reload_vector():
+        print(f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload queued")
+    else:
+        print(f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload FAILED")
+        return 1
+    return 1 if left_out else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

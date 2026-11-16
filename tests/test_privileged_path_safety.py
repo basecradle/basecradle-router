@@ -1037,12 +1037,21 @@ def test_the_root_exec_guard_is_not_vacuous(tmp_path: Path) -> None:
     test_no_unit_runs_as_root_out_of_the_mirrored_tree(unit)
 
 
-def test_the_reboot_orchestrator_is_installed_root_owned_and_run_from_there() -> None:
-    """The one genuinely-root unit: its script ships in deploy/bin/ and runs from bin/."""
-    assert (REPO / "deploy" / "bin" / "reboot-if-required.sh").is_file()
-    unit = REPO / "deploy" / "systemd" / "basecradle-router-reboot.service"
+@pytest.mark.parametrize(
+    ("unit_name", "script"),
+    [
+        ("basecradle-router-reboot.service", "reboot-if-required.sh"),
+        ("basecradle-router-writers.service", "fleet-writers"),
+    ],
+)
+def test_each_genuinely_root_unit_is_installed_root_owned_and_run_from_there(
+    unit_name: str, script: str
+) -> None:
+    """The two genuinely-root units: each script ships in deploy/bin/ and runs from bin/."""
+    assert (REPO / "deploy" / "bin" / script).is_file()
+    unit = REPO / "deploy" / "systemd" / unit_name
     execs = [v for k, v in unit_directives(unit.read_text()) if k.startswith("Exec")]
-    assert execs == [f"{ROOT_OWNED_BIN}/reboot-if-required.sh"]
+    assert execs == [f"{ROOT_OWNED_BIN}/{script}"]
 
 
 def test_the_daemon_start_never_writes_into_its_own_tree() -> None:

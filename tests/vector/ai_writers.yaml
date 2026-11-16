@@ -1,0 +1,334 @@
+# Vector unit tests for `ai_scrub`'s writer check (basecradle-router#484, basecradle/basecradle#868),
+# run by tests/test_vector_unit.py as `vector test <the shipped vector.yaml> <this file>`, with the
+# `fleet_writers` table read from the map that test writes. That map is built by the real
+# deploy/bin/fleet-writers from a fabricated registry and account database, so the writer and the
+# check are proven together. The cast and its UIDs are tests/fleet_writers_box.py's: Nova Digital
+# (`nova`, 1001), a harness agent; `basecradle-nova-ai` (1002), a builder; the daemon's `router` (999);
+# and John Doe's login session (`john`, 1000), which is in no registry.
+#
+# Every legitimate writer the look-back found (basecradle-noc#1518) reads exactly as before. Every
+# other line under a fleet identifier is kept and marked: `UNVERIFIED uid=<n> ` where the severity
+# stood, and the identifier renamed `unverified-<identifier>` in the field and the prefix alike.
+#
+# No dollar sign anywhere in this file: Vector interpolates environment variables across a test
+# file just as it does across a config.
+
+tests:
+  # --- every legitimate writer, unchanged --------------------------------------------------------
+
+  - name: "a harness agent writing under its own wake identifier is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "1001", "_COMM": "basecradle-harn", "_SYSTEMD_UNIT": "basecradle-router.service", "message": "INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=1.20s tokens_in=10 tokens_out=5 cost=0.000100 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=1.20s tokens_in=10 tokens_out=5 cost=0.000100 outcome=ok")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-wake-nova")
+
+  - name: "root on an agent's wake stream is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "0", "_COMM": "runuser", "message": "runuser: Session terminated, killing shell..."}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-nova] runuser: Session terminated, killing shell...")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-wake-nova")
+
+  - name: "a builder's translator writing under its own wake identifier is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-basecradle-nova-ai", "_UID": "1002", "_COMM": "python3", "message": "INFO wake start delivery=0192f3a4-5b6c-7d8e-9f01-00000000000a"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-wake-basecradle-nova-ai] INFO wake start delivery=0192f3a4-5b6c-7d8e-9f01-00000000000a")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-wake-basecradle-nova-ai")
+
+  - name: "the grammar probe written as one registered agent is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-log-grammar", "_UID": "1001", "_SYSTEMD_UNIT": "session-42.scope", "message": "INFO llm provider=probe source=probe"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-log-grammar] INFO llm provider=probe source=probe")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-log-grammar")
+
+  - name: "the grammar probe written as another registered agent is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-log-grammar", "_UID": "1002", "_SYSTEMD_UNIT": "session-43.scope", "message": "INFO llm provider=probe source=probe"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-log-grammar] INFO llm provider=probe source=probe")
+
+  - name: "the daemon writing under its own identifier is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "_COMM": "uvicorn", "_SYSTEMD_UNIT": "basecradle-router.service", "message": "INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova exit=0"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova exit=0")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-router")
+
+  - name: "the router's account writing its probe line from a session is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "_COMM": "cat", "_SYSTEMD_UNIT": "session-44.scope", "message": "PROBE ERROR event=breaker_tripped agent=nova source=probe"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] PROBE ERROR event=breaker_tripped agent=nova source=probe")
+
+  - name: "the recovery check written as the router's account is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "verify-recovery.sh", "_UID": "999", "_SYSTEMD_UNIT": "basecradle-router-recovery.service", "message": "RECOVERY OK"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[verify-recovery.sh] RECOVERY OK")
+              assert_eq!(.SYSLOG_IDENTIFIER, "verify-recovery.sh")
+
+  - name: "a line under an identifier no column trusts is kept as it is, whoever wrote it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "sshd", "_UID": "0", "message": "Accepted publickey for john from 192.0.2.10 port 50000 ssh2"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[sshd] Accepted publickey for john from 192.0.2.10 port 50000 ssh2")
+              assert_eq!(.SYSLOG_IDENTIFIER, "sshd")
+
+  # --- every other writer under a fleet identifier, marked ---------------------------------------
+
+  - name: "a login session writing under an agent's wake identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "1000", "_COMM": "cat", "_SYSTEMD_UNIT": "session-45.scope", "message": "INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=1 tokens_out=1 cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-nova] UNVERIFIED uid=1000 INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=1 tokens_out=1 cost=0.000001 outcome=ok")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-wake-nova")
+
+  - name: "one agent writing under another agent's wake identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "1002", "_COMM": "systemd-cat", "_SYSTEMD_UNIT": "basecradle-router.service", "message": "INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=1 tokens_out=1 cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-nova] UNVERIFIED uid=1002 INFO llm provider=anthropic purpose=main model=claude-opus-5-5 duration=0.01s tokens_in=1 tokens_out=1 cost=0.000001 outcome=ok")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-wake-nova")
+
+  - name: "the router's account writing under an agent's wake identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "999", "message": "INFO wake end outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-nova] UNVERIFIED uid=999 INFO wake end outcome=ok")
+
+  - name: "a wake identifier naming no registered agent is marked, even written by its namesake"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-john", "_UID": "1000", "message": "INFO llm provider=anthropic cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-john] UNVERIFIED uid=1000 INFO llm provider=anthropic cost=0.000001 outcome=ok")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-wake-john")
+
+  - name: "a line under a fleet identifier with no _UID is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "message": "INFO llm provider=anthropic cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-nova] UNVERIFIED uid=none INFO llm provider=anthropic cost=0.000001 outcome=ok")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-wake-nova")
+
+  - name: "a login session writing under the daemon's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "1000", "message": "ERROR basecradle_router.pipeline stage=wake outcome=failed agent=nova"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-router] UNVERIFIED uid=1000 ERROR basecradle_router.pipeline stage=wake outcome=failed agent=nova")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-router")
+
+  - name: "an agent writing under the daemon's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "1001", "message": "INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-router] UNVERIFIED uid=1001 INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova")
+
+  - name: "root writing under the daemon's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "0", "message": "INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-router] UNVERIFIED uid=0 INFO basecradle_router.pipeline stage=wake outcome=ok agent=nova")
+
+  - name: "a login session writing under the grammar probe's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-log-grammar", "_UID": "1000", "message": "INFO llm provider=anthropic cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-log-grammar] UNVERIFIED uid=1000 INFO llm provider=anthropic cost=0.000001 outcome=ok")
+
+  - name: "root writing under the grammar probe's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-log-grammar", "_UID": "0", "message": "INFO llm provider=probe source=probe"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-log-grammar] UNVERIFIED uid=0 INFO llm provider=probe source=probe")
+
+  - name: "an agent writing under the recovery check's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "verify-recovery.sh", "_UID": "1001", "message": "RECOVERY FAILED: basecradle-router.service inactive"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-verify-recovery.sh] UNVERIFIED uid=1001 RECOVERY FAILED: basecradle-router.service inactive")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-verify-recovery.sh")
+
+  - name: "a marked line is still redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-nova", "_UID": "1000", "message": "ERROR leaked ghp_Fab1catedFab1catedFab1catedFab1cated00"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-nova] UNVERIFIED uid=1000 ERROR leaked [REDACTED_GH_TOKEN]")
+
+  # --- the name a line ships under is the name that was checked ------------------------------------
+
+  - name: "an identifier sent twice ships as one string that names no fleet program"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": ["basecradle-wake-nova", "basecradle-wake-nova"], "_UID": "1000", "_COMM": "python3", "message": "INFO llm provider=anthropic cost=0.000001 outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.SYSLOG_IDENTIFIER, "[\"basecradle-wake-nova\",\"basecradle-wake-nova\"]")
+              assert_eq!(.message, "[[\"basecradle-wake-nova\",\"basecradle-wake-nova\"]] INFO llm provider=anthropic cost=0.000001 outcome=ok")
+
+  - name: "the wake prefix with no agent after it is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-wake-", "_UID": "0", "message": "INFO wake end outcome=ok"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-wake-] UNVERIFIED uid=0 INFO wake end outcome=ok")

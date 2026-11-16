@@ -63,6 +63,31 @@
 # BETTERSTACK_AI_SOURCE_TOKEN environment variable, supplied to vector.service via the chmod-640
 # EnvironmentFile /etc/vector/betterstack.env (a systemd drop-in), so the secret never lives in the
 # repo or the YAML, and a rotation is a one-line swap of that env file.
+#
+# WRITER BINDING (basecradle-router#484, basecradle/basecradle#868) — journald's identifier is chosen
+# by whoever writes the line, so any local account can write under an agent's wake identifier, and
+# it would be counted under that agent. The kernel vouches for `_UID`, so `ai_scrub` keeps a line
+# under a fleet identifier as it is only when its `_UID` is one the `fleet_writers` table lists for
+# that identifier, and marks every other one (below).
+
+# THE WRITER MAP — which accounts may write under which fleet identifier, one `identifier,uid` row
+# each. Written on the box, from the box's own router registry and account database, by
+# deploy/bin/fleet-writers (run as root by basecradle-router-writers.service before every start of
+# the daemon, and before Vector at boot), never by hand: a UID moves when an account is provisioned
+# again. Vector reads it at start and on a reload, which the writer queues whenever the map changed.
+# THE FILE MUST EXIST WHEN VECTOR STARTS: a missing table is a start failure (measured on 0.61.0;
+# `vector validate --no-environment` passes without it), which is why its writer is ordered before
+# vector.service. On a reload, a missing or unreadable file keeps the table Vector already holds.
+enrichment_tables:
+  fleet_writers:
+    type: "file"
+    file:
+      path: "/etc/vector/fleet-writers.csv"
+      encoding:
+        type: "csv"
+    schema:
+      identifier: "string"
+      uid: "string"
 
 sources:
   ai_journald:
@@ -364,10 +389,47 @@ transforms:
       # Fall back to the process comm, then to "unknown", so a line with no identifier (a kernel
       # message) still gets a prefix rather than a bare `[] `. Prefixing AFTER redaction is
       # deliberate: the prefix is not secret-bearing and must never itself be scanned or mangled.
-      ident = to_string(.SYSLOG_IDENTIFIER) ?? ""
+      # An identifier sent more than once (the native protocol allows it, and the journal then holds
+      # a list) is not one name, so it ships as its JSON text, one string that names no fleet
+      # program: the name a line ships under is always the name the writer check below read.
+      ident = ""
+      if is_string(.SYSLOG_IDENTIFIER) {
+          ident = string!(.SYSLOG_IDENTIFIER)
+      } else if .SYSLOG_IDENTIFIER != null {
+          ident = encode_json(.SYSLOG_IDENTIFIER)
+          .SYSLOG_IDENTIFIER = ident
+      }
       if ident == "" { ident = to_string(."_COMM") ?? "" }
       if ident == "" { ident = "unknown" }
-      .message = "[" + ident + "] " + msg
+      # BIND THE LINE TO ITS WRITER (basecradle-router#484). A fleet identifier is every
+      # `basecradle-wake-<agent>` and the three below: the names a NOC column trusts to say who
+      # wrote a line. A line under one is kept as it is only when the kernel-vouched `_UID` is one
+      # the `fleet_writers` map lists for that identifier: the agent's own account or root on its
+      # wake stream, any registered agent for the grammar probe, the router's account for its own
+      # two. Any other line under one, a line with no `_UID` included, is KEPT AND MARKED, never
+      # dropped and never counted: `UNVERIFIED uid=<n> ` stands where the severity would, so no
+      # head is at its position and no column counts it, and the identifier is renamed
+      # `unverified-<identifier>`, in the field and the prefix alike, so nothing attributes it to
+      # the account it named. The marker is what the NOC's `Unverified Log Writer` alarm reads. It
+      # is joined into the shipped line here, never written into `msg`, so the prefix pass stays the
+      # last thing that rewrites `msg` (tests/test_log_surface.py) and a marked line is redacted
+      # exactly as an unmarked one.
+      marker = ""
+      if starts_with(ident, "basecradle-wake-") || includes(["basecradle-router", "basecradle-log-grammar", "verify-recovery.sh"], ident) {
+          writer = to_string(."_UID") ?? ""
+          vouched = false
+          if writer != "" {
+              listed, err = find_enrichment_table_records("fleet_writers", {"identifier": ident, "uid": writer})
+              vouched = err == null && length(listed) > 0
+          }
+          if !vouched {
+              if writer == "" { writer = "none" }
+              marker = "UNVERIFIED uid=" + writer + " "
+              ident = "unverified-" + ident
+              .SYSLOG_IDENTIFIER = ident
+          }
+      }
+      .message = "[" + ident + "] " + marker + msg
       # Better Stack reads the event timestamp from `dt` (mirrors the generated log parser).
       del(.source_type)
       .dt = del(.timestamp)

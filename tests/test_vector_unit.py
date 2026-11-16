@@ -12,6 +12,14 @@ The suites:
 * `ai_scrub.yaml` — the redaction every shipped line passes: the literal rules before the prefix
   rules, and the harness's word rule (#398). Python's `re` cannot stand in for it: it has no
   `\p{L}` classes, and the word rule is a closure, so the real engine is the only test.
+* `ai_writers.yaml` — the writer check (#484): a line under a fleet identifier is kept as it is
+  only when its `_UID` is one the `fleet_writers` map lists for that identifier, and is otherwise
+  marked `UNVERIFIED uid=<n>` under a renamed identifier.
+
+Every suite runs against the host's shipped file with ONE change: the `fleet_writers` table reads
+a map under `tmp_path` instead of `/etc/vector/fleet-writers.csv`, which exists only on a box. That
+map is written by the real `deploy/bin/fleet-writers`, from a fabricated registry and account
+database, so the generator and the check that reads its output are proven together.
 
 CI installs that release (ci.yml → "Install Vector"), so there the binary is required. A
 laptop without it, or with a different release, skips: point `VECTOR_BIN` at the pinned
@@ -40,12 +48,31 @@ from pathlib import Path
 
 import pytest
 
+from fleet_writers_box import ACCOUNTS, REGISTRY, fw
+
 REPO = Path(__file__).resolve().parents[1]
 README = REPO / "deploy" / "README.md"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 HOSTS_DIR = REPO / "deploy" / "hosts"
 SUITES = sorted((REPO / "tests" / "vector").glob("*.yaml"))
 HOSTS = sorted(p.name for p in HOSTS_DIR.iterdir() if p.is_dir())
+#: The table's path line, as every host's vector.yaml carries it exactly once.
+MAP_LINE = f'      path: "{fw.MAP}"\n'
+
+
+def _under_test(host: str, tmp_path: Path) -> Path:
+    """The host's shipped vector.yaml, its `fleet_writers` table read from a map under `tmp_path`
+    that the real writer built from the fabricated box. Nothing else is changed."""
+    found, left_out = fw.rows(REGISTRY, ACCOUNTS.get)
+    assert not left_out, left_out
+    writers = tmp_path / "fleet-writers.csv"
+    writers.write_text(fw.render(found))
+    text = (HOSTS_DIR / host / "vector.yaml").read_text()
+    assert text.count(MAP_LINE) == 1, f"{host} must read the map from {fw.MAP} exactly once"
+    config = tmp_path / "vector.yaml"
+    config.write_text(text.replace(MAP_LINE, f'      path: "{writers}"\n'))
+    return config
+
 
 #: The switch the boxes' unit sets, in its drop-in
 #: `/etc/systemd/system/vector.service.d/20-env-interpolation.conf`.
@@ -118,7 +145,7 @@ def test_ci_installs_the_release_the_boxes_run() -> None:
 def test_every_suite_is_run() -> None:
     # The glob below is the whole list: a suite named here and missing from disk, or the scrub's
     # suite renamed out of the glob, would otherwise leave the redaction untested and green.
-    assert {suite.name for suite in SUITES} >= {"ai_scrub.yaml"}
+    assert {suite.name for suite in SUITES} >= {"ai_scrub.yaml", "ai_writers.yaml"}
 
 
 def test_the_readme_recipe_switches_interpolation_on_as_the_unit_does() -> None:
@@ -203,10 +230,10 @@ def test_interpolation_is_live_in_every_run(host: str, withheld: str) -> None:
 
 @pytest.mark.parametrize("suite", SUITES, ids=lambda suite: suite.stem)
 @pytest.mark.parametrize("host", HOSTS)
-def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path) -> None:
+def test_the_shipped_transforms_pass_every_suite(host: str, suite: Path, tmp_path: Path) -> None:
     vector = _vector()
     got = subprocess.run(
-        [vector, "test", str(HOSTS_DIR / host / "vector.yaml"), str(suite)],
+        [vector, "test", str(_under_test(host, tmp_path)), str(suite)],
         capture_output=True,
         text=True,
         check=False,
@@ -264,6 +291,23 @@ def _scrub_vrl(host: str) -> str:
     # Never a vacuous slice: the remap's first rule and its last statement are both inside it.
     assert 'del(."_CMDLINE")' in source and source.rstrip().endswith(".dt = del(.timestamp)")
     return source
+
+
+#: The writer check's opening line in the dedented VRL, and its block's close.
+_WRITER_CHECK_OPEN = 'if starts_with(ident, "basecradle-wake-")'
+
+
+def _without_the_writer_check(source: str) -> str:
+    """The scrub with the writer check's one block taken out, for `vector vrl`, which runs a
+    program with no enrichment tables and so cannot compile the table lookup. The check is one
+    table lookup per line, not a scan of it, so the timing below measures what it always did:
+    the redaction. The check itself runs in ai_writers.yaml, on the whole shipped program."""
+    start = source.index(_WRITER_CHECK_OPEN)
+    assert source.count(_WRITER_CHECK_OPEN) == 1 and source[start - 1] == "\n"
+    end = source.index("\n}\n", start) + len("\n}\n")
+    cut = source[:start] + source[end:]
+    assert '"fleet_writers"' not in cut and '"fleet_writers"' in source[start:end]
+    return cut
 
 
 def _prefix_body(host: str) -> str:
@@ -329,7 +373,7 @@ _LONG_TEXTS = {
 def test_the_scrub_is_linear_on_a_long_space_free_text(shape: str, tmp_path: Path) -> None:
     vector = _vector()
     program = tmp_path / "scrub.vrl"
-    program.write_text(_scrub_vrl("ai.basecradle.com"))
+    program.write_text(_without_the_writer_check(_scrub_vrl("ai.basecradle.com")))
     event = tmp_path / "event.json"
     line = {"SYSLOG_IDENTIFIER": "nova", "message": _LONG_TEXTS[shape]}
     event.write_text(json.dumps(line) + "\n")

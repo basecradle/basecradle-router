@@ -130,8 +130,8 @@ def test_every_shipped_line_is_prefixed_with_the_emitting_programs_identifier() 
     # Done in Vector, once, so it covers EVERY program (sshd, Caddy, a wake) — never
     # hand-prefixed into the daemon's own log strings, which would cover only the daemon.
     source = _scrub_source()
-    assert '.message = "[" + ident + "] " + msg' in source
-    assert "ident = to_string(.SYSLOG_IDENTIFIER)" in source
+    assert '.message = "[" + ident + "] " + marker + msg' in source
+    assert "ident = string!(.SYSLOG_IDENTIFIER)" in source
     # A line with no identifier (a kernel message) must still get a prefix, never `[] `.
     assert 'ident = "unknown"' in source
 
@@ -140,7 +140,9 @@ def test_the_prefix_is_applied_after_redaction_not_before() -> None:
     # The prefix is not secret-bearing; redaction must run on the raw message and the
     # prefix must never be scanned or mangled by a later pattern.
     source = _scrub_source()
-    assert source.index("[REDACTED_API_KEY]") < source.index('.message = "[" + ident + "] " + msg')
+    assert source.index("[REDACTED_API_KEY]") < source.index(
+        '.message = "[" + ident + "] " + marker + msg'
+    )
 
 
 # What the redaction does to a line is proven by running it: `tests/vector/ai_scrub.yaml`, through
