@@ -578,7 +578,10 @@ AGENT_SCRIPT='
 	# still holds the write end. It never stops reading before then, so claude never blocks on a
 	# full pipe, or dies of SIGPIPE, because its reader went away. If it exits non-zero anyway (it
 	# could not load, or it crashed), the rest of the stream is still read: jq writes the reply
-	# from the final `result` line, exactly where the reply always went, and should jq fail too,
+	# from the final `result` line, exactly where the reply always went and by the translator`s
+	# own rule (`claude_stream.quoted`, basecradle#868): every line led by "> ", cut at each of
+	# its record breaks (`claude_stream.RECORD_BREAKS`, a trailing one dropped) and into
+	# 8000-character pieces, so no line of model-written text can stand where a contract head does. Should jq fail too,
 	# cat drains what is left. The wake runs on either way. What is lost is telemetry: the lines of
 	# whatever the translator had read and not yet written, and of every line after it stopped; and
 	# the reply too, only if the final `result` line was already in its read buffer when it died.
@@ -593,7 +596,7 @@ AGENT_SCRIPT='
 		exec "$@" > >(
 			"$python" -I "$translate" "$$" || {
 				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$?" >&2
-				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings" ||
+				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings | \"\\r\\n|[\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]\" as \$b | sub(\"(?:\" + \$b + \")\\\\z\"; \"\") | splits(\$b) | if . == \"\" then \">\" else . as \$l | range(0; length; 8000) as \$i | \"> \" + \$l[\$i:\$i+8000] end" ||
 					"$cat" >/dev/null
 			}
 		)
