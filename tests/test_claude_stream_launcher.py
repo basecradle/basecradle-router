@@ -193,11 +193,13 @@ def test_unloadable_it_exits_70_and_says_why() -> None:
 # --- how it reads ----------------------------------------------------------------------------
 
 
-def _translate(tree: Path, read_fd: int, **kwargs) -> tuple[int, list[str]]:
+def _translate(
+    tree: Path, read_fd: int, *, environ: dict[str, str] | None = None, **kwargs
+) -> tuple[int, list[str]]:
     module = load(tree)
     read_out, write_out = os.pipe()
     try:
-        code = ct.run(module, read_fd, write_out, received=[], environ={}, **kwargs)
+        code = ct.run(module, read_fd, write_out, received=[], environ=environ or {}, **kwargs)
     finally:
         os.close(write_out)
     with os.fdopen(read_out, "rb") as out:
@@ -209,7 +211,21 @@ def test_it_translates_its_input_line_by_line(tree: Path) -> None:
         code, lines = _translate(tree, stream.fileno())
     assert code == 0
     assert lines[0].startswith("INFO llm shadow provider=anthropic ")
-    assert "Done: the work is finished." in lines
+    assert "> Done: the work is finished." in lines
+
+
+def test_the_builders_claude_home_reaches_the_translator(tree: Path) -> None:
+    # The subagent calls are read from the transcripts under the home the builder's environment
+    # names, through the three verified files and nothing else (#481).
+    home = FIXTURES / "transcripts" / "background_subagents"
+    with open(FIXTURES / "background_subagents.jsonl", "rb") as stream:
+        code, lines = _translate(tree, stream.fileno(), environ={"CLAUDE_CONFIG_DIR": str(home)})
+    assert code == 0
+    subagent = [line for line in lines if " llm shadow " in line and " duration=" not in line]
+    assert len(subagent) == 6 and all(" cost=" in line for line in subagent)
+    with open(FIXTURES / "background_subagents.jsonl", "rb") as stream:
+        _, unread = _translate(tree, stream.fileno())
+    assert any("with no session id or home to look in" in line for line in unread)
 
 
 def test_a_line_of_megabytes_is_one_line(tree: Path, tmp_path: Path) -> None:
@@ -219,7 +235,7 @@ def test_a_line_of_megabytes_is_one_line(tree: Path, tmp_path: Path) -> None:
     big.write_text(json.dumps(payload) + "\n" + (FIXTURES / "tools.jsonl").read_text())
     with open(big, "rb") as stream:
         code, lines = _translate(tree, stream.fileno())
-    assert code == 0 and "Done: the work is finished." in lines
+    assert code == 0 and "> Done: the work is finished." in lines
 
 
 def test_a_stream_whose_writer_is_gone_ends_once_the_pipe_is_quiet(tree: Path, monkeypatch) -> None:
@@ -235,7 +251,7 @@ def test_a_stream_whose_writer_is_gone_ends_once_the_pipe_is_quiet(tree: Path, m
         os.close(write_fd)  # held open throughout, as a leftover would hold it
         os.close(read_fd)
     assert code == 0
-    assert lines[-1].startswith("INFO Claude Code's stream ended without a result")
+    assert lines[-1].startswith("WARNING Claude Code's stream ended without a result")
 
 
 def test_a_live_writer_keeps_it_reading_through_a_quiet_spell(tree: Path, monkeypatch) -> None:
@@ -253,7 +269,7 @@ def test_a_live_writer_keeps_it_reading_through_a_quiet_spell(tree: Path, monkey
     code, lines = _translate(tree, read_fd, writer_alive=alive)
     os.close(read_fd)
     assert code == 0 and len(asked) >= 3
-    assert "Done: the work is finished." in lines
+    assert "> Done: the work is finished." in lines
 
 
 def test_pid_alive_answers_for_a_real_and_a_vanished_process() -> None:
@@ -322,7 +338,7 @@ def test_a_stops_sigterm_is_recorded_and_the_stream_is_read_to_its_end(tree: Pat
     child.stdin.close()
     out = child.stdout.read().decode()
     assert child.wait(timeout=30) == 0, child.stderr.read()
-    assert "Done: the work is finished." in out
+    assert "> Done: the work is finished." in out
     assert len([line for line in out.splitlines() if " llm shadow " in line]) == 4
 
 
@@ -342,7 +358,7 @@ def test_a_stream_a_stop_cut_short_says_so(tree: Path) -> None:
     child.stdin.close()
     out = child.stdout.read().decode()
     assert child.wait(timeout=30) == 0
-    assert out.splitlines()[-1].startswith("INFO Claude Code's stream ended after a SIGTERM")
+    assert out.splitlines()[-1].startswith("WARNING Claude Code's stream ended after a SIGTERM")
 
 
 def test_a_journal_gone_at_exit_still_exits_zero(tree: Path) -> None:

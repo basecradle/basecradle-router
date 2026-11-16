@@ -200,10 +200,19 @@ where it always went. The translation is `src/basecradle_router/claude_stream.py
 that module's docstring.
 
 - **What lands.** One `llm` line per model call, one `tool` line per tool use (a `WARNING tool …
-  error=` companion for a failed run), one `cost unpriced` line per wake per gap, and prose: the
-  reply, the turn count and why the run ended, and, per model, what Claude Code billed that the
-  stream did not itemize. **No `wake` line**: the router's own `stage=wake` line is a builder wake's
-  record. A subagent's calls are `purpose=main`, as the receiver writes them.
+  error=` companion for a failed run), one `cost unpriced` line per wake per gap, one closing `llm`
+  line per model for what Claude Code billed that no call itemizes, and prose: each reply as its
+  `result` arrives, then the run's turn count and why it ended. **No `wake` line**: the router's own
+  `stage=wake` line is a builder wake's record. A subagent's calls are `purpose=main`, as the
+  receiver writes them.
+- **Model-written text is quoted.** The reply, the run's `errors` and anything `claude` printed to
+  stdout are text a model or a tool wrote, so a prompt injection could make a line of it read `INFO
+  llm provider=… cost=…`, byte for byte a counted line at the head's position (basecradle#868,
+  basecradle-noc#1518). Every line of it is written as the contract's prose led by `> `, which no
+  head can stand behind, cut at each record break (a newline, a NUL, a CRLF as one, and the rest
+  `claude_stream.RECORD_BREAKS` names) and into 8000-character pieces, so journald's 48K `LineMax`
+  never starts a record without the lead. `wake-runner`'s `jq` fallback writes the reply by the same
+  rule, and a test holds its output to the translator's, line for line. `claude`'s own stderr still reaches the journal raw.
 - **The comparison mark.** While the `ai_otel` receiver (Part 5) still renders the same calls, every
   line that describes them carries **`shadow`** after its head: `llm shadow provider=`, `cost unpriced
   shadow`, and `tool shadow` for a server-side tool, whose fee the receiver's call cost already holds.
@@ -212,20 +221,41 @@ that module's docstring.
   harness or MCP `tool` line is a fact the receiver never had, so it is unmarked.
 - **Price.** Each call is priced from Anthropic's published rates (`anthropic_rates.py`,
   `cost_basis=computed`), and the sum is checked per model against Claude Code's own `costUSD` at the
-  end: a mismatch on the same tokens is a WARNING that the table is stale. A host whose price is not
+  end: a mismatch on the same tokens is a WARNING that the table is stale, and so is a closing line
+  whose remainder the table prices differently from what the stated total leaves. A host whose price is not
   Anthropic's (`ANTHROPIC_BASE_URL` elsewhere, or a Bedrock, Vertex or Foundry switch) leaves every
   call `cost_gap=unpriced_host`; one named only by Claude Code at the end is a WARNING that the costs
   above are list prices.
-- **What it cannot see.** A subagent's calls arrive without their final usage, so each gets an `llm`
-  line with `cost_gap=not_reported` and no tokens; Claude Code's helper calls (the model a WebSearch
-  runs on) never appear one by one. Both are stated against Claude Code's own `modelUsage` on the
-  prose line at the end. A call a stop or a crash cut short has no line.
+- **A subagent's calls, from its transcript.** The stream names a subagent's calls without their
+  final usage, so at the close the translator reads the transcripts the builder's own `claude` wrote,
+  `<home>/projects/<project>/<session id>/subagents/agent-*.jsonl` (`<home>` is `$CLAUDE_CONFIG_DIR`,
+  else `$HOME/.claude`; the session id is `system/init`'s), and writes one real `llm` line per API
+  response, read from its finished entry, never summed. On a run that ended with its final `result`, it waits
+  at most 2 s (`TRANSCRIPT_WAIT`) for a record still landing; `claude` has exited by then, so the
+  wake never waits, and a stopped run's files are read once, as they are. In a run that ended, a
+  call with no finished record keeps a line with `cost_gap=not_reported` and no tokens; in one that
+  did not, it was cut short and has none. Proven against Claude Code
+  2.1.325's transcripts; an entry from before 2.1.307, which recorded placeholder usage, is never read
+  for its numbers.
+- **The closing line, for what no call itemizes.** Claude Code's helper calls (the model a WebSearch
+  runs on) never appear one by one, in the stream or on disk. So, per model, whatever the run's own
+  stated total (the last `result`'s `modelUsage`; a run with background subagents writes several
+  `result`s, each cumulative) still exceeds becomes one `llm shadow … purpose=helper` line with the
+  remainder's tokens and `cost` = the stated `costUSD` less the dollars itemized, so a wake's lines add
+  up to Claude Code's stated total by construction. It carries no `kind`, `duration` or
+  `generation_id`, as the contract writes a builder's auxiliary call, so it is counted as one call;
+  a prose line beside it says it is a remainder. A stated total below what was itemized writes no
+  line, only a WARNING. A run that did not end on its final `result` (a stop, which can land
+  between a background run's results, or a crash) has no stated total and no closing line, and
+  its end says so in a WARNING. A call a stop or a crash cut short has no line.
 - **A stream it does not understand.** Never silent. A stream event that matches no open call, a
   `message_start` with no message id, a tool result with no tool use, a call still open at the
   `result`, or a main-thread message that came with no stream events is counted, and the end of the
   stream writes one WARNING naming each count, the Claude Code version that wrote it, and the
   versions whose shapes the translator reads (2.1.286 and 2.1.325). A stream event that names no
-  message is placed only when exactly one call is open, never guessed.
+  message is placed only when exactly one call is open, never guessed. A transcript it cannot read (no
+  directory for the session, a line that is not JSON, a call the stream named with no record) is a
+  second WARNING, naming each count and the transcript versions it reads.
 - **A stop.** Unchanged for `claude`: `runuser` relays its TERM, gives it 2 s, SIGKILLs it, and only
   then re-raises, so the router reads the stop off `sudo`'s exit with `claude` already gone. The
   translator, beneath `claude`, gets `stop-wake`'s own TERM, records it, and reads on until `claude`
@@ -236,7 +266,9 @@ that module's docstring.
 - **Ordering.** The wake ends when `claude` does, and the translator writes the last of its lines
   (the reply among them) a moment after, from what `claude` wrote before it exited. So a wake's last
   lines can land after the router's `event=wake_end`, and, in the rare case the agent's next wake
-  starts within that moment, beside that wake's first. The price of keeping `claude` `runuser`'s
+  starts within that moment, beside that wake's first. The moment is the pipe's one quiet second,
+  plus, only when a run ended cleanly with a subagent record still missing, up to 2 s more of
+  `TRANSCRIPT_WAIT`. The price of keeping `claude` `runuser`'s
   child, which is what keeps a stop a stop.
 - **If the translator fails.** It never stops reading early, so `claude` never blocks on the pipe or
   dies of SIGPIPE. If it exits non-zero (it could not load: exit 70, the reason on stderr; or it

@@ -162,7 +162,8 @@ def stream(
     padding: int = 0,
     jq: str | None = None,
     fixture: str = "tools",
-) -> subprocess.CompletedProcess[str]:
+    raw: bool = False,
+) -> subprocess.CompletedProcess:
     claude = tmp_path / "claude"
     claude.write_text(CLAUDE)
     claude.chmod(0o755)
@@ -183,7 +184,7 @@ def stream(
             str(padding),
         ],
         capture_output=True,
-        text=True,
+        text=not raw,  # raw: bytes as journald reads them, a `\r` never a line break
         timeout=60,
     )
 
@@ -207,7 +208,7 @@ def test_an_unloadable_translator_keeps_the_reply_and_the_wake(tmp_path: Path) -
         pytest.skip("this host carries a deployed router tree")
     done = stream(tmp_path, LAUNCHER, exit_code=0)
     assert done.returncode == 0
-    assert done.stdout == "Done: the work is finished.\n"
+    assert done.stdout == "> Done: the work is finished.\n"
     assert "the stream translator exited 70; keeping the reply" in done.stderr
     assert "not loading the translator" in done.stderr
 
@@ -220,7 +221,7 @@ def test_a_translator_that_crashes_mid_stream_costs_neither_the_wake_nor_the_rep
     # would block or die of SIGPIPE (141), never exit with its own status.
     done = stream(tmp_path, _helper(tmp_path, "crash.py", CRASH), exit_code=0, padding=20_000)
     assert done.returncode == 0
-    assert done.stdout == "Done: the work is finished.\n"
+    assert done.stdout == "> Done: the work is finished.\n"
     assert "the stream translator exited 1" in done.stderr
 
 
@@ -242,4 +243,38 @@ def test_with_jq_gone_too_cat_drains_and_the_wake_still_ends_as_claude_did(
 def test_the_fallback_reply_is_the_result_lines_text_and_nothing_else(tmp_path: Path) -> None:
     done = stream(tmp_path, _helper(tmp_path, "dead.py", DEAD), fixture="failed_model")
     result = json.loads((FIXTURES / "failed_model.jsonl").read_text().splitlines()[-1])
-    assert done.stdout == result["result"] + "\n"
+    assert done.stdout == "".join(f"> {line}\n" for line in result["result"].split("\n"))
+
+
+@needs_jq
+def test_the_fallback_reply_can_never_stand_at_the_heads_position(
+    tmp_path: Path, noc_counted_head, forged_reply
+) -> None:
+    # The translator dead before reading: jq writes the reply, by the translator's own rule.
+    forged = tmp_path / "forged.jsonl"
+    forged.write_text(json.dumps({"type": "result", "result": forged_reply}) + "\n")
+    done = stream(tmp_path, _helper(tmp_path, "dead.py", DEAD), fixture=str(forged)[:-6], raw=True)
+    records = done.stdout.decode().split("\n")[:-1]  # journald's record breaks: newline and NUL
+    records = [piece for record in records for piece in record.split("\x00")]
+    assert records and all(record.startswith(">") for record in records)
+    for record in records:
+        assert len(record.encode()) <= 48 * 1024
+        assert not noc_counted_head.match(record)
+        assert not noc_counted_head.match(f"[basecradle-wake-basecradle-nova-ai] {record}")
+
+
+@needs_jq
+def test_the_fallback_quotes_by_exactly_the_translators_rule(tmp_path: Path) -> None:
+    # One rule, two spellings: jq's output for a reply that holds every record break, a CRLF, an
+    # empty line, a trailing break and a line two pieces long is `quoted()`'s, line for line.
+    from basecradle_router.claude_stream import QUOTED_PIECE, quoted
+
+    reply = (
+        "a\r\nb\rc\x00d\x0be\x0cf\x1cg\x1dh\x1ei\x85j\u2028k\u2029l\n\nm"
+        + "z" * (QUOTED_PIECE + 5)
+        + "\n"
+    )
+    forged = tmp_path / "breaks.jsonl"
+    forged.write_text(json.dumps({"type": "result", "result": reply}) + "\n")
+    done = stream(tmp_path, _helper(tmp_path, "dead.py", DEAD), fixture=str(forged)[:-6], raw=True)
+    assert done.stdout.decode() == "".join(line + "\n" for line in quoted(reply))
