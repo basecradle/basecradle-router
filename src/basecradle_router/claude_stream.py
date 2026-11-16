@@ -39,10 +39,13 @@ the stream captured for #481, Claude Code 2.1.325):
 - **A call cut short** (a stop or a crash before ``message_stop``) has no word in the contract, so
   it gets no ``llm`` line.
 
-**The comparison mark.** While the ``ai_otel`` receiver still renders the same calls, every ``llm``
-line here is headed ``llm shadow provider=``: every NOC column that counts, times or prices a call
-is gated on ``llm provider=``, so no chart counts a call twice, and the two records differ by one
-word. Dropping it is the receiver's removal, and nothing else changes then.
+**The comparison mark.** While the ``ai_otel`` receiver still renders the same calls, every line
+that describes them carries ``shadow`` after its head: ``llm shadow provider=``, ``cost unpriced
+shadow``, and ``tool shadow`` for a server-side tool, whose fee the receiver's call cost already
+holds. Every NOC column that counts, times or prices a call or a tool fee is gated on the bare head
+(``llm provider=``, ``tool name=``), so no chart counts a fact twice, and the two records differ by
+one word. A harness or MCP ``tool`` line is a fact the receiver never had, so it is unmarked.
+Dropping the mark is the receiver's removal, and nothing else changes then.
 
 **No wake lines.** A builder has no wake in the contract's sense, and the router's own
 ``event=wake_start``, ``event=wake_end`` and ``stage=wake outcome=`` lines, observed by root from
@@ -72,9 +75,13 @@ from basecradle_router.logfmt import bounded, log_fields
 #: The vendor that bills every call a Claude Code builder makes.
 PROVIDER = "anthropic"
 
-#: The head of every model-call line while the receiver still writes the same calls (see the
-#: module docstring). Dropping ``shadow`` is the whole cutover.
-LLM_HEAD = "llm shadow"
+#: The mark on every line that describes the model calls the ``ai_otel`` receiver also records
+#: (see the module docstring): the calls themselves, their price gaps, and a server-side tool's
+#: fee, which the receiver's call cost already holds. Dropping it is the whole cutover.
+SHADOW = "shadow"
+LLM_HEAD = f"llm {SHADOW}"
+UNPRICED_HEAD = f"cost unpriced {SHADOW}"
+SERVER_TOOL_HEAD = f"tool {SHADOW}"
 
 #: The model id Claude Code gives the ``assistant`` line it writes when a call failed.
 SYNTHETIC_MODEL = "<synthetic>"
@@ -112,6 +119,26 @@ def fault_slug(status: object, *, no_response: bool = False) -> str:
     return "api_error"
 
 
+#: Claude Code's switches that send every call to a cloud provider's host, whose price is its own.
+CLOUD_SWITCHES = {
+    "CLAUDE_CODE_USE_BEDROCK": "bedrock",
+    "CLAUDE_CODE_USE_VERTEX": "vertex",
+    "CLAUDE_CODE_USE_FOUNDRY": "foundry",
+}
+
+
+def aimed_at(environ: Mapping[str, str]) -> str | None:
+    """Where Claude Code sends its calls, as far as its environment says; ``None`` is Anthropic.
+
+    A cloud provider's switch wins, as it does in Claude Code; its name is no Anthropic host, so
+    the rates price nothing there.
+    """
+    for switch, provider in CLOUD_SWITCHES.items():
+        if environ.get(switch, "").strip().lower() not in ("", "0", "false"):
+            return provider
+    return environ.get("ANTHROPIC_BASE_URL") or None
+
+
 def money(value: float) -> str:
     """Fixed-point US dollars, at most eight decimals, as the ``ai_otel_llm`` remap writes them."""
     text = f"{round(value, 8):.8f}".rstrip("0").rstrip(".")
@@ -123,10 +150,9 @@ def seconds(value: float) -> str:
     return f"{max(value, 0.0):.2f}s"
 
 
-def _count(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """``value`` if it is a mapping, else an empty one: a field of the wrong shape says nothing."""
+    return value if isinstance(value, Mapping) else {}
 
 
 def _when(value: Any) -> datetime | None:
@@ -175,8 +201,8 @@ def _final_usage(start: Mapping[str, Any], delta: Mapping[str, Any] | None) -> d
             breakdown = item.get("cache_creation") if isinstance(item, Mapping) else None
             if not isinstance(breakdown, Mapping):
                 return usage
-            five += _count(breakdown.get("ephemeral_5m_input_tokens")) or 0
-            hour += _count(breakdown.get("ephemeral_1h_input_tokens")) or 0
+            five += rates.count(breakdown.get("ephemeral_5m_input_tokens")) or 0
+            hour += rates.count(breakdown.get("ephemeral_1h_input_tokens")) or 0
         usage["cache_creation"] = {
             "ephemeral_5m_input_tokens": five,
             "ephemeral_1h_input_tokens": hour,
@@ -224,7 +250,8 @@ class Translator:
 
     ``write`` receives each output line without its newline. ``clock`` is a monotonic clock in
     seconds, read once per line as it arrives. ``base_url`` is the host Claude Code was aimed at
-    (``ANTHROPIC_BASE_URL``), which decides whether the published rates are its price.
+    (``ANTHROPIC_BASE_URL``, or the cloud provider its switch names, see :func:`aimed_at`), which
+    decides whether the published rates are its price.
     """
 
     write: Write
@@ -245,6 +272,11 @@ class Translator:
     _ledger: dict[str, _Ledger] = field(default_factory=dict)
     _gaps: set[tuple[str, str, str]] = field(default_factory=set)
 
+    @property
+    def _priced(self) -> bool:
+        """Whether any line this translator wrote carries a ``cost=``."""
+        return any(ledger.cost for ledger in self._ledger.values())
+
     # --- input ---------------------------------------------------------------------------------
 
     def feed(self, line: str) -> None:
@@ -260,7 +292,12 @@ class Translator:
         try:
             event = json.loads(text)
         except ValueError:
-            self.write(text)
+            if text.lstrip().startswith(("{", "[")):
+                # Stream JSON cut short (a stop or a crash mid-line): it can hold a tool's whole
+                # result, which never reached the journal before, so it is counted, never written.
+                self.unreadable += 1
+            else:
+                self.write(text)
             return
         except RecursionError:  # nested past the parser's depth: JSON nobody can read here
             self.unreadable += 1
@@ -338,7 +375,7 @@ class Translator:
                 return
             started = self._requested_at
             if started is None:
-                ttft = _count(event.get("ttft_ms"))
+                ttft = rates.count(event.get("ttft_ms"))
                 started = now - (ttft or 0) / 1000
             usage = message.get("usage")
             model = message.get("model")
@@ -436,7 +473,7 @@ class Translator:
             return
         self._gaps.add(key)
         self.write(
-            "WARNING cost unpriced "
+            f"WARNING {UNPRICED_HEAD} "
             + log_fields(provider=PROVIDER, model=model, charge=charge, reason=reason)
         )
 
@@ -469,8 +506,8 @@ class Translator:
                 "tokens_total": usage.prompt + usage.output,
                 "cached_tokens": usage.read if "cache_read_input_tokens" in raw else None,
                 "cache_write_tokens": usage.written or None,
-                "tokens_reasoning": _count(
-                    (raw.get("output_tokens_details") or {}).get("thinking_tokens")
+                "tokens_reasoning": rates.count(
+                    _mapping(raw.get("output_tokens_details")).get("thinking_tokens")
                 ),
             }
             price = rates.call_price(
@@ -515,7 +552,7 @@ class Translator:
         block = usage.get("server_tool_use")
         if not isinstance(block, Mapping):
             return
-        searches = _count(block.get("web_search_requests")) or 0
+        searches = rates.count(block.get("web_search_requests")) or 0
         if searches:
             price = rates.web_search_price(searches, base_url=self.base_url)
             if price.cost is None:
@@ -524,7 +561,7 @@ class Translator:
             else:
                 self._ledger_for(model).cost += price.cost
             self.write(
-                "INFO tool "
+                f"INFO {SERVER_TOOL_HEAD} "
                 + log_fields(
                     name="web_search",
                     executor="server",
@@ -538,11 +575,11 @@ class Translator:
                     generation_id=request_id,
                 )
             )
-        fetches = _count(block.get("web_fetch_requests")) or 0
+        fetches = rates.count(block.get("web_fetch_requests")) or 0
         if fetches:
             # Web fetch carries "no additional charges beyond standard token costs".
             self.write(
-                "INFO tool "
+                f"INFO {SERVER_TOOL_HEAD} "
                 + log_fields(
                     name="web_fetch",
                     executor="server",
@@ -554,8 +591,8 @@ class Translator:
             )
 
     def _retry(self, event: Mapping[str, Any]) -> None:
-        attempt = _count(event.get("attempt"))
-        max_retries = _count(event.get("max_retries"))
+        attempt = rates.count(event.get("attempt"))
+        max_retries = rates.count(event.get("max_retries"))
         self._retries += 1
         self._max_retries = max_retries
         self._no_response = isinstance(event.get("no_response"), Mapping)
@@ -579,6 +616,18 @@ class Translator:
     def _call_failed(
         self, event: Mapping[str, Any], message: Mapping[str, Any], now: float
     ) -> None:
+        if event.get("parent_tool_use_id") is not None:
+            # A subagent's call failed: its own line, and the main thread's call state untouched.
+            self._llm(
+                "WARNING",
+                purpose="main",
+                model=self.model,
+                outcome="failed",
+                reason=fault_slug(event.get("api_error_status")),
+                detail=bounded(_text(message.get("content"))) or None,
+                generation_id=_safe_id(event.get("request_id")),
+            )
+            return
         attempts = self._retries + 1
         self._llm(
             "WARNING",
@@ -661,7 +710,7 @@ class Translator:
             for error in errors:
                 if isinstance(error, str) and error:
                     self.write(error)
-        turns = _count(event.get("num_turns"))
+        turns = rates.count(event.get("num_turns"))
         ending = event.get("terminal_reason") or event.get("subtype")
         if turns is not None or isinstance(ending, str):
             count = str(turns) if turns is not None else "an unstated number of"
@@ -671,7 +720,24 @@ class Translator:
         if isinstance(billed, Mapping):
             for model, figures in billed.items():
                 if isinstance(model, str) and isinstance(figures, Mapping):
+                    self._served_by(model, figures)
                     self._reconcile(model, figures)
+
+    def _served_by(self, model: str, figures: Mapping[str, Any]) -> None:
+        """Say so when Claude Code reports a host whose price is not Anthropic's list price.
+
+        The environment the translator can read names most such hosts (``ANTHROPIC_BASE_URL``,
+        a cloud provider's switch), and a call there is priced nowhere. A host set some other way
+        (in Claude Code's own settings, say) is only known here, at the end, from the provider
+        Claude Code names, so the calls already written were priced as Anthropic's: say so.
+        """
+        served = figures.get("provider")
+        if not isinstance(served, str) or served in ("", "firstParty") or not self._priced:
+            return
+        self.write(
+            f"WARNING Claude Code served {model} through {bounded(served, 40)}, so the cost "
+            "on its calls above is Anthropic's list price, not what that host charges."
+        )
 
     def _reconcile(self, model: str, figures: Mapping[str, Any]) -> None:
         stated = figures.get("costUSD")
@@ -680,10 +746,10 @@ class Translator:
         if not math.isfinite(stated):
             return
         prompt = sum(
-            _count(figures.get(key)) or 0
+            rates.count(figures.get(key)) or 0
             for key in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
         )
-        output = _count(figures.get("outputTokens")) or 0
+        output = rates.count(figures.get("outputTokens")) or 0
         mine = self._ledger.get(model, _Ledger())
         if (prompt, output) == (mine.prompt, mine.output) and not mine.unitemized:
             if mine.unpriced or abs(stated - mine.cost) < 5e-7:

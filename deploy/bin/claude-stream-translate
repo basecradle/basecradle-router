@@ -174,17 +174,32 @@ def _lines(fd: int, writer_alive: Callable[[], bool] | None) -> Iterator[str]:
         yield b"".join(partial).decode("utf-8", "replace")
 
 
+def _started(pid: int) -> str | None:
+    """``pid``'s start time (proc(5) field 22), or ``None`` where there is no /proc."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            stat_line = fh.read()
+    except OSError:
+        return None
+    fields = stat_line[stat_line.rfind(")") + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
 def pid_alive(pid: int) -> Callable[[], bool]:
-    """Whether ``pid`` still exists: a signal-0 probe, which signals nothing."""
+    """Whether ``pid`` is still the process it was when this was asked first: ``claude``.
+
+    A signal-0 probe signals nothing. ``claude`` runs as this program's own account, so a pid we
+    may not signal is no longer it, and where /proc exists the start time must match too, so a
+    reused pid is never mistaken for the writer.
+    """
+    started = _started(pid)
 
     def alive() -> bool:
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return False
-        except PermissionError:
-            return True  # it exists; it is just not ours to signal
-        return True
+        return started is None or _started(pid) == started
 
     return alive
 
@@ -223,7 +238,7 @@ def run(
     """
     out = _Out(write_fd)
     translator = translation.Translator(
-        write=out, clock=time.monotonic, base_url=environ.get("ANTHROPIC_BASE_URL") or None
+        write=out, clock=time.monotonic, base_url=translation.aimed_at(environ)
     )
     for line in _lines(read_fd, writer_alive):
         translator.feed(line)

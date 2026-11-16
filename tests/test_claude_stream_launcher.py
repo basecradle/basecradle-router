@@ -263,6 +263,19 @@ def test_pid_alive_answers_for_a_real_and_a_vanished_process() -> None:
     assert not ct.pid_alive(child.pid)()
 
 
+def test_a_pid_another_account_holds_is_never_the_writer() -> None:
+    # claude runs as the translator's own account, so a pid it may not signal is a reused one.
+    if os.geteuid() == 0:
+        pytest.skip("root may signal every process")
+    assert not ct.pid_alive(1)()
+
+
+def test_a_reused_pid_is_never_the_writer(monkeypatch) -> None:
+    starts = iter(["100", "250"])
+    monkeypatch.setattr(ct, "_started", lambda _pid: next(starts))
+    assert not ct.pid_alive(os.getpid())()
+
+
 def test_a_journal_that_refuses_writes_stops_the_writing_never_the_reading(tree: Path) -> None:
     module = load(tree)
     read_out, write_out = os.pipe()

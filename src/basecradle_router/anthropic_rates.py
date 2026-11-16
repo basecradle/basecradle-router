@@ -137,7 +137,7 @@ class Price:
     gap: str | None = None
 
 
-def _count(value: Any) -> int | None:
+def count(value: Any) -> int | None:
     """A non-negative integer, or ``None`` — a count the vendor did not state is never a zero."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -152,16 +152,16 @@ def usage_of(usage: Any) -> Usage | None:
     """
     if not isinstance(usage, Mapping):
         return None
-    uncached = _count(usage.get("input_tokens"))
-    output = _count(usage.get("output_tokens"))
+    uncached = count(usage.get("input_tokens"))
+    output = count(usage.get("output_tokens"))
     if uncached is None and output is None:
         return None
-    written = _count(usage.get("cache_creation_input_tokens")) or 0
+    written = count(usage.get("cache_creation_input_tokens")) or 0
     breakdown = usage.get("cache_creation")
     five = hour = None
     if isinstance(breakdown, Mapping):
-        five = _count(breakdown.get("ephemeral_5m_input_tokens"))
-        hour = _count(breakdown.get("ephemeral_1h_input_tokens"))
+        five = count(breakdown.get("ephemeral_5m_input_tokens"))
+        hour = count(breakdown.get("ephemeral_1h_input_tokens"))
     if five is None and hour is None:
         # No breakdown: carried as 5-minute so the prompt counts stay right, and marked unsplit so
         # it is never priced.
@@ -173,7 +173,7 @@ def usage_of(usage: Any) -> Usage | None:
         uncached=uncached or 0,
         write_5m=five or 0,
         write_1h=hour or 0,
-        read=_count(usage.get("cache_read_input_tokens")) or 0,
+        read=count(usage.get("cache_read_input_tokens")) or 0,
         output=output or 0,
         split_known=split_known,
     )

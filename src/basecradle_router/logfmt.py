@@ -138,8 +138,9 @@ def _render_value(value: object) -> str:
 
     A ``bool`` renders lowercase (see :func:`log_fields`). Two of the harness's ``kv``
     jobs are not this function's: bounding a value's length (240 characters there),
-    which is a separate job from quoting and one the router has never done, and
-    credential scrubbing, which is the box's ``ai_scrub``, run over every journald line.
+    which is a separate job from quoting and is :func:`bounded`'s, applied by the caller
+    to foreign text only (the router's own values are never bounded), and credential
+    scrubbing, which is the box's ``ai_scrub``, run over every journald line.
     """
     text = ("true" if value else "false") if isinstance(value, bool) else str(value)
     text = " ".join(_CONTROL.sub(" ", text).split())

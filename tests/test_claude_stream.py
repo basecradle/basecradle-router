@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from basecradle_router.claude_stream import LLM_HEAD, Translator, fault_slug, money
+from basecradle_router.claude_stream import LLM_HEAD, Translator, aimed_at, fault_slug, money
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude_stream"
 TICK = 0.25
@@ -34,10 +34,17 @@ TOOL_FIELDS = {
     "error", "cost", "cost_basis", "cost_gap", "generation_id",
 }  # fmt: skip
 UNPRICED_FIELDS = {"provider", "model", "charge", "reason"}
-HEADS = {f"{LLM_HEAD}": LLM_FIELDS, "tool": TOOL_FIELDS, "cost unpriced": UNPRICED_FIELDS}
+HEADS = {
+    LLM_HEAD: LLM_FIELDS,
+    "tool": TOOL_FIELDS,
+    "tool shadow": TOOL_FIELDS,
+    "cost unpriced shadow": UNPRICED_FIELDS,
+}
 
 #: One structured line: severity, a head, then key=value fields (a value is bare or quoted).
-STRUCTURED = re.compile(r"\A(INFO|WARNING) (llm shadow|tool|cost unpriced) (.+)\Z")
+STRUCTURED = re.compile(
+    r"\A(INFO|WARNING) (llm shadow|tool shadow|tool|cost unpriced shadow) ([a-z_]+=.+)\Z"
+)
 FIELD = re.compile(r'([a-z_]+)=("[^"]*"|[^ "]+)(?: |\Z)')
 
 
@@ -110,6 +117,7 @@ def test_no_line_is_read_by_a_noc_call_column(name: str) -> None:
     # ` llm provider=`, so while the receiver still writes these calls, no line here may match.
     for line in run(name):
         assert "llm provider=" not in line, line
+        assert "cost unpriced provider=" not in line, line
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -279,7 +287,7 @@ def test_a_subagents_calls_are_counted_with_their_usage_left_out() -> None:
         assert not {"tokens_in", "tokens_out", "tokens_total", "duration"} & set(line)
     gaps = [line for line in out if line.startswith("WARNING cost unpriced ")]
     assert gaps == [
-        "WARNING cost unpriced provider=anthropic model=claude-opus-5-5 charge=tokens"
+        "WARNING cost unpriced shadow provider=anthropic model=claude-opus-5-5 charge=tokens"
         " reason=not_reported"
     ]  # once per wake per gap
     assert out[-1] == (
@@ -327,7 +335,7 @@ def test_an_unknown_model_is_unpriced_and_says_why_once() -> None:
     assert {line["cost_gap"] for line in calls} == {"unknown_model"}
     assert all("cost" not in line and "tokens_total" in line for line in calls)
     assert [line for line in out if "cost unpriced" in line] == [
-        "WARNING cost unpriced provider=anthropic model=claude-unknown-9 charge=tokens"
+        "WARNING cost unpriced shadow provider=anthropic model=claude-unknown-9 charge=tokens"
         " reason=unknown_model"
     ]
 
@@ -348,7 +356,8 @@ def test_a_server_side_search_is_a_server_tool_line_with_its_fee() -> None:
     out = translate(rewrite("max_turns", search))
     call = out.index(next(line for line in out if f" {LLM_HEAD} " in line))
     assert out[call + 1] == (
-        "INFO tool name=web_search executor=server provider=anthropic kind=search.web count=2"
+        "INFO tool shadow name=web_search executor=server provider=anthropic kind=search.web"
+        " count=2"
         " outcome=ok cost=0.02 cost_basis=computed generation_id=req_011FabNova03Call0001"
     )
     # The fee is part of what was priced, so the end finds Claude Code's figure matched.
@@ -409,3 +418,86 @@ def test_an_internal_fault_is_counted_and_said_never_raised(monkeypatch) -> None
 )
 def test_money_is_plain_fixed_point(value: float, text: str) -> None:
     assert money(value) == text
+
+
+def test_a_server_tools_fee_is_marked_because_the_receivers_call_cost_holds_it() -> None:
+    # A harness or MCP tool line is a fact the receiver never had, so it stays bare.
+    def search(event: dict[str, Any]) -> None:
+        if event["type"] == "stream_event" and event["event"]["type"] == "message_delta":
+            event["event"]["usage"]["server_tool_use"] = {"web_fetch_requests": 1}
+
+    out = translate(rewrite("max_turns", search))
+    assert any(line.startswith("INFO tool shadow name=web_fetch executor=server") for line in out)
+    assert any(line.startswith("INFO tool name=Bash executor=harness") for line in out)
+    assert not any(" tool name=" in line and "executor=server" in line for line in out)
+
+
+def test_stream_json_cut_mid_line_is_counted_and_never_written() -> None:
+    # A stop that lands mid-write leaves part of a line, which can hold a tool's whole result.
+    secretish = '{"type": "user", "message": {"content": [{"type": "tool_result", "content": "DB_'
+    out = translate([secretish])
+    assert not [line for line in out if "DB_" in line]
+    assert out[0].startswith("WARNING The stream translator could not read 1 line(s)")
+
+
+def test_a_subagents_failed_call_leaves_the_main_threads_call_alone() -> None:
+    lines = (FIXTURES / "tools.jsonl").read_text().splitlines()
+    first_start = next(i for i, line in enumerate(lines) if '"message_start"' in line)
+    failure = {
+        "type": "assistant",
+        "parent_tool_use_id": "toolu_01FabNova99Tool0001",
+        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API Error"}]},
+        "is_api_error_message": True,
+        "api_error_status": 529,
+    }
+    spliced = lines[:first_start] + [json.dumps(failure)] + lines[first_start:]
+    calls = llm_lines(translate(spliced))
+    failed = [line for line in calls if line["outcome"] == "failed"]
+    assert len(failed) == 1 and failed[0]["reason"] == "server_error"
+    assert "duration" not in failed[0] and "attempt" not in failed[0]
+    # The main thread's call still times from its own `status requesting`: unspliced it is 2.50s,
+    # and the spliced line adds one tick of the fake clock inside the call.
+    assert llm_lines(run("tools"))[0]["duration"] == "2.50s"
+    assert calls[1]["duration"] == "2.75s"
+
+
+@pytest.mark.parametrize(
+    ("environ", "host"),
+    [
+        ({}, None),
+        ({"ANTHROPIC_BASE_URL": "https://gateway.example.com"}, "https://gateway.example.com"),
+        ({"CLAUDE_CODE_USE_BEDROCK": "1"}, "bedrock"),
+        ({"CLAUDE_CODE_USE_VERTEX": "true", "ANTHROPIC_BASE_URL": "x"}, "vertex"),
+        ({"CLAUDE_CODE_USE_FOUNDRY": "0"}, None),
+    ],
+)
+def test_where_claude_code_sends_its_calls(environ: dict, host: str | None) -> None:
+    assert aimed_at(environ) == host
+
+
+def test_a_cloud_providers_switch_leaves_every_call_unpriced() -> None:
+    calls = llm_lines(run("tools", base_url=aimed_at({"CLAUDE_CODE_USE_BEDROCK": "1"})))
+    assert {line["cost_gap"] for line in calls} == {"unpriced_host"}
+
+
+def test_a_host_named_only_at_the_end_is_said_out_loud() -> None:
+    def elsewhere(event: dict[str, Any]) -> None:
+        if event["type"] == "result":
+            event["modelUsage"]["claude-opus-5-5"]["provider"] = "bedrock"
+
+    out = translate(rewrite("tools", elsewhere))
+    assert (
+        "WARNING Claude Code served claude-opus-5-5 through bedrock, so the cost on its calls"
+        " above is Anthropic's list price, not what that host charges."
+    ) in out
+
+
+@pytest.mark.parametrize("details", [[], "eight", 3])
+def test_a_usage_field_of_the_wrong_shape_costs_no_line(details) -> None:
+    def odd(event: dict[str, Any]) -> None:
+        if event["type"] == "stream_event" and event["event"]["type"] == "message_delta":
+            event["event"]["usage"]["output_tokens_details"] = details
+
+    calls = llm_lines(translate(rewrite("tools", odd)))
+    assert len(calls) == 4
+    assert all("tokens_reasoning" not in line and "cost" in line for line in calls)

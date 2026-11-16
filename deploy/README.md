@@ -199,13 +199,23 @@ where it always went. The translation is `src/basecradle_router/claude_stream.py
 `anthropic_rates.py`; how each line maps from the stream, and what the stream cannot itemize, is in
 that module's docstring.
 
-- **What lands.** One `llm` line per main-thread model call, headed **`llm shadow provider=`** while
-  the `ai_otel` receiver (Part 5) still renders the same calls: every NOC column that counts, times or
-  prices a call is gated on `llm provider=`, so nothing is counted twice, and the two records differ by
-  one word. One `tool` line per tool use (a `WARNING tool … error=` companion for a failed run), one
-  `cost unpriced` line per wake per gap, and prose: the reply, the turn count and why the run ended,
-  and, per model, what Claude Code billed that the stream did not itemize. **No `wake` line**: the
-  router's own `stage=wake` line is a builder wake's record.
+- **What lands.** One `llm` line per model call, one `tool` line per tool use (a `WARNING tool …
+  error=` companion for a failed run), one `cost unpriced` line per wake per gap, and prose: the
+  reply, the turn count and why the run ended, and, per model, what Claude Code billed that the
+  stream did not itemize. **No `wake` line**: the router's own `stage=wake` line is a builder wake's
+  record. A subagent's calls are `purpose=main`, as the receiver writes them.
+- **The comparison mark.** While the `ai_otel` receiver (Part 5) still renders the same calls, every
+  line that describes them carries **`shadow`** after its head: `llm shadow provider=`, `cost unpriced
+  shadow`, and `tool shadow` for a server-side tool, whose fee the receiver's call cost already holds.
+  Every NOC column that counts, times or prices a call or a fee is gated on the bare head (`llm
+  provider=`, `tool name=`), so nothing is counted twice, and the two records differ by one word. A
+  harness or MCP `tool` line is a fact the receiver never had, so it is unmarked.
+- **Price.** Each call is priced from Anthropic's published rates (`anthropic_rates.py`,
+  `cost_basis=computed`), and the sum is checked per model against Claude Code's own `costUSD` at the
+  end: a mismatch on the same tokens is a WARNING that the table is stale. A host whose price is not
+  Anthropic's (`ANTHROPIC_BASE_URL` elsewhere, or a Bedrock, Vertex or Foundry switch) leaves every
+  call `cost_gap=unpriced_host`; one named only by Claude Code at the end is a WARNING that the costs
+  above are list prices.
 - **What it cannot see.** A subagent's calls arrive without their final usage, so each gets an `llm`
   line with `cost_gap=not_reported` and no tokens; Claude Code's helper calls (the model a WebSearch
   runs on) never appear one by one. Both are stated against Claude Code's own `modelUsage` on the
@@ -217,6 +227,11 @@ that module's docstring.
 - **A leftover.** The stream ends at EOF, and something `claude` started could hold its stdout past
   it. So the translator is handed `claude`'s pid: once `claude` is gone and the pipe has been quiet
   for a second, the stream is over. The wake itself never waits on the pipe.
+- **Ordering.** The wake ends when `claude` does, and the translator writes the last of its lines
+  (the reply among them) a moment after, from what `claude` wrote before it exited. So a wake's last
+  lines can land after the router's `event=wake_end`, and, in the rare case the agent's next wake
+  starts within that moment, beside that wake's first. The price of keeping `claude` `runuser`'s
+  child, which is what keeps a stop a stop.
 - **If the translator fails.** It never stops reading early, so `claude` never blocks on the pipe or
   dies of SIGPIPE. If it exits non-zero (it could not load: exit 70, the reason on stderr; or it
   crashed), `wake-runner` reads the rest of the stream itself: `jq` writes the reply from the final
