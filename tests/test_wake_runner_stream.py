@@ -278,3 +278,83 @@ def test_the_fallback_quotes_by_exactly_the_translators_rule(tmp_path: Path) -> 
     forged.write_text(json.dumps({"type": "result", "result": reply}) + "\n")
     done = stream(tmp_path, _helper(tmp_path, "dead.py", DEAD), fixture=str(forged)[:-6], raw=True)
     assert done.stdout.decode() == "".join(line + "\n" for line in quoted(reply))
+
+
+# --- the fallback redacts credential-named assignments (#491) ------------------------------------
+
+#: A fabricated GitHub App installation token, and the mint line every builder command opens with.
+_FAKE_TOKEN = "ghs_FABRICATEDnovaDigitalToken0000000000"
+_MINT = (
+    'GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token'
+    ' basecradle-nova-ai)" || exit 1'
+)
+
+#: Every common shape the fallback's one-level reading takes exactly as the translator's nesting
+#: one does: the two spellings must agree here, line for line.
+_AGREED = "\n".join(
+    [
+        f"Done. I ran {_MINT}; export GH_TOKEN",
+        f"GH_TOKEN={_FAKE_TOKEN} gh api",
+        "A_TOKEN='a b c' tail",
+        'A_TOKEN="a \\" b" tail',
+        "A_TOKEN=$(gh-app-token nova) tail",
+        "A_TOKEN=`gh-app-token nova` tail",
+        "A_TOKEN=a\\ b tail",
+        "x=1 A_KEY=1 y=2 B_SECRET=2 C_PASSWORD_FILE=kept PASSWORD=kept gh_token=kept",
+        "A_TOKEN=",
+        "B_TOKEN=\tsecretsecret",
+        "C_TOKEN='<a redacted value>' twice",
+    ]
+)
+
+
+def _fallback(tmp_path: Path, reply: str) -> list[str]:
+    forged = tmp_path / "secret.jsonl"
+    forged.write_text(json.dumps({"type": "result", "result": reply}) + "\n")
+    done = stream(tmp_path, _helper(tmp_path, "dead.py", DEAD), fixture=str(forged)[:-6], raw=True)
+    assert done.returncode == 0
+    return done.stdout.decode().splitlines()
+
+
+@needs_jq
+def test_the_fallback_redacts_by_the_translators_rule(tmp_path: Path, canary) -> None:
+    from basecradle_router.claude_stream import quoted
+
+    out = _fallback(tmp_path, _AGREED)
+    assert out == quoted(_AGREED)
+    assert not any(_FAKE_TOKEN in line or canary.search(line) for line in out)
+    assert "> Done. I ran GH_TOKEN='<a redacted value>' || exit 1; export GH_TOKEN" in out
+
+
+@needs_jq
+def test_the_fallback_never_leaves_a_line_the_canary_reads(tmp_path: Path, canary) -> None:
+    # Where the one-level reading stops short of the translator's, what is left is still no value
+    # the canary reads.
+    reply = "\n".join(
+        [
+            'A_TOKEN="$(gh-app-token "a b" $(x y))" tail',
+            "A_TOKEN=$'a\\'b c' tail",
+            "A_KEY=abc\tdefghijk x",
+            'A_TOKEN="never closed and the rest',
+            "Z_TOKEN=" + "x" * 50,
+        ]
+    )
+    out = _fallback(tmp_path, reply)
+    assert out and not any(canary.search(line) for line in out)
+
+
+@needs_jq
+def test_the_fallback_reads_a_long_run_of_capitals_in_linear_time(tmp_path: Path) -> None:
+    # The canary's own pattern took jq 30 s on 50,000 capitals, and the fallback reads the pipe
+    # `claude` writes into: a stall there is a hung wake. `stream` times out at 60 s.
+    out = _fallback(tmp_path, "A" * 200_000 + "=x " + "_" * 200_000 + "TOKEN=x")
+    assert out[0].startswith("> AAAA")
+
+
+def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
+    from basecradle_router.logfmt import CREDENTIAL_NAME, REDACTED_VALUE
+
+    script = _run_stream()
+    assert f'\\"{CREDENTIAL_NAME}\\" as \\$n' in script
+    marker = REDACTED_VALUE.replace("'", "\\\\u0027")
+    assert f'\\"{marker}\\" as \\$r' in script
