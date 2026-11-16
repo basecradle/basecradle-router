@@ -12,6 +12,10 @@ The suites:
 * `ai_scrub.yaml` — the redaction every shipped line passes: the literal rules before the prefix
   rules, and the harness's word rule (#398). Python's `re` cannot stand in for it: it has no
   `\p{L}` classes, and the word rule is a closure, so the real engine is the only test.
+* `ai_credentials.yaml` — the credential-named assignment rule (#494): every credential-named
+  assignment's value, in every field, for every writer, ships as the box's marker, and both the
+  print site's marker and the box's own pass untouched. Beside it, below, a differential run holds
+  the box's reading of a value to the print site's (`logfmt.redact_credentials`, the reference).
 * `ai_writers.yaml` — the writer check (#484): a line under a fleet identifier is kept as it is
   only when its `_UID` is one the `fleet_writers` map lists for that identifier, and is otherwise
   marked `UNVERIFIED uid=<n>` under a renamed identifier.
@@ -38,8 +42,10 @@ No network, model or agent: `vector test` runs transforms only, never a source o
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -48,6 +54,14 @@ from pathlib import Path
 
 import pytest
 
+from basecradle_router.logfmt import (
+    _BREAK_CHARS,
+    CANARY_VALUE_STOPS,
+    REDACTED_VALUE,
+    log_fields,
+    redact_credentials,
+)
+from conftest import BOX_REDACTED_VALUE, FORGED_REPLY, NOC_CREDENTIAL_ASSIGNMENT
 from fleet_writers_box import ACCOUNTS, REGISTRY, fw
 
 REPO = Path(__file__).resolve().parents[1]
@@ -145,7 +159,11 @@ def test_ci_installs_the_release_the_boxes_run() -> None:
 def test_every_suite_is_run() -> None:
     # The glob below is the whole list: a suite named here and missing from disk, or the scrub's
     # suite renamed out of the glob, would otherwise leave the redaction untested and green.
-    assert {suite.name for suite in SUITES} >= {"ai_scrub.yaml", "ai_writers.yaml"}
+    assert {suite.name for suite in SUITES} >= {
+        "ai_credentials.yaml",
+        "ai_scrub.yaml",
+        "ai_writers.yaml",
+    }
 
 
 def test_the_readme_recipe_switches_interpolation_on_as_the_unit_does() -> None:
@@ -366,6 +384,15 @@ _LONG_TEXTS = {
     "x-api-key": _fill("x-api-key:"),
     "assignments": _fill("api_key=Bearer"),
     "bearers": _fill("Bearer"),
+    # The credential-named assignment rule (#494): names back to back, one name of 200,000
+    # capitals (quadratic for the canary's own spelling in a backtracking engine), and a value
+    # that keeps opening a quote, an escaped quote, a bearer word or a glued one.
+    "credential names": _fill("A_TOKEN="),
+    "credential capitals": _fill("A") + "_TOKEN=x",
+    "credential single quotes": "A_TOKEN=" + _fill("'"),
+    "credential escaped quotes": "A_TOKEN=" + _fill('\\"'),
+    "credential bearer words": "A_TOKEN=" + _fill("Bearer\t"),
+    "credential glued bearers": "A_TOKEN=" + _fill("xbearer"),
 }
 
 
@@ -391,3 +418,424 @@ def test_the_scrub_is_linear_on_a_long_space_free_text(shape: str, tmp_path: Pat
     # `vector vrl -o` prints VRL's display of the event, not JSON, so read it as text.
     assert '"message": "[nova] ' in got.stdout, got.stdout[:400]
     assert elapsed < _TIME_BOUND_SECONDS, f"{shape}: {elapsed:.1f}s"
+
+
+# --- the box reads a value as the print site does (#494) -----------------------------------------
+#
+# The print site's `logfmt.redact_credentials` is the reference (basecradle-router#491). The box's
+# rule is VRL and reads a whole line, so it is held to the reference by running both on the same
+# text: on every line below the box writes exactly what the print site writes, its own marker in
+# place of the print site's. Where the two read a value differently, the difference is named,
+# its box output pinned, and the canary is silent on it either way. The lists are the cases found,
+# never a proof that no other exists: the seeded fuzz below is what holds the rule's two
+# properties, that the canary reads nothing the box ships and that no credential-named assignment
+# ships a value.
+
+#: Lines on which the two agree: every reading the box shares with the print site, fabricated.
+_AGREED = [
+    "+ export DEPLOY_TOKEN=fabricatedDeployValue0001 && ./run",
+    "A_KEY=k1 B_TOKEN=t1 C_SECRET=s1 D_PASSWORD=p1 E_PASSPHRASE=q1 S3_BUCKET_2_KEY=v myAPI_KEY=w",
+    "A_TOKEN=abc\tB_TOKEN=fabricatedValue0002 next=1",
+    "A_TOKEN=fabricatedValue0003\ntokens_in=5 cost=0.1",
+    "A_PASSWORD='fabricated pass phrase' next=1",
+    'B_PASSWORD="fabricated pass phrase" next=2',
+    'C_PASSWORD="fabricated end"',
+    "EMPTY_TOKEN= next=1 | LAST_TOKEN=",
+    "x_token=abcdefghij TOKEN_FILE=/run/fabricated KEY=abcdefghij PASSWORD=abcdefghij",
+    "GH_TOKEN=ghp_Fab1catedGithubToken000000000000 OPENAI_API_KEY=sk-proj-Fab1catedKey00000000",
+    "INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2"
+    " duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277"
+    " cache_write_tokens=1024 cost=0.0445 cost_basis=computed outcome=ok agent=nova"
+    " generation_id=gen-1791030923-8abbrsSEsIk06gI224Fi",
+    "INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7"
+    " duration=402.18s outcome=ok cost=0.07 | INFO key spend provider=openrouter spent=1.04",
+    *FORGED_REPLY.split("\n")[:-1],
+    # The review's cases (#494). A value glued after a marker, or punctuation, reads as a value
+    # with it.
+    "X_TOKEN='<a redacted value>'fabricatedGlued0004 next=1",
+    f"MY_API_KEY={BOX_REDACTED_VALUE}.",
+    # A double-quoted value opened outside every quote goes whole, closed or not, with whatever is
+    # glued after it: Python's repr of an argv, a shell line, prose, and a line cut short.
+    "Command '['sh', '-c', 'export X_TOKEN=\"fabricatedSecret0001\"']' failed",
+    'Y_TOKEN="fabricatedSecret0002"; ./run',
+    'Set X_TOKEN="fabricatedSecret0003". done | X_TOKEN="fabricatedSecret0004":x',
+    'export X_TOKEN="fabricated secret value',
+    "X_PASSPHRASE='correct horse battery",
+    'X_API_KEY=\\"fabricatedSecret0005\\"abc next=1',
+    # A shell word holding a quote, read by parity: a quote inside the value, an escaped backslash
+    # before one, one name's value holding another's, and two quoted pieces.
+    'E_TOKEN=abc"def ghi" next=1',
+    'X_TOKEN=\\\\"fabricatedSecret0001" next=1',
+    'X_TOKEN=Y_TOKEN="fabricatedSecret0002" next=1',
+    'X_TOKEN="fabricated""Secret0003" next=1',
+    # Every credential word under a quoted value, so each copy of the name is run.
+    'A_KEY="k 1" B_TOKEN="t 1" C_SECRET="s 1" D_PASSWORD="p 1" E_PASSPHRASE="q 1" next=1',
+    # The one shape the parity-independent quoted reading misreads, as the print site does: an
+    # empty assignment closing a quoted value, and a next field whose own value begins with a
+    # blank. The field goes; a stray quote earlier never lets a quoted value through, which is what
+    # the reading buys.
+    'a="X_TOKEN=" b=" y" c=1',
+    # Every piece of a shell word, anywhere in it.
+    "F_TOKEN=(cat /run/fabricated) next=1",
+    "L_TOKEN=abc'def ghi' next=1 | M_TOKEN=abc\\ def next=2 | N_TOKEN=$'abc def' next=3",
+    "O_TOKEN=`cat /run/fabricated` next=1 | P_TOKEN=$(cat /run/fabricated) next=2",
+]
+
+#: Lines the router renders itself: the print site has already redacted them, so the box must pass
+#: them exactly as they came (the capital, 2026-11-16, on basecradle-router#494).
+_RENDERED = [
+    log_fields(stage="wake", outcome="error", agent="nova", detail=text)
+    for text in (
+        "refused: export DEPLOY_TOKEN=fabricatedDeployValue0001 && ./run",
+        "ANTHROPIC_API_KEY='fabricated key value' then GH_TOKEN=ghp_Fab1catedGithubToken0000",
+        'said "STEEL_API_KEY=fabricatedSteelValue01" and A_TOKEN=Bearer',
+    )
+] + [
+    "ANTHROPIC_API_KEY='<a redacted value>' | api_key='<a redacted value>'",
+    # A marker inside a quoted value: kept too, though the print site never writes one so.
+    "X_TOKEN=\"'<a redacted value>'\" next=1",
+]
+
+#: Where the box reads a value differently, and why: the box output, which the canary reads
+#: nothing in. The print site reads one value, the box a whole line, so the box never reads past
+#: the line's own structure: the close of the quoted value an assignment sits in, a `"` a
+#: single-quoted value would cross, a `,` or `}`, a record break, a shell substitution.
+_DIFFERENT = {
+    # The canary stops at a `,` or a `}`, and so does the box, in either pass: in a JSON line they
+    # are structure.
+    'Q_TOKEN=v1,next="x y" end=1': f'Q_TOKEN={BOX_REDACTED_VALUE},next="x y" end=1',
+    "C_TOKEN=v1,next=2 D_TOKEN=v2}": (
+        f"C_TOKEN={BOX_REDACTED_VALUE},next=2 D_TOKEN={BOX_REDACTED_VALUE}}}"
+    ),
+    # The box reads one level of a substitution, and no quote inside it; the print site nests. A
+    # `)` inside a quote ends the box's substitution, and the quote then opens a piece that runs
+    # to the record's end: more is taken, never less.
+    "F_TOKEN=$(cat $(ls /run) /x) next=1": f"F_TOKEN={BOX_REDACTED_VALUE} /x) next=1",
+    "G_TOKEN=$(echo ')' fabricated) next=1": f"G_TOKEN={BOX_REDACTED_VALUE}",
+    # A bare `(` left open is an ordinary character: prose opens far more of them than a shell.
+    "H_TOKEN=a(b fabricated next=1": f"H_TOKEN={BOX_REDACTED_VALUE} fabricated next=1",
+    # A single-quoted piece never crosses a bare `"`, where the shell would read it as literal.
+    "I_TOKEN='a\"b c' next=1": f"I_TOKEN={BOX_REDACTED_VALUE}\"b c' next=1",
+    # `\"` opens a JSON-escaped piece, as it does inside a JSON string, where the shell reads a
+    # literal `"` and goes on to a `'` that opens a quote.
+    "J_TOKEN=\\\"a'b\\\" c' next=1": f"J_TOKEN={BOX_REDACTED_VALUE} c' next=1",
+    # A tab is part of a value, as it is of the canary's run, and a quote opened after one goes
+    # with it; the print site takes the longer of the canary's run and the shell word, which stops
+    # at the tab.
+    "K_TOKEN=a\t'b c' next=1": f"K_TOKEN={BOX_REDACTED_VALUE} next=1",
+    # A single-quoted value never crosses a `"`: a request's `'` keeps an access line's JSON whole.
+    '{"request":{"uri":"/hook?X_TOKEN=\'abc&y=1"},"status":202}': (
+        f'{{"request":{{"uri":"/hook?X_TOKEN={BOX_REDACTED_VALUE}"}},"status":202}}'
+    ),
+    # A `"` after the `=` inside a quoted value is that value's close, not an opening, whatever
+    # follows it (the next field's value may be empty).
+    'a="set FOO_TOKEN=" b="x y" c=1': 'a="set FOO_TOKEN=" b="x y" c=1',
+    'a="X_TOKEN=" b="" c=1': 'a="X_TOKEN=" b="" c=1',
+    # Every record break ends the box's value, as it ends the canary's run. The print site's shell
+    # reading of an unquoted value ends only at a space, a tab or a newline, so it runs on through
+    # a `\r`, a NUL or a U+2028 into what the box ships as the next record.
+    "B_TOKEN=fabricatedValue0004\u2028next=1\rC_TOKEN=fabricatedValue0005\x00next=2": (
+        f"B_TOKEN={BOX_REDACTED_VALUE}\u2028next=1\rC_TOKEN={BOX_REDACTED_VALUE}\x00next=2"
+    ),
+    # A record break right after the `=`: the print site's value is empty, and the box's is too,
+    # but the canary's run crosses the break, so the box writes its marker before it.
+    "X_TOKEN=\nfabricatedAfterBreak0005 next=1": (
+        f"X_TOKEN={BOX_REDACTED_VALUE}\nfabricatedAfterBreak0005 next=1"
+    ),
+    # A bearer value goes with its token, where the print site redacts the scheme word alone.
+    "A_TOKEN=Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig next=1": f"A_TOKEN={BOX_REDACTED_VALUE} next=1",
+    "X_API_KEY=KBearer abcdefgh:fabricatedTail0003 next=1": (
+        f"X_API_KEY={BOX_REDACTED_VALUE} next=1"
+    ),
+    "X_TOKEN=Bearer fabricatedSecret=x next=1": f"X_TOKEN={BOX_REDACTED_VALUE} next=1",
+    "X_TOKEN=Bearer abc123=xyz789fabricated next=1": f"X_TOKEN={BOX_REDACTED_VALUE} next=1",
+    # The token is the whole run, an `=` included, so a scheme word with a bare field after it
+    # takes the field: a fleet line quotes any value holding an `=`, so it is never a fleet
+    # line's, and redaction comes first.
+    "stage=wake X_TOKEN=Bearer cost=0.1 outcome=ok": (
+        f"stage=wake X_TOKEN={BOX_REDACTED_VALUE} outcome=ok"
+    ),
+    # An unclosed JSON-escaped value ends at its JSON string's own close, where the print site's
+    # shell reading takes the rest of the line as the open quote's.
+    '{"cmd":"export X_TOKEN=\\"fabricatedUnclosed0006","n":1}': (
+        f'{{"cmd":"export X_TOKEN={BOX_REDACTED_VALUE}","n":1}}'
+    ),
+}
+
+
+def _credential_rule() -> str:
+    """The credential-named assignment rule alone, as the shipped scrub carries it: from its value
+    pass to its field-name check's close."""
+    source = _scrub_vrl("ai.basecradle.com")
+    start = source.index("scrubbed = map_values(., recursive: true) -> |value| {")
+    end = source.index("\n}\n", source.index("for_each(scrubbed) -> |field, value| {")) + 3
+    return source[start:end]
+
+
+def _parity_pass() -> str:
+    """The credential rule with its second pass taken out: quote parity alone."""
+    rule = _credential_rule()
+    assert rule.count("replace_with(parity, ") == 1
+    start = rule.index("        replace_with(parity, r'(?x)")
+    end = rule.index("\n    } else {\n        value\n", start) + 1
+    return rule[:start] + "        parity\n" + rule[end:]
+
+
+def _scrub_lines(vector: str, tmp_path: Path, lines: list[str], *, alone: str = "") -> list[str]:
+    """Each line's message after the shipped scrub, its `[identifier] ` prefix taken off; or, with
+    `alone`, after the credential rule alone (`"rule"`) or its parity pass alone (`"parity"`)."""
+    program = tmp_path / "scrub.vrl"
+    if alone:
+        rule = {"rule": _credential_rule, "parity": _parity_pass}[alone]()
+        body = rule + '.message = "[x] " + string!(.message)\n'
+    else:
+        body = _without_the_writer_check(_scrub_vrl("ai.basecradle.com"))
+    program.write_text(body + "encode_base64(.message)\n")
+    events = tmp_path / "events.json"
+    events.write_text(
+        "".join(json.dumps({"SYSLOG_IDENTIFIER": "x", "message": line}) + "\n" for line in lines)
+    )
+    got = subprocess.run(
+        [vector, "vrl", "-q", "-i", str(events), "-p", str(program)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_env({}),
+    )
+    assert got.returncode == 0, got.stdout + got.stderr
+    out = [base64.b64decode(json.loads(row)).decode() for row in got.stdout.splitlines() if row]
+    assert len(out) == len(lines), got.stdout
+    assert all(row.startswith("[x] ") for row in out), out
+    return [row[len("[x] ") :] for row in out]
+
+
+def test_the_box_reads_a_value_as_the_print_site_does(tmp_path: Path) -> None:
+    vector = _vector()
+    box = _scrub_lines(vector, tmp_path, _AGREED)
+    for line, got in zip(_AGREED, box, strict=True):
+        assert got == redact_credentials(line).replace(REDACTED_VALUE, BOX_REDACTED_VALUE), line
+
+
+def test_a_line_the_print_site_redacted_passes_the_box_untouched(tmp_path: Path) -> None:
+    assert all(REDACTED_VALUE in line for line in _RENDERED)
+    assert _scrub_lines(_vector(), tmp_path, _RENDERED) == _RENDERED
+
+
+def test_every_difference_from_the_print_site_is_named_and_the_canary_reads_nothing(
+    tmp_path: Path,
+) -> None:
+    canary = re.compile(NOC_CREDENTIAL_ASSIGNMENT)
+    lines = list(_DIFFERENT)
+    box = _scrub_lines(_vector(), tmp_path, lines)
+    for line, got in zip(lines, box, strict=True):
+        assert got == _DIFFERENT[line], line
+        # Named because it IS a difference: a case the two agree on belongs in _AGREED.
+        reference = redact_credentials(line).replace(REDACTED_VALUE, BOX_REDACTED_VALUE)
+        assert got != reference, line
+    for got in box + _scrub_lines(_vector(), tmp_path, _AGREED + _RENDERED):
+        assert not canary.search(got), got
+
+
+#: The pieces a fuzzed line is made of: credential names, every quote, escape, stop, blank and
+#: record break the rule reads, bearer words, both markers, and plain text.
+_FUZZ_PIECES = [
+    "A_TOKEN=",
+    "MY_API_KEY=",
+    "x_token=",
+    "api_key=",
+    "'",
+    '"',
+    "\\",
+    "\\\\",
+    '\\"',
+    ",",
+    "}",
+    ")",
+    ";",
+    " ",
+    "\t",
+    "\n",
+    "\r",
+    "\x00",
+    "\u2028",
+    "Bearer ",
+    "KBearer ",
+    "=",
+    "==",
+    REDACTED_VALUE,
+    BOX_REDACTED_VALUE,
+    "fabricated",
+    "Secret0001",
+    "abc",
+    ".",
+    ":",
+    ">",
+    '""',
+    "=x",
+    "cost=0.1",
+]
+
+#: The characters an empty value may end at: a blank or a canary stop. A record break, a tab or
+#: anything else right after a credential name's `=` is a value the box should have taken.
+_EMPTY_VALUE_ENDS = set(CANARY_VALUE_STOPS)
+
+
+#: The canary's name with its `=`, as tests/conftest.py holds it.
+_CREDENTIAL_NAME = re.compile(NOC_CREDENTIAL_ASSIGNMENT[: NOC_CREDENTIAL_ASSIGNMENT.index("=") + 1])
+
+
+def _quote_open_at(record: str, at: int) -> bool:
+    """Whether a `"` is open at `at`, read as the box reads parity: a backslash escapes the next
+    character, and a record is one record, so a quote may span its lines."""
+    open_, i = False, 0
+    while i < at:
+        c = record[i]
+        if c == "\\" and i + 1 < at:
+            i += 1
+        elif c == '"':
+            open_ = not open_
+        i += 1
+    return open_
+
+
+#: What a value's run may hold: anything but a blank, a canary stop or a record break.
+_VALUE_CHAR = re.compile("[^" + re.escape(" \t" + CANARY_VALUE_STOPS + _BREAK_CHARS) + "]")
+_MARKERS = (REDACTED_VALUE, BOX_REDACTED_VALUE)
+
+
+def _after_marker(rest: str) -> str:
+    """`rest` with a marker at its head taken off."""
+    for marker in _MARKERS:
+        if rest.startswith(marker):
+            return rest[len(marker) :]
+    return rest
+
+
+def _opens_a_quoted_value(line: str) -> str | None:
+    """The first credential name in `line` whose shell word holds a `"` that opens a value, or
+    None: what the parity pass must leave none of. A marker at the word's head is skipped, so a
+    quoted value glued after one is caught; a `"` that closes the quoted value the name sits in
+    is the end of an empty value."""
+    for name in _CREDENTIAL_NAME.finditer(line):
+        at = len(line) - len(_after_marker(line[name.end() :]))
+        while at < len(line) and line[at] != '"' and _VALUE_CHAR.match(line, at):
+            if line[at] == "'":
+                # A single-quoted piece is skipped to its close. One that would cross a `"` is
+                # the named difference (`_DIFFERENT`): no piece crosses a bare `"`, so the word
+                # is not read past it.
+                close = re.compile("['\"" + re.escape(_BREAK_CHARS) + "]").search(line, at + 1)
+                if close is None or line[close.start()] != "'":
+                    break
+                at = close.end()
+                continue
+            # Inside a word a backslash escapes the next character, a record break aside, as the
+            # shell reads one (`\\'` is no quote).
+            escaped = line[at] == "\\" and at + 1 < len(line) and line[at + 1] not in _BREAK_CHARS
+            at += 2 if escaped else 1
+        if line[at : at + 1] == '"' and not _quote_open_at(line, at):
+            return line[name.start() : name.end() + 24]
+    return None
+
+
+def _ships_a_value(line: str) -> str | None:
+    """The first credential name in `line` followed by a value, or by a marker with a value glued
+    to it, a quoted one aside (the parity pass's, held by its own property and by the stray-quote
+    test below), or None: what the whole rule must leave none of."""
+    for name in _CREDENTIAL_NAME.finditer(line):
+        rest = line[name.end() :]
+        after = _after_marker(rest)
+        if after is not rest:
+            if after and _VALUE_CHAR.match(after) and after[0] != '"':
+                return line[name.start() : name.end() + 40]
+            continue
+        if not rest or rest[0] in _EMPTY_VALUE_ENDS:
+            continue
+        return line[name.start() : name.end() + 24]
+    return None
+
+
+def test_the_canary_reads_nothing_the_box_ships(tmp_path: Path) -> None:
+    # The property the whole rule exists for (basecradle/basecradle#877): a canary match on a line
+    # the box shipped means the scrub failed. A hand-picked list cannot show it holds, so this is
+    # seeded fuzz over the pieces the rule reads: 3,000 lines of 1 to 24 pieces each.
+    rng = random.Random(494)
+    lines = [
+        "".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(1, 24))) for _ in range(3000)
+    ]
+    canary = re.compile(NOC_CREDENTIAL_ASSIGNMENT)
+    box = _scrub_lines(_vector(), tmp_path, lines)
+    leaked = [(line, got) for line, got in zip(lines, box, strict=True) if canary.search(got)]
+    assert not leaked, leaked[:5]
+    # And the rule redacts, not only blinds the canary, which never reads a quoted value: every
+    # credential-named assignment it leaves is followed by a marker or by an empty value. Read in
+    # its two halves, each where its parity is the line's: the parity pass leaves no credential
+    # name opening a quoted value, and the whole rule no other value. (A later rule, or the run
+    # pass itself, may take a `"` or half of an escaped one with a value, and parity read on what
+    # it leaves is not the parity the line had.)
+    for alone, check in (("parity", _opens_a_quoted_value), ("rule", _ships_a_value)):
+        out = _scrub_lines(_vector(), tmp_path, lines, alone=alone)
+        shipped = [(line, got, check(got)) for line, got in zip(lines, out, strict=True)]
+        assert not [c for c in shipped if c[2]], (alone, [c for c in shipped if c[2]][:5])
+
+
+#: The oracle's pieces: every construct the box and the print site read alike, and nothing that is
+#: a named difference (`_DIFFERENT`): no line structure (`"`, `,`, `}`, a record break), no
+#: substitution or parenthesis, no bearer word, no escaped `\"`, no tab. A marker appears only as
+#: both redactors write one, before a blank.
+_ORACLE_SECRET = "Fab1catedSecret"
+_ORACLE_PIECES = [
+    "A_TOKEN=",
+    "MY_API_KEY=",
+    "x_token=",
+    "'",
+    "\\",
+    "\\\\",
+    " ",
+    "=",
+    "$'",
+    "`",
+    "abc",
+    _ORACLE_SECRET,
+    REDACTED_VALUE + " ",
+    BOX_REDACTED_VALUE + " ",
+    ".",
+    ":",
+    ";",
+]
+
+
+def test_the_box_never_leaves_more_of_a_value_than_the_print_site(tmp_path: Path) -> None:
+    # The reference holds the box to itself, not only to the lines picked above: on every
+    # construct the two read alike, the box takes at least what the print site takes. Seeded fuzz,
+    # 3,000 lines; a fabricated secret the print site redacts must not survive the box.
+    rng = random.Random(877)
+    lines = [
+        "".join(rng.choice(_ORACLE_PIECES) for _ in range(rng.randint(1, 30))) for _ in range(3000)
+    ]
+    box = _scrub_lines(_vector(), tmp_path, lines, alone="rule")
+    leaked = [
+        (line, got)
+        for line, got in zip(lines, box, strict=True)
+        if got.count(_ORACLE_SECRET) > redact_credentials(line).count(_ORACLE_SECRET)
+    ]
+    assert not leaked, leaked[:5]
+
+
+def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> None:
+    # Quote parity is the fleet's reading of a well-formed line, and a foreign line need not be one:
+    # a stray `"` earlier (an inch mark, a `'"'` in a traceback, a quote opened on a line above)
+    # flips it, and a quoted value then reads as a close. So a double-quoted value closed on its
+    # line before a word's end goes whatever the parity, and this holds it independently of the
+    # parity model the property above shares with the rule: seeded junk of every kind before it.
+    rng = random.Random(1877)
+    junk = ['"', "'", '\\"', "\n", '5" wide', "KeyError: '\"'", "a=", " ", "x", "\\", "`"]
+    secret = "Fab1catedQuotedSecret"
+    lines = [
+        "".join(rng.choice(junk) for _ in range(rng.randint(0, 12)))
+        + f' X_TOKEN="{secret} value"'
+        + rng.choice(["", " next=1", "\n", ",", "}", "\tz"])
+        for _ in range(3000)
+    ]
+    box = _scrub_lines(_vector(), tmp_path, lines)
+    leaked = [(line, got) for line, got in zip(lines, box, strict=True) if secret in got]
+    assert not leaked, leaked[:5]

@@ -41,6 +41,13 @@ NOC_HEAD_POSITION = (
 #: uses this pattern as its oracle. Moving it is a change to the NOC's rule: move it here with it.
 NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}'
 
+#: The box's marker: what `ai_scrub` writes where a credential-named assignment's value stood
+#: (basecradle-router#494), and what the NOC counts per writer as a value a source let through
+#: (basecradle-noc#1535; deploy/README.md → Part 5). Its bytes are that metric's contract: changed
+#: in the hosts' files alone, the count reads zero while the box goes on redacting. The print
+#: site's marker is `logfmt.REDACTED_VALUE`, which the box passes untouched.
+BOX_REDACTED_VALUE = "'<a value the box redacted>'"
+
 #: Model-written text built to pass for the counted heads, every line a well-formed contract line
 #: with a cost, in every shape a record can begin with: bare, behind Vector's identifier, behind
 #: the router's timestamp and logger, behind a probe token, painted, and behind each record break
