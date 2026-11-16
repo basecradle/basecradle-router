@@ -116,14 +116,14 @@ def _render_value(value: object) -> str:
 
     The rule is basecradle-harness ``docs/telemetry.md`` → The Grammar, the one
     definition (the harness's ``_observability._value``); this is the router's copy of
-    it, and the ``detail=`` remap in ``vector.yaml`` is the other, byte for byte
-    (``tests/test_logfmt.py`` reads the remap's case and holds the two together):
+    it. (The ``detail=`` remap in ``vector.yaml`` that was once a third copy retired with
+    the builders' telemetry receiver, #486.)
 
     1. **Flatten.** Every run of whitespace becomes one space, trimmed at both ends, so
        a record stays one line. A control character that is not whitespace (an escape,
-       a NUL) becomes a space first, as the remap's ``\\p{Cc}`` and the harness's
-       ``_flatten`` do (harness 0.177.0, so the fleet's three renderers flatten the
-       same bytes) — what keeps a value from painting the line outside :func:`paint`.
+       a NUL) becomes a space first, as the harness's ``_flatten`` does (harness
+       0.177.0, so the fleet's renderers flatten the same bytes) — what keeps a value
+       from painting the line outside :func:`paint`.
     2. **Quote** a value holding a space, an ``=`` or a double quote, so it reads as
        *one* value rather than as extra fields — and turn its own ``"`` into ``'``.
 
