@@ -6,6 +6,7 @@ against, so its UIDs live in exactly one place:
 
   nova                 a harness agent                          uid 1001
   basecradle-nova-ai   a builder (``basecradle/basecradle-nova``)   uid 1002
+  root                 root                                     uid 0
   router               the daemon's account                     uid 999
   john                 John Doe's login session, in no registry  uid 1000
 """
@@ -33,7 +34,7 @@ def _load():
 
 fw = _load()
 
-ACCOUNTS = {"router": 999, "john": 1000, "nova": 1001, "basecradle-nova-ai": 1002}
+ACCOUNTS = {"root": 0, "router": 999, "john": 1000, "nova": 1001, "basecradle-nova-ai": 1002}
 REGISTRY = {
     "nova": {"kind": "harness", "os_user": "nova", "clone_path": "/home/nova/harness"},
     "basecradle/basecradle-nova": {"os_user": "basecradle-nova-ai"},

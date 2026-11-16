@@ -402,20 +402,20 @@ transforms:
       if ident == "" { ident = to_string(."_COMM") ?? "" }
       if ident == "" { ident = "unknown" }
       # BIND THE LINE TO ITS WRITER (basecradle-router#484). A fleet identifier is every
-      # `basecradle-wake-<agent>` and the three below: the names a NOC column trusts to say who
-      # wrote a line. A line under one is kept as it is only when the kernel-vouched `_UID` is one
-      # the `fleet_writers` map lists for that identifier: the agent's own account or root on its
-      # wake stream, any registered agent for the grammar probe, the router's account for its own
-      # two. Any other line under one, a line with no `_UID` included, is KEPT AND MARKED, never
-      # dropped and never counted: `UNVERIFIED uid=<n> ` stands where the severity would, so no
-      # head is at its position and no column counts it, and the identifier is renamed
-      # `unverified-<identifier>`, in the field and the prefix alike, so nothing attributes it to
-      # the account it named. The marker is what the NOC's `Unverified Log Writer` alarm reads. It
-      # is joined into the shipped line here, never written into `msg`, so the prefix pass stays the
-      # last thing that rewrites `msg` (tests/test_log_surface.py) and a marked line is redacted
-      # exactly as an unmarked one.
+      # `basecradle-wake-<agent>` and the five below: the names a NOC column trusts to say who wrote
+      # a line. A line under one is kept as it is only when the kernel-vouched `_UID` is one the
+      # `fleet_writers` map lists for that identifier: the agent's own account or root on its wake
+      # stream, any registered agent for the grammar probe, the router's account for its own two,
+      # root alone for the operator's stop and the NOC's deploy runner. Any other line under one, a
+      # line with no `_UID` included, is KEPT AND MARKED, never dropped and never counted:
+      # `UNVERIFIED uid=<n> ` stands where the severity would, so no head is at its position and no
+      # column counts it, and the identifier is renamed `unverified-<identifier>`, in the field and
+      # the prefix alike, so nothing attributes it to the account it named. The marker is what the
+      # NOC's `Unverified Log Writer` alarm reads. It is joined into the shipped line here, never
+      # written into `msg`, so the prefix pass stays the last thing that rewrites `msg`
+      # (tests/test_log_surface.py) and a marked line is redacted exactly as an unmarked one.
       marker = ""
-      if starts_with(ident, "basecradle-wake-") || includes(["basecradle-router", "basecradle-log-grammar", "verify-recovery.sh"], ident) {
+      if starts_with(ident, "basecradle-wake-") || includes(["basecradle-router", "basecradle-log-grammar", "verify-recovery.sh", "basecradle-router-stop-wake", "fleet-deploy-runner"], ident) {
           writer = to_string(."_UID") ?? ""
           vouched = false
           if writer != "" {
