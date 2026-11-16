@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +83,15 @@ SHADOW = "shadow"
 LLM_HEAD = f"llm {SHADOW}"
 UNPRICED_HEAD = f"cost unpriced {SHADOW}"
 SERVER_TOOL_HEAD = f"tool {SHADOW}"
+
+#: The Claude Code versions whose stream shapes this translator reads: 2.1.325, from the streams
+#: captured for #481, and 2.1.286, the box's, whose one difference (a stream event names its
+#: message only on ``message_start``) was read off its binary. Named in the WARNING a stream that
+#: does not fit writes, so a reader knows which shapes were expected.
+KNOWN_VERSIONS = ("2.1.286", "2.1.325")
+
+#: A Claude Code version, as ``system/init`` states it, when it is inert enough to name in a line.
+_VERSION = re.compile(r"[0-9][0-9A-Za-z.+-]{0,31}")
 
 #: The model id Claude Code gives the ``assistant`` line it writes when a call failed.
 SYNTHETIC_MODEL = "<synthetic>"
@@ -259,12 +269,14 @@ class Translator:
     base_url: str | None = None
 
     model: str | None = None
+    version: str | None = None
     unreadable: int = 0
+    #: Everything the stream wrote that the translator expected and could not place, by shape.
+    #: Never silent: :meth:`finish` names each count, because a stream that changed shape under
+    #: the translator otherwise looks exactly like a wake that made no model calls (#481).
+    unplaced: Counter[str] = field(default_factory=Counter)
     result_seen: bool = False
     _calls: dict[str, _Call] = field(default_factory=dict)
-    #: The main-thread call the last ``message_start`` opened: the one a ``message_delta`` or
-    #: ``message_stop`` that names no message belongs to.
-    _open: str | None = None
     _request_ids: dict[str, str] = field(default_factory=dict)
     _requested_at: float | None = None
     _retries: int = 0
@@ -315,16 +327,36 @@ class Translator:
             self.unreadable += 1
 
     def finish(self, *, stopped_by: str | None = None) -> None:
-        """The stream has ended. Say so in prose when it ended without a ``result``.
+        """The stream has ended. Say what could not be read or placed, and how it ended.
 
         ``stopped_by`` is the signal the translator received while reading (``TERM`` from a stop),
         or ``None``. Whatever was in flight writes no contract line: a call cut short has no word
-        in the contract, and the wake's own record is the router's ``stage=wake`` line.
+        in the contract, and the wake's own record is the router's ``stage=wake`` line. But a call
+        or a tool use still open after a ``result``, or a main-thread message that arrived with no
+        stream events, is a stream the translator did not understand, and that is said loudly.
         """
         if self.unreadable:
             self.write(
                 f"WARNING The stream translator could not read {self.unreadable} line(s) of "
                 "Claude Code's stream; their model calls or tool uses have no line."
+            )
+        if self.result_seen:
+            if self._calls:
+                self.unplaced["model call(s) still open at the result"] += len(self._calls)
+            if self._tools:
+                self.unplaced["tool use(s) never answered by the result"] += len(self._tools)
+        if self._request_ids:
+            self.unplaced["main-thread message(s) that came with no stream events"] += len(
+                self._request_ids
+            )
+        if self.unplaced:
+            found = "; ".join(f"{count} {shape}" for shape, count in sorted(self.unplaced.items()))
+            wrote = f"Claude Code {self.version}" if self.version else "Claude Code"
+            known = " and ".join(KNOWN_VERSIONS)
+            self.write(
+                f"WARNING The stream translator could not place what {wrote} wrote: {found}. The"
+                " model calls and tool uses involved have no lines, so this wake's telemetry is"
+                f" incomplete. The shapes it reads are Claude Code {known}'s."
             )
         if self.result_seen:
             return
@@ -356,6 +388,11 @@ class Translator:
             model = event.get("model")
             if isinstance(model, str) and model:
                 self.model = model
+            else:
+                self.unplaced["init line(s) that named no model"] += 1
+            version = event.get("claude_code_version")
+            if isinstance(version, str) and _VERSION.fullmatch(version):
+                self.version = version
         elif subtype == "status" and event.get("status") == "requesting":
             self._requested_at = now
             self._retries = 0
@@ -366,32 +403,40 @@ class Translator:
     def _stream_event(self, event: Mapping[str, Any], now: float) -> None:
         inner = event.get("event")
         if not isinstance(inner, Mapping):
+            self.unplaced["stream event(s) that carried no event"] += 1
             return
         kind = inner.get("type")
-        # Claude Code names the message on every stream event only from 2.1.325 on; 2.1.286, the
-        # box's, names it on `message_start` alone. The main thread runs one call at a time, so
-        # an event that names none belongs to the call the last `message_start` opened.
-        message_id = event.get("api_message_id") or self._open
+        # Some Claude Code versions (2.1.286) name the message on `message_start` alone, others
+        # (2.1.325) on every stream event. An event that names none belongs to the one call that
+        # is open, and only when exactly one is: with none or several open, it is counted as
+        # unplaced, never guessed.
+        message_id = event.get("api_message_id")
+        if not message_id and kind != "message_start" and len(self._calls) == 1:
+            message_id = next(iter(self._calls))
         if kind == "message_start":
             message = inner.get("message")
-            if not isinstance(message, Mapping):
+            message_id = message.get("id") if isinstance(message, Mapping) else None
+            if not isinstance(message_id, str) or not message_id:
+                self.unplaced["message_start(s) that named no message"] += 1
                 return
-            message_id = message.get("id") or message_id
-            if not isinstance(message_id, str):
-                return
+            if self._calls:
+                self.unplaced["message_start(s) while another call was still open"] += 1
             started = self._requested_at
             if started is None:
                 ttft = rates.count(event.get("ttft_ms"))
                 started = now - (ttft or 0) / 1000
             usage = message.get("usage")
             model = message.get("model")
-            self._open = message_id
             self._calls[message_id] = _Call(
                 model=model if isinstance(model, str) and model else (self.model or ""),
                 started=started,
                 start_usage=usage if isinstance(usage, Mapping) else {},
             )
             self._requested_at = None
+        elif kind in ("message_delta", "message_stop") and not (
+            isinstance(message_id, str) and message_id in self._calls
+        ):
+            self.unplaced[f"{kind}(s) that matched no open model call"] += 1
         elif isinstance(message_id, str) and message_id in self._calls:
             call = self._calls[message_id]
             if kind == "message_delta":
@@ -403,8 +448,6 @@ class Translator:
                     call.stop_reason = delta["stop_reason"]
             elif kind == "message_stop":
                 del self._calls[message_id]
-                if self._open == message_id:
-                    self._open = None
                 call.request_id = call.request_id or self._request_ids.pop(message_id, None)
                 self._call_ended(call, now)
 
@@ -467,6 +510,7 @@ class Translator:
                 else None
             )
             if use is None:
+                self.unplaced["tool result(s) that matched no tool use"] += 1
                 continue
             self._tool_ended(use, block, decisions.get(block["tool_use_id"]), at, now)
 
@@ -654,6 +698,9 @@ class Translator:
         self._requested_at = None
         self._retries = 0
         self._no_response = False
+        # The call the failure ended, if it had begun streaming: it is accounted for by the line
+        # above, so it is closed, and no later event can close it again as a success.
+        self._calls.clear()
 
     def _subagent_call(self, message: Mapping[str, Any], request_id: str | None) -> None:
         """A subagent's call: counted, with the usage the stream never states left out."""
