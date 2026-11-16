@@ -15,6 +15,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import credential_rule
+from basecradle_router.logfmt import _BREAK_CHARS, CANARY_VALUE_STOPS, REDACTED_VALUE
+from conftest import BOX_REDACTED_VALUE, NOC_CREDENTIAL_ASSIGNMENT
+
 _DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 UNIT = _DEPLOY / "systemd" / "basecradle-router.service"
 WAKE_RUNNER = _DEPLOY / "bin" / "wake-runner"
@@ -338,16 +342,37 @@ _X_API_KEY = (
     r"""(?:(?i:bearer)\s+)*(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)"""
 )
 _API_KEY = (
-    r"""(?i)api[-_]?key="?(?:bearer\s+)*"""
-    r"""(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+)"""
+    r"""(?i)api[-_]?key=(?:(?P<kept>(?-i:"""
+    r"""\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
+    r"""(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))"""
+    r"""|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
+    r"""[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*"""
+    r"""|"?(?:bearer\s+)*(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+))"""
 )
+
+#: The assignment rule's whole closure (basecradle-router#494): a marker after the `=`, the print
+#: site's or the box's own, is kept as it is; any other match is the fixed label it always was.
+_API_KEY_PASS = f"msg = replace_with(msg, r'{_API_KEY}') -> |assignment| {{"
+_API_KEY_CLOSURE = [
+    _API_KEY_PASS,
+    'if assignment.kept != null { assignment.string } else { "apiKey=[REDACTED]" }',
+    "}",
+]
+
+
+#: Where the message passes begin. The credential rule, which rewrites every field before this, is
+#: pinned on its own (below).
+_MESSAGE_READ = 'msg = to_string(.message) ?? ""'
 
 
 def _statements(source: str) -> list[str]:
-    """Every non-comment line of `source` that mentions `replace`, in file order."""
+    """Every non-comment line of the message passes that mentions `replace`, in file order: every
+    such line after `msg` is read, whatever it assigns to, so a `replace` written into `.message`
+    or `ident` after the prefix pass is one the order guard below still sees."""
+    assert source.count(_MESSAGE_READ) == 1
     return [
         line.strip()
-        for line in source.splitlines()
+        for line in source[source.index(_MESSAGE_READ) :].splitlines()
         if "replace" in line and not line.lstrip().startswith("#")
     ]
 
@@ -384,16 +409,19 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
     lines = [line.strip() for line in _scrub_source().splitlines()]
     start = lines.index(_HEARTBEAT_PASS)
     assert lines[start : start + len(_HEARTBEAT_CLOSURE)] == _HEARTBEAT_CLOSURE
-    for line in literal[1:]:
-        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
     # The `x-api-key` rule goes before the assignment rule, so the header's name goes with its
     # value: the assignment rule reads `x-api-key=>V` as `key=` and takes it under its own label.
-    patterns = [_REPLACE.match(line).group("pattern") for line in literal[1:]]
-    assert patterns == [
-        _X_API_KEY,
-        _API_KEY,
-        r"(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*",
+    # The assignment rule is a closure that keeps a marker (basecradle-router#494), pinned whole.
+    assert literal[1:] == [
+        f"msg = replace(msg, r'{_X_API_KEY}', \"x-api-key: [REDACTED]\")",
+        _API_KEY_PASS,
+        "msg = replace(msg, r'(?i)bearer\\s+(?:bearer\\s+)*[A-Za-z0-9._~+/\\-]+=*', "
+        '"Bearer [REDACTED]")',
     ]
+    for line in (literal[1], literal[3]):
+        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
+    start = lines.index(_API_KEY_PASS)
+    assert lines[start : start + len(_API_KEY_CLOSURE)] == _API_KEY_CLOSURE
 
 
 def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
@@ -408,7 +436,7 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     for rule in (
         _PREFIX_PASS,
         "msg = replace(msg, r'(?i:x[-_]api[-_]?key)",
-        "msg = replace(msg, r'(?i)api[-_]?key=",
+        "msg = replace_with(msg, r'(?i)api[-_]?key=",
     ):
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
 
@@ -450,6 +478,194 @@ def test_the_command_line_drop_is_unconditional_not_an_identifier_allow_list() -
         "the `_CMDLINE` deletion must not sit inside a conditional — it applies to every "
         "event, whatever program emitted it (an identifier allow-list is what leaked)"
     )
+
+
+# --- the credential-named assignment rule (basecradle-router#494, basecradle/basecradle#877) -----
+#
+# What it does to a line is proven by running it (tests/vector/ai_credentials.yaml, and the
+# differential run against the print site in tests/test_vector_unit.py). What is pinned here, with
+# no Vector on the machine, is that the rule is held to the one definition: the NOC canary's name,
+# byte for byte, quote parity as the fleet reads it, the canary's value run, and the two markers.
+
+
+_CREDENTIAL_PASS = "scrubbed = map_values(., recursive: true) -> |value| {"
+_PARITY_OPEN = "parity = replace_with(text, r'(?x)"
+_PARITY_CLOSE = "') -> |segment| {"
+_RUN_OPEN = "replace_with(parity, r'(?x)"
+_RUN_CLOSE = "') -> |assignment| {"
+
+#: The canary's name, up to and with its `=`, as tests/conftest.py holds it.
+_CANARY_NAME = NOC_CREDENTIAL_ASSIGNMENT[: NOC_CREDENTIAL_ASSIGNMENT.index("=") + 1]
+
+
+def _pattern(open_: str, close: str) -> str:
+    """One of the rule's two patterns with the free-spacing whitespace taken out, which `(?x)`
+    ignores. No class in it holds a raw space: a space is `\\x20`, because `(?x)` drops one even
+    inside a class, so `[ \\t]` there is a tab alone and `[ ]` an unclosed class (measured on
+    0.61.0)."""
+    source = _scrub_source()
+    assert source.count(open_) == 1
+    start = source.index(open_) + len(open_)
+    body = source[start : source.index(close, start)]
+    assert not re.search(r"\[(?:\\.|[^\]\\])* ", body), "a raw space inside a class"
+    return re.sub(r"\s+", "", body)
+
+
+def _excluded(class_body: str) -> set[str]:
+    """The characters a class body names, its escapes and its `a-z` ranges read as Rust's regex
+    reads them."""
+    chars: list[tuple[str, bool]] = []  # each character, and whether it was a bare `-`
+    token = r"\\(x\{[0-9A-Fa-f]+\}|x[0-9A-Fa-f]{2}|[nrt\\\"])|([^\\])"
+    for escape, literal in re.findall(token, class_body):
+        if literal:
+            chars.append((literal, literal == "-"))
+        elif escape.startswith("x{"):
+            chars.append((chr(int(escape[2:-1], 16)), False))
+        elif escape.startswith("x"):
+            chars.append((chr(int(escape[1:], 16)), False))
+        else:
+            chars.append(({"n": "\n", "r": "\r", "t": "\t"}.get(escape, escape), False))
+    out: set[str] = set()
+    i = 0
+    while i < len(chars):
+        if i + 2 < len(chars) and chars[i + 1][1]:
+            out.update(chr(c) for c in range(ord(chars[i][0]), ord(chars[i + 2][0]) + 1))
+            i += 3
+        else:
+            out.add(chars[i][0])
+            i += 1
+    return out
+
+
+def _negated_classes(pattern: str) -> list[set[str]]:
+    return [_excluded(c) for c in re.findall(r"\[\^((?:\\.|[^\]\\])*)\]", pattern)]
+
+
+def _spelled(marker: str) -> str:
+    return marker.replace("'", r"\x27").replace(" ", r"\x20")
+
+
+def test_every_hosts_credential_rule_is_the_documented_construction() -> None:
+    # VRL composes no pattern from parts, so each host's file spells every piece out many times
+    # over. `tests/credential_rule.py` writes each piece once, with what it reads; every host's
+    # block is that construction, byte for byte, so no copy of a piece can drift alone.
+    hosts = sorted((_DEPLOY / "hosts").glob("*/vector.yaml"))
+    assert len(hosts) == 3
+    for path in hosts:
+        text = path.read_text()
+        assert text.count(credential_rule.START) == 1, path.parent.name
+        assert credential_rule.shipped(text) == credential_rule.BLOCK, (
+            f"{path.parent.name}: rewrite it with `uv run python tests/credential_rule.py`"
+        )
+    # No class in either pattern holds a raw space, which `(?x)` drops even inside a class.
+    _pattern(_PARITY_OPEN, _PARITY_CLOSE)
+    _pattern(_RUN_OPEN, _RUN_CLOSE)
+    # The assignment rule keeps a marker where the credential rule does: one end, spelled alike.
+    assert f"(?:{credential_rule.MARKER_END}))" in _API_KEY
+
+
+def test_the_credential_rule_reads_the_canarys_own_name() -> None:
+    # One definition (basecradle/basecradle#877): a name is a credential's by the canary's rule and
+    # nothing else, spelled byte for byte. Rust's regex is linear, so the canary's own spelling is
+    # safe here; Python's `re` is not, which is why the print site carries a linear respelling.
+    assert credential_rule.NAME + "=" == _CANARY_NAME
+    # Every record break, as the print site's own list holds them.
+    assert _excluded(credential_rule.BRK) == set(_BREAK_CHARS)
+
+
+def test_no_piece_crosses_a_bare_quote_or_a_record_break() -> None:
+    # On a JSON or logfmt line a bare `"` is the line's own, so no piece of a value ever reads
+    # past one (a request's `'` must never take the rest of an access line), and no value runs
+    # into the next record. Every character a piece takes is one its classes admit, or one an
+    # escape takes after its backslash, which never takes a break either.
+    breaks = set(_BREAK_CHARS)
+    for piece in credential_rule.CLOSED_PIECES + credential_rule.OPEN_PIECES:
+        for excluded in _negated_classes(piece):
+            assert breaks <= excluded, piece
+            assert '"' in excluded or excluded == breaks or excluded == breaks | {"'"}, piece
+    # The ordinary character: anything but a blank, a canary stop, a break, or a piece's opener.
+    plain = _excluded(credential_rule.CLOSED_PIECES[-1][2:-1])
+    assert plain == set(CANARY_VALUE_STOPS) | breaks | set("\\'`")
+    assert credential_rule.OPEN_PIECES[-2] == credential_rule.CLOSED_PIECES[-1]
+    # The parity reading's double-quoted piece and its outside: a record is one record, so a quote
+    # may span its lines; a backslash escapes as JSON does inside a quote, and outside never reads
+    # `\"` as `\` and an opening quote.
+    assert credential_rule.DOUBLE_QUOTED == r'"(?:[^"\\]|\\[\s\S])*"?'
+    assert credential_rule.OUTSIDE == r'(?:[^"\\]|\\[\s\S])'
+
+
+def test_pass_one_pieces_all_close() -> None:
+    # A piece left open in pass 1 would let the pattern read `'a' n=1 b="x"` as two open pieces and
+    # reach the later `"`, which eats the fields between. So every pass 1 piece but the ordinary
+    # character and the escape ends in its own closer, never an optional one.
+    for piece in credential_rule.CLOSED_PIECES[1:-1]:
+        assert not piece.endswith("?"), piece
+
+
+def test_a_kept_marker_ends_where_the_canarys_run_would() -> None:
+    breaks = set(_BREAK_CHARS)
+    end = credential_rule.MARKER_END
+    assert end.endswith(r"]|\z")
+    assert _excluded(end[1 : end.index("]|")]) == set(CANARY_VALUE_STOPS) | breaks | {"\t"}
+    # A record break right after the `=` is the run pass's last alternative: the marker goes
+    # before it, so the canary, whose run crosses a break, never reads the next record as a value.
+    assert f"| (?P<record_break>[{credential_rule.BRK}])\n" in credential_rule.BLOCK
+    # Only a field holding an `=` is read at all, and only one holding a `"` by parity.
+    assert 'if is_string(value) && contains(text, "=") {' in credential_rule.BLOCK
+    assert 'if contains(text, "\\"") {' in credential_rule.BLOCK
+
+
+def test_both_markers_are_kept_and_neither_is_a_canary_match(canary: re.Pattern[str]) -> None:
+    # The print site's marker passes the box untouched, so the box's count is only what a source
+    # let through (the capital, 2026-11-16, on basecradle-router#494), and the box's own marker
+    # redacts to itself. Each is one shell word with a space at its fourth character, so the
+    # canary's run after the `=` is `'<a`, under its floor whatever follows.
+    assert _spelled(REDACTED_VALUE) == credential_rule.PRINT_MARKER
+    assert _spelled(BOX_REDACTED_VALUE) == credential_rule.BOX_MARKER
+    for marker in (REDACTED_VALUE, BOX_REDACTED_VALUE):
+        assert marker[3] == " "
+        assert not canary.search(f"DEPLOY_TOKEN={marker} next=1")
+    # The rule writes the box's marker, and only it: for a quoted value, for any other value, and
+    # as a credential-named field's value, each of a list's, unless empty or a marker already.
+    source = _scrub_source()
+    assert f'(string(segment.head) ?? "") + "{BOX_REDACTED_VALUE}"' in source
+    assert f'(string(assignment.name) ?? "") + "{BOX_REDACTED_VALUE}" +' in source
+    keep = f'includes(["", "{REDACTED_VALUE}", "{BOX_REDACTED_VALUE}"], '
+    assert f'if {keep}element) {{ element }} else {{ "{BOX_REDACTED_VALUE}" }}' in source
+    assert f"}} else if !{keep}value) {{" in source
+    assert f'. = set!(., [field], "{BOX_REDACTED_VALUE}")' in source
+    assert source.count(f'"{BOX_REDACTED_VALUE}"') == 6
+    assert source.count(f'"{REDACTED_VALUE}"') == 2
+    # The one rule after it that reads an assignment keeps both markers.
+    assert _spelled(REDACTED_VALUE).replace(r"\x20", " ") in _API_KEY
+    assert _spelled(BOX_REDACTED_VALUE).replace(r"\x20", " ") in _API_KEY
+
+
+def test_the_credential_rule_runs_first_over_every_field_and_before_the_writer_check() -> None:
+    # Before the token-shape rules, so every credential-named assignment carries the one marker the
+    # NOC counts and each value is read as its writer wrote it; over every field, because a writer
+    # chooses far more of the record than its message; before the writer check, so a marked line is
+    # redacted as an unmarked one; after `_CMDLINE` is gone, which is never shipped at all. And
+    # unconditional: no identifier is exempt, the box layer exists for writers the fleet is not.
+    source = _scrub_source()
+    order = [
+        'del(."_CMDLINE")',
+        _CREDENTIAL_PASS,
+        _PARITY_OPEN,
+        _RUN_OPEN,
+        ". = scrubbed",
+        "for_each(scrubbed) -> |field, value| {",
+        _MESSAGE_READ,
+        _HEARTBEAT_PASS,
+        'if starts_with(ident, "basecradle-wake-")',
+    ]
+    at = [source.index(statement) for statement in order]
+    assert at == sorted(at), order
+    top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
+    field_check = 'if match(join!(keys(.), "\\n"), r\''
+    assert source.index(field_check) < source.index("for_each(scrubbed) -> |field, value| {")
+    for statement in (_CREDENTIAL_PASS, ". = scrubbed", field_check):
+        assert _statement_indent(source, statement) == top_level, statement
 
 
 def test_basecradle_integration_signing_keys_are_redacted() -> None:

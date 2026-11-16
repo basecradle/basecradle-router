@@ -2093,7 +2093,8 @@ Caddy, no database) and has three load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
    (the argv leak path) and from Vector itself (the self-logged-token path), **deletes the
-   `_CMDLINE` field from every event** (below), and **redacts**
+   `_CMDLINE` field from every event** (below), **redacts the value of every credential-named
+   assignment, in every field, to the box's marker** (below, basecradle-router#494), and **redacts**
    secret-shaped patterns (`github_pat_…`, `gh[a-z]_…`, `Bearer …`, `…/heartbeat/…`, `bc_uat_…`,
    `bc_isk_…`, and **provider API keys** — `sk-…` covering the whole
    `sk-ant-`/`sk-proj-`/`sk-or-v1-` family, plus `xai-…` (its run takes `_` and `-`, as the
@@ -2297,7 +2298,102 @@ the whole command line to the journal, and on a telemetry box that ships it. Pas
 > agent's `agent.env` is read *by the agent*, after the privilege drop, from a `0600` file it alone
 > can read — and `python -m basecradle_router probe wake` takes its BCNOC1 marker on **stdin, never
 > argv**. This scrub is the box-wide belt for every *other* program's braces.
->
+
+**Every credential-named assignment is redacted on the box, in every field, for every writer**
+(basecradle-router#494, @origin's decision recorded on basecradle#877). The print site redacts the
+lines the router renders (#491), and the harness its own; neither can reach a program they do not
+render (Caddy, the ASGI server's access line, a traceback, a shell script, anything else on the box).
+The box is the one place every writer passes, so `ai_scrub` carries the rule too:
+
+- **The definition is the NOC canary's** `credential_assignment` rule, never a list of the box's own:
+  a name is a credential's when it matches `[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=`.
+  `ai_scrub` spells it byte for byte (Rust's regex, under VRL, is linear, so the canary's own spelling
+  is safe), and `tests/test_log_surface.py` holds the VRL to the copy in `tests/conftest.py`
+  (`NOC_CREDENTIAL_ASSIGNMENT`), which the NOC's drift guard holds to the canary (basecradle-noc#1535).
+  A bare `PASSWORD=` and a lower-case name are not credential names to the canary, so they are not to
+  the box; the NOC measures both gaps and the capital decides.
+- **The name stays; the value becomes the box's marker, `'<a value the box redacted>'`.** A value is
+  a **shell word**, read as the print site's `logfmt.redact_credentials` (the reference) reads one
+  wherever a whole line allows: pieces up to a blank, a canary stop (`"`, `,`, `}`) or a record break,
+  each piece anywhere in the word: a backslash escape, a single-quoted, dollar-sign-quoted or
+  backquoted piece, a command substitution, a closed parenthesis, a JSON-escaped `\"…\"`, and every
+  bearer scheme word with its token. The print site reads one value; the box reads a whole line, so
+  **no piece ever crosses a bare `"`**, which on a JSON or logfmt line is the line's own (a request's
+  `'` never takes the rest of an access line). Two passes:
+  1. **Quote parity.** Whether a `"` opens a piece or closes the quoted value the assignment sits in
+     (`a="X_TOKEN=" b=1`) is the count of quotes before it in the record, as every fleet consumer
+     reads a line; a journal record is one record, so its quotes may span its lines. A name outside
+     every quote whose word holds a double-quoted piece has the whole word as its value
+     (`X_TOKEN="…"`, `X_TOKEN=abc"d e"`, `X_TOKEN=Y_TOKEN="…"`). Every other piece here must close:
+     one left open could reach a later `"` and eat the fields between.
+  2. **The run**, for every other value: a double-quoted value closed on its line before a word's
+     end, whatever the parity, so a stray quote earlier (an inch mark, a traceback's `'"'`) never
+     lets a quoted value through; then the word, its pieces allowed to stay open (each to its close
+     or to a bare `"` or a record break).
+
+  An empty value is left as it is, except right before a record break: the canary's run crosses a
+  break, so the marker stands between the `=` and the break, and nothing is taken.
+  **The patterns are generated.** VRL composes no pattern from parts, so each host's file spells
+  every piece out many times; `tests/credential_rule.py` writes each piece once, with what it reads,
+  writes the block into every host's file (`uv run python tests/credential_rule.py`), and the tests
+  hold every host's block to it byte for byte. Change the rule there.
+  **Where the box reads less than the print site, by design** (each named and pinned in
+  `tests/test_vector_unit.py`): the close of the quoted value an assignment sits in, a `,` or `}`, a
+  record break, and a single-quoted piece meeting a bare `"` all end a value; a substitution is read
+  one level deep, with no quote tracked inside it; a bare `(` left open is an ordinary character;
+  `\"` opens a JSON-escaped piece where a shell would read a literal quote; and a tab is part of a
+  word, as it is of the canary's run, where the print site takes the longer of the two readings. The
+  print site redacts a bearer scheme word alone and leaves its token; the box takes the token. One
+  shape both over-read: an empty assignment closing a quoted value, followed by a field whose own
+  value begins with a blank (`a="X_TOKEN=" b=" y"`), loses that field.
+  **Four properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
+  written): the canary reads nothing the box ships; no credential-named assignment the rule leaves
+  is followed by a value, by the rule's own reading of quotes; a quoted value closed before a word's
+  end goes whatever junk came before it, which holds that reading to account; and, on every
+  construct the two read alike, the box never leaves more of a fabricated secret than the print
+  site does.
+- **Every field, because a writer chooses far more of the record than its message:** the identifier,
+  the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
+  name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule
+  runs over every string in the event, a field sent more than once (a list) included, and a field whose
+  own name is a credential's (`DEPLOY_API_KEY` sent as a journal field) ships the marker as its whole
+  value (each of a list's), unless the value is empty or a marker already, so a source that sent its
+  own redaction is never counted as a leak. A number or a timestamp cannot carry one. `_CMDLINE` is deleted outright (above).
+- **It runs first**: after the `sudo`/Vector drops and the `_CMDLINE` deletion, before every
+  token-shape rule and before the writer check. Before the shape rules, so each value is read as its
+  writer wrote it and every credential-named assignment carries the one marker (after them,
+  `X_API_KEY=…` shipped as `X_apiKey=[REDACTED]` and `AUTH_TOKEN=Bearer …` as `AUTH_TOKEN=Bearer
+  [REDACTED]`, which nothing counts). Before the writer check, so a line marked `UNVERIFIED` is redacted
+  exactly as an unmarked one.
+- **A value the print site redacted passes untouched.** The print site's marker is `'<a redacted
+  value>'`, a source doing its job, and the box leaves it, and its own marker, as they are wherever the
+  canary's run would end after it, which is where both redactors end every value (anything glued to a
+  marker is read as a value with it, and goes): the
+  `api[-_]?key=` rule keeps both too (before #494 it read the print site's `'<a` as a value and shipped
+  `ANTHROPIC_apiKey=[REDACTED] redacted value>'`). Both markers are one shell word with a space at
+  their fourth character, so the canary reads `'<a` after the `=` and never matches.
+- **The marker is the NOC's counter, and it is stable.** The NOC counts `'<a value the box redacted>'`
+  per writer (identifier and host) as the signal that a source let a value through (basecradle-noc#1535).
+  Its bytes are a contract: a change to them, here or in any host's file, is a change to the NOC's
+  metric and moves only with it. It appears wherever the value stood: in `message`, and in any other
+  field that carried one (a credential-named field is the marker alone). An identifier that carried
+  one ships with the marker in `SYSLOG_IDENTIFIER` and in the `[identifier]` prefix alike, so read the
+  writer from the field: that prefix then holds spaces, the NOC's record prefix (`[^] ]*`) does not
+  read it as one, and no head on such a line is counted. It is never a fleet identifier, since none
+  holds an `=`. The counted fields of a real
+  line are lower-case names and never touched; `tests/vector/ai_credentials.yaml` pins real lines of
+  the store's grammar, `cached_tokens=` and `cache_write_tokens=` among them, byte for byte.
+- **Cost.** Measured on Vector 0.61.0 (M1, one thread, `stdin` → `ai_scrub` → `blackhole`, 200,000
+  fabricated journald records of 28 fields, the box's measured average): 82,728 records/s before,
+  35,927 after, about 16 µs more per record, nearly all of it VRL walking every field, not the
+  patterns. A field with no `=` skips both passes, one with no `"` skips the parity pass (without
+  that guard the parity pass alone took the rule to 16,345 records/s), and one pattern over the
+  record's field names decides whether any name is a credential's before a second walk. An
+  `ends_with` pre-check on each field name was slower than its one pattern (25,217).
+  `ai.basecradle.com` journals about 179,000 records a day (2026-11-16), so the rule costs a few
+  CPU-seconds a day there. The patterns are linear: `tests/test_vector_unit.py` runs them over
+  200,000-character adversarial texts.
+
 > **A merged change to this file is installed unattended, in the same tick that deploys it — but only
 > over a config the NOC itself shipped** (basecradle-noc#677 / #680). The router's own `drift-check.sh`
 > cannot see this file (it compares the *deploy stamp* against `origin/main`), so the whole path is the

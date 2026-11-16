@@ -15,6 +15,11 @@
 # writer check has its own suite, ai_writers.yaml, and the map both run against is the fabricated
 # one tests/test_vector_unit.py writes.
 #
+# An upper-case credential name (`AUTH_API_KEY=`, `XAI_MANAGEMENT_KEY=`) is the credential-named
+# assignment rule's since basecradle-router#494 (ai_credentials.yaml): it runs before every rule here,
+# so such a value ships as the box's marker. Where a case below tests an older rule's own reading of
+# a value, a lower-case twin on the same line keeps that reading tested.
+#
 # Every key is a fabricated, correctly shaped fake. No dollar sign anywhere in this file: Vector
 # interpolates environment variables across a test file just as it does across a config.
 
@@ -93,13 +98,13 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "failed: AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected | failed: auth_api_key=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc rejected"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] failed: AUTH_apiKey=[REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: AUTH_API_KEY='<a value the box redacted>' rejected | failed: auth_apiKey=[REDACTED] rejected")
 
   - name: "a heartbeat url after a bearer word redacts its secret"
     inputs:
@@ -273,7 +278,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] | AUTH_apiKey=[REDACTED] | GET /v1/models?apiKey=[REDACTED] HTTP/1.1")
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] | AUTH_API_KEY='<a value the box redacted>' | GET /v1/models?apiKey=[REDACTED] HTTP/1.1")
 
   - name: "a query key whose value is a bearer header redacts the token after the scheme"
     inputs:
@@ -349,14 +354,16 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          # The name is normalised and the value never ships, even for a provider no prefix rule knows.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "STEEL_API_KEY=novaOpaqueFabricatedValue0001 ANTHROPIC_API_KEY=sk-ant-0000000000000000000000000000000000000000"}
+          # The value never ships, even for a provider no prefix rule knows. An upper-case name is the
+          # credential rule's, which keeps the name; the lower-case twin keeps the assignment rule's own
+          # reading tested, which normalises the name.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "STEEL_API_KEY=novaOpaqueFabricatedValue0001 ANTHROPIC_API_KEY=sk-ant-0000000000000000000000000000000000000000 | steel_api_key=novaOpaqueFabricatedValue0001"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] STEEL_apiKey=[REDACTED] ANTHROPIC_apiKey=[REDACTED]")
+              assert_eq!(.message, "[basecradle-router] STEEL_API_KEY='<a value the box redacted>' ANTHROPIC_API_KEY='<a value the box redacted>' | steel_apiKey=[REDACTED]")
 
   # --- a vendor prefix inside a word is a word -------------------------------------------------
 
@@ -784,7 +791,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-wake-nova] XAI_MANAGEMENT_KEY=[REDACTED_API_KEY] | balance lookup with [REDACTED_API_KEY] failed | xai said {\"error\":\"Incorrect API key provided: [REDACTED_API_KEY]\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"[REDACTED_API_KEY]\\\"}\"")
+              assert_eq!(.message, "[basecradle-wake-nova] XAI_MANAGEMENT_KEY='<a value the box redacted>' | balance lookup with [REDACTED_API_KEY] failed | xai said {\"error\":\"Incorrect API key provided: [REDACTED_API_KEY]\",\"code\":\"invalid_api_key\"} | body=\"{\\\"key\\\":\\\"[REDACTED_API_KEY]\\\"}\"")
 
   - name: "a wide xai run keeps the word rule and takes a key glued after it"
     inputs:
@@ -873,13 +880,13 @@ tests:
         type: "vrl"
         source: |
           # Before the fix the value could not start at the quote, so the rule matched nothing.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "loaded NOVA_API_KEY=\"novaOpaqueFabricatedValue0001\" from env"}
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "loaded NOVA_API_KEY=\"novaOpaqueFabricatedValue0001\" from env | loaded nova_api_key=\"novaOpaqueFabricatedValue0001\" from env"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] loaded NOVA_apiKey=[REDACTED]\" from env")
+              assert_eq!(.message, "[basecradle-router] loaded NOVA_API_KEY='<a value the box redacted>' from env | loaded nova_apiKey=[REDACTED]\" from env")
 
   - name: "a bearer header glued to an api-key value goes with it"
     inputs:
@@ -894,7 +901,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] AUTH_apiKey=[REDACTED] | GET /v1?apiKey=[REDACTED] HTTP/1.1 | GET /v1?token=KBearer [REDACTED] HTTP/1.1")
+              assert_eq!(.message, "[basecradle-router] AUTH_API_KEY='<a value the box redacted>' | GET /v1?apiKey=[REDACTED] HTTP/1.1 | GET /v1?token=KBearer [REDACTED] HTTP/1.1")
 
   # --- harness 0.186.0: a heartbeat URL never takes a kv value's closing quote (basecradle-router#423)
 
