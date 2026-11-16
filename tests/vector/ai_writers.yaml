@@ -126,6 +126,34 @@ tests:
               assert_eq!(.message, "[verify-recovery.sh] RECOVERY OK")
               assert_eq!(.SYSLOG_IDENTIFIER, "verify-recovery.sh")
 
+  - name: "the operator's stop written as root is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router-stop-wake", "_UID": "0", "_COMM": "stop-wake", "_SYSTEMD_UNIT": "session-46.scope", "message": "event=wake_stop_requested delivery=0192f3a4-5b6c-7d8e-9f01-00000000000b agent=nova by=john signal=TERM pids=3"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router-stop-wake] event=wake_stop_requested delivery=0192f3a4-5b6c-7d8e-9f01-00000000000b agent=nova by=john signal=TERM pids=3")
+              assert_eq!(.SYSLOG_IDENTIFIER, "basecradle-router-stop-wake")
+
+  - name: "the NOC's deploy runner written as root is kept as it is"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "fleet-deploy-runner", "_UID": "0", "_COMM": "bash", "_SYSTEMD_UNIT": "basecradle-scratch-cleanup@nova.service", "message": "event=scratch_sweep agent=nova removed=0"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[fleet-deploy-runner] event=scratch_sweep agent=nova removed=0")
+              assert_eq!(.SYSLOG_IDENTIFIER, "fleet-deploy-runner")
+
   - name: "a line under an identifier no column trusts is kept as it is, whoever wrote it"
     inputs:
       - insert_at: "ai_scrub"
@@ -332,3 +360,45 @@ tests:
           - type: "vrl"
             source: |
               assert_eq!(.message, "[unverified-basecradle-wake-] UNVERIFIED uid=0 INFO wake end outcome=ok")
+
+  - name: "a login session writing under the deploy runner's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "fleet-deploy-runner", "_UID": "1000", "_COMM": "logger", "_SYSTEMD_UNIT": "session-47.scope", "message": "event=scratch_sweep agent=nova removed=0"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-fleet-deploy-runner] UNVERIFIED uid=1000 event=scratch_sweep agent=nova removed=0")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-fleet-deploy-runner")
+
+  - name: "an agent writing under the operator's stop identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router-stop-wake", "_UID": "1001", "_COMM": "systemd-cat", "message": "event=wake_stop_requested delivery=0192f3a4-5b6c-7d8e-9f01-00000000000b agent=nova by=john signal=TERM pids=3"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-basecradle-router-stop-wake] UNVERIFIED uid=1001 event=wake_stop_requested delivery=0192f3a4-5b6c-7d8e-9f01-00000000000b agent=nova by=john signal=TERM pids=3")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-basecradle-router-stop-wake")
+
+  - name: "the router's account writing under the deploy runner's identifier is marked"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "fleet-deploy-runner", "_UID": "999", "_SYSTEMD_UNIT": "basecradle-router.service", "message": "event=scratch_sweep agent=nova removed=0"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[unverified-fleet-deploy-runner] UNVERIFIED uid=999 event=scratch_sweep agent=nova removed=0")
+              assert_eq!(.SYSLOG_IDENTIFIER, "unverified-fleet-deploy-runner")

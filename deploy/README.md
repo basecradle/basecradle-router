@@ -2218,13 +2218,16 @@ under that agent's name, and a well-formed contract line written that way was co
 like a real one (basecradle-noc#1518). The kernel vouches for `_UID`, so `ai_scrub` checks it:
 
 - **The fleet identifiers** are every `basecradle-wake-<agent>` and `basecradle-router`,
-  `basecradle-log-grammar` and `verify-recovery.sh`: the names a NOC column trusts to say who wrote a
-  line. Every other identifier is shipped as before.
+  `basecradle-log-grammar`, `verify-recovery.sh`, `basecradle-router-stop-wake` and
+  `fleet-deploy-runner`: the names a NOC column trusts to say who wrote a line, the last two because
+  their lines carry ` agent=`. Every other identifier is shipped as before.
 - **The writer map**, `/etc/vector/fleet-writers.csv` (root:vector 0640), lists which UIDs may write
   under each: the agent's own account and root (the `runuser` messages) on its wake stream; every
   registered agent for the grammar probe, which the NOC runs as each agent; the `router` account for
-  the daemon's own identifier and the recovery check's. These are exactly the writers the look-back
-  over everything the store holds found real.
+  the daemon's own identifier and the recovery check's; root alone for the operator's stop
+  (`stop-wake` refuses any other account before it writes a line) and the NOC's deploy runner (the
+  scratch-sweep units, all root). These are exactly the writers the look-back over everything the store
+  holds found real.
 - **A line under a fleet identifier whose `_UID` the map does not list for it** (a login session, one
   agent under another's name, root under the daemon's name, a line with no `_UID`) is **kept and
   marked, never dropped and never counted**: `UNVERIFIED uid=<n> ` (`uid=none` when it carries none)
@@ -2246,13 +2249,14 @@ like a real one (basecradle-noc#1518). The kernel vouches for `_UID`, so `ai_scr
 - **Fail directions.** A writer the map does not list only ever has its lines marked, which is loud,
   never counted. **At Vector's start the map must exist** (measured on 0.61.0, and `vector validate
   --no-environment` passes without it), so no failure ever leaves a box with none: an unreadable
-  registry or a missing `router` account leaves the map in place, and where there is none it writes the
-  header alone, which loads and vouches for no one, so every fleet line is marked and the box keeps
-  shipping. An entry naming no account, or one below the floor, is left out and named. Each of these
-  fails the unit, which never holds the daemon or Vector (`Wants=`). A map whose bytes are current but
-  whose owner, group or mode is not is rewritten. On a reload, a missing or unreadable map keeps the
-  table Vector holds. The writer queues a reload only of a Vector that is running (`try-`), so it never
-  starts one someone stopped; a Vector that is down starts on a fresh map through the drop-in.
+  registry or a fixed writer's missing account (`router`, `root`) leaves the map in place, and where
+  there is none it writes the header alone, which loads and vouches for no one, so every fleet line is
+  marked and the box keeps shipping. An entry naming no account, or one below the floor, is left out and
+  named. Each of these fails the unit, which never holds the daemon or Vector (`Wants=`). A map whose
+  bytes are current but whose owner, group or mode is not is rewritten. On a reload, a missing or
+  unreadable map keeps the table Vector holds. The writer queues a reload only of a Vector that is
+  running (`try-`), so it never starts one someone stopped; a Vector that is down starts on a fresh map
+  through the drop-in.
 - **An account whose UID moves without a registry change** keeps its old row until the daemon or
   Vector next starts, and its lines are marked meanwhile; `systemctl start
   basecradle-router-writers.service` rebuilds the map at once.

@@ -44,10 +44,12 @@ def test_every_legitimate_writer_is_listed_and_nothing_else() -> None:
         ("basecradle-log-grammar", 1001),
         ("basecradle-log-grammar", 1002),
         ("basecradle-router", 999),
+        ("basecradle-router-stop-wake", 0),
         ("basecradle-wake-basecradle-nova-ai", 0),
         ("basecradle-wake-basecradle-nova-ai", 1002),
         ("basecradle-wake-nova", 0),
         ("basecradle-wake-nova", 1001),
+        ("fleet-deploy-runner", 0),
         ("verify-recovery.sh", 999),
     ]
 
@@ -58,12 +60,25 @@ def test_a_login_account_is_never_a_writer_of_anything() -> None:
     assert all(identifier != "basecradle-wake-john" for identifier, _ in found)
 
 
-def test_root_writes_only_on_a_wake_stream() -> None:
+def test_root_writes_only_on_a_wake_stream_and_under_its_own_two() -> None:
     found, _ = _rows()
     assert {identifier for identifier, uid in found if uid == 0} == {
         "basecradle-wake-nova",
         "basecradle-wake-basecradle-nova-ai",
+        "basecradle-router-stop-wake",
+        "fleet-deploy-runner",
     }
+
+
+def test_root_is_the_only_writer_of_its_own_two_whatever_the_registry_holds() -> None:
+    # The operator's stop and the NOC's deploy runner write only as root (basecradle-noc#1518's
+    # look-back), so no agent, the router or a login is ever listed under either, and an empty
+    # registry lists root under both all the same.
+    for registry in (REGISTRY, {}):
+        found, _ = _rows(registry=registry)
+        for identifier in ("basecradle-router-stop-wake", "fleet-deploy-runner"):
+            assert fw.FIXED_WRITERS[identifier] == fw.ROOT_ACCOUNT
+            assert [uid for name, uid in found if name == identifier] == [0]
 
 
 def test_one_agent_is_never_listed_under_another_agents_wake() -> None:
@@ -83,7 +98,7 @@ def test_the_map_follows_a_moved_uid() -> None:
 def test_two_entries_sharing_an_account_give_one_row_each() -> None:
     # `get`-style lookups refuse a duplicate match; the map never holds one.
     found, _ = _rows(registry={**REGISTRY, "nova-again": {"os_user": "nova"}})
-    assert len(found) == len(set(found)) == 8
+    assert len(found) == len(set(found)) == 10
 
 
 @pytest.mark.parametrize(
@@ -214,7 +229,7 @@ def box(tmp_path: Path, monkeypatch):
 def test_a_run_that_changed_the_map_queues_one_reload(box, capsys) -> None:
     _, dest, reloads = box
     assert fw.main() == 0
-    assert reloads == ["reload"] and dest.read_text().count("\n") == 6
+    assert reloads == ["reload"] and dest.read_text().count("\n") == 8
     assert "Vector reload queued" in capsys.readouterr().out
 
 
@@ -274,7 +289,8 @@ def test_the_router_account_is_the_one_the_units_run_as() -> None:
 
 def test_the_daemons_identifier_is_one_the_map_vouches_for() -> None:
     assert _directive(DAEMON_UNIT, "SyslogIdentifier") == ["basecradle-router"]
-    assert "basecradle-router" in fw.ROUTER_IDENTIFIERS
+    assert fw.FIXED_WRITERS["basecradle-router"] == fw.ROUTER_ACCOUNT
+    assert fw.FIXED_WRITERS["verify-recovery.sh"] == fw.ROUTER_ACCOUNT
     # verify-recovery.sh logs under its script's name, the unit's ExecStart.
     assert _directive(RECOVERY_UNIT, "ExecStart")[0].endswith("/verify-recovery.sh")
 
@@ -282,6 +298,16 @@ def test_the_daemons_identifier_is_one_the_map_vouches_for() -> None:
 def test_the_wake_identifier_is_the_one_wake_runner_writes() -> None:
     wake_runner = (REPO / "deploy" / "bin" / "wake-runner").read_text()
     assert f'journal_tag="{fw.WAKE_PREFIX}$user"' in wake_runner
+
+
+def test_the_stop_identifier_is_the_one_stop_wake_writes_and_only_root_reaches_it() -> None:
+    stop_wake = (REPO / "deploy" / "bin" / "stop-wake").read_text()
+    assert '\nIDENT = "basecradle-router-stop-wake"\n' in stop_wake
+    assert fw.FIXED_WRITERS["basecradle-router-stop-wake"] == fw.ROOT_ACCOUNT
+    # It refuses any account but root before it opens the journal, so root is its only writer.
+    refusal = stop_wake.index("if os.geteuid() != 0:")
+    assert refusal < stop_wake.index("syslog.openlog(IDENT")
+    assert stop_wake.count("syslog.openlog(") == 1
 
 
 def test_the_grammar_probe_identifier_is_one_the_map_vouches_for() -> None:
@@ -309,7 +335,7 @@ def test_the_writer_runs_as_root_from_the_root_owned_helpers_and_before_vector()
 def test_the_writer_logs_under_a_name_no_column_trusts() -> None:
     (identifier,) = _directive(WRITER_UNIT, "SyslogIdentifier")
     assert not identifier.startswith(fw.WAKE_PREFIX)
-    assert identifier not in (fw.LOG_GRAMMAR, *fw.ROUTER_IDENTIFIERS)
+    assert identifier not in (fw.LOG_GRAMMAR, *fw.FIXED_WRITERS)
 
 
 def test_the_script_is_executable_and_runs_isolated() -> None:
@@ -328,9 +354,32 @@ def test_every_host_vets_exactly_the_identifiers_the_map_vouches_for(host: str) 
     )
     prefix, exact = check
     assert prefix == fw.WAKE_PREFIX
-    assert sorted(re.findall(r'"([^"]+)"', exact)) == sorted(
-        (fw.LOG_GRAMMAR, *fw.ROUTER_IDENTIFIERS)
-    )
+    assert sorted(re.findall(r'"([^"]+)"', exact)) == sorted((fw.LOG_GRAMMAR, *fw.FIXED_WRITERS))
+
+
+def _bullet(path: Path, lead: str) -> str:
+    """The one markdown bullet in `path` that starts with `lead`, joined onto one line."""
+    text = path.read_text()
+    start = text.index(lead)
+    end = text.find("\n- ", start)
+    return " ".join(text[start : end if end != -1 else None].split())
+
+
+@pytest.mark.parametrize(
+    ("doc", "lead"),
+    [
+        ("CLAUDE.md", "- **Every line under a fleet identifier is bound to its writer**"),
+        ("deploy/README.md", "- **The fleet identifiers**"),
+    ],
+)
+def test_the_prose_names_exactly_the_identifiers_the_map_vouches_for(doc: str, lead: str) -> None:
+    # The prose is where a session learns which names are bound; a name added in code and not
+    # here is a writer nobody knows to list.
+    bullet = _bullet(REPO / doc, lead)
+    named = set(re.findall(r"`([a-z][a-z0-9.-]*)`", bullet)) - {"fleet-writers"}
+    named = {name for name in named if not name.startswith("basecradle-wake")}
+    assert named == {fw.LOG_GRAMMAR, *fw.FIXED_WRITERS}, bullet
+    assert f"`{fw.WAKE_PREFIX}" in bullet
 
 
 # --- the review's fail directions (#484) ----------------------------------------------------------

@@ -20,7 +20,11 @@ WHAT IT WRITES, one `identifier,uid` row per writer the look-back found real (ba
     a builder's `claude` and its stream translator, Steel, all as the agent);
   * `basecradle-wake-<os_user>`, `0`: root, for the `runuser` messages on the wake's stream;
   * `basecradle-log-grammar`, each registered agent's UID (the NOC's grammar probe);
-  * `basecradle-router` and `verify-recovery.sh`, the router's own account (`router`).
+  * each identifier one fixed account writes under (`FIXED_WRITERS`), that account:
+    `basecradle-router` and `verify-recovery.sh`, the router's own account (`router`);
+    `basecradle-router-stop-wake` and `fleet-deploy-runner`, root alone (`stop-wake` refuses any
+    other account before it writes a line, and the NOC's deploy runner and the units that run its
+    scratch sweeps write only as root).
 
 THE INPUTS ARE THE BOX'S OWN. The registry is `/etc/basecradle-router/agents.json` (root-owned, the
 wake-runner's trusted allowlist; this reads it and never writes it), and each account's UID comes
@@ -32,9 +36,9 @@ FAIL DIRECTIONS. A map that is missing a real writer only ever MARKS that writer
 loud (the `Unverified Log Writer` alarm), and never counts a forged one. A box with NO map is worse
 than either: Vector cannot start without the file, and every line stops shipping. So:
 
-  * an unreadable or malformed registry, or a missing router account, leaves the map in place as
-    it was and exits 1; when there is no map at all, it writes the header alone, which loads and
-    vouches for no one, so every fleet line is marked and the box keeps shipping;
+  * an unreadable or malformed registry, or a fixed writer's missing account, leaves the map in
+    place as it was and exits 1; when there is no map at all, it writes the header alone, which
+    loads and vouches for no one, so every fleet line is marked and the box keeps shipping;
   * a registry entry whose `os_user` is malformed, has no account, or has a UID below wake-runner's
     floor (`MIN_UID`: wake-runner never wakes such an account, so it is never a real writer) is left
     out, the rest is written, and the run exits 1, naming the entry;
@@ -84,7 +88,18 @@ VECTOR_SERVICE = "vector.service"
 #: prefix), and tests/test_fleet_writers.py pins the two lists to each other.
 WAKE_PREFIX = "basecradle-wake-"
 LOG_GRAMMAR = "basecradle-log-grammar"
-ROUTER_IDENTIFIERS = ("basecradle-router", "verify-recovery.sh")
+#: Every identifier one fixed account writes under, and that account, resolved to its UID on the
+#: box like every other row: the daemon and its recovery check, as `router`; the operator's stop
+#: (`deploy/bin/stop-wake`, which refuses to run as anyone else) and the NOC's deploy runner
+#: (basecradle-noc#1518's look-back: root on every line the store holds), as root. The last two
+#: carry ` agent=` on their lines, which is why they are vetted at all.
+ROOT_ACCOUNT = "root"
+FIXED_WRITERS = {
+    "basecradle-router": ROUTER_ACCOUNT,
+    "verify-recovery.sh": ROUTER_ACCOUNT,
+    "basecradle-router-stop-wake": ROOT_ACCOUNT,
+    "fleet-deploy-runner": ROOT_ACCOUNT,
+}
 
 #: Root: a writer on every wake stream (the `runuser` messages), and the map's owner.
 ROOT_UID = 0
@@ -111,10 +126,12 @@ def rows(
 
     `uid_of` returns an account's UID, or None when the box has no such account.
     """
-    router_uid = uid_of(ROUTER_ACCOUNT)
-    if router_uid is None:
-        raise MapError(f"the router's own account {ROUTER_ACCOUNT!r} does not exist")
-    found: set[tuple[str, int]] = {(identifier, router_uid) for identifier in ROUTER_IDENTIFIERS}
+    found: set[tuple[str, int]] = set()
+    for identifier, account in FIXED_WRITERS.items():
+        uid = uid_of(account)
+        if uid is None:
+            raise MapError(f"{identifier}'s writer, the account {account!r} does not exist")
+        found.add((identifier, uid))
     left_out: list[str] = []
     for key, entry in registry.items():
         os_user = entry.get("os_user") if isinstance(entry, dict) else None
