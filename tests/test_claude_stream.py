@@ -671,3 +671,39 @@ def test_a_main_thread_failure_closes_the_call_it_ended() -> None:
     )
     assert [line["outcome"] for line in llm_lines(out)] == ["failed"]
     assert any("matched no open model call" in line for line in out)
+
+
+def test_the_box_shape_reconciles_against_claude_codes_alias() -> None:
+    # The box: Claude Code 2.1.286 (no message ids on stream events) running the 1M-context
+    # alias, which Claude Code's `modelUsage` names `claude-opus-5-5[1m]` and the API's message
+    # names `claude-opus-5-5`. The first real builder wakes (2026-11-16) had both.
+    def alias(event: dict[str, Any]) -> None:
+        event.pop("api_message_id", None)
+        if event["type"] == "result":
+            usage = event["modelUsage"]
+            usage["claude-opus-5-5[1m]"] = usage.pop("claude-opus-5-5")
+
+    out = translate(rewrite("tools", alias))
+    assert len(llm_lines(out)) == 4
+    assert not [line for line in out if "billed" in line or "could not place" in line]
+
+
+def test_a_stated_canonical_model_is_the_one_reconciled() -> None:
+    def named(event: dict[str, Any]) -> None:
+        if event["type"] == "result":
+            usage = event["modelUsage"]
+            figures = usage.pop("claude-opus-5-5")
+            usage["opus-alias"] = figures | {"canonicalModel": "claude-opus-5-5"}
+
+    assert not [line for line in translate(rewrite("tools", named)) if "billed" in line]
+
+
+def test_an_alias_on_the_streams_own_message_is_reconciled_too() -> None:
+    # The other direction: the call names the alias or a snapshot, Claude Code's total the id.
+    def alias(event: dict[str, Any]) -> None:
+        if event["type"] == "stream_event" and event["event"]["type"] == "message_start":
+            event["event"]["message"]["model"] = "claude-opus-5-5[1m]"
+
+    out = translate(rewrite("tools", alias))
+    assert {line["model"] for line in llm_lines(out)} == {"claude-opus-5-5[1m]"}
+    assert not [line for line in out if "billed" in line]

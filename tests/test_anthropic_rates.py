@@ -120,3 +120,19 @@ def test_a_dated_snapshot_is_priced_as_the_id_it_pins() -> None:
 @pytest.mark.parametrize("usage", [None, {}, {"input_tokens": -1}, {"output_tokens": True}, []])
 def test_usage_that_states_no_counts_is_none(usage) -> None:
     assert rates.usage_of(usage) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "id"),
+    [
+        ("claude-opus-5-5[1m]", "claude-opus-5-5"),
+        ("Claude-Opus-5-5", "claude-opus-5-5"),
+        ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+        ("claude-opus-5-5", "claude-opus-5-5"),
+    ],
+)
+def test_a_model_is_priced_under_its_plain_id(model: str, id: str) -> None:
+    # Claude Code's alias carries a context-window marker the API's message does not, and every
+    # current model is priced flat across its whole window, so the marker changes no rate.
+    assert rates.canonical(model) == id
+    assert rates.call_price(model, USAGE) == rates.call_price(id, USAGE)

@@ -517,7 +517,8 @@ class Translator:
     # --- model calls ---------------------------------------------------------------------------
 
     def _ledger_for(self, model: str) -> _Ledger:
-        return self._ledger.setdefault(model, _Ledger())
+        """One model's ledger, under the id Claude Code and the API both reduce it to."""
+        return self._ledger.setdefault(rates.canonical(model), _Ledger())
 
     def _unpriced(self, model: str, charge: str, reason: str) -> None:
         """The contract's ``cost unpriced`` WARNING, once per wake per gap."""
@@ -806,7 +807,10 @@ class Translator:
             for key in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
         )
         output = rates.count(figures.get("outputTokens")) or 0
-        mine = self._ledger.get(model, _Ledger())
+        named = figures.get("canonicalModel")
+        mine = self._ledger.get(
+            rates.canonical(named if isinstance(named, str) and named else model), _Ledger()
+        )
         if (prompt, output) == (mine.prompt, mine.output) and not mine.unitemized:
             if mine.unpriced or abs(stated - mine.cost) < 5e-7:
                 return
