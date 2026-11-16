@@ -80,7 +80,9 @@ def _signature(nonce: str, secret: str) -> str:
 
 def main(argv: list[str]) -> int:
     if not 1 <= len(argv) <= 2:
-        print(f"probe-ack: usage: probe-ack '{SCHEME} <nonce> <hmac>' [would-exec]", file=sys.stderr)
+        print(
+            f"probe-ack: usage: probe-ack '{SCHEME} <nonce> <hmac>' [would-exec]", file=sys.stderr
+        )
         return EXIT_UNPROVABLE
     marker = argv[0]
     would_exec = argv[1] if len(argv) > 1 else "(unknown)"

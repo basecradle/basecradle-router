@@ -12,7 +12,8 @@ each host's `vector.yaml`, keeps a line under a fleet identifier as it is only w
 one this map lists for that identifier, and marks every other one `UNVERIFIED uid=<n>` under a
 renamed identifier, which no column counts. Only the box knows its accounts' UIDs, so the map is
 built here, on the box, from the box's own registry; it is never transcribed by hand, because a
-UID moves when an account is provisioned again (the router's own UID has already moved once on a fleet box, 999 -> 995).
+UID moves when an account is provisioned again (the router's own UID has already moved once on a
+fleet box, 999 -> 995).
 
 WHAT IT WRITES, one `identifier,uid` row per writer the look-back found real (basecradle-noc#1518):
 
@@ -50,12 +51,11 @@ ordered before vector.service, and a reload it waited for would wait on this ver
 changed nothing reloads nothing.
 
 THE FILE. `/etc/vector/fleet-writers.csv`, root:vector 0640, beside the config that reads it: Vector
-reads it through its group, as it reads `vector.yaml`. A map whose bytes are current but whose owner,
-group or mode is not is rewritten, because an allowlist another account can edit is no allowlist. It
-is replaced whole, by a rename from one
-fixed-name temp slot in the same directory (`.fleet-writers.csv.tmp`), which every run removes
-whether it succeeds or fails; a run killed in between leaves that one slot, and the next run
-replaces it.
+reads it through its group, as it reads `vector.yaml`. A map whose bytes are current but whose
+owner, group or mode is not is rewritten, because an allowlist another account can edit is no
+allowlist. It is replaced whole, by a rename from one fixed-name temp slot in the same directory
+(`.fleet-writers.csv.tmp`), which every run removes whether it succeeds or fails; a run killed in
+between leaves that one slot, and the next run replaces it.
 """
 
 from __future__ import annotations
@@ -231,7 +231,9 @@ def main() -> int:
             # No map at all would keep Vector from starting. One that vouches for no one loads, and
             # marks every fleet line, which is loud and counts nothing.
             install(HEADER, MAP, TEMP, MAP_OWNER, gid)
-            print(f"fleet-writers: {exc}; wrote an empty map: every fleet line is marked UNVERIFIED")
+            print(
+                f"fleet-writers: {exc}; wrote an empty map: every fleet line is marked UNVERIFIED"
+            )
         return 1
     for entry in left_out:
         print(f"fleet-writers: left out {entry}; its lines will be marked UNVERIFIED")
@@ -240,9 +242,13 @@ def main() -> int:
     if not changed:
         print(f"fleet-writers: {MAP} is current ({len(found)} rows, {agents} agents)")
     elif reload_vector():
-        print(f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload queued")
+        print(
+            f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload queued"
+        )
     else:
-        print(f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload FAILED")
+        print(
+            f"fleet-writers: wrote {MAP} ({len(found)} rows, {agents} agents); Vector reload FAILED"
+        )
         return 1
     return 1 if left_out else 0
 
