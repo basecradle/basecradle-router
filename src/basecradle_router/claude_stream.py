@@ -262,7 +262,12 @@ class Translator:
         except ValueError:
             self.write(text)
             return
+        except RecursionError:  # nested past the parser's depth: JSON nobody can read here
+            self.unreadable += 1
+            return
         if not isinstance(event, dict):
+            # Valid JSON but no event (a bare number, `null`, a list): plain stdout, as above.
+            self.write(text)
             return
         try:
             self._dispatch(event, now)
@@ -499,10 +504,14 @@ class Translator:
             outcome="refused" if refused else "ok",
             generation_id=call.request_id,
         )
-        self._server_tools(raw, call.request_id)
+        self._server_tools(call.model, raw, call.request_id)
 
-    def _server_tools(self, usage: Mapping[str, Any], request_id: str | None) -> None:
-        """One ``tool executor=server`` line per server-side tool the call used, after its call."""
+    def _server_tools(self, model: str, usage: Mapping[str, Any], request_id: str | None) -> None:
+        """One ``tool executor=server`` line per server-side tool the call used, after its call.
+
+        The per-search fee joins the model's ledger, because Claude Code's ``costUSD`` for the
+        model includes it: left out, every wake that searched would read as a stale rate.
+        """
         block = usage.get("server_tool_use")
         if not isinstance(block, Mapping):
             return
@@ -510,7 +519,10 @@ class Translator:
         if searches:
             price = rates.web_search_price(searches, base_url=self.base_url)
             if price.cost is None:
-                self._unpriced(self.model or "", "search", price.gap or rates.NOT_REPORTED)
+                self._unpriced(model, "search", price.gap or rates.NOT_REPORTED)
+                self._ledger_for(model).unpriced += 1
+            else:
+                self._ledger_for(model).cost += price.cost
             self.write(
                 "INFO tool "
                 + log_fields(

@@ -21,8 +21,8 @@
 # must be exactly `claude -p <trigger>`, and the wrapper completes it itself: as the agent it
 # runs
 #
-#   claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
-#       | python3 -I /opt/basecradle-router/bin/claude-stream-translate
+#   exec claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
+#       > >(python3 -I /opt/basecradle-router/bin/claude-stream-translate <claude's pid>)
 #
 # so Claude Code's own structured output is turned into the telemetry contract's lines, written
 # into the builder's journal stream beside its reply, under the builder's own identifier. The
@@ -374,10 +374,14 @@ github)
 		die "refusing: command must be the bare word 'claude', got '$1'"
 	# And nothing but `-p <trigger>` after it (#481). Before the pipe, the rest of the argv passed
 	# through uninspected; now the wrapper adds the stream flags itself, so the caller's whole say
-	# is the trigger, and a flag slipped in beside it is refused rather than run.
+	# is the trigger, and a flag slipped in beside it is refused rather than run. So is a trigger
+	# that is itself an option: claude would parse `-p --mcp-config=<file>` as a flag, not a prompt.
 	[[ -n $probe ]] ||
 		[[ $# -eq 3 && "$2" == -p ]] ||
 		die "refusing: a builder's command must be exactly 'claude -p <trigger>' ($# words given)"
+	[[ -n $probe ]] ||
+		[[ "$3" != -* ]] ||
+		die "refusing: a builder's trigger may not begin with '-' (claude would read it as an option)"
 	launch_bin="$(PATH="$TRUSTED_PATH" command -v claude)" || die "claude not found on the trusted PATH"
 	if [[ -z $probe ]]; then
 		# The pipe's other end, resolved the same way: at a fixed root-owned path or off the trusted
@@ -562,37 +566,37 @@ AGENT_SCRIPT='
 	stream_python=$1 stream_translate=$2 stream_jq=$3 stream_cat=$4
 	shift 4
 	# >>> run_stream >>>
-	# A builder wake (#481): its claude piped into the stream translator, both as the agent.
-	# The exit status is the one claude exits with, always: the translator never decides it.
+	# A builder wake (#481): its claude, exec-ed as every wake is, its stdout a pipe into the stream
+	# translator, both as the agent. The exec is the point. runuser`s child is claude itself, so a
+	# stop is what it always was: runuser relays its TERM to claude, gives it 2 s, SIGKILLs it, and
+	# only then re-raises, so the router never reads a wake as over while its claude still runs.
+	# The exit status is claude`s, by construction, and the wake ends when claude ends: nothing
+	# that holds the pipe open afterwards can hold the wake.
 	#
-	# The translator never stops reading before the stream ends, so claude never blocks on a full
-	# pipe, or dies of SIGPIPE, because its reader went away. If the translator exits non-zero
-	# anyway (it could not load, or it crashed), the rest of the stream is still read: jq writes
-	# the reply from the final `result` line, exactly where the reply always went, and should jq
-	# fail too, cat drains what is left. The wake runs on either way. What is lost is telemetry:
-	# the lines of whatever the translator had read and not yet written, and of every line after
-	# it stopped; and the reply too, only if the final `result` line was already in its read
-	# buffer when it died. The reason is on stderr, in the same journal.
+	# The translator is passed claude`s pid ($$, which the exec hands to claude), so when claude is
+	# gone and the pipe has gone quiet it finishes, rather than wait on a leftover process that
+	# still holds the write end. It never stops reading before then, so claude never blocks on a
+	# full pipe, or dies of SIGPIPE, because its reader went away. If it exits non-zero anyway (it
+	# could not load, or it crashed), the rest of the stream is still read: jq writes the reply
+	# from the final `result` line, exactly where the reply always went, and should jq fail too,
+	# cat drains what is left. The wake runs on either way. What is lost is telemetry: the lines of
+	# whatever the translator had read and not yet written, and of every line after it stopped; and
+	# the reply too, only if the final `result` line was already in its read buffer when it died.
+	# The reason is on stderr, in the same journal.
 	#
-	# Under a stop, runuser signals THIS shell, and stop-wake signals claude and the translator
-	# directly (everything beneath runuser`s child gets its own TERM). The shell dies of it; the
-	# translator records it and reads on until claude has exited, so its last lines still land.
+	# Under a stop, stop-wake signals the translator directly (everything beneath runuser`s child
+	# gets its own TERM); it records the signal and reads on until claude has exited, so its last
+	# lines still land.
 	run_stream() {
-		local python=$1 translate=$2 jq=$3 cat=$4 status
+		local python=$1 translate=$2 jq=$3 cat=$4
 		shift 4
-		set +e
-		"$@" | {
-			"$python" -I "$translate"
-			translated=$?
-			if [[ $translated -ne 0 ]]; then
-				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$translated" >&2
+		exec "$@" > >(
+			"$python" -I "$translate" "$$" || {
+				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$?" >&2
 				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings" ||
 					"$cat" >/dev/null
-			fi
-		}
-		status=${PIPESTATUS[0]}
-		set -e
-		return "$status"
+			}
+		)
 	}
 	# <<< run_stream <<<
 	if [[ -z $stream_translate ]]; then

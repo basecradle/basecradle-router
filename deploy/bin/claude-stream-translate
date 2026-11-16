@@ -6,8 +6,8 @@ NOC's deploy, like every `deploy/bin/*` helper. `wake-runner` runs it AS THE BUI
 privilege drop, with the python3 it resolved off its trusted PATH, on the read end of the pipe the
 builder's `claude` writes its stream into (basecradle-router#481):
 
-    claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \\
-        | python3 -I /opt/basecradle-router/bin/claude-stream-translate
+    exec claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \\
+        > >(python3 -I /opt/basecradle-router/bin/claude-stream-translate <claude's pid>)
 
 Its stdout and stderr are the journal stream wake-runner opened for the builder
 (`basecradle-wake-<os_user>`), so its lines land under the builder's identity exactly as the
@@ -33,7 +33,14 @@ translated as it arrives. A stop's SIGTERM (stop-wake signals everything beneath
 does not end it: the signal is recorded and reading continues to the end of the stream, which comes
 when `claude` exits, so the lines a stop leaves behind still land. A journal that stops accepting
 writes stops the writing, never the reading: `claude` must never block or die on a full pipe
-because its reader went away.
+because its reader went away. Writes go straight to the descriptor, never through a Python buffer,
+so a journal that went away cannot fail the exit either.
+
+ITS ONE ARGUMENT is `claude`'s pid, the writer of its stream. The stream ends at EOF, which comes
+when the last holder of the pipe's write end closes it, and that is `claude` unless something it
+started inherited its stdout and outlived it. So once that pid is gone and the pipe has been quiet
+for :data:`QUIET` seconds, the stream is over, and a leftover process can never keep this one
+reading forever. With no argument it reads to EOF.
 
 EXIT CODES
     0   the stream was read to its end
@@ -44,13 +51,13 @@ EXIT CODES
 from __future__ import annotations
 
 import os
+import select
 import signal
 import stat
 import sys
 import time
 import types
-from collections.abc import Iterable, Mapping
-from typing import BinaryIO
+from collections.abc import Callable, Iterator, Mapping
 
 #: The daemon tree's source root, and the three files loaded from it, in load order.
 APP_SRC = "/opt/basecradle-router/app/src"
@@ -58,6 +65,9 @@ PACKAGE = "basecradle_router"
 MODULES = ("logfmt", "anthropic_rates", "claude_stream")
 
 EXIT_UNLOADABLE = 70
+
+#: Seconds of silence on the pipe, with its writer gone, after which the stream is over.
+QUIET = 1.0
 
 #: The signals a stop or a closing session sends; each is recorded, and the stream is read on.
 _DRAIN_THROUGH = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
@@ -135,46 +145,87 @@ def load(src_root: str = APP_SRC, *, anchor: str = "/", owner: int = 0) -> types
     return module
 
 
-def _lines(stream: BinaryIO) -> Iterable[str]:
-    for raw in stream:
-        yield raw.decode("utf-8", "replace")
+def _lines(fd: int, writer_alive: Callable[[], bool] | None) -> Iterator[str]:
+    """The stream on ``fd``, one decoded line at a time, until EOF or its writer is gone.
+
+    ``writer_alive`` is asked only when the pipe has been quiet for :data:`QUIET` seconds; once it
+    answers no, whatever was read is the whole stream.
+    """
+    partial: list[bytes] = []  # a line still arriving: one large tool result is one line
+    while True:
+        if writer_alive is not None:
+            ready, _, _ = select.select([fd], [], [], QUIET)
+            if not ready:
+                if writer_alive():
+                    continue
+                break
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            break
+        start = 0
+        while (end := chunk.find(b"\n", start)) != -1:
+            partial.append(chunk[start:end])
+            yield b"".join(partial).decode("utf-8", "replace")
+            partial.clear()
+            start = end + 1
+        if start < len(chunk):
+            partial.append(chunk[start:])
+    if partial:
+        yield b"".join(partial).decode("utf-8", "replace")
+
+
+def pid_alive(pid: int) -> Callable[[], bool]:
+    """Whether ``pid`` still exists: a signal-0 probe, which signals nothing."""
+
+    def alive() -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # it exists; it is just not ours to signal
+        return True
+
+    return alive
 
 
 class _Out:
-    """Writes lines to the journal stream until it refuses one, then writes no more."""
+    """Writes lines to the journal's descriptor until it refuses one, then writes no more."""
 
-    def __init__(self, stream: BinaryIO) -> None:
-        self._stream = stream
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
         self.broken = False
 
     def __call__(self, line: str) -> None:
         if self.broken:
             return
+        data = memoryview(line.encode("utf-8", "replace") + b"\n")
         try:
-            self._stream.write(line.encode("utf-8", "replace") + b"\n")
-            self._stream.flush()
+            while data:
+                data = data[os.write(self._fd, data) :]
         except OSError:
             self.broken = True
 
 
 def run(
     translation: types.ModuleType,
-    stdin: BinaryIO,
-    stdout: BinaryIO,
+    read_fd: int,
+    write_fd: int,
     *,
     received: list[str],
     environ: Mapping[str, str],
+    writer_alive: Callable[[], bool] | None = None,
 ) -> int:
-    """Translate ``stdin`` to ``stdout`` until the stream ends; return the exit status.
+    """Translate the stream on ``read_fd`` to ``write_fd`` until it ends; return the exit status.
 
     ``received`` is the list :func:`drain_through_signals` appends each signal's name to; the
     first one is what the stream is said to have ended after.
     """
-    out = _Out(stdout)
+    out = _Out(write_fd)
     translator = translation.Translator(
         write=out, clock=time.monotonic, base_url=environ.get("ANTHROPIC_BASE_URL") or None
     )
-    for line in _lines(stdin):
+    for line in _lines(read_fd, writer_alive):
         translator.feed(line)
     translator.finish(stopped_by=received[0] if received else None)
     return 0
@@ -197,9 +248,10 @@ def drain_through_signals() -> list[str]:
     return received
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
     # First, before anything can take time: a stop's TERM during the load must not end us early.
     received = drain_through_signals()
+    writer = int(argv[0]) if argv and argv[0].isdigit() and int(argv[0]) > 1 else None
     try:
         translation = load()
     except (Refused, OSError, SyntaxError, ImportError, AttributeError) as exc:
@@ -211,9 +263,14 @@ def main() -> int:
         )
         return EXIT_UNLOADABLE
     return run(
-        translation, sys.stdin.buffer, sys.stdout.buffer, received=received, environ=os.environ
+        translation,
+        sys.stdin.fileno(),
+        sys.stdout.fileno(),
+        received=received,
+        environ=os.environ,
+        writer_alive=pid_alive(writer) if writer is not None else None,
     )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

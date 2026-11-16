@@ -61,6 +61,13 @@ def test_a_builders_command_must_be_exactly_claude_p_trigger() -> None:
     )
 
 
+def test_a_trigger_that_is_itself_an_option_is_refused() -> None:
+    assert re.search(
+        r'\[\[ "\$3" != -\* \]\] \|\|\n\t\tdie "refusing: a builder\'s trigger may not begin with',
+        _script(),
+    )
+
+
 def test_the_flags_are_appended_by_root_and_only_for_a_builders_real_wake() -> None:
     assert re.search(
         r'shift # drop argv\[1\].*\n\t# .*\n\t\[\[ -z \$stream_translate \]\] \|\| set -- "\$@"'
@@ -89,6 +96,15 @@ def test_the_stream_helpers_ride_into_the_drop_as_inert_positionals() -> None:
         r' "\$delivery"\n\t"\$stream_python" "\$stream_translate" "\$stream_jq" "\$stream_cat"'
         r' "\$launch_bin" "\$@"\)',
         _script(),
+    )
+
+
+def test_a_builders_claude_is_execed_with_its_stdout_into_the_translator() -> None:
+    # runuser's child must be claude itself, as for every wake: a shell in between would die of
+    # runuser's relayed TERM at once, and the router would read the wake as over while claude ran.
+    assert re.search(
+        r'\texec "\$@" > >\(\n\t\t"\$python" -I "\$translate" "\$\$" \|\| \{\n',
+        _run_stream(),
     )
 
 

@@ -186,9 +186,11 @@ socket survives a journald restart.
 A builder's wake is a pipe (#481), run as the builder after the drop:
 
 ```text
-claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
-    | python3 -I /opt/basecradle-router/bin/claude-stream-translate
+exec claude -p <trigger> --output-format stream-json --verbose --include-partial-messages \
+    > >(python3 -I /opt/basecradle-router/bin/claude-stream-translate <claude's pid>)
 ```
+
+`claude` is still `exec`'d, so it is still `runuser`'s child, and the wake ends when it ends.
 
 `claude-stream-translate` turns Claude Code's own structured output into the telemetry contract's
 lines (basecradle-harness `docs/telemetry.md`), rendered by the router's one renderer, `logfmt`, and
@@ -208,10 +210,13 @@ that module's docstring.
   line with `cost_gap=not_reported` and no tokens; Claude Code's helper calls (the model a WebSearch
   runs on) never appear one by one. Both are stated against Claude Code's own `modelUsage` on the
   prose line at the end. A call a stop or a crash cut short has no line.
-- **A stop.** `stop-wake` signals the shell that runs the pipe (through `runuser`) and `claude` and the
-  translator directly. The translator records the SIGTERM and reads on until `claude` has exited, so
-  every line up to the stop lands, and it says the stream ended after a SIGTERM. The router still
-  reads the stop off `sudo`'s exit, unchanged.
+- **A stop.** Unchanged for `claude`: `runuser` relays its TERM, gives it 2 s, SIGKILLs it, and only
+  then re-raises, so the router reads the stop off `sudo`'s exit with `claude` already gone. The
+  translator, beneath `claude`, gets `stop-wake`'s own TERM, records it, and reads on until `claude`
+  has exited, so every line up to the stop lands, and it says the stream ended after a SIGTERM.
+- **A leftover.** The stream ends at EOF, and something `claude` started could hold its stdout past
+  it. So the translator is handed `claude`'s pid: once `claude` is gone and the pipe has been quiet
+  for a second, the stream is over. The wake itself never waits on the pipe.
 - **If the translator fails.** It never stops reading early, so `claude` never blocks on the pipe or
   dies of SIGPIPE. If it exits non-zero (it could not load: exit 70, the reason on stderr; or it
   crashed), `wake-runner` reads the rest of the stream itself: `jq` writes the reply from the final
@@ -1696,7 +1701,7 @@ never out of the mirrored tree), and they are this repo's to keep stable:
 | Contract | What the op does with it |
 |---|---|
 | `/opt/basecradle-router/app` | the **root-owned** daemon tree the op mirrors into (protecting its `.venv`, the one `router:router` path). Ownership is narrowed **before** the mirror and **read back after** it, and only then is anything root-owned installed (basecradle-noc#777). The op then runs **`uv sync --locked`** as `router`. The sync must land **before** the restart: the unit starts cache-less and `--no-sync`, so it neither rebuilds nor reaches the network — it runs exactly what the sync left (#280, #297). |
-| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), `stop-wake` (#386), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
+| `deploy/bin/*` | **every** file reinstalled root-owned (`root:root`, `0755`) to `/opt/basecradle-router/bin/<name>` on every deploy (globbed, basecradle-noc#428), so a newly-added root-owned helper is never missed — today `wake-runner`, `probe-ack` (#208), `reboot-if-required.sh` (#297), `stop-wake` (#386), `claude-stream-translate` (#481: `wake-runner` refuses every builder wake while it is missing), and `router-admin` (the NOC calls the `app/` copy). **This is the path anything of ours that runs as root must live at**, so a root `ExecStart=` never depends on how the mirrored `app/` tree happens to be owned. `wake-runner` must be present and executable in the deployed tree, or the deploy fails. |
 | `deploy/systemd/*.service` + `*.timer` | **all** unit files installed (globbed `0644`), so a newly-added unit is never missed. Enable **policy stays the router's**: the op arms every `*.timer` (`enable --now`) and keeps `basecradle-router.service` enabled, but **never enables `*.service` generically** — it cannot tell `recovery.service` (must be enabled) from `reboot.service` (must stay timer-triggered, though it carries `[Install]`). **The reboot timer is not here**: it is per host (next row). |
 | `deploy/hosts/<fqdn>/basecradle-router-reboot.timer` | the host's **own** reboot window (#334), installed `0644` to `/etc/systemd/system/` and armed (`enable --now`) like the shared timers. There is deliberately no shared copy: a host whose directory lacks it gets no reboot timer, never another box's window. |
 | `/etc/basecradle-router/deployed-sha` | the SHA stamp, written `0644` — the drift source `drift-check.sh` reads. The file mode is world-readable but its directory is not: `/etc/basecradle-router` is `750 root:router` (it also holds `router.env`), so only root and the `router` group reach the stamp. That is by design — the drift unit runs `User=router` and traverses as a group member; any other reader (an operator account included) needs `sudo`. |

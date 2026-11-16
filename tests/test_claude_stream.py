@@ -342,6 +342,8 @@ def test_a_server_side_search_is_a_server_tool_line_with_its_fee() -> None:
     def search(event: dict[str, Any]) -> None:
         if event["type"] == "stream_event" and event["event"]["type"] == "message_delta":
             event["event"]["usage"]["server_tool_use"] = {"web_search_requests": 2}
+        if event["type"] == "result":  # Claude Code's own figure carries the fee
+            event["modelUsage"]["claude-opus-5-5"]["costUSD"] += 0.02
 
     out = translate(rewrite("max_turns", search))
     call = out.index(next(line for line in out if f" {LLM_HEAD} " in line))
@@ -349,6 +351,8 @@ def test_a_server_side_search_is_a_server_tool_line_with_its_fee() -> None:
         "INFO tool name=web_search executor=server provider=anthropic kind=search.web count=2"
         " outcome=ok cost=0.02 cost_basis=computed generation_id=req_011FabNova03Call0001"
     )
+    # The fee is part of what was priced, so the end finds Claude Code's figure matched.
+    assert not [line for line in out if "rate table may be stale" in line]
 
 
 # --- nothing it reads can cost the wake ----------------------------------------------------------
@@ -358,6 +362,16 @@ def test_a_line_that_is_not_json_passes_through_as_prose() -> None:
     assert translate(["claude: a warning printed as plain text"])[0] == (
         "claude: a warning printed as plain text"
     )
+
+
+@pytest.mark.parametrize("line", ["200", "null", "true", '"quoted"', "[1, 2]"])
+def test_json_that_is_no_event_passes_through_as_prose(line: str) -> None:
+    assert translate([line])[0] == line
+
+
+def test_json_nested_past_the_parsers_depth_is_counted_never_raised() -> None:
+    out = translate(["[" * 100_000 + "]" * 100_000])
+    assert out[0].startswith("WARNING The stream translator could not read 1 line(s)")
 
 
 @pytest.mark.parametrize(

@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import importlib.machinery
 import importlib.util
-import io
+import json
 import os
 import shutil
 import signal
@@ -193,35 +193,86 @@ def test_unloadable_it_exits_70_and_says_why() -> None:
 # --- how it reads ----------------------------------------------------------------------------
 
 
-def test_it_translates_stdin_to_stdout_line_by_line(tree: Path) -> None:
+def _translate(tree: Path, read_fd: int, **kwargs) -> tuple[int, list[str]]:
     module = load(tree)
-    out = io.BytesIO()
-    code = ct.run(
-        module,
-        io.BytesIO((FIXTURES / "tools.jsonl").read_bytes()),
-        out,
-        received=[],
-        environ={},
-    )
+    read_out, write_out = os.pipe()
+    try:
+        code = ct.run(module, read_fd, write_out, received=[], environ={}, **kwargs)
+    finally:
+        os.close(write_out)
+    with os.fdopen(read_out, "rb") as out:
+        return code, out.read().decode().splitlines()
+
+
+def test_it_translates_its_input_line_by_line(tree: Path) -> None:
+    with open(FIXTURES / "tools.jsonl", "rb") as stream:
+        code, lines = _translate(tree, stream.fileno())
     assert code == 0
-    lines = out.getvalue().decode().splitlines()
     assert lines[0].startswith("INFO llm shadow provider=anthropic ")
     assert "Done: the work is finished." in lines
 
 
-class _Refusing(io.RawIOBase):
-    def writable(self) -> bool:
+def test_a_line_of_megabytes_is_one_line(tree: Path, tmp_path: Path) -> None:
+    # One large tool result is one JSON line, arriving in many reads.
+    big = tmp_path / "big.jsonl"
+    payload = {"type": "user", "message": {"content": "x" * 2_000_000}}
+    big.write_text(json.dumps(payload) + "\n" + (FIXTURES / "tools.jsonl").read_text())
+    with open(big, "rb") as stream:
+        code, lines = _translate(tree, stream.fileno())
+    assert code == 0 and "Done: the work is finished." in lines
+
+
+def test_a_stream_whose_writer_is_gone_ends_once_the_pipe_is_quiet(tree: Path, monkeypatch) -> None:
+    # A leftover process holding the write end must not keep the translator reading forever.
+    monkeypatch.setattr(ct, "QUIET", 0.05)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, (FIXTURES / "stopped.jsonl").read_bytes())
+        started = time.monotonic()
+        code, lines = _translate(tree, read_fd, writer_alive=lambda: False)
+        assert time.monotonic() - started < 5
+    finally:
+        os.close(write_fd)  # held open throughout, as a leftover would hold it
+        os.close(read_fd)
+    assert code == 0
+    assert lines[-1].startswith("INFO Claude Code's stream ended without a result")
+
+
+def test_a_live_writer_keeps_it_reading_through_a_quiet_spell(tree: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ct, "QUIET", 0.05)
+    read_fd, write_fd = os.pipe()
+    asked = []
+
+    def alive() -> bool:
+        asked.append(1)
+        if len(asked) == 3:
+            os.write(write_fd, (FIXTURES / "tools.jsonl").read_bytes())
+            os.close(write_fd)
         return True
 
-    def write(self, _data) -> int:
-        raise BrokenPipeError("the journal stream is gone")
+    code, lines = _translate(tree, read_fd, writer_alive=alive)
+    os.close(read_fd)
+    assert code == 0 and len(asked) >= 3
+    assert "Done: the work is finished." in lines
+
+
+def test_pid_alive_answers_for_a_real_and_a_vanished_process() -> None:
+    assert ct.pid_alive(os.getpid())()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert not ct.pid_alive(child.pid)()
 
 
 def test_a_journal_that_refuses_writes_stops_the_writing_never_the_reading(tree: Path) -> None:
     module = load(tree)
-    stdin = io.BytesIO((FIXTURES / "tools.jsonl").read_bytes())
-    assert ct.run(module, stdin, _Refusing(), received=[], environ={}) == 0
-    assert stdin.read() == b""  # read to the end, so the writer upstream never blocked
+    read_out, write_out = os.pipe()
+    os.close(read_out)  # the journal is gone: every write is EPIPE
+    with open(FIXTURES / "tools.jsonl", "rb") as stream:
+        try:
+            assert ct.run(module, stream.fileno(), write_out, received=[], environ={}) == 0
+            assert stream.read() == b""  # read to the end, so the writer upstream never blocked
+        finally:
+            os.close(write_out)
 
 
 #: A child that loads the translator from `tree` exactly as main() loads it from the box.
@@ -234,7 +285,7 @@ loader.exec_module(ct)
 received = ct.drain_through_signals()
 module = ct.load(sys.argv[2], anchor=os.path.dirname(sys.argv[2]), owner=os.getuid())
 print("loaded", flush=True)
-sys.exit(ct.run(module, sys.stdin.buffer, sys.stdout.buffer, received=received, environ={}))
+sys.exit(ct.run(module, 0, 1, received=received, environ={}))
 """
 
 
@@ -279,3 +330,28 @@ def test_a_stream_a_stop_cut_short_says_so(tree: Path) -> None:
     out = child.stdout.read().decode()
     assert child.wait(timeout=30) == 0
     assert out.splitlines()[-1].startswith("INFO Claude Code's stream ended after a SIGTERM")
+
+
+def test_a_journal_gone_at_exit_still_exits_zero(tree: Path) -> None:
+    # Buffered writes would fail again in the interpreter's final flush and exit 120, which
+    # wake-runner would read as a translator failure on every such wake.
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", CHILD, str(SCRIPT), str(tree)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert child.stdout.readline() == b"loaded\n"
+    child.stdout.close()
+    child.stdin.write((FIXTURES / "tools.jsonl").read_bytes())
+    child.stdin.close()
+    assert child.wait(timeout=30) == 0, child.stderr.read()
+
+
+def test_its_one_argument_is_the_writers_pid() -> None:
+    # Anything else, or nothing, reads to EOF: the watch is a bound, never a requirement.
+    source = SCRIPT.read_text()
+    assert "writer = int(argv[0]) if argv and argv[0].isdigit() and int(argv[0]) > 1 else None" in (
+        source
+    )
+    assert "sys.exit(main(sys.argv[1:]))" in source

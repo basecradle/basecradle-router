@@ -667,10 +667,10 @@ PLANTED: dict[tuple[str, str], tuple[str, str]] = {
         )
         for mode in ("harness", "probe")
     },
-    # A builder's wake is the pipe's, never the `exec` (#481): the plant goes on its command.
+    # A builder's wake takes the stream's `exec` (#481): the plant goes on that command.
     ("deploy/bin/wake-runner", "builder"): (
-        '\t\t"$@" | {\n',
-        '\t\tenv "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@" | {\n',
+        '\t\texec "$@" > >(\n',
+        '\t\texec env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@" > >(\n',
     ),
     (".github/scripts/ping-heartbeat.sh", "ping"): (
         '--config - <<<"url = \\"$url\\""\n',
