@@ -220,6 +220,12 @@ that module's docstring.
   line with `cost_gap=not_reported` and no tokens; Claude Code's helper calls (the model a WebSearch
   runs on) never appear one by one. Both are stated against Claude Code's own `modelUsage` on the
   prose line at the end. A call a stop or a crash cut short has no line.
+- **A stream it does not understand.** Never silent. A stream event that matches no open call, a
+  `message_start` with no message id, a tool result with no tool use, a call still open at the
+  `result`, or a main-thread message that came with no stream events is counted, and the end of the
+  stream writes one WARNING naming each count, the Claude Code version that wrote it, and the
+  versions whose shapes the translator reads (2.1.286 and 2.1.325). A stream event that names no
+  message is placed only when exactly one call is open, never guessed.
 - **A stop.** Unchanged for `claude`: `runuser` relays its TERM, gives it 2 s, SIGKILLs it, and only
   then re-raises, so the router reads the stop off `sudo`'s exit with `claude` already gone. The
   translator, beneath `claude`, gets `stop-wake`'s own TERM, records it, and reads on until `claude`

@@ -408,7 +408,9 @@ def test_an_internal_fault_is_counted_and_said_never_raised(monkeypatch) -> None
 
     monkeypatch.setattr(Translator, "_user", boom)
     out = run("tools")
-    assert out[-1].startswith("WARNING The stream translator could not read 3 line(s)")
+    assert any(
+        line.startswith("WARNING The stream translator could not read 3 line(s)") for line in out
+    )
     assert "Done: the work is finished." in out
 
 
@@ -501,3 +503,207 @@ def test_a_usage_field_of_the_wrong_shape_costs_no_line(details) -> None:
     calls = llm_lines(translate(rewrite("tools", odd)))
     assert len(calls) == 4
     assert all("tokens_reasoning" not in line and "cost" in line for line in calls)
+
+
+def _without_message_ids(name: str) -> list[str]:
+    """The fixture as Claude Code 2.1.286 writes it: no ``api_message_id`` on a stream event."""
+
+    def strip(event: dict[str, Any]) -> None:
+        event.pop("api_message_id", None)
+
+    return rewrite(name, strip)
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_stream_that_names_no_message_on_its_events_renders_the_same_lines(name: str) -> None:
+    # Claude Code 2.1.286 names a message on `message_start` only; the captures (2.1.325) name
+    # it on every stream event. The lines must not depend on which wrote them.
+    stopped = "TERM" if name == "stopped" else None
+    assert translate(_without_message_ids(name), stopped_by=stopped) == run(
+        name, stopped_by=stopped
+    )
+
+
+def test_a_cut_call_without_message_ids_still_has_no_line() -> None:
+    assert translate(_without_message_ids("stopped"), stopped_by="TERM") == run(
+        "stopped", stopped_by="TERM"
+    )
+
+
+# --- a stream the translator does not understand is said, never silent (#481) --------------------
+
+UNPLACED = "WARNING The stream translator could not place what Claude Code 2.1.325 wrote: "
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_stream_of_a_known_shape_places_everything(name: str) -> None:
+    stopped = "TERM" if name == "stopped" else None
+    assert not [line for line in run(name, stopped_by=stopped) if "could not place" in line]
+
+
+def _drop(name: str, keep) -> list[str]:
+    return [json.dumps(e) for e in _events(name) if keep(e)]
+
+
+def test_calls_that_never_open_are_said_loudly() -> None:
+    # What the box's 2.1.286 stream did to the code that keyed every event on its message id:
+    # no call ever matched, and the wake looked like one that made no model calls.
+    out = translate(
+        _drop(
+            "tools",
+            lambda e: not (e["type"] == "stream_event" and e["event"]["type"] == "message_start"),
+        )
+    )
+    assert not llm_lines(out)
+    (warning,) = [line for line in out if "could not place" in line]
+    assert warning.startswith(UNPLACED)
+    for shape in (
+        "4 main-thread message(s) that came with no stream events",
+        "4 message_delta(s) that matched no open model call",
+        "4 message_stop(s) that matched no open model call",
+    ):
+        assert shape in warning
+    assert warning.endswith("The shapes it reads are Claude Code 2.1.286 and 2.1.325's.")
+
+
+def test_a_stream_with_no_stream_events_at_all_is_said_loudly() -> None:
+    # What a missing --include-partial-messages, or a Claude Code that dropped them, looks like.
+    out = translate(_drop("tools", lambda e: e["type"] != "stream_event"))
+    assert not llm_lines(out)
+    assert any(
+        line.startswith(UNPLACED)
+        and "4 main-thread message(s) that came with no stream events" in line
+        for line in out
+    )
+
+
+def test_calls_still_open_at_the_result_are_said_loudly() -> None:
+    out = translate(
+        _drop(
+            "tools",
+            lambda e: not (e["type"] == "stream_event" and e["event"]["type"] == "message_stop"),
+        )
+    )
+    (warning,) = [line for line in out if "could not place" in line]
+    assert "4 model call(s) still open at the result" in warning
+    assert "3 message_start(s) while another call was still open" in warning
+
+
+def test_a_tool_result_for_no_tool_use_is_counted() -> None:
+    out = translate(_drop("tools", lambda e: e["type"] != "assistant"))
+    (warning,) = [line for line in out if "could not place" in line]
+    assert "3 tool result(s) that matched no tool use" in warning
+
+
+START = {"type": "stream_event", "parent_tool_use_id": None, "event": {"type": "message_start"}}
+
+
+def _start(message_id: str) -> str:
+    event = json.loads(json.dumps(START))
+    event["event"]["message"] = {
+        "id": message_id,
+        "model": "claude-opus-5-5",
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+    }
+    return json.dumps(event)
+
+
+def _event(kind: str, message_id: str | None = None) -> str:
+    event: dict[str, Any] = {"type": "stream_event", "parent_tool_use_id": None}
+    event["event"] = {"type": kind}
+    if kind == "message_delta":
+        event["event"]["usage"] = {"input_tokens": 2, "output_tokens": 40}
+        event["event"]["delta"] = {"stop_reason": "end_turn"}
+    if message_id is not None:
+        event["api_message_id"] = message_id
+    return json.dumps(event)
+
+
+def test_a_named_event_goes_to_the_call_it_names() -> None:
+    out = translate(
+        [
+            _start("msg_01FabNova90Call0001"),
+            _start("msg_01FabNova90Call0002"),
+            _event("message_delta", "msg_01FabNova90Call0001"),
+            _event("message_stop", "msg_01FabNova90Call0001"),
+        ]
+    )
+    (call,) = llm_lines(out)
+    assert call["tokens_out"] == "40"
+
+
+def test_an_unnamed_event_with_two_calls_open_is_counted_never_guessed() -> None:
+    out = translate(
+        [
+            _start("msg_01FabNova91Call0001"),
+            _start("msg_01FabNova91Call0002"),
+            _event("message_delta"),
+            _event("message_stop"),
+        ]
+    )
+    assert not llm_lines(out)
+    (warning,) = [line for line in out if "could not place" in line]
+    assert "1 message_delta(s) that matched no open model call" in warning
+    assert "1 message_stop(s) that matched no open model call" in warning
+    assert "1 message_start(s) while another call was still open" in warning
+
+
+def test_an_unnamed_event_with_no_call_open_is_counted() -> None:
+    out = translate([_event("message_stop")])
+    assert any("1 message_stop(s) that matched no open model call" in line for line in out)
+
+
+def test_a_main_thread_failure_closes_the_call_it_ended() -> None:
+    failure = {
+        "type": "assistant",
+        "parent_tool_use_id": None,
+        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API Error"}]},
+        "is_api_error_message": True,
+        "api_error_status": 529,
+    }
+    out = translate(
+        [
+            _start("msg_01FabNova92Call0001"),
+            json.dumps(failure),
+            _event("message_delta"),
+            _event("message_stop"),
+        ]
+    )
+    assert [line["outcome"] for line in llm_lines(out)] == ["failed"]
+    assert any("matched no open model call" in line for line in out)
+
+
+def test_the_box_shape_reconciles_against_claude_codes_alias() -> None:
+    # The box: Claude Code 2.1.286 (no message ids on stream events) running the 1M-context
+    # alias, which Claude Code's `modelUsage` names `claude-opus-5-5[1m]` and the API's message
+    # names `claude-opus-5-5`. The first real builder wakes (2026-11-16) had both.
+    def alias(event: dict[str, Any]) -> None:
+        event.pop("api_message_id", None)
+        if event["type"] == "result":
+            usage = event["modelUsage"]
+            usage["claude-opus-5-5[1m]"] = usage.pop("claude-opus-5-5")
+
+    out = translate(rewrite("tools", alias))
+    assert len(llm_lines(out)) == 4
+    assert not [line for line in out if "billed" in line or "could not place" in line]
+
+
+def test_a_stated_canonical_model_is_the_one_reconciled() -> None:
+    def named(event: dict[str, Any]) -> None:
+        if event["type"] == "result":
+            usage = event["modelUsage"]
+            figures = usage.pop("claude-opus-5-5")
+            usage["opus-alias"] = figures | {"canonicalModel": "claude-opus-5-5"}
+
+    assert not [line for line in translate(rewrite("tools", named)) if "billed" in line]
+
+
+def test_an_alias_on_the_streams_own_message_is_reconciled_too() -> None:
+    # The other direction: the call names the alias or a snapshot, Claude Code's total the id.
+    def alias(event: dict[str, Any]) -> None:
+        if event["type"] == "stream_event" and event["event"]["type"] == "message_start":
+            event["event"]["message"]["model"] = "claude-opus-5-5[1m]"
+
+    out = translate(rewrite("tools", alias))
+    assert {line["model"] for line in llm_lines(out)} == {"claude-opus-5-5[1m]"}
+    assert not [line for line in out if "billed" in line]

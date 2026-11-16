@@ -179,13 +179,21 @@ def usage_of(usage: Any) -> Usage | None:
     )
 
 
-def _model_key(model: str) -> str:
-    return re.sub(r"-\d{8}\Z", "", model.strip().lower())
+def canonical(model: str) -> str:
+    """The id a model is priced and counted under.
+
+    Claude Code names a model by its configured alias, which may carry a context-window marker
+    (``claude-opus-5-5[1m]``, the box's builders' since 2026-11), while the API's own message
+    carries the plain id; and a dated snapshot (``claude-haiku-4-5-20251001``) is the id it pins.
+    Every current model is priced flat across its whole context window, so the marker changes no
+    rate.
+    """
+    return re.sub(r"(?:\[[^\]]*\]|-\d{8})\Z", "", model.strip().lower())
 
 
 def known(model: str) -> bool:
     """Whether the table carries ``model`` at all."""
-    return _model_key(model) in RATES
+    return canonical(model) in RATES
 
 
 def priced_host(base_url: str | None) -> bool:
@@ -213,7 +221,7 @@ def call_price(
     """
     if not priced_host(base_url):
         return Price(None, UNPRICED_HOST)
-    rates = RATES.get(_model_key(model))
+    rates = RATES.get(canonical(model))
     if rates is None:
         return Price(None, UNKNOWN_MODEL)
     multiplier = _GEO_MULTIPLIERS.get(_name(geo))
