@@ -607,47 +607,27 @@ def test_the_scrub_never_strips_the_ansi_colour_the_journal_lines_carry() -> Non
     )
 
 
-# --- 6. the Claude Code builders' OpenTelemetry path (#380) ----------------
-#
-# What the transform renders is proven by running it (tests/test_vector_unit.py). These pin
-# the plumbing around it, which `vector test` never exercises: where the listener binds and which
-# sink the rendered line reaches.
+# --- 6. the only path to the logs sink is the scrub ----------------------
 
 
-def test_the_otel_listeners_are_bound_to_localhost_only() -> None:
-    # The senders are the builders' own Claude Code processes on this box. Binding 0.0.0.0 would
-    # let anyone on the internet write lines into the fleet's log store under any agent's name.
-    source = _component("ai_otel")
-    assert re.search(r"""type:\s*["']opentelemetry["']""", source)
-    addresses = re.findall(r"""address:\s*["']([^"']+)["']""", source)
-    assert addresses == ["127.0.0.1:4317", "127.0.0.1:4318"], addresses
-
-
-def test_only_the_rendered_llm_line_reaches_the_log_sink_and_through_the_scrub() -> None:
-    # The raw OTel event carries session, user and account identifiers. It reaches Better Stack
-    # only as the line `ai_otel_llm` rebuilds, and that line passes `ai_scrub` like every journald
-    # line, so its redaction and prefix come from the one place that applies them.
-    assert re.search(r"""inputs:\s*\[["']ai_scrub["']\]""", _component("better_stack_logs"))
-    scrub_inputs = (
-        r"""inputs:\s*\n\s*- ["']ai_journald["']\s*\n(\s*#.*\n)*\s*- ["']ai_otel_llm["']"""
+def _inputs(component_id: str) -> list[str]:
+    """A component's ``inputs``, comment lines left out, in either YAML list form."""
+    body = "".join(
+        line
+        for line in _component(component_id).splitlines(keepends=True)
+        if not line.lstrip().startswith("#")
     )
-    assert re.search(scrub_inputs, _scrub_source())
-    transform = _component("ai_otel_llm")
-    assert re.search(r"""inputs:\s*\n\s*- ["']ai_otel\.logs["']\s*\n""", transform)
-    for component_id in ("better_stack_logs", "better_stack_metrics", "ai_scrub"):
-        assert "ai_otel." not in _component(component_id), component_id
+    flow = re.search(r"^ *inputs: *\[(.*)\] *$", body, re.MULTILINE)
+    if flow:
+        return re.findall(r"""["']([^"']+)["']""", flow.group(1))
+    block = re.search(r"^ *inputs: *\n((?: *- .*\n)+)", body, re.MULTILINE)
+    assert block, f"{component_id} declares no inputs"
+    return re.findall(r"""^ *- ["']([^"']+)["'] *$""", block.group(1), re.MULTILINE)
 
 
-def test_a_failing_render_drops_the_event_never_forwards_it() -> None:
-    # A remap forwards the ORIGINAL event on a runtime error unless told otherwise, and the
-    # original is the raw OTel event, identifiers and all. Both drops are load-bearing.
-    transform = _component("ai_otel_llm")
-    assert re.search(r"^ *drop_on_abort: true$", transform, re.MULTILINE)
-    assert re.search(r"^ *drop_on_error: true$", transform, re.MULTILINE)
-
-
-def test_the_rendered_event_is_rebuilt_from_scratch() -> None:
-    # `. = {` replaces the whole event, so no field of the input survives by omission. A version
-    # that deleted fields one by one would ship every field Claude Code adds in a later release.
-    transform = _component("ai_otel_llm")
-    assert re.search(r"^ *\. = \{$", transform, re.MULTILINE)
+def test_the_logs_sink_reads_only_the_scrub_and_the_scrub_only_the_journal() -> None:
+    # A raw source wired to the logs sink, or a second input into the scrub that skips nothing,
+    # ships `sudo` argv and tokens to Better Stack (basecradle#338). These two lists are the
+    # whole log path; the sources themselves are pinned in tests/test_per_host_deploy.py.
+    assert _inputs("better_stack_logs") == ["ai_scrub"]
+    assert _inputs("ai_scrub") == ["ai_journald"]

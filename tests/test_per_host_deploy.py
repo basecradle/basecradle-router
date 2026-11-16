@@ -134,6 +134,17 @@ REFERENCE_SINKS = ["better_stack_logs", "better_stack_metrics", "ai_vector_healt
 #: message to scrub and keep ``timestamp``. Every other source is raw.
 SHIPPABLE_INPUTS = {"ai_scrub": "dt", "ai_host_metrics": "timestamp"}
 
+#: Every source a host's Vector config may carry, to its type: each reads what the box itself
+#: attests, journald (whose records the kernel stamps with the sender's ``_UID``) and the box's own
+#: metrics. A listening source takes whatever any local account sends, attributed as the sender
+#: claims, and no Vector source can verify its sender (basecradle#789, #486), so another kind of
+#: source is a decision, never a line added in passing.
+HOST_SOURCES = {
+    "ai_journald": "journald",
+    "ai_host_metrics": "host_metrics",
+    "ai_internal_metrics": "internal_metrics",
+}
+
 #: The scrub's last statement, which is why a scrubbed log's time is ``dt``.
 SCRUB_TIME_MOVE = "      .dt = del(.timestamp)\n"
 
@@ -243,6 +254,20 @@ def test_an_owner_destination_never_holds_better_stack_back_nor_ships_raw(host: 
             f"{component_id} takes {inputs[0]}, whose event time is in "
             f"{SHIPPABLE_INPUTS[inputs[0]]!r}, not {url['field']!r}: Axiom would date it by arrival"
         )
+
+
+@pytest.mark.parametrize("host", sorted(INGEST_HOSTS))
+def test_every_source_on_a_host_reads_the_box_itself(host: str) -> None:
+    text = _read(host, "vector.yaml")
+    assert text.count("\nsources:\n") == 1 and text.count("\ntransforms:\n") == 1, host
+    components = _components(text.split("\nsources:\n", 1)[1].split("\ntransforms:\n", 1)[0])
+    assert sorted(components) == sorted(HOST_SOURCES), sorted(components)
+    for component_id, body in components.items():
+        # A key at a component's own indent that the split did not take (an id outside `\w`,
+        # a trailing comment) would hide inside its neighbour's body: nothing may stand there.
+        assert not re.search(r"^ {0,3}\S", body, re.MULTILINE), f"{component_id}: {body!r}"
+        types = re.findall(r"^\s+type:\s*(.*?)\s*$", body, re.MULTILINE)
+        assert types == [f'"{HOST_SOURCES[component_id]}"'], f"{component_id}: {types}"
 
 
 @pytest.mark.parametrize("host", sorted(INGEST_HOSTS))

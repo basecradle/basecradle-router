@@ -203,8 +203,8 @@ that module's docstring.
   error=` companion for a failed run), one `cost unpriced` line per wake per gap, one closing `llm`
   line per model for what Claude Code billed that no call itemizes, and prose: each reply as its
   `result` arrives, then the run's turn count and why it ended. **No `wake` line**: the router's own
-  `stage=wake` line is a builder wake's record. A subagent's calls are `purpose=main`, as the
-  receiver writes them.
+  `stage=wake` line is a builder wake's record. A subagent's calls are `purpose=main`: a subagent
+  is the builder's own turn.
 - **Model-written text is quoted.** The reply, the run's `errors` and anything `claude` printed to
   stdout are text a model or a tool wrote, so a prompt injection could make a line of it read `INFO
   llm provider=… cost=…`, byte for byte a counted line at the head's position (basecradle#868,
@@ -213,12 +213,11 @@ that module's docstring.
   `claude_stream.RECORD_BREAKS` names) and into 8000-character pieces, so journald's 48K `LineMax`
   never starts a record without the lead. `wake-runner`'s `jq` fallback writes the reply by the same
   rule, and a test holds its output to the translator's, line for line. `claude`'s own stderr still reaches the journal raw.
-- **The comparison mark.** While the `ai_otel` receiver (Part 5) still renders the same calls, every
-  line that describes them carries **`shadow`** after its head: `llm shadow provider=`, `cost unpriced
-  shadow`, and `tool shadow` for a server-side tool, whose fee the receiver's call cost already holds.
-  Every NOC column that counts, times or prices a call or a fee is gated on the bare head (`llm
-  provider=`, `tool name=`), so nothing is counted twice, and the two records differ by one word. A
-  harness or MCP `tool` line is a fact the receiver never had, so it is unmarked.
+- **The record.** These lines are a builder's only record of its calls (basecradle#789, #486), each
+  under the contract's bare head, so every NOC column reads them as it reads a harness agent's. A
+  call's `llm` line carries the price of its tokens, and a server-side tool's fee rides its own
+  `tool … executor=server` line beside it: a wake's `llm` and `tool` dollars together are Claude
+  Code's stated total.
 - **Price.** Each call is priced from Anthropic's published rates (`anthropic_rates.py`,
   `cost_basis=computed`), and the sum is checked per model against Claude Code's own `costUSD` at the
   end: a mismatch on the same tokens is a WARNING that the table is stale, and so is a closing line
@@ -240,7 +239,7 @@ that module's docstring.
 - **The closing line, for what no call itemizes.** Claude Code's helper calls (the model a WebSearch
   runs on) never appear one by one, in the stream or on disk. So, per model, whatever the run's own
   stated total (the last `result`'s `modelUsage`; a run with background subagents writes several
-  `result`s, each cumulative) still exceeds becomes one `llm shadow … purpose=helper` line with the
+  `result`s, each cumulative) still exceeds becomes one `llm … purpose=helper` line with the
   remainder's tokens and `cost` = the stated `costUSD` less the dollars itemized, so a wake's lines add
   up to Claude Code's stated total by construction. It carries no `kind`, `duration` or
   `generation_id`, as the contract writes a builder's auxiliary call, so it is counted as one call;
@@ -301,11 +300,10 @@ becomes `'` — never `\"`. A backslash is an ordinary character. The fleet's co
 outside every quoted value by counting the `"` before it, so an escaped quote would flip that count and
 let a value forge a line's own fields (#396). `logfmt.log_fields` renders it, and a value reaches a
 router line only through it: `tests/test_logfmt.py` fails on any log format that drops one in after a
-key (`key=%s`). The `detail=` of `ai_otel_llm` (below) renders the same bytes, and the same file holds
-the two together. Two differences from the harness's `kv`, both deliberate: the router also turns every
-other control character (an escape, a NUL) into a space, as `ai_otel_llm` does, so no value can paint
-the line; and it does not bound a value's length, which the harness does at 240 characters (that is a
-separate job from quoting, and the router has never done it).
+key (`key=%s`). Two differences from the harness's `kv`, both deliberate: the router also turns every
+other control character (an escape, a NUL) into a space, so no value can paint the line; and it does
+not bound a value's length, which the harness does at 240 characters (that is a separate job from
+quoting, and the router has never done it).
 
 The vocabulary, in the order one delivery produces it:
 
@@ -2086,7 +2084,7 @@ mirrors the proven, scrubbed config `basecradle-noc` already runs (basecradle-no
 of truth** (for example [`deploy/hosts/ai.basecradle.com/vector.yaml`](hosts/ai.basecradle.com/vector.yaml)),
 not Better Stack's generated kitchen-sink. Every host's copy is the same config with only its two sink
 URIs differing, plus `ubuntu-1`'s declared owner destination (Part 2, *One router, many hosts*). It is tailored to a router box (a webhook daemon +
-Caddy, no database) and has four load-bearing properties:
+Caddy, no database) and has three load-bearing properties:
 
 1. **`journald` → `ai_scrub` → logs sink.** The `ai_scrub` remap **drops** whole events from `sudo`
    (the argv leak path) and from Vector itself (the self-logged-token path), **deletes the
@@ -2207,40 +2205,11 @@ Caddy, no database) and has four load-bearing properties:
    the chmod-640 `/etc/vector/betterstack.env`, supplied to `vector.service` by the systemd drop-in
    [`deploy/systemd/vector.service.d/10-ai-betterstack-env.conf`](systemd/vector.service.d/10-ai-betterstack-env.conf).
    The secret lives in exactly one place; a rotation is a one-line swap of that file + a restart.
-4. **`opentelemetry` (`ai_otel`) → `ai_otel_llm` → `ai_scrub` → logs sink** (basecradle-router#380).
-   The Claude Code builders on the box export one OpenTelemetry log event per model call (the NOC's
-   managed-settings file turns it on and names each builder, basecradle-noc#1179). The source
-   listens on **`127.0.0.1:4318`** (OTLP http; the required gRPC listener is `127.0.0.1:4317` and
-   has no sender), localhost only. `ai_otel_llm` renders two Claude Code events as the fleet's own
-   `llm` line, the harness telemetry contract's head and fields, so every Better Stack column reads
-   a builder's model calls the way it reads a harness agent's (basecradle-harness#782,
-   basecradle-router#384): a `claude_code.api_request` is a billed line, `INFO … outcome=ok`, and a
-   `claude_code.api_error` (sent once per call, after Claude Code's own retries are spent) is a
-   decision line, `WARNING … outcome=failed reason=<slug> detail=…`, with no tokens or cost, and a
-   `duration` only for a call that made one attempt and reached Anthropic (the event's time is the
-   last attempt's, so for any other call it is not the whole wait). The slug is the contract's own,
-   read off the HTTP status by its one *Fault Slugs* table (basecradle-harness `docs/telemetry.md`,
-   basecradle-harness#786), which is the reference: this page does not copy it. Claude Code sends
-   no status for a call Anthropic never answered, and the remap tells the two such calls apart by
-   Claude Code's own message: a connection that failed is `transport`, and one that ran out of
-   Claude Code's deadline (`Request timed out.`) is `timeout`.
-   It is WARNING rather than ERROR because the NOC's *Error on AI Server* alert pages on ERROR, and
-   whether a builder's failed call pages is basecradle/basecradle#726's open question. An auxiliary
-   call is `purpose=helper` with no `kind`; every other call is `purpose=main`. It **rebuilds the
-   event from scratch**: the slug, the model id, the request id and every number are checked first,
-   the error text is flattened and quoted by the fleet's value rule (above), and bounded without
-   ever cutting a credential-shaped run
-   short of its redaction, and nothing else Claude Code
-   attaches (session, user and account ids, the prompt id) survives; a render that fails is dropped,
-   never forwarded (`drop_on_error`). The rebuilt line then passes `ai_scrub` like a journald
-   record, which redacts it and adds the `[basecradle-wake-<slug>]` prefix. Every other Claude Code
-   event is dropped, `claude_code.api_retries_exhausted` included, so a failure is counted once.
-   The port is **not authenticated**: any local account can send to it under any agent's name, and
-   nothing records who did. `detail` is the one value no charset limits, so through it a sender can
-   ship up to 240 characters of its own text; it is quoted, so only a consumer that matches inside
-   quoted values reads it as more than text.
-   `tests/vector/ai_otel_llm.yaml` asserts the exact shipped bytes, run by `vector test` on the
-   boxes' Vector release in CI.
+
+**No source listens** (basecradle#789, #486). Every source reads what the box itself attests: journald,
+whose records the kernel stamps with the sender's `_UID`, and the box's own metrics. A listening source
+takes whatever any local account sends, attributed as the sender claims, and no Vector source can verify
+its sender. `tests/test_per_host_deploy.py` pins each host's sources to that list.
 
 **Never pass a secret as a command-line argument** (to `sudo`, `bash -s`, anything) — sudo/PAM logs
 the whole command line to the journal, and on a telemetry box that ships it. Pass secrets via
