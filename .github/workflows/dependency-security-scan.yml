@@ -63,25 +63,32 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/osv-scanner"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      # The issue and its label must come from the basecradle-ai App, never GITHUB_TOKEN:
-      # GitHub starts no workflow for an event GITHUB_TOKEN caused, so a needs-human label
-      # it applied would page nobody. Scoped to issues.
-      - name: Mint the basecradle-ai App Token
+      # The issue and its label must come from a GitHub App, never GITHUB_TOKEN: GitHub
+      # starts no workflow for an event GITHUB_TOKEN caused, so a needs-human label it
+      # applied would page nobody. Scoped to issues.
+      #
+      # Whose token (basecradle#870): this repository's own bot, basecradle-router-ai[bot].
+      # FLEET_BOT_CLIENT_ID and FLEET_BOT_APP_PRIVATE_KEY hold this repository's captain's
+      # App, so the capital's key is needed nowhere here, and there is no fallback to it.
+      # Pinned to a full commit SHA, its version in the comment: this step holds this
+      # repository's App private key, so a moved tag would run someone else's code with it
+      # (Dependabot bumps a SHA pin with its comment).
+      - name: Mint This Repository's Bot Token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}
-          private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}
           permission-issues: write
 
       # With their authors: this repository is public, so an issue carrying the scan's
-      # title is the scan's only if basecradle-ai[bot] wrote it (the script's SCAN_AUTHOR).
-      # The --author filter keeps anyone else's issues from pushing the scan's own past the
-      # limit; the script checks the author again.
+      # title is the scan's only if basecradle-router-ai[bot] wrote it (the script's
+      # SCAN_AUTHOR). The --author filter keeps anyone else's issues from pushing the scan's
+      # own past the limit; the script checks the author again.
       - name: Read the Open Issues
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: gh issue list --state open --author 'basecradle-ai[bot]' --limit 1000 --json number,title,body,author > "$RUNNER_TEMP/open-issues.json"
+        run: gh issue list --state open --author 'basecradle-router-ai[bot]' --limit 1000 --json number,title,body,author > "$RUNNER_TEMP/open-issues.json"
 
       # The runner's own python3: the script is standard library only.
       - name: Scan

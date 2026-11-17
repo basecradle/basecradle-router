@@ -40,8 +40,11 @@ is automated, read back, and watched (#449):
 
 A reminder counts only when its title is exactly
 `⏰ Renew interaction limit before <YYYY-MM-DD> (public-repo write-lockdown)` and
-it was written by `@basecradle-ai` or `@origin`: these repositories are public,
-so anyone can open an issue with any title.
+it was written by `@basecradle-router-ai`, `@basecradle-ai` or `@origin`: these
+repositories are public, so anyone can open an issue with any title. The
+capital's bot is on that list for good: it wrote as this workflow before
+basecradle#870 and filed every standing reminder, and a reminder is moved in
+place, never re-filed, so it keeps that author. Never close one to re-file it.
 
 ### Credentials
 
@@ -58,9 +61,10 @@ Two, each for its own half:
   (*Administration: Read and write*), in the words of the kind of token it is. The run's log is
   public, so it names only the token's kind, and warns of its expiry only in the
   last 60 days.
-- **The `basecradle-ai` App token**, minted per run with `issues: write` and
-  scoped to exactly the public repositories, reads and moves the reminders and
-  files the gap issue.
+- **This repository's own `basecradle-router-ai` App token** (basecradle#870),
+  minted per run from `FLEET_BOT_CLIENT_ID` and `FLEET_BOT_APP_PRIVATE_KEY` with
+  `issues: write` and scoped to exactly the public repositories, reads and moves
+  the reminders and files the gap issue.
 - **`PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL`** is the heartbeat's write-only ping URL.
   Unset, the run fails after its renewals, so a missing monitor never stops the
   guard itself.
@@ -72,7 +76,7 @@ When a new public fleet repo is stood up (the capital's new-repository recipe):
 1. Apply the limit once:
    `gh api -X PUT /repos/basecradle/<repo>/interaction-limits -f limit=collaborators_only -f expiry=six_months`
 2. Open its one renewal-reminder issue, titled as above.
-3. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-ai` App reach it. The audit
+3. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-router-ai` App reach it. The audit
    finds every public repository on its own: one it cannot renew or read is a gap
    within the week, and one the App cannot reach fails the run (every other
    repository is still renewed), so the heartbeat pages either way.

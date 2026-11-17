@@ -17,8 +17,9 @@ name: Public Repository Lockdown
 # - FLEET_ADMIN_TOKEN renews and reads the limits. Repository Administration is not a
 #   permission GITHUB_TOKEN can be granted, so it is a standing secret, provisioned by @origin.
 #   It never writes an issue: anything it posted would carry its owner's name.
-# - The basecradle-ai App token, minted per run with issues: write and scoped to exactly the
-#   public repositories, reads and edits the reminders and files the gap issue.
+# - This repository's own bot's App token (basecradle-router-ai, basecradle#870), minted per
+#   run with issues: write and scoped to exactly the public repositories, reads and edits the
+#   reminders and files the gap issue.
 #
 # It reads repository secrets, so it never runs on a pull request.
 
@@ -73,18 +74,23 @@ jobs:
           python3 .github/scripts/public_repository_lockdown.py repositories --org "$ORG" --out "$RUNNER_TEMP/repositories.txt"
           echo "names=$(sed 's|.*/||' "$RUNNER_TEMP/repositories.txt" | paste -sd, -)" >> "$GITHUB_OUTPUT"
 
-      # The reminders and the gap issue are written by the basecradle-ai App, never by
-      # FLEET_ADMIN_TOKEN and never by GITHUB_TOKEN (which cannot reach the other repositories,
-      # and whose label events start no workflow). Scoped to the repositories just listed.
-      # Allowed to fail, so a repository the App is not installed on never stops a renewal:
-      # the audit still renews everything, then dies at the gap issue, and nothing is pinged.
-      - name: Mint the basecradle-ai App Token
+      # The reminders and the gap issue are written by this repository's own bot,
+      # basecradle-router-ai[bot] (basecradle#870), never by FLEET_ADMIN_TOKEN and never by
+      # GITHUB_TOKEN (which cannot reach the other repositories, and whose label events start
+      # no workflow). FLEET_BOT_* hold this repository's captain's App, with no fallback to
+      # the capital's key. Scoped to the repositories just listed. Allowed to fail, so a
+      # repository the App is not installed on never stops a renewal: the audit still renews
+      # everything, then dies at the gap issue, and nothing is pinged.
+      # Pinned to a full commit SHA, its version in the comment: this step holds this
+      # repository's App private key, so a moved tag would run someone else's code with it
+      # (Dependabot bumps a SHA pin with its comment).
+      - name: Mint This Repository's Bot Token
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.BASECRADLE_AI_APP_ID }}
-          private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ steps.repositories.outputs.names }}
           permission-issues: write

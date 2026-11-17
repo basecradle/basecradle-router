@@ -24,8 +24,10 @@ Two credentials, each for its own half, so neither is used for what the other is
 - **The admin token** (``FLEET_ADMIN_TOKEN``) renews and reads the limits. Repository
   ``Administration`` is not a permission ``GITHUB_TOKEN`` can be granted, so it is a
   standing secret. It never writes an issue: whatever it posts would carry its owner's name.
-- **The issues token** (the ``basecradle-ai`` App, minted per run, ``issues: write``, scoped
-  to the public repositories) reads and edits the reminders and files the gap issue.
+- **The issues token** (this repository's own ``basecradle-router-ai`` App, minted per run,
+  ``issues: write``, scoped to the public repositories) reads and edits the reminders and
+  files the gap issue. It was the capital's ``basecradle-ai`` App before basecradle#870, so
+  the reminders that bot filed are still the record (``REMINDER_AUTHORS``).
 
 Every GitHub call goes through ``gh api`` in :class:`GitHub`, the one boundary, so the tests
 replace it and nothing here has to reach GitHub to be exercised. Standard library only, so
@@ -58,11 +60,19 @@ EXPIRY = "six_months"
 # with a weekly run and the heartbeat's grace already spent noticing.
 MARGIN = timedelta(days=30)
 
+# The bot this workflow writes as: this repository's own, since basecradle#870.
+WRITER_BOT = "basecradle-router-ai[bot]"
+
 # A reminder is an open issue with this title written by one of these. The repositories are
 # public, so anyone can open an issue with any title; one nobody on the allow-list wrote is
 # never the record. The whole title is matched exactly, not searched: GitHub's search read
 # #449's own title ("... Interaction-Limit ... Renew ...") as a second reminder here.
-REMINDER_AUTHORS = frozenset({"basecradle-ai[bot]", "drawkkwast"})
+#
+# The capital's bot is on it for good, not for a transition: it wrote as this workflow
+# before basecradle#870 and filed every public repository's reminder then, and a reminder is
+# moved in place (its title and body edited), never re-filed, so it keeps its author. Drop
+# the entry and every one of those reads as missing.
+REMINDER_AUTHORS = frozenset({WRITER_BOT, "basecradle-ai[bot]", "drawkkwast"})
 REMINDER_FORMAT = "⏰ Renew interaction limit before {date} (public-repo write-lockdown)"
 REMINDER_TITLE = re.compile(
     "^" + re.escape(REMINDER_FORMAT).replace(re.escape("{date}"), r"(\d{4}-\d{2}-\d{2})") + "$"
@@ -70,7 +80,7 @@ REMINDER_TITLE = re.compile(
 REMINDER_BODY_DATE = re.compile(r"expires `(\d{4}-\d{2}-\d{2})`")
 
 GAP_TITLE = "Public Repository Lockdown Found a Gap"
-GAP_AUTHOR = "basecradle-ai[bot]"
+GAP_AUTHOR = WRITER_BOT
 GAP_LABEL = "needs-capital"
 MARKER = re.compile(r"<!-- public-repository-lockdown (\{.*\}) -->")
 
@@ -108,7 +118,7 @@ CREDENTIAL_HOW = {
 }
 CREDENTIAL_LIMITS = (
     "Nothing broader is needed: never organization administration, and no issue permission, "
-    "because the `basecradle-ai` App writes the reminders and this issue. A newly minted token "
+    "because this repository's own App writes the reminders and this issue. A newly minted token "
     "is stored as the `FLEET_ADMIN_TOKEN` secret on `basecradle/basecradle-router`. The token "
     "is `@origin`'s to change, and the first clean run after that closes this issue."
 )
@@ -116,8 +126,8 @@ GAP_NEXT = (
     "Every run renews every public repository's limit, so a limit that was only missing is "
     "usually back by the next run. A reminder that is missing or doubled is the capital's to "
     "fix by hand: one open reminder per public repository, titled exactly `⏰ Renew interaction "
-    "limit before <YYYY-MM-DD> (public-repo write-lockdown)` and written by `@basecradle-ai` "
-    "or `@origin`. "
+    "limit before <YYYY-MM-DD> (public-repo write-lockdown)` and written by "
+    "`@basecradle-router-ai`, `@basecradle-ai` or `@origin`. "
     "This issue is updated in place while a gap stands, and the run that finds none closes it."
 )
 

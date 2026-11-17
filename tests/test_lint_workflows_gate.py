@@ -16,6 +16,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 GATE = REPO / ".github" / "scripts" / "lint-workflows.sh"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
@@ -99,6 +101,12 @@ def test_no_workflows_is_a_failure_not_a_pass(tmp_path: Path) -> None:
 # collection). In a plain scalar, ": " starts a mapping and " #" starts a comment.
 _PLAIN = re.compile(r"^\s*(?:- )?[\w.-]+: (?P<value>[^\s|>\"'\[{&*!].*)$")
 
+# The one plain scalar whose " #" is meant: an action pinned to a commit, its version in a
+# trailing comment (`uses: owner/repo@<sha> # v1.2.3`), the form Dependabot bumps with its
+# comment. A `uses:` value is one token with no space in it, so a " #" after it can only be
+# that comment, never a truncated value.
+_PINNED_USES = re.compile(r"^\s*(?:- )?uses: [^\s#]+@[0-9a-f]{40} # v\S+$")
+
 
 def test_no_workflow_line_holds_a_plain_scalar_yaml_would_misread() -> None:
     offenders = []
@@ -106,10 +114,27 @@ def test_no_workflow_line_holds_a_plain_scalar_yaml_would_misread() -> None:
         for number, line in enumerate(workflow.read_text().splitlines(), 1):
             if line.lstrip().startswith("#"):
                 continue
+            if _PINNED_USES.match(line):
+                continue
             match = _PLAIN.match(line)
             if match and (": " in match["value"] or " #" in match["value"]):
                 offenders.append(f"{workflow.name}:{number}: {line.strip()}")
     assert offenders == [], "use a | block or quote the value:\n" + "\n".join(offenders)
+
+
+@pytest.mark.parametrize(
+    ("line", "exempt"),
+    [
+        ("        uses: actions/create-github-app-token@" + "0" * 40 + " # v3.3.0", True),
+        ("      - uses: actions/checkout@" + "a" * 40 + " # v7.0.1", True),
+        ("        uses: actions/checkout@v7 # moved tag", False),
+        ("        run: gh issue list --author x@" + "0" * 40 + " # v3.3.0", False),
+        ("        uses: actions/checkout@" + "a" * 40 + " # v7 and: more", False),
+    ],
+    ids=["pinned", "pinned-list-item", "tag", "run-line", "spaced-comment"],
+)
+def test_only_a_commit_pinned_uses_line_may_carry_a_comment(line: str, exempt: bool) -> None:
+    assert bool(_PINNED_USES.match(line)) is exempt
 
 
 def test_the_shape_check_catches_the_line_that_broke_the_lockdown() -> None:

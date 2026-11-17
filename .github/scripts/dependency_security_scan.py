@@ -58,7 +58,11 @@ ECOSYSTEM_NAMES = {"pypi": "Python package"}
 # not write is never read as what it knows, and never edited, labelled or closed by it.
 # (The capital's repository is private, so its scan can go by title alone.) `gh issue list`
 # names a GitHub App's bot as `app/<slug>`.
-SCAN_AUTHOR = "app/basecradle-ai"
+#
+# This repository's own bot since basecradle#870, and only it. The capital's bot ran the
+# scan before that; no scan issue it filed was open when the identity moved, so nothing it
+# wrote is the scan's to read.
+SCAN_AUTHOR = "app/basecradle-router-ai"
 
 # Each issue body carries the state it was written for, so the next run can tell a
 # standing finding (say nothing) from a changed one.

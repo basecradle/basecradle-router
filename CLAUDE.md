@@ -130,7 +130,7 @@ To author or maintain the `deploy/` contract (the version-controlled config the 
 
 - **The issue.** Findings land as one issue, `[SECURITY] Dependency Advisories Against main (Daily Scan)`. High or Critical carries `needs-human` and pages `@origin`. Anything lower carries `needs-capital`.
 - **Closing dismisses nothing.** The workflow never closes the `[SECURITY]` issue, and closing it by hand dismisses nothing.
-- **Decisions in code.** The decisions live in tested code, `.github/scripts/dependency_security_scan.py`. The workflow writes the issue as `basecradle-ai[bot]`, because a label `GITHUB_TOKEN` applies would page nobody.
+- **Decisions in code.** The decisions live in tested code, `.github/scripts/dependency_security_scan.py`. The workflow writes the issue as this repository's own bot, `basecradle-router-ai[bot]` (basecradle#870), because a label `GITHUB_TOKEN` applies would page nobody. Its `needs-human` is @origin's standing ruling applied by the workflow (2026-11-05, basecradle#750), never this agent's own escalation.
 - **The fix.** A fix is a minimal lock bump, and it is live only once the NOC's unattended deploy carries it, never by this agent's hand.
 
 To respond to the issue, a red scan run, or an advisory found any other way, invoke the `security-scan-bump` skill.

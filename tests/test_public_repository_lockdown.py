@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,8 @@ _spec.loader.exec_module(lockdown)
 NOW = datetime(2026, 11, 16, 9, 30, tzinfo=timezone.utc)
 RUN_URL = "https://github.com/basecradle/basecradle-router/actions/runs/1"
 HOME = lockdown.HOME_REPOSITORY
+# The bot this workflow writes as (basecradle#870), and the capital's, which wrote as it before.
+OWN_BOT = "basecradle-router-ai[bot]"
 CAPITAL = "basecradle-ai[bot]"
 FLEET = ["basecradle/.github", "basecradle/basecradle-python", HOME]
 
@@ -43,7 +46,7 @@ def _iso(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def reminder_issue(number: int, date: str, author: str = CAPITAL, **extra: Any) -> dict[str, Any]:
+def reminder_issue(number: int, date: str, author: str = OWN_BOT, **extra: Any) -> dict[str, Any]:
     return {
         "number": number,
         "title": f"⏰ Renew interaction limit before {date} (public-repo write-lockdown)",
@@ -425,14 +428,17 @@ def test_a_clean_dry_run_still_never_pings() -> None:
 
 
 def _gap_issue(
-    github: FakeGitHub, number: int = 500, labels: tuple[str, ...] = ("needs-capital",)
+    github: FakeGitHub,
+    number: int = 500,
+    labels: tuple[str, ...] = ("needs-capital",),
+    author: str = OWN_BOT,
 ) -> dict[str, Any]:
     body = created(github)[3]
     return {
         "number": number,
         "title": lockdown.GAP_TITLE,
         "body": body,
-        "user": {"login": CAPITAL},
+        "user": {"login": author},
         "labels": [{"name": label} for label in labels],
     }
 
@@ -515,6 +521,36 @@ def test_a_second_copy_of_the_gap_issue_is_closed_as_one() -> None:
     assert "#500, which is the record" in on_copy[0][3]
     assert json.loads(on_copy[2][3])["state"] == "closed"
     assert not [w for w in again.writes if len(w) > 2 and w[2] == "500"]
+
+
+@pytest.mark.parametrize("author", [OWN_BOT, CAPITAL], ids=["own-bot", "capital-bot"])
+def test_a_reminder_either_writer_bot_filed_is_the_record(author: str) -> None:
+    # The workflow moved from the capital's bot to this repository's own (basecradle#870).
+    # Every standing reminder is the capital's bot's, and a reminder is moved in place, never
+    # re-filed: it is the record whoever wrote it, never doubled by a fresh one beside it.
+    issue = reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}", author)
+    assert [r.number for r in lockdown.reminders_in([issue])] == [10]
+    github = FakeGitHub(issues={repo: [issue] for repo in FLEET})
+    assert audit(github).heartbeat == "ping"
+    assert "create" not in github.kinds()
+
+
+@pytest.mark.parametrize("author", [CAPITAL, "basecradle-ruby-ai[bot]"], ids=["capital", "sibling"])
+def test_a_gap_issue_another_fleet_bot_filed_is_not_the_record(author: str) -> None:
+    # The gap issue is this repository's own bot's alone: none was open under the capital's
+    # when the identity moved (basecradle#870), and a sibling captain's is never the record.
+    first = FakeGitHub(issues={"basecradle/.github": []})
+    audit(first)
+    github = _second_run({"basecradle/.github": []}, _gap_issue(first, author=author))
+    audit(github)
+    assert not [w for w in github.writes if len(w) > 2 and w[2] == "500"]
+    assert created(github)[1] == HOME
+
+
+def test_a_sibling_bots_reminder_is_not_the_record() -> None:
+    assert (
+        lockdown.reminders_in([reminder_issue(10, "2027-05-14", "basecradle-ruby-ai[bot]")]) == []
+    )
 
 
 def test_a_strangers_issue_with_the_gap_title_is_never_touched() -> None:
@@ -778,9 +814,23 @@ def test_the_admin_token_never_reaches_an_issue_write() -> None:
     assert "secrets.GITHUB_TOKEN" not in text and "github.token" not in text
 
 
+def test_the_issues_token_is_this_repositorys_own_bot_with_no_fallback() -> None:
+    # basecradle#870: FLEET_BOT_* hold this repository's captain's App; the capital's key
+    # is needed nowhere here, so nothing may fall back to it once its copies are deleted.
+    text = _workflow()
+    mint = text.split("- name: Mint This Repository's Bot Token", 1)[1].split("- name:", 1)[0]
+    assert "client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}\n" in mint
+    assert "private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}\n" in mint
+    assert "BASECRADLE_AI" not in text
+    assert re.search(r"uses: actions/create-github-app-token@[0-9a-f]{40} # v\d", mint), (
+        "the step holding the App's private key runs a commit, never a tag that can move"
+    )
+    assert lockdown.WRITER_BOT == lockdown.GAP_AUTHOR == OWN_BOT
+
+
 def test_a_failed_app_token_mint_never_stops_the_renewal_step() -> None:
     text = _workflow()
-    mint = text.split("- name: Mint the basecradle-ai App Token", 1)[1].split("- name:", 1)[0]
+    mint = text.split("- name: Mint This Repository's Bot Token", 1)[1].split("- name:", 1)[0]
     assert "continue-on-error: true" in mint
     renew = text.split("- name: Renew, Read Back, and Record", 1)[1].split("- name:", 1)[0]
     assert "if:" not in renew
@@ -906,7 +956,7 @@ def _open_gap(body: str) -> list[dict[str, Any]]:
         "number": 452,
         "title": lockdown.GAP_TITLE,
         "body": body,
-        "user": {"login": CAPITAL},
+        "user": {"login": OWN_BOT},
         "labels": [{"name": "needs-capital"}],
     }
     return [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), gap]
