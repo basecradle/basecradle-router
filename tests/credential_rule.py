@@ -16,7 +16,7 @@ a canary stop (`"`, `,`, `}`) or a record break. The two passes:
    name outside every quote whose word holds a double-quoted piece has that whole word as its
    value. Every other piece here must close, so that no piece left open can reach a later quote.
 2. THE RUN, for every other value: the word, read with pieces that may stay open (each to its
-   close or to a bare `"` or a record break), and every bearer scheme word with its token.
+   close or to a bare `"` or a record break), and every run of bearer scheme words with its token.
 
 No piece crosses a bare `"`: on a JSON or logfmt line it is the line's own.
 """
@@ -26,6 +26,8 @@ No piece crosses a bare `"`: on a JSON or logfmt line it is the line's own.
 from __future__ import annotations
 
 from pathlib import Path
+
+from basecradle_router.logfmt import SCHEME_GLUE
 
 #: Every record break, as each class spells it (`logfmt._BREAK_CHARS`, pinned by a test).
 BRK = r"\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}"
@@ -81,12 +83,25 @@ OPEN_PIECES = [
 CLOSED_PIECE = "(?:" + "|".join(CLOSED_PIECES) + ")"
 OPEN_PIECE = "(?:" + "|".join(OPEN_PIECES) + ")"
 
-#: Pass 1's value: a word holding a double-quoted piece, a marker at its head included.
-PARITY_WORD = f"{MARKERS}?{CLOSED_PIECE}*{DOUBLE_QUOTED}(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*"
+#: What a bearer header may be glued to: a value of token characters (the print site's one
+#: spelling, `logfmt.SCHEME_GLUE`), and the scheme word as HTTP spells it, so a value merely ending
+#: in the letters (`abc-bearer`) is no header.
+GLUED = f"[{SCHEME_GLUE}]*?Bearer"
 
-#: What a bearer header may be glued to: a value of token characters, and the scheme word as HTTP
-#: spells it, so a value merely ending in the letters (`abc-bearer`) is no header.
-GLUED = r"[A-Za-z0-9._~+/%:=-]*?Bearer"
+#: A scheme word, alone in any case or glued.
+SCHEME = f"(?:(?i:bearer)|{GLUED})"
+
+
+#: A run of scheme words, each with the blanks after it, in any order, as the print site's
+#: `logfmt._value_end` reads them (#497).
+SCHEMES = rf"(?:{SCHEME}[\x20\t]+)"
+
+
+#: Pass 1's value: a word holding a double-quoted piece, a marker at its head included, and the
+#: scheme words before it (`X_TOKEN=Bearer "…"`).
+PARITY_WORD = (
+    f"{MARKERS}?{SCHEMES}*{CLOSED_PIECE}*{DOUBLE_QUOTED}(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*"
+)
 
 #: Where a kept marker ends: where the canary's run would.
 MARKER_END = r'[\x20\t",}' + BRK + r"]|\z"
@@ -114,13 +129,15 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       #      in (`a="X_TOKEN=" b=1`) is the count of quotes before it in the record, as every fleet
       #      consumer reads a line; a record is one record, so its quotes may span its lines. A name
       #      outside every quote whose word holds a double-quoted piece has the whole word as its
-      #      value (`X_TOKEN="…"`, `X_TOKEN=abc"d e"`, `X_TOKEN=Y_TOKEN="…"`). Every other piece here
-      #      must close: one left open could reach a later `"` and eat a field.
+      #      value (`X_TOKEN="…"`, `X_TOKEN=abc"d e"`, `X_TOKEN=Y_TOKEN="…"`), bearer scheme words
+      #      before it included (`X_TOKEN=Bearer "…"`). Every other piece here must close: one left
+      #      open could reach a later `"` and eat a field.
       #   2. THE RUN, for every other value: a double-quoted value closed on its line before a word's
       #      end, whatever the parity (a stray quote earlier, an inch mark or a traceback's `'"'`,
-      #      never lets one through); the word, with pieces that may stay open; and every bearer
-      #      scheme word with its token (a `Bearer` glued to a value included), as the
-      #      `api[-_]?key=` rule below takes them: the scheme word alone is the canary's whole value.
+      #      never lets one through); the word, with pieces that may stay open; and every run of
+      #      bearer scheme words with the token after it (a `Bearer` glued to a value included, the
+      #      words in any order), as the print site and the `api[-_]?key=` rule below take them: the
+      #      scheme word alone is the canary's whole value.
       # An empty value is left as it is, except before a record break, which the canary's run
       # crosses: the marker stands between the `=` and the break, and nothing is taken.
       #
@@ -166,8 +183,7 @@ BLOCK = (
                       (?P<kept>{MARKERS}|"{MARKERS}")(?P<kept_end>{MARKER_END})
                     | (?P<value>
                           {CLOSED_QUOTED_VALUE}
-                        | (?:(?i:bearer)[\\x20\\t]+)+{OPEN_PIECE}+
-                        | {GLUED}[\\x20\\t]+{OPEN_PIECE}+
+                        | {SCHEMES}+{OPEN_PIECE}+
                         | {OPEN_PIECE}+
                         | (?P<record_break>[{BRK}])
                       )

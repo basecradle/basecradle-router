@@ -235,9 +235,44 @@ def _shell_word_end(text: str, start: int) -> int:
     return min(i, n)
 
 
+#: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
+#: a token's, as a header value spells one. The box's rule builds its glued scheme word from this
+#: one spelling (``tests/credential_rule.py``, ``GLUED``), and ``wake-runner``'s ``jq`` fallback
+#: carries it verbatim (pinned by a test).
+SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
+
+#: A bearer header's scheme word, which is never a credential's whole value: the token after it is
+#: (#497). Alone it is the word in any case; glued to a value only as HTTP spells it, so a value
+#: merely ending in the letters (``abc-bearer``) is no header.
+_SCHEME_WORD = re.compile(f"(?i:bearer)|[{SCHEME_GLUE}]*Bearer")
+
+#: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
+_SCHEME_BLANKS = re.compile("[ \t]+")
+
+
 def _value_end(text: str, start: int) -> int:
-    """Where a credential's value from ``start`` ends: the longer of the two readings."""
-    return max(_shell_word_end(text, start), _CANARY_RUN.match(text, start).end())
+    """Where a credential's value from ``start`` ends: the longer of the two readings of its word,
+    and while a word of the value is a bearer scheme word (:data:`_SCHEME_WORD`), the word after
+    the blanks that follow it too, so a doubled scheme word goes with the token after both. A scheme
+    word with nothing after it on its line is the value alone.
+
+    The words are shell words: the canary's run crosses a tab, and read that way
+    ``bearer<TAB>Bearer`` would be one word and no scheme word, and the token after it would ship.
+    Each word is read once, and the canary's run once from where the last one ended, so the value
+    is linear in its length."""
+    run_end = _CANARY_RUN.match(text, start).end()
+    word_end = _shell_word_end(text, start)
+    end = max(word_end, run_end)
+    while _SCHEME_WORD.fullmatch(text, start, word_end) and (
+        blanks := _SCHEME_BLANKS.match(text, word_end)
+    ):
+        start = blanks.end()
+        if (word_end := _shell_word_end(text, start)) == start:
+            break  # nothing after the scheme word on its line
+        if start >= run_end:
+            run_end = _CANARY_RUN.match(text, start).end()
+        end = max(end, word_end, run_end)
+    return end
 
 
 def redact_credentials(text: str) -> str:
@@ -246,9 +281,10 @@ def redact_credentials(text: str) -> str:
     The name stays. The value is the longer of two readings from the character after the ``=``
     (:func:`_value_end`): the shell word there (:func:`_shell_word_end`), so a quoted value or a
     ``"$(…)"`` goes whole, and the canary's own run, so whatever the canary would read as the value
-    is gone in every record the text is written into, a prose line that keeps a tab included. An
-    empty value (a space, a record break or the text's end follows the ``=``) has nothing to hide
-    and is left as it is. Linear in ``text``, and idempotent: the marker is redacted to itself, so
+    is gone in every record the text is written into, a prose line that keeps a tab included. A
+    bearer scheme word is no value alone: the token after it goes with it (#497). An empty value
+    (a space, a record break or the text's end follows the ``=``) has nothing to hide and is left
+    as it is. Linear in ``text``, and idempotent: the marker is redacted to itself, so
     a value redacted where it is bounded and again where it is rendered stays one marker.
     """
     if "=" not in text:

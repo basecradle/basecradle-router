@@ -10,10 +10,12 @@ translator launcher, a crashing one, real ``jq`` and real ``cat``.
 from __future__ import annotations
 
 import json
+import random
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -306,6 +308,14 @@ _AGREED = "\n".join(
         "C_TOKEN='<a redacted value>' twice",
         "A_KEY=(sk1 sk2secretsecret) x",
         "GH_TOKEN=don't do that.",
+        # A bearer value goes with its token (#497): any case, glued, doubled, in any order.
+        "AUTH_TOKEN=Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+        "X_API_KEY=KBearer eyJhbGciOiJIUzI1NiJ9 next=1",
+        "A_TOKEN=Bearer Bearer eyJabc next=1 | B_TOKEN=bearer\tBEARER eyJabc next=2",
+        "C_TOKEN=Bearer KBearer eyJabc next=1 | D_TOKEN=x.Bearer Bearer eyJabc next=2",
+        'E_TOKEN=Bearer "a b" next=1 | F_TOKEN=abc-bearer next=2 | G_TOKEN=Bearer',
+        "H_TOKEN=Bearer ",
+        'I_TOKEN=Bearer\t"a b" next=1 | J_TOKEN=a\\ Bearer eyJabc next=2',
         "",
         "The rest of the reply.",
     ]
@@ -355,10 +365,55 @@ def test_the_fallback_reads_a_long_run_of_capitals_in_linear_time(tmp_path: Path
     assert out[0].startswith("> AAAA")
 
 
+#: The pieces of a fuzzed reply: credential names, every form of scheme word, tokens and blanks.
+#: A tab only after a scheme word, and every line ends in a word: elsewhere the fallback's word
+#: ends at a tab and the translator's run does not, a difference of the degraded reading that is
+#: not this rule's.
+_SCHEME_PIECES = [
+    "A_TOKEN=", "MY_API_KEY=", "Bearer ", "Bearer\t", "BEARER ", "bearer ", "KBearer ",
+    "x.Bearer ", "abc-bearer ", "eyJabc", "abc", " ", "=", ".", ":", "next=1",
+]  # fmt: skip
+
+
+@needs_jq
+def test_the_fallback_reads_scheme_words_as_the_translator_does(tmp_path: Path) -> None:
+    # Seeded fuzz, 600 lines: on every run of scheme words the two spellings agree (#497).
+    from basecradle_router.claude_stream import quoted
+
+    rng = random.Random(497)
+    reply = "\n".join(
+        "".join(rng.choice(_SCHEME_PIECES) for _ in range(rng.randint(1, 16))) + " end"
+        for _ in range(600)
+    )
+    assert _fallback(tmp_path, reply) == quoted(reply)
+
+
+@needs_jq
+@pytest.mark.parametrize(
+    ("run", "left"),
+    [("Bearer ", ""), ("Bearer\t", ""), ("xBearer", ""), ("A_TOKEN=Bearer", ""), ("xbearer", " x")],
+)
+def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
+    tmp_path: Path, run: str, left: str
+) -> None:
+    # A backtracking engine reads the scheme words before a value: none of these may stall it. A
+    # run of scheme words takes the word after it; a value ending in `bearer` is no header.
+    reply = "A_TOKEN=" + run * 40_000 + " x"
+    started = time.monotonic()
+    out = _fallback(tmp_path, reply)
+    assert time.monotonic() - started < 15.0
+    assert out == ["> A_TOKEN='<a redacted value>'" + left]
+    from basecradle_router.claude_stream import quoted
+
+    assert out == quoted(reply)
+
+
 def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
-    from basecradle_router.logfmt import CREDENTIAL_NAME, REDACTED_VALUE
+    from basecradle_router.logfmt import CREDENTIAL_NAME, REDACTED_VALUE, SCHEME_GLUE
 
     script = _run_stream()
     assert f'\\"{CREDENTIAL_NAME}\\" as \\$n' in script
+    # Every scheme word before the value goes with it, by the translator's spelling (#497).
+    assert f'\\")(?:(?:(?i:bearer)|[{SCHEME_GLUE}]*Bearer)[ \\\\t]+)*(?:' in script
     marker = REDACTED_VALUE.replace("'", "\\\\u0027")
     assert f'\\"{marker}\\" as \\$r' in script

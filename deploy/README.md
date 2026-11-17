@@ -2317,15 +2317,18 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   wherever a whole line allows: pieces up to a blank, a canary stop (`"`, `,`, `}`) or a record break,
   each piece anywhere in the word: a backslash escape, a single-quoted, dollar-sign-quoted or
   backquoted piece, a command substitution, a closed parenthesis, a JSON-escaped `\"…\"`, and every
-  bearer scheme word with its token. The print site reads one value; the box reads a whole line, so
-  **no piece ever crosses a bare `"`**, which on a JSON or logfmt line is the line's own (a request's
-  `'` never takes the rest of an access line). Two passes:
+  run of bearer scheme words with the token after it (alone in any case, or glued to a value as
+  HTTP spells `Bearer`, in any order: basecradle-router#497).
+  The print site reads one value; the box reads a whole line, so **no piece ever crosses a bare
+  `"`**, which on a JSON or logfmt line is the line's own (a request's `'` never takes the rest of an
+  access line). Two passes:
   1. **Quote parity.** Whether a `"` opens a piece or closes the quoted value the assignment sits in
      (`a="X_TOKEN=" b=1`) is the count of quotes before it in the record, as every fleet consumer
      reads a line; a journal record is one record, so its quotes may span its lines. A name outside
      every quote whose word holds a double-quoted piece has the whole word as its value
-     (`X_TOKEN="…"`, `X_TOKEN=abc"d e"`, `X_TOKEN=Y_TOKEN="…"`). Every other piece here must close:
-     one left open could reach a later `"` and eat the fields between.
+     (`X_TOKEN="…"`, `X_TOKEN=abc"d e"`, `X_TOKEN=Y_TOKEN="…"`), scheme words before it included
+     (`X_TOKEN=Bearer "…"`). Every other piece here must close: one left open could reach a later
+     `"` and eat the fields between.
   2. **The run**, for every other value: a double-quoted value closed on its line before a word's
      end, whatever the parity, so a stray quote earlier (an inch mark, a traceback's `'"'`) never
      lets a quoted value through; then the word, its pieces allowed to stay open (each to its close
@@ -2342,10 +2345,10 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   record break, and a single-quoted piece meeting a bare `"` all end a value; a substitution is read
   one level deep, with no quote tracked inside it; a bare `(` left open is an ordinary character;
   `\"` opens a JSON-escaped piece where a shell would read a literal quote; and a tab is part of a
-  word, as it is of the canary's run, where the print site takes the longer of the two readings. The
-  print site redacts a bearer scheme word alone and leaves its token; the box takes the token. One
-  shape both over-read: an empty assignment closing a quoted value, followed by a field whose own
-  value begins with a blank (`a="X_TOKEN=" b=" y"`), loses that field.
+  word, as it is of the canary's run, where the print site takes the longer of the two readings. A
+  bearer token is a value like any other, so a `,` or `}` inside one ends it too. One shape both
+  over-read: an empty assignment closing a quoted value, followed by a field whose own value begins
+  with a blank (`a="X_TOKEN=" b=" y"`), loses that field.
   **Four properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
   written): the canary reads nothing the box ships; no credential-named assignment the rule leaves
   is followed by a value, by the rule's own reading of quotes; a quoted value closed before a word's
