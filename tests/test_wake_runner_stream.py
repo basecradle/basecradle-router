@@ -506,13 +506,38 @@ def test_sparse_assignments_cost_neither_time_nor_memory(tmp_path: Path) -> None
     assert out.splitlines() == quoted(reply)
 
 
+@needs_jq
 def test_a_search_that_exhausts_the_retry_limit_is_made_again_for_fewer(tmp_path: Path) -> None:
     # Short assignments let a search read 256, and the long ones after them take it past its retry
-    # limit, which a quarter as many are not.
+    # limit, which a quarter as many are not. Their values are escapes, a piece that costs retries:
+    # a plain character costs none (#509).
     from basecradle_router.claude_stream import quoted
 
-    reply = "A_TOKEN=x " * 1_000 + ("A_TOKEN=" + "x" * 10_000 + " ") * 100
+    reply = "A_TOKEN=x " * 1_000 + ("A_TOKEN=" + "\\x" * 5_000 + " ") * 100
     assert _fallback(tmp_path, reply) == quoted(reply)
+
+
+@needs_jq
+@pytest.mark.parametrize(
+    ("piece", "count"),
+    [
+        ("x", 3_000_000),  # a plain character, the first piece tried: no retry at all
+        ("\\x", 350_000),  # an escape, the piece tried last
+        ("\t", 3_000_000),  # tabs, read possessively
+        ("SE=", 130_000),  # the costliest: under the some 430,000 the program's comment states
+    ],
+)
+def test_one_value_of_millions_of_characters_stays_under_the_retry_limit(
+    tmp_path: Path, piece: str, count: int
+) -> None:
+    # Each piece tried before a value's own costs a retry when it fails, and the engine allows
+    # 10,000,000 in one search: one value of some 600,000 plain characters exhausted them, jq
+    # failed, and the reply was lost (#509).
+    from basecradle_router.claude_stream import quoted
+
+    reply = "A_TOKEN=" + piece * count + " after"
+    out = _fallback(tmp_path, reply)
+    assert out == quoted(reply) == ["> A_TOKEN='<a redacted value>' after"]
 
 
 #: Every piece the fuzz below writes a reply from: the scheme words' pieces, and every opener,

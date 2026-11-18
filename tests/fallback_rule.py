@@ -13,9 +13,14 @@ the repository root (`uv run python tests/fallback_rule.py`), which writes `PROG
 The value is the translator's reading of one, degraded only where a backtracking engine needs it:
 the scheme words before it (#497), the lead words a tab joins it across (#502), the value of every
 credential name it holds outside a quote (#504's review), then its last word, a quote or a
-substitution read one level deep. Two choices keep the engine under its retry limit on any text: a
-piece before a credential name never crosses a name's `=`, so each name is one item with one
-reading, and a run of pieces with one reading repeats possessively.
+substitution read one level deep. Every piece the engine tries and fails costs it a retry, of
+10,000,000 a search, and three choices keep them few: a piece before a credential name never
+crosses a name's `=`, so each name is one item with one reading; a run of pieces with one reading
+repeats possessively, a run of tabs included; and a value's plain character is the first piece
+tried, and a name's `=` is looked behind only where an `=` stands (#509). So a run of plain
+characters costs none and reads at any length, and every other piece costs a few: the costliest
+value, a run of `=` each after the last two letters of a credential word (`SE=SE=…`), exhausts the
+limit at some 430,000 characters, and jq then fails, closed, the reply lost.
 
 jq 1.7 counts every match's and capture's offset from the start of the string, and a slice
 measures the whole string, so one `gsub` search an assignment and one `splits` a record cost the
@@ -74,14 +79,24 @@ def run_char(but: str = "") -> str:
 SPELLINGS = [word + tail for tail in ("", CREDENTIAL_TAIL) for word in CREDENTIAL_WORDS]
 
 #: An `=` that ends no credential name, and one that ends one. jq's Oniguruma allows no look-behind
-#: whose alternatives differ in length, so each spelling has a look-behind of its own.
-NOT_A_NAMES_EQ = "".join(f"(?<!{spelling})" for spelling in SPELLINGS) + "="
-A_NAMES_EQ = "(?:" + "|".join(f"(?<={spelling})" for spelling in SPELLINGS) + ")="
+#: whose alternatives differ in length, so each spelling has a look-behind of its own. Each looks
+#: behind only at an `=`, and one after no spelling's last letter, or last two, ends no name at once
+#: (#509).
+LAST_ONE = "".join(sorted({spelling[-1] for spelling in SPELLINGS}))
+LAST_TWO = "|".join(sorted({spelling[-2:] for spelling in SPELLINGS}))
+if not (LAST_ONE + LAST_TWO.replace("|", "")).isupper():
+    raise ValueError("a spelling's last two characters stand in a look-behind as themselves")
+NOT_A_NAMES_EQ = (
+    f"(?==)(?:(?<![{LAST_ONE}])|(?<!{LAST_TWO})|"
+    + "".join(f"(?<!{spelling})" for spelling in SPELLINGS)
+    + ")="
+)
+A_NAMES_EQ = "(?==)(?:" + "|".join(f"(?<={spelling})" for spelling in SPELLINGS) + ")="
 
 #: The last word's pieces, the translator's shell word read one level deep: a double-quoted piece
 #: (in which a backslash escapes), a single-quoted one, a substitution, a backquoted one, each to its
 #: close or the record's end, an escape (of anything but a tab), and any other character but a
-#: blank or an opener.
+#: blank or an opener, which is tried first: a value is mostly made of it (#509).
 DOUBLE = '\\"(?:[^\\"' + BACKSLASH + BRK + "]|" + BACKSLASH + '.)*\\"'
 SINGLE = "\\u0027[^\\u0027" + BRK + "]*\\u0027"
 SUBSTITUTION = "\\\\$?\\\\([^)" + BRK + "]*\\\\)"
@@ -94,12 +109,12 @@ def bare(but: str = "") -> str:
     return "[^" + jq(" \t\n\"'`\\(" + but) + "]"
 
 
-PIECE = f"(?:{DOUBLE}?|{SINGLE}?|{SUBSTITUTION}?|{BACKQUOTED}?|{ESCAPE}|{bare()})"
+PIECE = f"(?:{bare()}|{DOUBLE}?|{SINGLE}?|{SUBSTITUTION}?|{BACKQUOTED}?|{ESCAPE})"
 
 #: The same pieces, each closed, and no bare `=` that ends a credential name: what stands before an
-#: inner name's `=`, so a name inside a quote is the quote's text.
+#: inner name's `=`, so a name inside a quote is the quote's text. A plain character first (#509).
 CLOSED_PIECE = (
-    f"(?:{DOUBLE}|{SINGLE}|{SUBSTITUTION}|{BACKQUOTED}|{ESCAPE}|{bare('=')}|{NOT_A_NAMES_EQ})"
+    f"(?:{bare('=')}|{NOT_A_NAMES_EQ}|{DOUBLE}|{SINGLE}|{SUBSTITUTION}|{BACKQUOTED}|{ESCAPE})"
 )
 
 #: Where a word after a tab may start (`logfmt._reached`): not at a blank, a canary stop other than
@@ -127,7 +142,7 @@ LEAD = f"(?:{LEAD_PIECE}++(?:{BACKSLASH})?|{BACKSLASH})\\t+"
 SCHEME = f"(?:(?i:bearer)|[{SCHEME_GLUE}]*Bearer)[ \\t]+(?={REACH})"
 
 #: The tabs a value opens with, before a word the canary's run reaches.
-OPENING_TABS = f"(?:\\t+(?={REACH}))?"
+OPENING_TABS = f"(?:\\t++(?={REACH}))?"
 
 #: An inner credential name: the closed pieces up to its `=`, possessive, then its value's tabs.
 TO_A_NAME = f"{CLOSED_PIECE}*+{A_NAMES_EQ}"
@@ -154,7 +169,8 @@ RUN = run_char() + "{" + str(CANARY_VALUE_FLOOR) + ",}"
 #: for every assignment, and jq offers no linear construction. Reading many per search divides that
 #: cost by as many; assignments further apart than `GAP` cost what each did before. A search reads
 #: four times as many as the last only while four times the last one's reach stays under `SPAN`
-#: characters, far below what exhausts the engine's retry limit (some 600,000 of one value).
+#: characters, far below what exhausts the engine's retry limit (some 430,000 characters of one
+#: value of the costliest pieces, #509).
 UNITS = 256
 GAP = 4096
 SPAN = 65536
