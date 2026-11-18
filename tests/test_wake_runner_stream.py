@@ -473,7 +473,6 @@ def test_the_fallback_reads_many_assignments_in_seconds(tmp_path: Path, assignme
 
 
 @needs_jq
-@needs_jq
 def test_sparse_assignments_cost_neither_time_nor_memory(tmp_path: Path) -> None:
     # 3,000 assignments 300 characters apart, a megabyte. A search reads one only while they are
     # further apart than its gap, and a loop holding a copy of the text for each search held 1.45 GB
