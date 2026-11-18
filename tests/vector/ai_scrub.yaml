@@ -347,7 +347,9 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\"")
+              # `API-KEY=` holds a bare `KEY=`, a credential's name to the canary (basecradle-router#504),
+              # so the credential rule takes that value first and keeps the name.
+              assert_eq!(.message, "[basecradle-router] GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\" | GET /v1/tools?API-KEY='<a value the box redacted>' \"ok\" | GET /v1/tools?apiKey=[REDACTED] \"ok\"")
 
   - name: "an env dump api key is redacted whatever its provider"
     inputs:

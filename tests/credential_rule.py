@@ -16,7 +16,8 @@ a canary stop (`"`, `,`, `}`) or a record break. The two passes:
    name outside every quote whose word holds a double-quoted piece has that whole word as its
    value. Every other piece here must close, so that no piece left open can reach a later quote.
 2. THE RUN, for every other value: the word, read with pieces that may stay open (each to its
-   close or to a bare `"` or a record break), and every run of bearer scheme words with its token.
+   close or to a bare `"` or a record break), and every run of bearer scheme words with its token,
+   a scheme word a tab glues to a value after lead words included (`LEAD_WORD`, #502).
 
 No piece crosses a bare `"`: on a JSON or logfmt line it is the line's own.
 """
@@ -27,13 +28,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from basecradle_router.logfmt import SCHEME_GLUE
+from basecradle_router.logfmt import (
+    CREDENTIAL_TAIL,
+    CREDENTIAL_WORDS,
+    SCHEME_GLUE,
+)
 
 #: Every record break, as each class spells it (`logfmt._BREAK_CHARS`, pinned by a test).
 BRK = r"\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}"
 
 #: The canary's credential name, byte for byte (`conftest.NOC_CREDENTIAL_ASSIGNMENT`).
-NAME = "[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)"
+NAME = f"[A-Z0-9_]*({'|'.join(CREDENTIAL_WORDS)})({CREDENTIAL_TAIL})?"
 
 #: The print site's marker and the box's own, as a raw string spells them (`\x27` is `'`).
 PRINT_MARKER = r"\x27<a\x20redacted\x20value>\x27"
@@ -97,10 +102,36 @@ SCHEME = f"(?:(?i:bearer)|{GLUED})"
 SCHEMES = rf"(?:{SCHEME}[\x20\t]+)"
 
 
+#: A run of scheme words reached across tabs, as well as blanks (#502): each one after any prefix of
+#: closed pieces that ends at a tab (`x<TAB>Bearer`, `'q'<TAB>KBearer`, `(a)<TAB>Bearer`), a
+#: backslash right before the tab included, as the print site's `logfmt._value_end` never ends a
+#: value between a scheme word and its token. Every piece of the prefix closes, so none can stop
+#: inside a quote: one that could would let `'a<TAB>Bearer b'` read as a scheme word and open a
+#: quote that eats the line's fields. The box reads at least what the print site does here.
+REACHED_SCHEMES = rf"(?:(?:{CLOSED_PIECE}*?\\?\t)?\t*{SCHEME}[\x20\t]+)"
+
+
+#: The credential names a value holds outside every quote, each with its `=` (`'q'DB_PASSWORD=`):
+#: the value goes on into each one's value, as the print site's `logfmt._value_end` reads it (#504's
+#: review). The pieces before each name all close, so a name inside a quote is the quote's text. (A
+#: `,` ends the box's value, so a name after one is an assignment of the box's own.)
+INNER_NAMES = f"(?:{CLOSED_PIECE}*?{NAME}=)*"
+
+#: A run of scheme words, each with the inner names its token holds before the next.
+SCHEME_CHAIN = f"(?:{REACHED_SCHEMES}{INNER_NAMES})"
+
 #: Pass 1's value: a word holding a double-quoted piece, a marker at its head included, and the
-#: scheme words before it (`X_TOKEN=Bearer "…"`).
+#: scheme words before it (`X_TOKEN=Bearer "…"`, `X_TOKEN=x<TAB>Bearer "…"`).
+#: After its double-quoted piece the word goes on to a tab, and past it only by a scheme word and its
+#: token (`X_TOKEN="a b"<TAB>Bearer tok`), so it never ends between the two.
+_BARE = CLOSED_PIECES[-1]
+assert _BARE.startswith(r"[^\x20"), _BARE  # any other character, a tab included
+_TAIL = _BARE[len(r"[^\x20") :]
+CLOSED_PIECE_BEFORE_A_TAB = "(?:" + "|".join([*CLOSED_PIECES[:-1], r"[^\x20\t" + _TAIL]) + ")"
 PARITY_WORD = (
-    f"{MARKERS}?{SCHEMES}*{CLOSED_PIECE}*{DOUBLE_QUOTED}(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*"
+    f"{INNER_NAMES}(?:{MARKERS}{SCHEMES}*|{SCHEME_CHAIN}*)"
+    f"{CLOSED_PIECE}*{DOUBLE_QUOTED}(?:{CLOSED_PIECE_BEFORE_A_TAB}|{DOUBLE_QUOTED})*"
+    f"(?:{SCHEME_CHAIN}+(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*)?"
 )
 
 #: Where a kept marker ends: where the canary's run would.
@@ -113,8 +144,9 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       # basecradle/basecradle#877). The value of any credential-named assignment becomes the box's
       # marker, `'<a value the box redacted>'`, and the name stays. "Names a credential" is the NOC's
       # log-store canary's definition, its `credential_assignment` rule, never a list of this box's
-      # own: `[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=`, byte for byte (Rust's regex,
-      # under VRL, is linear, so the canary's own spelling is safe here).
+      # own: `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=`, byte for byte (Rust's
+      # regex, under VRL, is linear, so the canary's own spelling is safe here; @origin widened it
+      # on 2026-11-17, basecradle-noc#1547: a bare word is a name, and `_BASE` the one tail).
       #
       # GENERATED. tests/credential_rule.py writes each piece of the two patterns below once, with
       # what it reads, and writes this block into every host's file; tests/test_log_surface.py holds
@@ -137,7 +169,12 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       #      never lets one through); the word, with pieces that may stay open; and every run of
       #      bearer scheme words with the token after it (a `Bearer` glued to a value included, the
       #      words in any order), as the print site and the `api[-_]?key=` rule below take them: the
-      #      scheme word alone is the canary's whole value.
+      #      scheme word alone is the canary's whole value. The canary's run crosses a tab, so a
+      #      scheme word after one is reached too, after any prefix of pieces that all close
+      #      (`x<TAB>Bearer`, `'q'<TAB>KBearer`, `(a)<TAB>Bearer`, basecradle-router#502): a value
+      #      never ends between a scheme word and its token.
+      #   Both passes read on into the value of a credential name the value holds outside every
+      #   quote (`'q'DB_PASSWORD=<TAB>…`, `'q'DB_PASSWORD=Bearer …`), as the print site does.
       # An empty value is left as it is, except before a record break, which the canary's run
       # crosses: the marker stands between the `=` and the break, and nothing is taken.
       #
@@ -182,9 +219,12 @@ BLOCK = (
                   (?:
                       (?P<kept>{MARKERS}|"{MARKERS}")(?P<kept_end>{MARKER_END})
                     | (?P<value>
-                          {CLOSED_QUOTED_VALUE}
-                        | {SCHEMES}+{OPEN_PIECE}+
-                        | {OPEN_PIECE}+
+                          {INNER_NAMES}
+                          (?:
+                              {CLOSED_QUOTED_VALUE}
+                            | {SCHEME_CHAIN}+{OPEN_PIECE}+
+                            | {OPEN_PIECE}+
+                          )
                         | (?P<record_break>[{BRK}])
                       )
                   )') -> |assignment| {{
