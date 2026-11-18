@@ -968,16 +968,17 @@ def _box_writes_back(line: str) -> bool:
 
 def test_the_box_never_leaves_more_of_a_value_than_the_print_site(tmp_path: Path) -> None:
     # The reference holds the box to itself, not only to the lines picked above: on every
-    # construct the two read alike, the box (its rules together) takes at least what the print
+    # construct the two read alike, the box's credential rule alone takes at least what the print
     # site takes. Seeded fuzz, 3,000 lines; a fabricated secret the print site redacts must not
-    # survive the box. A scheme word the box writes back is no construct the two read alike.
+    # survive the rule. A scheme word the rule writes back is no construct the two read alike: the
+    # bearer rule takes its token, which the header fuzz below holds.
     rng = random.Random(877)
     lines = [
         "".join(rng.choice(_ORACLE_PIECES) for _ in range(rng.randint(1, 30))) for _ in range(3000)
     ]
     lines = [line for line in lines if not _box_writes_back(line)]
     assert len(lines) > 1500
-    box = _scrub_lines(_vector(), tmp_path, lines)
+    box = _scrub_lines(_vector(), tmp_path, lines, alone="rule")
     leaked = [
         (line, got)
         for line, got in zip(lines, box, strict=True)
@@ -1134,7 +1135,7 @@ def test_no_credential_value_ends_between_a_scheme_word_and_its_token_at_the_pri
 #: The words of closed pieces as the box reads them: on the box an escaped quote opens a
 #: JSON-escaped piece (a named difference above), so a scheme word glued after one is glued after a
 #: piece left open there, the stated limit below.
-_BOX_CLOSED_WORDS = [word for word in _GLUED_SCHEME_WORDS if not word.startswith("\\")]
+_BOX_CLOSED_WORDS = [word for word in _GLUED_SCHEME_WORDS if not word.startswith('\\"')]
 
 #: The stated limit (deploy/README.md → the credential rule's "One limit both read alike"): in a
 #: credential-named value, a scheme word glued after a quote, a backquote or a substitution the

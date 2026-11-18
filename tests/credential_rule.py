@@ -141,22 +141,26 @@ PARITY_WORD = (
 
 #: The scheme word a value ended on, written back after the marker as a fixed word so the bearer
 #: rule, the one rule that reads a header, reads the token after it by the fleet's definition
-#: (basecradle-router#510): any word ending in `bearer`, with a blank after it, or with blanks inside
-#: the value after it (a JSON-escaped piece crosses them and stops at a `"`). This rule never reads
+#: (basecradle-router#510): any word ending in `bearer`, with a blank after it. This rule never reads
 #: a header it does not already read (#497), so its match is what it always was, and the written
 #: word only gives the bearer rule, the last literal rule, more to take. Only where a token could
-#: follow on the record: a value at the text's end, or before a record break, a `,` or a `}`,
-#: writes nothing back, so the bearer rule never reads a token across a break.
+#: follow on the record (`FOLLOWS`). `{indent}` is the closure's own indentation.
 PUT_BACK = (
     'held = string({value}) ?? ""\n'
-    '                          label = ""\n'
-    "                          if {after}.stop == null && match(held, r'(?i)bearer[\\x20\\t]+\\z') {{ label = \" Bearer \" }}"
-    ' else if {after}.stop == null && (string({after}.blank) ?? "") != "" && match(held, r\'(?i)bearer\\z\') {{ label = " Bearer" }}'
+    '{indent}label = ""\n'
+    '{indent}if {after}.stop == null && (string({after}.blank) ?? "") != "" && match(held, r\'(?i)bearer\\z\') {{ label = " Bearer" }}'
 )
 
 #: What follows a value, captured so the put-back can see it and written back as it came: its
-#: blanks, then the text's end, a record break, or a `,` or `}`, which no bearer token opens with.
-FOLLOWS = rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|[,}}{BRK}])?"
+#: blanks, then a stop no token follows on the record: the text's end, a record break, a backslash
+#: before one, a `,` or a `}`, which no bearer token opens with, and in the run pass a bare `"` that
+#: closes the line's own string, before a `,`, `}`, `]`, `:`, a record break or the end (written back
+#: in front of it, the word let the bearer rule read across a JSON string's close and eat the line);
+#: a `"` before anything else opens a quoted token. In the parity pass a `"` after a value opens one
+#: by the count of quotes, and consuming it would shift that count.
+FOLLOWS_PARITY = rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{BRK}]|[,}}])?"
+CLOSING_QUOTE = rf'"[\x20\t]*(?:[,}}\]:{BRK}]|\z)'
+FOLLOWS = rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{BRK}]|[,}}]|{CLOSING_QUOTE})?"
 
 #: Where a kept marker ends: where the canary's run would.
 MARKER_END = r'[\x20\t",}' + BRK + r"]|\z"
@@ -236,12 +240,12 @@ BLOCK = (
               if contains(text, "\\"") {{
                   parity = replace_with(text, r'(?x)
                       (?P<head>{OUTSIDE}*?\\\\?{NAME}=)
-                      (?P<value>{PARITY_WORD}){FOLLOWS}
+                      (?P<value>{PARITY_WORD}){FOLLOWS_PARITY}
                     | {OUTSIDE}*(?:{DOUBLE_QUOTED})?') -> |segment| {{
                       if segment.value == null || includes(["\\"'<a redacted value>'\\"", "\\"'<a value the box redacted>'\\""], segment.value) {{
                           segment.string
                       }} else {{
-                          {PUT_BACK.format(value="segment.value", after="segment")}
+                          {PUT_BACK.format(value="segment.value", after="segment", indent=" " * 26)}
                           (string(segment.head) ?? "") + "'<a value the box redacted>'" + label + (string(segment.blank) ?? "") + (string(segment.stop) ?? "")
                       }}
                   }}
@@ -263,7 +267,7 @@ BLOCK = (
                   if assignment.kept != null {{
                       assignment.string
                   }} else {{
-                      {PUT_BACK.format(value="assignment.value", after="assignment")}
+                      {PUT_BACK.format(value="assignment.value", after="assignment", indent=" " * 22)}
                       (string(assignment.name) ?? "") + "'<a value the box redacted>'" + label + (string(assignment.quote_end) ?? string(assignment.record_break) ?? "") + (string(assignment.blank) ?? "") + (string(assignment.stop) ?? "")
                   }}
               }}

@@ -2364,8 +2364,9 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   basecradle-harness `docs/telemetry.md` → Credential Scrubbing, read as written (`Bear'er'` is
   none). The print site and the `jq` fallback read every such word into the value with its token.
   **The box's credential rule never reads one it did not read before:** a value that ends at any
-  other word ending in `bearer`, with a token able to follow on the record, writes the fixed word
-  ` Bearer` back after the marker, and the bearer rule, the one rule that reads a header (#507),
+  other word ending in `bearer`, with a token able to follow on the record (not before the line's
+  own closing `"`, a `,` or `}`, a record break or the end), writes the fixed word ` Bearer` back
+  after the marker, and the bearer rule, the one rule that reads a header (#507),
   takes the token by the fleet's definition. Reading the header in this rule's value instead
   consumed other rules' labels (`x-api-key:`, `apiKey=`) and left their tokens to no rule, 3,199
   regressions in the NOC's differential (basecradle-noc#1573), and the rule's match is what it was

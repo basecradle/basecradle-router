@@ -718,16 +718,25 @@ def test_a_value_ending_at_a_scheme_word_writes_the_word_back_for_the_bearer_rul
     # byte of the value, and never a header read here, which consumed other rules' labels
     # (basecradle-noc#1573).
     block = credential_rule.BLOCK
-    follows = credential_rule.FOLLOWS
-    assert follows == rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|[,}}{credential_rule.BRK}])?"
-    assert block.count(follows) == 2
-    for name in ("segment", "assignment"):
-        put_back = credential_rule.PUT_BACK.format(value=f"{name}.value", after=name)
-        assert put_back in block
-        assert put_back.count(f"{name}.stop == null") == 2
+    brk = credential_rule.BRK
+    # The run pass stops at a bare `"` too, the line's own there; the parity pass cannot consume
+    # one, which would shift its count of quotes.
+    parity = credential_rule.FOLLOWS_PARITY
+    run = credential_rule.FOLLOWS
+    assert parity == rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{brk}]|[,}}])?"
+    closing = credential_rule.CLOSING_QUOTE
+    assert closing == rf'"[\x20\t]*(?:[,}}\]:{brk}]|\z)'
+    assert run == rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{brk}]|[,}}]|{closing})?"
+    assert block.count(f"(?P<value>{credential_rule.PARITY_WORD}){parity}\n") == 1
+    assert block.count(f"){run}') -> |assignment|") == 1
+    for name, indent in (("segment", 26), ("assignment", 22)):
+        put_back = credential_rule.PUT_BACK.format(
+            value=f"{name}.value", after=name, indent=" " * indent
+        )
+        assert f"{' ' * indent}{put_back}\n" in block
+        assert put_back.count(f"{name}.stop == null") == 1
         assert f'(string({name}.blank) ?? "") + (string({name}.stop) ?? "")' in block
     assert "match(held, r'(?i)bearer\\z')" in credential_rule.PUT_BACK
-    assert "match(held, r'(?i)bearer[\\x20\\t]+\\z')" in credential_rule.PUT_BACK
     assert block.count("\"'<a value the box redacted>'\" + label + ") == 2
 
 
