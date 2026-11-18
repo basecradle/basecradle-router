@@ -594,6 +594,32 @@ def test_no_piece_crosses_a_bare_quote_or_a_record_break() -> None:
     assert credential_rule.OUTSIDE == r'(?:[^"\\]|\\[\s\S])'
 
 
+def test_a_scheme_word_a_tab_glues_to_a_value_is_reached_after_closed_pieces() -> None:
+    # A value never ends between a scheme word and its token (#502). The box reaches a scheme word
+    # after any prefix of pass 1's pieces that ends at a tab, and every one of them closes, so the
+    # prefix can never stop inside a quote: one that could would read `'a<TAB>Bearer b'` as a scheme
+    # word and open a quote that eats a line's fields.
+    reached = credential_rule.REACHED_SCHEMES
+    closed = credential_rule.CLOSED_PIECE
+    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}[\x20\t]+)"
+    chain = credential_rule.SCHEME_CHAIN
+    assert chain == f"(?:{reached}{credential_rule.INNER_NAMES})"
+    assert f"| {chain}+{credential_rule.OPEN_PIECE}+\n" in credential_rule.BLOCK
+    inner = credential_rule.INNER_NAMES
+    # A credential name the value holds outside every quote goes on into its value (#504's
+    # review): only closed pieces stand before it, so a name inside a quote is the quote's text.
+    assert inner == f"(?:{closed}*?{credential_rule.NAME}=)*"
+    # Pass 1's word goes on past its quoted piece to a tab, and past one only by a scheme word.
+    before_a_tab = credential_rule.CLOSED_PIECE_BEFORE_A_TAB
+    assert _negated_classes(before_a_tab)[-1] == _negated_classes(closed)[-1] | {"\t"}
+    assert (
+        f"{inner}(?:{credential_rule.MARKERS}{credential_rule.SCHEMES}*|{chain}*)"
+        f"{closed}*{credential_rule.DOUBLE_QUOTED}"
+        f"(?:{before_a_tab}|{credential_rule.DOUBLE_QUOTED})*"
+        f"(?:{chain}+(?:{closed}|{credential_rule.DOUBLE_QUOTED})*)?"
+    ) == credential_rule.PARITY_WORD
+
+
 def test_pass_one_pieces_all_close() -> None:
     # A piece left open in pass 1 would let the pattern read `'a' n=1 b="x"` as two open pieces and
     # reach the later `"`, which eats the fields between. So every pass 1 piece but the ordinary

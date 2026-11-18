@@ -302,7 +302,9 @@ _AGREED = "\n".join(
         "A_TOKEN=$(gh-app-token nova) tail",
         "A_TOKEN=`gh-app-token nova` tail",
         "A_TOKEN=a\\ b tail",
-        "x=1 A_KEY=1 y=2 B_SECRET=2 C_PASSWORD_FILE=kept PASSWORD=kept gh_token=kept",
+        "x=1 A_KEY=1 y=2 B_SECRET=2 C_PASSWORD_FILE=kept gh_token=kept API_KEY_ID=kept",
+        # A bare word names a credential, and `_BASE` is the one tail (#504).
+        "PASSWORD=gone KEY=gone SECRET_KEY_BASE=gone",
         "A_TOKEN=",
         "B_TOKEN=\tsecretsecret",
         "C_TOKEN='<a redacted value>' twice",
@@ -316,6 +318,27 @@ _AGREED = "\n".join(
         'E_TOKEN=Bearer "a b" next=1 | F_TOKEN=abc-bearer next=2 | G_TOKEN=Bearer',
         "H_TOKEN=Bearer ",
         'I_TOKEN=Bearer\t"a b" next=1 | J_TOKEN=a\\ Bearer eyJabc next=2',
+        # A scheme word a tab glues to a value goes with its token (#502): the issue's three lines,
+        # several lead words, every lead piece, and a quoted value holding a tab, which is one word.
+        "A_TOKEN=x\tBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+        "A_TOKEN=\tBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+        "A_TOKEN='q'\tKBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+        "B_TOKEN=x\tbearer\tBEARER eyJabc next=1 | C_TOKEN=a\\'b\t`c`\tBearer eyJabc next=2",
+        "D_TOKEN='a\tBearer b' next=1 | E_TOKEN=a\t'b c' next=2 | F_KEY=abc\tdefghijk x",
+        "G_TOKEN=x\t next=1 | H_TOKEN=x\t,y next=2 | I_TOKEN=\t next=3",
+        'J_TOKEN=x\t"a b" next=1 | K_TOKEN=\t"a b" next=2',
+        # A credential name inside a value takes its own value with it (#504's review), and a name
+        # inside a quote is the quote's text.
+        "AUTH_TOKEN=x,DB_PASSWORD=\thunter2hunter2 next=1",
+        "A_TOKEN='a b'B_TOKEN=\tsecretsecret next=1 | C_TOKEN=x'q'D=x'q'E_TOKEN=Bearer eyJ next=2",
+        "F_TOKEN=\t'q'G_PASSWORD=Bearer eyJabc next=1",
+        "H_TOKEN=Bearer ;I_KEY=:KBearer :\tBearer eyJabc x",
+        "J_TOKEN=x,K_TOKEN= next=1 | L_TOKEN=x,M_TOKEN=\t next=2 | N_TOKEN='O_TOKEN=x' next=3 o=1",
+        "P_TOKEN='<a redacted value>',next=1 | Q_TOKEN='<a redacted value>' twice",
+        # A backslash before a tab is its word's last character, so a scheme word after the tab is
+        # the value's; and a scheme word's token is a word on its own record (the review of #502).
+        "R_TOKEN=a\\\tBearer eyJabc next=1 | S_TOKEN=Bearer ,next=1 | T_TOKEN=Bearer \\\t}x",
+        "U_TOKEN=(a)\tBearer eyJabc next=1 | V_TOKEN=f(x)\tKBearer eyJabc next=2",
         "",
         "The rest of the reply.",
     ]
@@ -365,13 +388,15 @@ def test_the_fallback_reads_a_long_run_of_capitals_in_linear_time(tmp_path: Path
     assert out[0].startswith("> AAAA")
 
 
-#: The pieces of a fuzzed reply: credential names, every form of scheme word, tokens and blanks.
-#: A tab only after a scheme word, and every line ends in a word: elsewhere the fallback's word
-#: ends at a tab and the translator's run does not, a difference of the degraded reading that is
-#: not this rule's.
+#: The pieces of a fuzzed reply: credential names, every form of scheme word, tokens, blanks, and
+#: lead words a tab glues to a scheme word (#502), a canary stop after one included. No piece the
+#: fallback reads one level deep (a quote that never closes, a parenthesis): there its reading is
+#: the degraded one, which is not this rule's.
 _SCHEME_PIECES = [
-    "A_TOKEN=", "MY_API_KEY=", "Bearer ", "Bearer\t", "BEARER ", "bearer ", "KBearer ",
-    "x.Bearer ", "abc-bearer ", "eyJabc", "abc", " ", "=", ".", ":", "next=1",
+    "A_TOKEN=", "MY_API_KEY=", "PASSWORD=", "Bearer ", "Bearer\t", "BEARER ", "bearer ",
+    "KBearer ", "x.Bearer ", "abc-bearer ", "eyJabc", "abc", " ", "=", ".", ":", "next=1",
+    "\t", "x\t", "\tBearer ", "'q'\t", "`a`\t", "\\\t", ",", "}",
+    "DB_PASSWORD=", "x,", "'q'", "(a)\t",
 ]  # fmt: skip
 
 
@@ -391,7 +416,24 @@ def test_the_fallback_reads_scheme_words_as_the_translator_does(tmp_path: Path) 
 @needs_jq
 @pytest.mark.parametrize(
     ("run", "left"),
-    [("Bearer ", ""), ("Bearer\t", ""), ("xBearer", ""), ("A_TOKEN=Bearer", ""), ("xbearer", " x")],
+    [
+        ("Bearer ", ""),
+        ("Bearer\t", ""),
+        ("xBearer", ""),
+        ("A_TOKEN=Bearer", ""),
+        ("xbearer", " x"),
+        # Lead words before a scheme word a tab glues to a value (#502), and tabs alone.
+        ("x\t", " x"),
+        ("'q'\t", " x"),
+        ("`a`\t", " x"),
+        ("x\tBearer ", ""),
+        ("\t", " x"),
+        ("\tA_TOKEN=", " x"),
+        # Credential names inside a value (#504's review): each one item, read once.
+        ("x,A_TOKEN=", " x"),
+        ("x'q'A_TOKEN=\t", " x"),
+        ("x,A_TOKEN=Bearer ", ""),
+    ],
 )
 def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
     tmp_path: Path, run: str, left: str
@@ -408,12 +450,27 @@ def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
     assert out == quoted(reply)
 
 
+def test_the_fallback_is_its_generated_program_byte_for_byte() -> None:
+    # The program is spelled three times over (regex, jq string, bash string), so it is generated
+    # from the translator's own constants (`tests/fallback_rule.py`), never written by hand: a piece
+    # is changed in one place, and the shipped line is held to it here.
+    import fallback_rule
+
+    assert fallback_rule.shipped(WAKE_RUNNER.read_text()) == fallback_rule.PROGRAM, (
+        "rewrite it with `uv run python tests/fallback_rule.py`"
+    )
+
+
 def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
-    from basecradle_router.logfmt import CREDENTIAL_NAME, REDACTED_VALUE, SCHEME_GLUE
+    import fallback_rule
+    from basecradle_router.logfmt import CREDENTIAL_NAME, LEAD_OPENERS, REDACTED_VALUE, SCHEME_GLUE
 
     script = _run_stream()
     assert f'\\"{CREDENTIAL_NAME}\\" as \\$n' in script
-    # Every scheme word before the value goes with it, by the translator's spelling (#497).
-    assert f'\\")(?:(?:(?i:bearer)|[{SCHEME_GLUE}]*Bearer)[ \\\\t]+)*(?:' in script
     marker = REDACTED_VALUE.replace("'", "\\\\u0027")
     assert f'\\"{marker}\\" as \\$r' in script
+    # Every piece the value reads is the translator's (#497, #502, #504's review), one spelling.
+    program = fallback_rule.PROGRAM_JQ
+    assert f"[{SCHEME_GLUE}]*Bearer" in program
+    assert fallback_rule.run_char("\t" + LEAD_OPENERS + "=") in fallback_rule.LEAD
+    assert all(f"(?<={s})" in program and f"(?<!{s})" in program for s in fallback_rule.SPELLINGS)

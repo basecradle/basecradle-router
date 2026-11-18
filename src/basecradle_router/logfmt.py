@@ -118,7 +118,10 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # it. "Names a credential" is the NOC's log-store canary's definition, its `credential_assignment`
 # rule (basecradle-noc `observability/log-canary.json`), never a list of this repository's own:
 #
-#     [A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}
+#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}
+#
+# (widened by @origin on 2026-11-17, basecradle-noc#1547: a bare word is a name, and `_BASE` is the
+# one tail after the word, basecradle-router#504).
 #
 # `tests/conftest.py` holds that pattern byte for byte, and the tests hold the pieces below to
 # it: the words, the value's stop characters and its floor must spell it exactly, and the canary's
@@ -132,16 +135,21 @@ CREDENTIAL_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSPHRASE")
 CANARY_VALUE_STOPS = ' ",}'
 CANARY_VALUE_FLOOR = 8
 
+#: The one tail the canary allows after a credential word, before the ``=`` (``SECRET_KEY_BASE=``).
+#: No other: ``GH_TOKEN_FILE=``, ``API_KEY_ID=`` and ``MAX_TOKENS=`` name no credential.
+CREDENTIAL_TAIL = "_BASE"
+
 #: A credential name, up to the ``=`` it is assigned with. The canary's own name pattern,
-#: ``[A-Z][A-Z0-9_]*(…)=``, run unanchored in a backtracking engine (Python's ``re``, jq's
+#: ``[A-Z0-9_]*(…)(_BASE)?=``, run unanchored in a backtracking engine (Python's ``re``, jq's
 #: Oniguruma) tries every start inside a long run of capitals and is quadratic in it: 50,000 of
 #: them took jq 30 seconds, and a translator that stalls stops reading the pipe ``claude`` writes
 #: into, which hangs the wake. This spelling matches before exactly the same ``=``s (pinned against
 #: the canary's pattern by a test), and is linear: it starts only where a run of name characters
-#: starts, skips digits and underscores to the run's first capital, which the canary's ``[A-Z]``
-#: needs, and extends lazily to a credential word. ``wake-runner``'s ``jq`` fallback carries the
-#: same spelling.
-CREDENTIAL_NAME = r"(?<![A-Z0-9_])[0-9_]*[A-Z][A-Z0-9_]*?(?:" + "|".join(CREDENTIAL_WORDS) + ")="
+#: starts and extends lazily to a credential word and its tail. ``wake-runner``'s ``jq`` fallback
+#: carries the same spelling.
+CREDENTIAL_NAME = (
+    r"(?<![A-Z0-9_])[A-Z0-9_]*?(?:" + "|".join(CREDENTIAL_WORDS) + f")(?:{CREDENTIAL_TAIL})?="
+)
 _CREDENTIAL_NAME = re.compile(CREDENTIAL_NAME)
 
 #: What stands where a credential's value stood. It must read as one value to the redactor and as
@@ -166,17 +174,30 @@ _CANARY_RUN = re.compile("[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS) + "
 _SHELL_BLANKS = " \t\n"
 
 
-def _shell_word_end(text: str, start: int) -> int:
+#: The end of a credential name, its ``=`` included: a credential word, the one tail, the ``=``. The
+#: canary's name is unanchored, so whatever comes before the word, this is a name's end.
+_NAME_END = re.compile("(?:" + "|".join(CREDENTIAL_WORDS) + f")(?:{CREDENTIAL_TAIL})?=\\Z")
+_NAME_END_REACH = max(len(word) for word in CREDENTIAL_WORDS) + len(CREDENTIAL_TAIL) + 1
+
+
+def _shell_word_end(text: str, start: int) -> tuple[int, bool]:
     """Where the shell word from ``start`` ends: at a blank outside every quote, or the end.
 
     One word as the shell reads it, so a value is taken whole whatever surrounds it: a single- or
     double-quoted string, an ANSI-C ``$'…'``, a ``$(…)``, ``${…}`` or ``(…)`` (each nesting as the
-    shell's does, quotes inside included), a backquoted command, and a backslash escape. Only a
+    shell's does, quotes inside included), a backquoted command, and a backslash escape (but of a
+    tab outside every quote: the backslash is then the word's last character, since the canary's
+    run crosses the tab and a scheme word after it is the value's, #502's review). Only a
     space, a tab or a newline ends an unquoted word, as in the shell, so no other character can cut
     a value short. A quote or a substitution still open at a record break ends there: it is prose
     (an apostrophe, a markdown backquote) far more often than a value that spans lines, and read
     on it would hide the rest of a reply. Iterative, with its own stack, so no depth of nesting can
     exhaust the interpreter's.
+
+    The word also ends just past a credential name's ``=`` that stands outside every quote and
+    substitution in it (``x,DB_PASSWORD=…``), and then says so: the rest of the word is that name's
+    value (#504's review, from basecradle-harness#928). A name inside a quote is the quote's text.
+    Returns where the word ends, and whether it ends at a name's ``=``.
     """
     stack: list[str] = []  # what closes each open context: ' " ` ) } and $' for ANSI-C
     i = start
@@ -185,7 +206,7 @@ def _shell_word_end(text: str, start: int) -> int:
         c = text[i]
         top = stack[-1] if stack else ""
         if top and c in _BREAK_CHARS:
-            return i
+            return i, False
         if top == "'":
             if c == "'":
                 stack.pop()
@@ -198,6 +219,9 @@ def _shell_word_end(text: str, start: int) -> int:
                 stack.pop()
             i += 1
         elif c == "\\":
+            if not top and text.startswith("\t", i + 1):
+                # A backslash before a tab is the word's last character (#502's review).
+                return i + 1, False
             i += 2
         elif top == "`":
             if c == "`":
@@ -217,6 +241,12 @@ def _shell_word_end(text: str, start: int) -> int:
         else:  # outside every quote: the word itself, or inside a ( ), $( ) or ${ }
             if not top and c in _SHELL_BLANKS:
                 break
+            if (
+                not top
+                and c == "="
+                and _NAME_END.search(text, max(start, i + 1 - _NAME_END_REACH), i + 1)
+            ):
+                return i + 1, True
             if top and c == top:
                 stack.pop()
                 i += 1
@@ -232,7 +262,7 @@ def _shell_word_end(text: str, start: int) -> int:
                 elif c == "(" and top != "}":
                     stack.append(")")  # an array, a subshell, arithmetic
                 i += 1
-    return min(i, n)
+    return min(i, n), False
 
 
 #: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
@@ -249,43 +279,162 @@ _SCHEME_WORD = re.compile(f"(?i:bearer)|[{SCHEME_GLUE}]*Bearer")
 #: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
 _SCHEME_BLANKS = re.compile("[ \t]+")
 
+#: The characters, beyond a blank, a canary stop and a record break, that a word may not hold
+#: unquoted before the tab ahead of a bearer scheme word (#502): a quote's opener, a backslash's
+#: escape and a parenthesis, whose reading a regular expression cannot nest. Each of the three
+#: copies builds its lead word from this one spelling: the print site's :data:`_LEAD_WORD`, the
+#: box's rule (``tests/credential_rule.py``, ``LEAD_WORD``) and ``wake-runner``'s ``jq`` fallback
+#: (pinned by a test).
+LEAD_OPENERS = "'`\\("
+
+
+def _run_char(but: str = "") -> str:
+    """A character of the canary's run (a tab is one), and none of ``but``."""
+    return "[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS + but) + "]"
+
+
+#: A word the canary's run crosses whole, and the tabs after it: what stands before a scheme word
+#: that a tab glues to a value (``x<TAB>Bearer``, ``'q'<TAB>KBearer``), so the token after that
+#: scheme word goes with the value. Its pieces each close inside the run: a bare character, a
+#: backslash and the character after it, a single-quoted piece and a backquoted one (in which a
+#: backslash escapes), so each piece has one reading and the word one end in every engine, the
+#: shell word's. A backslash before the tab is the word's last character, as the shell reading has
+#: it here (``a\<TAB>Bearer``: the canary's run crosses the tab). A word holding a quote that never
+#: closes there, a ``"``, a ``(``, a blank or a stop is no lead word, and no scheme word after it is
+#: read as one: that is the definition, in all three copies alike.
+_LEAD_PIECE = (
+    "(?:"
+    + "|".join(
+        [
+            _run_char("\t" + LEAD_OPENERS),  # a bare character: neither a tab nor an opener
+            "\\\\" + _run_char("\t"),  # an escape, of a quote or a backslash included
+            "'" + _run_char("'") + "*'",  # single-quoted: no escape inside
+            "`(?:" + _run_char("`\\") + "|\\\\" + _run_char() + ")*`",  # backquoted
+            "\\(" + _run_char("()'`\\") + "*\\)",  # a parenthesis, closed, one level, no quote
+        ]
+    )
+    + ")"
+)
+_LEAD_WORD = re.compile(f"(?:{_LEAD_PIECE}+\\\\?|\\\\)\t+")
+
+#: The tabs a value may open with: the canary's run crosses them to its first word.
+_TABS = re.compile("\t*")
+
+
+#: Where a marker at a value's head ends it: a blank, a canary stop or a record break after it (the
+#: canary's own run ends inside the marker, at its space), as the box's rule keeps one
+#: (``tests/credential_rule.py``, ``MARKER_END``), so a value redacted where it is bounded and again
+#: where it is rendered stays one marker.
+_MARKER_ENDS = frozenset("\t" + CANARY_VALUE_STOPS + _BREAK_CHARS)
+
+#: What a word after a tab may not start with, to be reached across it: a blank, a ``,`` or a ``}``
+#: (the canary's stops, which end its run and are structure on a JSON line) and a record break, so
+#: no word the value reaches this way starts in the next record. A ``"`` may: it opens the word's
+#: quoted piece, as the box's parity reading takes it.
+_UNREACHED = frozenset(CANARY_VALUE_STOPS.replace('"', "") + _BREAK_CHARS)
+
+
+def _reached(text: str, at: int) -> bool:
+    return at < len(text) and text[at] not in _UNREACHED
+
+
+def _token_after_a_glued_scheme_word(text: str, floor: int, end: int) -> int | None:
+    """Where the token starts, when a value read from ``floor`` ends at ``end`` just after a bearer
+    scheme word a tab glues to it (``(a)<TAB>Bearer tok``: the canary's run takes the scheme word),
+    with a word on its record after its blanks; else ``None``. A value never ends between a scheme
+    word and its token, whatever stands before the tab (the review of #502). The lead words are
+    the shapes the box and the ``jq`` fallback read word by word; this rule is the print site's net
+    under every other."""
+    tab = text.rfind("\t", floor, end)
+    if tab < 0 or not _SCHEME_WORD.fullmatch(text, tab + 1, end):
+        return None
+    if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
+        return None
+    return blanks.end()
+
 
 def _value_end(text: str, start: int) -> int:
-    """Where a credential's value from ``start`` ends: the longer of the two readings of its word,
-    and while a word of the value is a bearer scheme word (:data:`_SCHEME_WORD`), the word after
-    the blanks that follow it too, so a doubled scheme word goes with the token after both. A scheme
-    word with nothing after it on its line is the value alone.
+    """Where a credential's value from ``start`` ends: past every word the value reaches, each read
+    whole as a shell word, and past the canary's run.
 
-    The words are shell words: the canary's run crosses a tab, and read that way
-    ``bearer<TAB>Bearer`` would be one word and no scheme word, and the token after it would ship.
-    Each word is read once, and the canary's run once from where the last one ended, so the value
-    is linear in its length."""
+    A value reaches its first word, after any tabs it opens with, unless it opens with a marker
+    where the canary's run would end after it, which is the whole value. From a word it reaches:
+
+    1. **Across a tab** to the next word, while the word is a lead word (:data:`_LEAD_WORD`): the
+       canary's run crosses a tab, so a word after one is still the value's (#502). The next word
+       must start where a run could go on (:func:`_reached`).
+    2. **Across blanks** to the next word, while the word is a bearer scheme word
+       (:data:`_SCHEME_WORD`), so a doubled scheme word goes with the token after both (#497), and
+       wherever the value would end just after a scheme word a tab glues to it, whatever stands
+       before the tab (:func:`_token_after_a_glued_scheme_word`). A scheme word with nothing after
+       it on its record is the value alone.
+    3. **Into a value of its own** at a credential name's ``=`` outside every quote in the word
+       (``x,DB_PASSWORD=<TAB>…``): the redactor's next search starts past that ``=``, so the name's
+       value is read here, by this same reading, and goes with this one (#504's review).
+
+    Each word is read once, the canary's run once from each place the value goes on past it, and the
+    walk stops where a word's shell reading runs past its lead word's tab (a ``${`` the lead word
+    reads as plain text): the value already reaches that far. So the value is linear in its
+    length."""
     run_end = _CANARY_RUN.match(text, start).end()
-    word_end = _shell_word_end(text, start)
-    end = max(word_end, run_end)
-    while _SCHEME_WORD.fullmatch(text, start, word_end) and (
-        blanks := _SCHEME_BLANKS.match(text, word_end)
-    ):
-        start = blanks.end()
-        if (word_end := _shell_word_end(text, start)) == start:
-            break  # nothing after the scheme word on its line
-        if start >= run_end:
-            run_end = _CANARY_RUN.match(text, start).end()
-        end = max(end, word_end, run_end)
-    return end
+    end = run_end
+    at = start
+    while True:  # a value from `at`
+        floor = at
+        if text.startswith(REDACTED_VALUE, at):
+            after = at + len(REDACTED_VALUE)
+            if after == len(text) or text[after] in _MARKER_ENDS:
+                return max(end, after)
+        if (tabs := _TABS.match(text, at).end()) > at:
+            if not _reached(text, tabs):
+                return end  # nothing after the tabs is the value's: a blank, a stop or a break
+            at = tabs
+        while True:  # the words it reaches
+            word_end, at_a_name = _shell_word_end(text, at)
+            end = max(end, word_end)
+            if at_a_name:
+                break  # a credential name's `=`: its value is read as one from here
+            if _SCHEME_WORD.fullmatch(text, at, word_end) and (
+                blanks := _SCHEME_BLANKS.match(text, word_end)
+            ):
+                token = blanks.end()
+                if _reached(text, token):  # a word after the blanks, on the same record
+                    at = token
+                    if at >= run_end:
+                        run_end = _CANARY_RUN.match(text, at).end()
+                        end = max(end, run_end)
+                    continue
+            lead = _LEAD_WORD.match(text, at)
+            if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
+                # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
+                # unless it ends just after a scheme word a tab glues to it.
+                if (token := _token_after_a_glued_scheme_word(text, floor, end)) is None:
+                    return end
+                at = floor = token
+                if at >= run_end:
+                    run_end = _CANARY_RUN.match(text, at).end()
+                    end = max(end, run_end)
+                continue
+            at = lead.end()
+        at = word_end
+        if at >= run_end:
+            run_end = _CANARY_RUN.match(text, at).end()
+            end = max(end, run_end)
 
 
 def redact_credentials(text: str) -> str:
     """``text`` with every credential-named assignment's value replaced by :data:`REDACTED_VALUE`.
 
-    The name stays. The value is the longer of two readings from the character after the ``=``
-    (:func:`_value_end`): the shell word there (:func:`_shell_word_end`), so a quoted value or a
-    ``"$(…)"`` goes whole, and the canary's own run, so whatever the canary would read as the value
-    is gone in every record the text is written into, a prose line that keeps a tab included. A
-    bearer scheme word is no value alone: the token after it goes with it (#497). An empty value
-    (a space, a record break or the text's end follows the ``=``) has nothing to hide and is left
-    as it is. Linear in ``text``, and idempotent: the marker is redacted to itself, so
-    a value redacted where it is bounded and again where it is rendered stays one marker.
+    The name stays. The value (:func:`_value_end`) is every shell word it reaches from the
+    character after the ``=`` (:func:`_shell_word_end`), so a quoted value or a ``"$(…)"`` goes
+    whole, and the canary's own run, so whatever the canary would read as the value is gone in every
+    record the text is written into, a prose line that keeps a tab included. It reaches across a tab
+    after a lead word (#502), past a bearer scheme word to its token (#497), and into the value of a
+    credential name standing in it outside a quote (#504's review). An empty value (a space, a
+    record break or the text's end follows the ``=``) has nothing to hide and is left as it is.
+    Linear in ``text``, and idempotent: a marker where the canary's run would end after it is a
+    whole value, so a value redacted where it is bounded and again where it is rendered stays one
+    marker.
     """
     if "=" not in text:
         return text

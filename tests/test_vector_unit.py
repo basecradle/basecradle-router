@@ -57,6 +57,7 @@ import pytest
 
 from basecradle_router.logfmt import (
     _BREAK_CHARS,
+    _LEAD_WORD,
     _SCHEME_WORD,
     CANARY_VALUE_STOPS,
     REDACTED_VALUE,
@@ -396,6 +397,15 @@ _LONG_TEXTS = {
     "credential bearer words": "A_TOKEN=" + _fill("Bearer\t"),
     "credential glued bearers": "A_TOKEN=" + _fill("xbearer"),
     "credential runs of scheme words": "A_TOKEN=" + _fill("xBearer\tBearer "),
+    # Lead words before a scheme word a tab glues to a value (#502), names behind tabs, and bare
+    # names with the one tail (#504).
+    "credential lead words": "A_TOKEN=" + _fill("x\t"),
+    "credential quoted lead words": "A_TOKEN=" + _fill("'q'\t`a`\t"),
+    "credential glued scheme words": "A_TOKEN=" + _fill("x\tBearer "),
+    "credential names behind tabs": _fill("A_TOKEN=\t"),
+    "credential bare names": _fill("KEY_BASE="),
+    "credential names inside a value": "A_TOKEN=" + _fill("x'q'A_TOKEN="),
+    "credential substitutions after tabs": "A_TOKEN=" + _fill("${x\t"),
 }
 
 
@@ -502,6 +512,42 @@ _AGREED = [
     # takes the field: a fleet line quotes any value holding an `=`, so it is never a fleet
     # line's, and redaction comes first.
     "stage=wake X_TOKEN=Bearer cost=0.1 outcome=ok",
+    # A scheme word a tab glues to a value goes with its token (#502): the issue's three lines, any
+    # case, several lead words, every lead piece, after a token, and a quoted token by parity.
+    "A_TOKEN=x\tBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+    "A_TOKEN=\tBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+    "A_TOKEN='q'\tKBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1",
+    "B_TOKEN=x\tbearer\t\tBEARER fabricated next=1 | C_TOKEN=a\tb\tBearer fabricated next=2",
+    "D_TOKEN=a\\'b\tBearer fabricated next=1 | E_TOKEN=`a\tb`\tBearer fabricated next=2",
+    "F_TOKEN='a\tb'\tBearer fabricated next=1 | G_TOKEN=Bearer x\tBearer fabricated next=2",
+    'H_TOKEN=x\tBearer "fabricated quoted" next=1',
+    # The shape #497 backed out: a quoted value holding a tab and a scheme word is one word, and
+    # every field after it stays.
+    "I_TOKEN='a\tBearer b' next=1 outcome=ok",
+    # A word after a lead word is read whole, a quoted one too.
+    "J_TOKEN=a\t'b c' next=1",
+    # A backslash before a tab is its word's last character, so the scheme word after the tab is the
+    # value's (the review of #502); and a scheme word's token is a word on its own record.
+    "K_TOKEN=a\\\tBearer fabricated next=1 | L_TOKEN=Bearer ,next=1",
+    "M_TOKEN=Bearer \rImportant next=1",
+    # Whatever stands before the tab, a value never ends between a scheme word and its token (the
+    # third review of #502): a parenthesis and a substitution, the box's closed pieces.
+    "N_TOKEN=(a)\tBearer fabricated next=1 | O_TOKEN=$(cat\tf)\tBearer fabricated next=2",
+    "P_TOKEN=f(x)\tKBearer fabricated next=1",
+    # A bare word names a credential, and `_BASE` is the one tail (#504).
+    "PASSWORD=fabricated1 KEY=fabricated2 SECRET_KEY_BASE=fabricated3 _TOKEN=fabricated4",
+    "GH_TOKEN_FILE=/run/fabricated API_KEY_ID=abcdefghij MAX_TOKENS=1000000 x_token=abcdefghij",
+    # A double-quoted value after a tab goes with the word, as the box's parity reads it (#502's
+    # review).
+    'L_TOKEN=a\t"b c" next=1 | M_TOKEN=\t"fabricated secret value" next=2',
+    # A credential name inside a value takes its own value with it (#504's review, from
+    # basecradle-harness#928), read as any value is; a name inside a quote is the quote's text.
+    "A_TOKEN='a b'B_TOKEN=\tfabricatedSecret1 next=1",
+    "C_TOKEN=\t'q'DB_PASSWORD=Bearer fabricatedSecret2 next=1",
+    "D_TOKEN=x'q'E=x'q'F_TOKEN=Bearer fabricatedSecret3 next=1",
+    "G_TOKEN=Bearer ;H_KEY=:KBearer :\tBearer fabricatedSecret4 next=1",
+    "I_TOKEN='q'J_TOKEN=x\tBearer fabricatedSecret5 next=1",
+    "K_TOKEN=x'q'L_TOKEN= next=1 | M_TOKEN='N_TOKEN=x' next=2 other=3",
 ]
 
 #: Lines the router renders itself: the print site has already redacted them, so the box must pass
@@ -542,10 +588,21 @@ _DIFFERENT = {
     # `\"` opens a JSON-escaped piece, as it does inside a JSON string, where the shell reads a
     # literal `"` and goes on to a `'` that opens a quote.
     "J_TOKEN=\\\"a'b\\\" c' next=1": f"J_TOKEN={BOX_REDACTED_VALUE} c' next=1",
-    # A tab is part of a value, as it is of the canary's run, and a quote opened after one goes
-    # with it; the print site takes the longer of the canary's run and the shell word, which stops
-    # at the tab.
-    "K_TOKEN=a\t'b c' next=1": f"K_TOKEN={BOX_REDACTED_VALUE} next=1",
+    # A tab is part of a word on the box, as it is of the canary's run, whatever came before it;
+    # the print site crosses one only after a lead word, and a quoted value holding a blank is none
+    # (#502). Neither ships a value the canary reads.
+    "K_TOKEN='a b'\tc next=1": f"K_TOKEN={BOX_REDACTED_VALUE} next=1",
+    # The box reaches a scheme word after any prefix of its closed pieces, a quoted value holding a
+    # blank included, where the canary's run, and so the print site's value, stops inside the quote;
+    # and a double-quoted value goes on, by parity, past a tab only to a scheme word and its token.
+    # The print site leaves the scheme word in sight for the box's bearer rule either way.
+    "X_TOKEN=x\t'a b'\tBearer fabricatedTok next=1": f"X_TOKEN={BOX_REDACTED_VALUE} next=1",
+    'Y_TOKEN="a b"\tBearer fabricatedTok next=1': f"Y_TOKEN={BOX_REDACTED_VALUE} next=1",
+    # A credential name after a `,` inside a value is the box's own assignment, since a `,` ends the
+    # box's value: its value goes either way, and on the box its name stays.
+    "AUTH_TOKEN=x,DB_PASSWORD=\tfabricatedSecret6 next=1": (
+        f"AUTH_TOKEN={BOX_REDACTED_VALUE},DB_PASSWORD={BOX_REDACTED_VALUE} next=1"
+    ),
     # A single-quoted value never crosses a `"`: a request's `'` keeps an access line's JSON whole.
     '{"request":{"uri":"/hook?X_TOKEN=\'abc&y=1"},"status":202}': (
         f'{{"request":{{"uri":"/hook?X_TOKEN={BOX_REDACTED_VALUE}"}},"status":202}}'
@@ -674,6 +731,13 @@ _FUZZ_PIECES = [
     "\u2028",
     "Bearer ",
     "KBearer ",
+    "\tBearer ",
+    "x\t",
+    "PASSWORD=",
+    "SECRET_KEY_BASE=",
+    "DB_PASSWORD=",
+    "x'q'",
+    "(a)\t",
     "=",
     "==",
     REDACTED_VALUE,
@@ -716,9 +780,19 @@ def _quote_open_at(record: str, at: int) -> bool:
 _VALUE_CHAR = re.compile("[^" + re.escape(" \t" + CANARY_VALUE_STOPS + _BREAK_CHARS) + "]")
 _MARKERS = (REDACTED_VALUE, BOX_REDACTED_VALUE)
 
-#: The bearer scheme words a value may open with, each with its blanks (#497): a quoted value after
-#: them is still the name's, and the parity pass takes it with them.
-_SCHEME_RUN = re.compile("(?:(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*")
+#: The bearer scheme words a value may open with, each with its blanks (#497), and the lead words a
+#: tab glues one to (#502): a quoted value after them is still the name's, and the parity pass takes
+#: it with them.
+_SCHEME_RUN = re.compile(
+    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*"
+)
+
+#: After a marker, only scheme words glued to it: the marker is no lead word.
+_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*")
+
+#: What may follow a quoted marker the parity pass keeps whole: anything that ends its word, the
+#: line's end included.
+_QUOTED_MARKER_END = {"", *" ,}" + _BREAK_CHARS}
 
 
 def _after_marker(rest: str) -> str:
@@ -735,8 +809,16 @@ def _opens_a_quoted_value(line: str) -> str | None:
     quoted value glued after one is caught, and so are bearer scheme words before it; a `"` that
     closes the quoted value the name sits in is the end of an empty value."""
     for name in _CREDENTIAL_NAME.finditer(line):
-        at = len(line) - len(_after_marker(line[name.end() :]))
-        at = _SCHEME_RUN.match(line, at).end()
+        rest = line[name.end() :]
+        if any(
+            rest.startswith(f'"{marker}"')
+            and rest[len(marker) + 2 : len(marker) + 3] in _QUOTED_MARKER_END
+            for marker in _MARKERS
+        ):
+            continue  # a quoted marker, which the parity pass keeps as it is
+        after = _after_marker(rest)
+        at = len(line) - len(after)
+        at = (_GLUED_SCHEME_RUN if after is not rest else _SCHEME_RUN).match(line, at).end()
         while at < len(line) and line[at] != '"' and _VALUE_CHAR.match(line, at):
             if line[at] == "'":
                 # A single-quoted piece is skipped to its close. One that would cross a `"` is
@@ -799,8 +881,9 @@ def test_the_canary_reads_nothing_the_box_ships(tmp_path: Path) -> None:
 
 #: The oracle's pieces: every construct the box and the print site read alike, and nothing that is
 #: a named difference (`_DIFFERENT`): no line structure (`"`, `,`, `}`, a record break), no
-#: substitution or parenthesis, no escaped `\"`, no tab. A marker appears only as both redactors
-#: write one, before a blank.
+#: substitution or parenthesis, no escaped `\"`. A tab is one (#502): the box reads more past one
+#: than the print site, never less. A marker appears only as both redactors write one, before a
+#: blank.
 _ORACLE_SECRET = "Fab1catedSecret"
 _ORACLE_PIECES = [
     "A_TOKEN=",
@@ -822,6 +905,13 @@ _ORACLE_PIECES = [
     ";",
     "Bearer ",
     "KBearer ",
+    "\t",
+    "\tBearer ",
+    "x\t",
+    "PASSWORD=",
+    "DB_PASSWORD=",
+    "x'q'",
+    "(a)\t",
 ]
 
 

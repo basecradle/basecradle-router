@@ -25,6 +25,7 @@ from basecradle_router.logfmt import (
     CANARY_VALUE_FLOOR,
     CANARY_VALUE_STOPS,
     CREDENTIAL_NAME,
+    CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
     REDACTED_VALUE,
     bounded,
@@ -62,8 +63,8 @@ def silent(canary: re.Pattern[str], *lines: str) -> bool:
 
 
 def test_the_pieces_spell_the_canarys_rule_byte_for_byte() -> None:
-    stops = CANARY_VALUE_STOPS
-    spelled = f"[A-Z][A-Z0-9_]*({'|'.join(CREDENTIAL_WORDS)})=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
+    words, tail, stops = "|".join(CREDENTIAL_WORDS), CREDENTIAL_TAIL, CANARY_VALUE_STOPS
+    spelled = f"[A-Z0-9_]*({words})({tail})?=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
     assert spelled == NOC_CREDENTIAL_ASSIGNMENT
 
 
@@ -87,6 +88,9 @@ def _linear_name_ends(text: str) -> set[int]:
         "KEYKEY=x PASSPHRASE=x A_PASSPHRASE=x APASSWORD=x A_SECRET_KEY=x",
         "gh_token=x Gh_TOKEN=x GH_TOKEN_FILE=x GH_TOKENS=x A_KEY==x",
         "A_TOKEN=B_TOKEN=C_TOKEN=x",
+        # The one tail (#504): after a word, and nowhere else.
+        "SECRET_KEY_BASE=x KEY_BASE=x _TOKEN_BASE=x TOKEN_BASE_BASE=x KEY_BASEX=x _BASE=x",
+        "API_KEY_ID=x MAX_TOKENS=x GIT_CONFIG_KEY_0=x A_SECRET_FALLBACK=x x.KEY=x $TOKEN=x",
     ],
 )
 def test_the_linear_spelling_names_exactly_the_canarys_credentials(text: str) -> None:
@@ -95,19 +99,42 @@ def test_the_linear_spelling_names_exactly_the_canarys_credentials(text: str) ->
 
 def test_the_linear_spelling_agrees_with_the_canary_on_random_text() -> None:
     rng = random.Random(491)
-    alphabet = ["A", "K", "E", "Y", "T", "O", "N", "S", "_", "9", "a", "=", " "] + list(
-        CREDENTIAL_WORDS
-    )
+    alphabet = ["A", "B", "K", "E", "Y", "T", "O", "N", "S", "_", "9", "a", "=", " ", "_BASE"]
+    alphabet += list(CREDENTIAL_WORDS)
     for _ in range(4000):
         text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 14)))
         assert _linear_name_ends(text) == _canary_name_ends(text), text
 
 
-def test_a_bare_word_is_no_credentials_name_because_the_canarys_is_not() -> None:
-    # The canary needs a capital before the word, so `PASSWORD=` alone names nothing to it, and a
-    # lowercase name nothing either. One definition: what the canary does not page on is kept.
-    for text in ("PASSWORD=hunter2hunter2", "TOKEN=abcdefghij", "gh_token=abcdefghij"):
-        assert redact_credentials(text) == text
+def test_a_bare_word_and_the_base_tail_name_a_credential_because_the_canarys_do(canary) -> None:
+    # @origin widened the canary on 2026-11-17 (basecradle-noc#1547): the word alone is a name,
+    # and `_BASE` is the one tail after it (`SECRET_KEY_BASE`, the Rails master secret). One
+    # definition: what the canary pages on is redacted, and nothing else is.
+    for text in ("PASSWORD=hunter2hunter2", "TOKEN=abcdefghij", "$KEY=abcdefghij", "_TOKEN=x"):
+        name = text[: text.index("=") + 1]
+        assert redact_credentials(text) == name + REDACTED_VALUE
+    for text in ("SECRET_KEY_BASE=fabricatedRailsSecret0001", "env -i KEY_BASE=FABRICATEDCANARY0"):
+        assert canary.search(text)
+        assert silent(canary, redact_credentials(text)), text
+        assert redact_credentials(text).endswith("_BASE=" + REDACTED_VALUE)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "gh_token=abcdefghij",
+        "GH_TOKEN_FILE=/run/fabricated",
+        "API_KEY_ID=abcdefghij",
+        "MAX_TOKENS=1000000000",
+        "GIT_CONFIG_KEY_0=credential.helper",
+        "A_SECRET_FALLBACK=abcdefghij",
+        "KEY_BASEX=abcdefghij",
+    ],
+)
+def test_a_name_the_canary_does_not_read_is_kept(text: str, canary) -> None:
+    # A lowercase name, and every tail but `_BASE`: none is a credential's name to the canary.
+    assert not canary.search(text)
+    assert redact_credentials(text) == text
 
 
 def test_a_long_run_of_capitals_is_read_in_linear_time() -> None:
@@ -117,6 +144,8 @@ def test_a_long_run_of_capitals_is_read_in_linear_time() -> None:
     redact_credentials("A" * 50_000 + "=x")
     redact_credentials("KEY" * 17_000 + "=x")
     redact_credentials("_" * 50_000 + "TOKEN=x")
+    redact_credentials("KEY_BASE" * 10_000 + "_X=x")
+    redact_credentials("A_TOKEN" * 10_000 + "_BASEX=x")
     assert time.monotonic() - started < 5.0
 
 
@@ -240,6 +269,139 @@ def test_a_bearer_scheme_word_goes_with_its_token(text: str, redacted: str, cana
     assert silent(canary, redacted)
 
 
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The issue's reproductions (#502): the canary's run crosses a tab, so a scheme word after
+        # one is inside the value, and the token after it goes with it.
+        (f"A_TOKEN=x\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN='q'\tKBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Any case, any run of tabs, several lead words, and after a token.
+        (f"A_TOKEN=x\tbearer\t\tBEARER {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=a\tb\tc\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=Bearer x\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Every lead piece: an escape, a single-quoted and a backquoted piece, a tab inside one.
+        (f"A_TOKEN=a\\'b\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=`a\tb`\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN='a\tb'\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # A word after a lead word is read whole, a quoted one too, a double-quoted one included.
+        ("A_TOKEN=a\t'b c' next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ('A_TOKEN=x\t"a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        ('A_TOKEN=\t"fabricated secret value" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        ('KEY=\t"', "KEY='<a redacted value>'"),
+        (f'A_TOKEN=x\tBearer "{FAKE_JWT} y" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        # The shape #497 backed out: a quoted value holding a tab and a scheme word is one word,
+        # and nothing after it goes.
+        ("A_TOKEN='a\tBearer b' next=1 c=2", "A_TOKEN='<a redacted value>' next=1 c=2"),
+        # A backslash before a tab is its word's last character: the canary's run crosses the tab,
+        # so the scheme word after it is the value's (the review of #502). An escaped space is still
+        # its word's, and the run stops at it.
+        (f"A_TOKEN=a\\\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=\\\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Whatever stands before the tab, a value never ends between a scheme word and its token
+        # (the third review of #502): a parenthesis, a substitution, ANSI-C quoting, a nested one.
+        (f"A_TOKEN=(a)\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=f(x)\tKBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=$(cat\tf)\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=$'a\\'b'\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=a$(b$(c)\td)\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Where the definition ends: the canary's run stops inside a quoted value holding a blank,
+        # so the value ends with that word and the scheme word after the tab is none. It stays in
+        # sight, before its token, for the box's own bearer rule.
+        (f"A_TOKEN='a b'\tBearer {FAKE_JWT}", f"A_TOKEN='<a redacted value>'\tBearer {FAKE_JWT}"),
+    ],
+)
+def test_a_scheme_word_a_tab_glues_to_a_value_goes_with_its_token(
+    text: str, redacted: str, canary
+) -> None:
+    assert redact_credentials(text) == redacted
+    assert redact_credentials(redacted) == redacted
+    assert silent(canary, redacted)
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        ("A_TOKEN=x\t,next=1", "A_TOKEN='<a redacted value>',next=1"),
+        ("A_TOKEN=\t\rnext=1", "A_TOKEN='<a redacted value>'\rnext=1"),
+        ("A_TOKEN=x\t\u2028next=1", "A_TOKEN='<a redacted value>'\u2028next=1"),
+        # A scheme word's token is a word reached after its blanks the same way (#502's review).
+        ("A_TOKEN=Bearer \rImportant next", "A_TOKEN='<a redacted value>' \rImportant next"),
+        ("A_TOKEN=Bearer ,next=1 b=2", "A_TOKEN='<a redacted value>' ,next=1 b=2"),
+    ],
+)
+def test_a_word_after_the_tabs_outside_the_canarys_run_is_not_the_values(
+    text: str, redacted: str, canary
+) -> None:
+    # The canary's run ends at a `,`, a `}` or a record break, so a word starting there is not one
+    # it reaches across the tab, and a value never runs into the next record. Read again, the
+    # marker stands where the run would end after it, so it is the whole value and stays.
+    assert redact_credentials(text) == redacted
+    assert redact_credentials(redacted) == redacted
+    assert silent(canary, redacted)
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The capital's shape (#504's task 6, from basecradle-harness#928): the first value's shell
+        # word runs past the second name's `=`, and the redactor's next search starts past it.
+        (
+            "AUTH_TOKEN=x,DB_PASSWORD=\thunter2hunter2 next=1",
+            "AUTH_TOKEN='<a redacted value>' next=1",
+        ),
+        ("A_TOKEN='a b'B_TOKEN=\tsecretsecret next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=x}B_TOKEN=\tsecretsecret next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # The inner name's value is read as any value is: a scheme word takes its token, and so does
+        # one in a token, or behind a nested name, or a lead word.
+        (
+            f"AUTH_TOKEN=x,DB_PASSWORD=Bearer {FAKE_JWT} next=1",
+            "AUTH_TOKEN='<a redacted value>' next=1",
+        ),
+        (
+            f"A_TOKEN=x'q'A=x'q'B_TOKEN=Bearer {FAKE_JWT} next=1",
+            "A_TOKEN='<a redacted value>' next=1",
+        ),
+        (
+            f"A_TOKEN=Bearer ;B_KEY=:KBearer :\tBearer {FAKE_JWT} x",
+            "A_TOKEN='<a redacted value>' x",
+        ),
+        (f"A_TOKEN='q'B_TOKEN=x\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # An inner name's empty value, or tabs alone, ends the value there.
+        ("A_TOKEN=x,B_TOKEN= next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=x,B_TOKEN=\t next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=x,B_TOKEN=\t,next=1", "A_TOKEN='<a redacted value>',next=1"),
+        # A name inside a quote is the quote's text, not an assignment: nothing past the quote goes.
+        ("A_TOKEN='B_TOKEN=x' next=1 other=2", "A_TOKEN='<a redacted value>' next=1 other=2"),
+        ('A_TOKEN="B_TOKEN=x" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=$(B_TOKEN=x) next=1", "A_TOKEN='<a redacted value>' next=1"),
+    ],
+)
+def test_a_credential_name_inside_a_value_takes_its_own_value_with_it(
+    text: str, redacted: str, canary
+) -> None:
+    assert redact_credentials(text) == redacted
+    assert redact_credentials(redacted) == redacted
+    assert silent(canary, redacted)
+    assert "hunter2" not in log_fields(detail=text) and FAKE_JWT not in bounded(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "A_TOKEN='<a redacted value>',next=1",
+        "A_TOKEN='<a redacted value>'\rnext=1",
+        "A_TOKEN='<a redacted value>'\"x\" next=1",
+        "A_TOKEN='<a redacted value>'\tBearer x",
+    ],
+)
+def test_a_marker_where_the_run_would_end_is_the_whole_value(text: str) -> None:
+    # The box keeps a marker the same way (`credential_rule.MARKER_END`), so a value redacted where
+    # it is bounded and again where it is rendered stays one marker (the review of #502).
+    assert redact_credentials(text) == text
+
+
 def test_the_renderer_ships_no_token_after_a_marker() -> None:
     # The issue's line: the token was rendered after the marker, and left the box.
     line = log_fields(stage="wake", detail=f"curl -H AUTH_TOKEN=Bearer {FAKE_JWT}")
@@ -249,9 +411,14 @@ def test_the_renderer_ships_no_token_after_a_marker() -> None:
 def test_no_run_of_scheme_words_lets_a_token_through(canary) -> None:
     rng = random.Random(497)
     words = ["Bearer", "bearer", "BEARER", "KBearer", "x.Bearer", "a=Bearer"]
+    # A run of lead words before a scheme word, which a tab glues to it (#502).
+    leads = ["", "x\t", "\t", "'q'\t", "`a`\t", "a\\'b\t", "a\tb\t", "(a)\t", "$(b\tc)\t"]
     for _ in range(3000):
         blanks = [" ", "\t", "  "]
-        run = "".join(rng.choice(words) + rng.choice(blanks) for _ in range(rng.randint(1, 5)))
+        run = "".join(
+            rng.choice(leads) + rng.choice(words) + rng.choice(blanks)
+            for _ in range(rng.randint(1, 5))
+        )
         head, tail = rng.choice(["", "x ", "curl -H "]), rng.choice(["", " next=1"])
         token = rng.choice([FAKE_JWT, f'"{FAKE_JWT} x"', f"'{FAKE_JWT} x'", f"x,{FAKE_JWT}"])
         text = f"{head}A_TOKEN={run}{token}{tail}"
@@ -268,7 +435,15 @@ def test_a_long_run_of_scheme_words_is_read_in_linear_time() -> None:
     redact_credentials("A_TOKEN=" + "Bearer\t" * 50_000)
     redact_credentials("A_TOKEN=" + "xbearer" * 50_000)
     redact_credentials("A_TOKEN=" + "xBearer" * 50_000 + " x")
+    # Lead words before a scheme word a tab glues to a value (#502), and tabs alone.
+    for lead in ("x\t", "'q'\t", "`a`\t", "a\\'\t", "x\tBearer ", "\t", "${x\t", "$'a\\'\t"):
+        redact_credentials("A_TOKEN=" + lead * 40_000 + " x")
+        redact_credentials(("A_TOKEN=" + lead) * 20_000)
+    # Credential names inside a value (#504's review), each read once however densely they come.
+    for inner in ("x,A_TOKEN=", "x'q'A_TOKEN=", "x,A_TOKEN=\t", "x,A_TOKEN=Bearer "):
+        redact_credentials("A_TOKEN=" + inner * 30_000 + "x")
     bounded("A_TOKEN=" + "Bearer " * 50_000 + "x")
+    bounded("A_TOKEN=" + "x\t" * 50_000 + "x")
     assert time.monotonic() - started < 5.0
 
 
