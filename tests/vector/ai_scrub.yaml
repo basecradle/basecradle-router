@@ -1115,6 +1115,21 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] apiKey=[REDACTED]\\\" n | {\"h\":\"apiKey=[REDACTED]\\\"\"} | x-api-key: [REDACTED]apiKey=[REDACTED]\\\" n")
 
+  - name: "an api-key value reads through every api-key label it holds"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#510: a value that held a second label left that label's value to no
+          # rule (`main` shipped the first; #515's opener reached the second, basecradle-noc#1573).
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "api_key=x,api_key=\"eyJfabricatedSecretValue04\" next=1 | api_key=\\\",api_key=\"eyJfabricatedSecretValue01&a=1 next=2 | api-key=\"Bearer api_key=\"eyJfabricatedSecretValue46&a=1 next=3"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] apiKey=[REDACTED]\" next=1 | apiKey=[REDACTED]&a=1 next=2 | apiKey=[REDACTED]&a=1 next=3")
+
   - name: "a header after an x-api-key value ending in a scheme word still loses its value"
     inputs:
       - insert_at: "ai_scrub"
