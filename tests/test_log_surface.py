@@ -360,7 +360,8 @@ _API_KEY = (
     r"""(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))"""
     r"""|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
     r"""[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*"""
-    rf"""|"?(?P<value>(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})|{_API_GLUED}|[^&\s"]+)"""
+    rf"""|(?:\\?")?(?P<value>(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})|{_API_GLUED}"""
+    r"""|(?:[^&\s"\\]|\\+[^&\s"\\])+)"""
     r"""(?P<blank>\s+)?)"""
 )
 

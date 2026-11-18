@@ -2147,7 +2147,9 @@ Caddy, no database) and has three load-bearing properties:
      differential, basecradle-noc#1570). The order stays: with the header rule after the assignment
      rule, `api_key=x-api-key: "K9…"` lost `x-api-key:` into the assignment's value and shipped the
      key, the same class mirrored. The assignment rule's value may open with a `"` (`API_KEY="…"` matched
-     nothing before), and a bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
+     nothing before) or an escaped `\"` (basecradle-router#515: `api_key=\"K9…\"` took only the
+     backslash and shipped the key); its run stops at a backslash before a `"`, so inside a JSON
+     string the escaped close survives and the line still parses. A bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
      (basecradle-router#423, basecradle-harness#866). Inside the pass the rules run one after another (the harness's
      are one alternation), so their order is load-bearing: the bearer rule's token class takes an
      assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`

@@ -1100,6 +1100,21 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED]apiKey=[REDACTED] next=1 | x-api-key: [REDACTED]apiKey=[REDACTED] next=2 | apiKey=[REDACTED] [REDACTED]\" next=3 | x-api-key: [REDACTED] next=4")
 
+  - name: "an api-key value opening with an escaped quote is redacted and a JSON line stays JSON"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#515: the value took only the backslash of `\"` and shipped the key.
+          # Its run stops at the backslash before the closing `\"`, so the JSON string still closes.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "api_key=\\\"K9fabricatedSecret07\\\" n | {\"h\":\"api_key=\\\"K9fabricatedSecret03\\\"\"} | x-api-key: api_key=\\\"K9fabricatedSecret06\\\" n"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] apiKey=[REDACTED]\\\" n | {\"h\":\"apiKey=[REDACTED]\\\"\"} | x-api-key: [REDACTED]apiKey=[REDACTED]\\\" n")
+
   - name: "a header after an x-api-key value ending in a scheme word still loses its value"
     inputs:
       - insert_at: "ai_scrub"

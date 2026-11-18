@@ -348,7 +348,10 @@ transforms:
       #     `api_key=` into a bearer value and the secret shipped. The assignment rule takes every
       #     bearer scheme in its value, as the harness's does, so `AUTH_API_KEY=Bearer eyJ…` is
       #     redacted whole rather than stopping at the space after `Bearer`. Its value may open with
-      #     a `"`, and a bearer header glued to the value goes with it, as the harness's does
+      #     a `"` or an escaped `\"` (basecradle-router#515: `api_key=\"K9…\"` took only the
+      #     backslash and shipped the key), and a run of any other value stops at a backslash before
+      #     a `"`, so in a JSON string the escaped close stays (`{"h":"apiKey=[REDACTED]\""}` still
+      #     parses). A bearer header glued to the value goes with it, as the harness's does
       #     (basecradle-router#423, basecradle-harness#866): `API_KEY="…"` matched nothing, because
       #     the value could not start at the quote, and `api_key=KBearer eyJ…` ended the value at the
       #     scheme word and left its token to no rule. The value is a glued `bearer` and a bare
@@ -412,7 +415,7 @@ transforms:
       # alternative, so nothing else this rule matches changes, and it is kept only where the
       # canary's run would end after it, as the credential rule keeps one: a marker with anything
       # glued to it is a value, and goes whole.
-      msg = replace_with(msg, r'(?i)api[-_]?key=(?:(?P<kept>(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*|"?(?P<value>(?:bearer\s+)+(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*)|[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+)(?P<blank>\s+)?)') -> |assignment| {
+      msg = replace_with(msg, r'(?i)api[-_]?key=(?:(?P<kept>(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*|(?:\\?")?(?P<value>(?:bearer\s+)+(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*)|[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|(?:[^&\s"\\]|\\+[^&\s"\\])+)(?P<blank>\s+)?)') -> |assignment| {
           blank = string(assignment.blank) ?? ""
           if assignment.kept != null { assignment.string } else if blank != "" && match(string(assignment.value) ?? "", r'(?i)bearer\z') { "apiKey=[REDACTED]Bearer" + blank } else { "apiKey=[REDACTED]" + blank }
       }
