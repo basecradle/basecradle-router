@@ -1,4 +1,4 @@
-"""The `jq` fallback's program in `wake-runner` (basecradle-router#491, #497, #502, #504), from its pieces.
+"""The `jq` fallback's program in `wake-runner` (basecradle-router#491, #497, #502, #504, #505), from its pieces.
 
 The fallback writes a builder's reply when the stream translator has died, by the translator's own
 rule (`claude_stream.quoted`): every credential-named assignment's value redacted, then every line
@@ -16,6 +16,12 @@ credential name it holds outside a quote (#504's review), then its last word, a 
 substitution read one level deep. Two choices keep the engine under its retry limit on any text: a
 piece before a credential name never crosses a name's `=`, so each name is one item with one
 reading, and a run of pieces with one reading repeats possessively.
+
+jq 1.7 counts every match's and capture's offset from the start of the string, and a slice
+measures the whole string, so one `gsub` search an assignment and one `splits` a record cost the
+text's length each (#505). The redaction reads many assignments a search (`redactor`) and the
+records are cut by literal splits (`CUT`); both write exactly what the program before them wrote
+(`BEFORE_JQ`), which the suite holds by a seeded fuzz.
 """
 
 # ruff: noqa: E501 — `PROGRAM` is one shell line of the shipped script.
@@ -142,15 +148,96 @@ VALUE = f"(?:{KEPT_MARKER}|{OPENING_TABS}{ITEM}*(?:{LAST_INNER_NAME}|{LEAD}|{PIE
 #: Any canary-length run a value left, as the canary reads one.
 RUN = run_char() + "{" + str(CANARY_VALUE_FLOOR) + ",}"
 
-PROGRAM_JQ = (
-    'fromjson? | select(type == "object" and .type == "result") | .result | strings'
-    f' | "{CREDENTIAL_NAME}" as $n | "{MARKER}" as $r'
-    f' | gsub("(?<n>" + $n + "){VALUE}"; "\\(.n)\\($r)")'
-    f' | gsub("(?<n>" + $n + "){RUN}"; "\\(.n)\\($r)")'
-    f' | "{jq(RECORD_BREAKS)}" as $b | sub("(?:" + $b + ")\\\\z"; "") | splits($b)'
+#: The most credential-named assignments one search reads (#505), and the most characters it reads
+#: across between two of them. jq 1.7 counts every match's offset, and every capture's, from the
+#: start of the string, and a slice measures the whole string, so `gsub` cost the string's length
+#: for every assignment, and jq offers no linear construction. Reading many per search divides that
+#: cost by as many; assignments further apart than `GAP` cost what each did before. A search reads
+#: four times as many as the last only while four times the last one's reach stays under `SPAN`
+#: characters, far below what exhausts the engine's retry limit (some 600,000 of one value).
+UNITS = 256
+GAP = 4096
+SPAN = 65536
+
+
+def redactor(units: int = UNITS, gap: int = GAP) -> str:
+    """The jq `redact($body)`: what `GSUB` writes, with up to `units` assignments read per search.
+
+    A search runs on the rest of the text, so every reading sees all that follows, as `gsub`'s
+    did, and the rest starts where `gsub`'s next search would. The rest cannot see the character
+    before it, which matters only to a name starting there, and none can: a value that ends in a
+    name character is followed by none, since a name character would be the value's. Each further
+    assignment is the next one `gsub` finds: the characters before it are those where none starts,
+    each tried as `gsub` tries it. The name is the assignment up to its first `=`, the name's own.
+
+    The first search reads one, and one that reads all it may lets the next read four times as many
+    (see `SPAN`), so a reply with few assignments compiles no pattern longer than it needs. One
+    search's assignments share one retry limit, which `gsub` gave each: a search that exhausts it is
+    made again for a quarter as many, down to one, which is `gsub`'s own search; only that one
+    failing fails the program, as `gsub` did, and so does any other error. The searches are a loop
+    that holds only the rest of the text, never a copy for each search made."""
+    unit = f'"(?:(?<g>(?:(?!\\\\g<x>)(?s:.)){{0,{gap}}}+)(?<u>\\\\g<x>)"'
+    return (
+        'def redact($body): ("(?<x>" + $n + $body + "){0}") as $x'
+        ' | def search($k): ["(?<u>\\\\g<x>)", (range(1; $k) | '
+        + unit
+        + '), (range(1; $k) | ")?"), $x] | add;'
+        " [label $done | foreach range(0; infinite) as $_ ({t: ., k: 1}; .t as $t | .k as $k"
+        " | (try ([$t | match(search($k))] | first)"
+        ' catch (if $k > 1 and test("retry-limit") then "retry" else error end)) as $m'
+        ' | if $m == "retry" then {t: $t, k: ([$k / 4 | floor, 1] | max), out: []}'
+        " elif $m == null then {t: null, out: [$t]}"
+        ' else [$m.captures[] | select(.offset >= 0 and .name != "x")] as $c'
+        " | {t: $t[$m.offset + $m.length:], k: (if $m.length * 4 < "
+        + str(SPAN)
+        + ' and ([$c[] | select(.name == "u")] | length) == $k then [$k * 4, '
+        + str(units)
+        + "] | min else $k end), out: [$t[:$m.offset], ($c[]"
+        ' | if .name == "g" then .string else (.string | .[:index("=") + 1]), $r end)]} end;'
+        " .out[], if .t == null then break $done else empty end)] | add;"
+    )
+
+
+#: The reply's lines: its records, cut at every record break (a CRLF first, as `RECORD_BREAKS`
+#: reads one) and a trailing one dropped, then into pieces, by literal splits and slices of each
+#: record's characters (an empty one kept: jq splits it into none). jq 1.7's `splits` measures the
+#: whole text for every record, and a slice of a string measures the string, where a slice of its
+#: characters does not (#505).
+if RECORD_BREAKS != "\r\n|[" + _BREAK_CHARS + "]":
+    raise ValueError("the records are cut by a CRLF and each of the break characters")
+_SINGLE_BREAKS = ", ".join('"' + jq(c) + '"' for c in _BREAK_CHARS)
+CUT = (
+    f'reduce ("\\r\\n", {_SINGLE_BREAKS}) as $c ([.]; [.[] | if . == "" then . else split($c)[] end])'
+    ' | if length > 1 and .[-1] == "" then .[:-1] end'
+    f' | .[] | if . == "" then ">" else explode as $c | range(0; $c | length; {QUOTED_PIECE})'
+    f' as $i | "> " + ($c[$i:$i+{QUOTED_PIECE}] | implode) end'
+)
+
+#: The program before #505, its redaction and its cut, which the program must read exactly as: one
+#: `gsub` search an assignment, and a `splits` and a slice of the string a record.
+GSUB = 'def redact($body): gsub("(?<n>" + $n + ")" + $body; "\\(.n)\\($r)");'
+SPLITS = (
+    f'"{jq(RECORD_BREAKS)}" as $b | sub("(?:" + $b + ")\\\\z"; "") | splits($b)'
     f' | if . == "" then ">" else . as $l | range(0; length; {QUOTED_PIECE}) as $i'
     f' | "> " + $l[$i:$i+{QUOTED_PIECE}] end'
 )
+
+
+def program_jq(
+    units: int = UNITS, gap: int = GAP, *, redaction: str | None = None, cut: str = CUT
+) -> str:
+    """The fallback's program, reading `units` assignments per search (or by `redaction`)."""
+    return (
+        'fromjson? | select(type == "object" and .type == "result") | .result | strings'
+        f' | "{CREDENTIAL_NAME}" as $n | "{MARKER}" as $r | {redaction or redactor(units, gap)}'
+        f' redact("{VALUE}") | redact("{RUN}") | {cut}'
+    )
+
+
+#: The program before #505.
+BEFORE_JQ = program_jq(redaction=GSUB, cut=SPLITS)
+
+PROGRAM_JQ = program_jq()
 
 
 def bash(text: str) -> str:

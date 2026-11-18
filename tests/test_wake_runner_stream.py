@@ -450,6 +450,125 @@ def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
     assert out == quoted(reply)
 
 
+@needs_jq
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "A_TOKEN=x ",
+        "A_TOKEN=x,B=\t",
+        "GH_TOKEN=Bearer eyJabc next=1 ",
+        "x=1 MY_API_KEY='a b'\n",
+    ],
+)
+def test_the_fallback_reads_many_assignments_in_seconds(tmp_path: Path, assignment: str) -> None:
+    # `gsub` cost the text's length for each assignment: 4,000 took over a second, 40,000 minutes
+    # (#505). The redaction reads 256 a search, and `stream` times out at 60 s.
+    from basecradle_router.claude_stream import quoted
+
+    reply = assignment * 40_000
+    started = time.monotonic()
+    out = _fallback(tmp_path, reply)
+    assert time.monotonic() - started < 15.0
+    assert out == quoted(reply)
+
+
+@needs_jq
+@needs_jq
+def test_sparse_assignments_cost_neither_time_nor_memory(tmp_path: Path) -> None:
+    # 3,000 assignments 300 characters apart, a megabyte. A search reads one only while they are
+    # further apart than its gap, and a loop holding a copy of the text for each search held 1.45 GB
+    # of this, `gsub` 41 MB (#505's review). The peak is jq's own, read in a process of its own.
+    import fallback_rule
+    from basecradle_router.claude_stream import quoted
+
+    reply = ("A_TOKEN=x " + "y" * 290 + " ") * 3_000
+    forged = tmp_path / "sparse.jsonl"
+    forged.write_text(json.dumps({"type": "result", "result": reply}) + "\n")
+    measure = (
+        "import resource, subprocess, sys\n"
+        "out = subprocess.run(sys.argv[1:], capture_output=True, check=True).stdout\n"
+        "peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+        "peak = peak if sys.platform == 'darwin' else peak * 1024\n"  # bytes there, KiB on Linux
+        "sys.stdout.buffer.write(str(peak).encode() + b'\\n' + out)\n"
+    )
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", measure, shutil.which("jq") or "jq", "-R", "-r"]
+        + [fallback_rule.PROGRAM_JQ, str(forged)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert time.monotonic() - started < 15.0
+    peak, _, out = done.stdout.partition("\n")
+    assert int(peak) < 256 * 1024 * 1024
+    assert out.splitlines() == quoted(reply)
+
+
+def test_a_search_that_exhausts_the_retry_limit_is_made_again_for_fewer(tmp_path: Path) -> None:
+    # Short assignments let a search read 256, and the long ones after them take it past its retry
+    # limit, which a quarter as many are not.
+    from basecradle_router.claude_stream import quoted
+
+    reply = "A_TOKEN=x " * 1_000 + ("A_TOKEN=" + "x" * 10_000 + " ") * 100
+    assert _fallback(tmp_path, reply) == quoted(reply)
+
+
+#: Every piece the fuzz below writes a reply from: the scheme words' pieces, and every opener,
+#: closer, escape, record break, marker and name character a value or a name is read across.
+_EVERY_PIECE = _SCHEME_PIECES + [
+    "SECRET_KEY_BASE=", "=\t", "A_TOKEN=\t", '"', "'", "`", "(", ")", "$(", "\\", "\r\n",
+    "\n", "\r", "\x00", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ",
+    "'<a redacted value>'", "AAAA", "_", "KEY", "x", "y" * 9, "é", "{",
+]  # fmt: skip
+
+#: Where a search can end against what follows it: a value ending in a name character, a quote,
+#: a tab or an `=`, and a name right after, glued or not (#505's review).
+_SEARCH_ENDS = [
+    "A_TOKEN=xB_TOKEN=y", "A_TOKEN=x B_TOKEN=y", "A_TOKEN='q'B_TOKEN=y", "A_TOKEN=\tB_TOKEN=y",
+    "A_TOKEN=B_TOKEN=", "KEY=" * 9, "A_TOKEN=x" + "_TOKEN=y" * 5, "A_TOKEN=x" + "\nB_KEY=y" * 5,
+]  # fmt: skip
+
+
+@needs_jq
+@pytest.mark.parametrize("seed", [505, 506])
+def test_the_fallback_writes_exactly_what_it_wrote_before_505(seed: int) -> None:
+    # Seeded fuzz: the shipped program, and the same reading 2 to 4 assignments a search with gaps
+    # of 0 to 16 characters, so a search ends almost everywhere, all write what one `gsub` search
+    # an assignment and one `splits` a record wrote. Nothing it redacts can narrow.
+    import fallback_rule
+
+    rng = random.Random(seed)
+    lines = (
+        "".join(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "".join(rng.choice(_EVERY_PIECE) for _ in range(rng.randint(0, 60))),
+                }
+            )
+            + "\n"
+            for _ in range(1_000)
+        )
+        + json.dumps({"type": "result", "result": ("A_TOKEN=x " + "y" * 9_000 + "\n") * 3})
+        + "\n"
+        + "".join(json.dumps({"type": "result", "result": end}) + "\n" for end in _SEARCH_ENDS)
+    )
+
+    def run(program: str) -> str:
+        jq = shutil.which("jq")
+        assert jq
+        return subprocess.run(
+            [jq, "-R", "-r", program], input=lines, capture_output=True, text=True, check=True
+        ).stdout
+
+    expected = run(fallback_rule.BEFORE_JQ)
+    assert expected.count("<a redacted value>") > 1_000
+    for units, gap in [(2, 0), (3, 2), (4, 16), (fallback_rule.UNITS, fallback_rule.GAP)]:
+        assert run(fallback_rule.program_jq(units, gap)) == expected, (units, gap)
+
+
 def test_the_fallback_is_its_generated_program_byte_for_byte() -> None:
     # The program is spelled three times over (regex, jq string, bash string), so it is generated
     # from the translator's own constants (`tests/fallback_rule.py`), never written by hand: a piece
