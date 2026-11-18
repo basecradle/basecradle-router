@@ -751,6 +751,10 @@ _FUZZ_PIECES = [
     "DB_PASSWORD=",
     "x'q'",
     "(a)\t",
+    "abc-bearer ",
+    "(a)Bearer ",
+    'x"q"bearer ',
+    "\\Bearer ",
     "=",
     "==",
     REDACTED_VALUE,
@@ -793,15 +797,28 @@ def _quote_open_at(record: str, at: int) -> bool:
 _VALUE_CHAR = re.compile("[^" + re.escape(" \t" + CANARY_VALUE_STOPS + _BREAK_CHARS) + "]")
 _MARKERS = (REDACTED_VALUE, BOX_REDACTED_VALUE)
 
+#: A scheme word as this reading skips one: closed pieces that cross no `"`, no canary stop and no
+#: record break, as the box's never do, then the six letters (`logfmt.SCHEME_WORD`, #510). Never
+#: past a `"` or into a quote left open, so a quoted value glued in a scheme word is still read as
+#: one below.
+_NOT_IN_A_SCHEME_WORD = re.escape(" \t" + CANARY_VALUE_STOPS + _BREAK_CHARS)
+_SCHEME_WORD_READ = (
+    f"(?:[^{_NOT_IN_A_SCHEME_WORD}'`\\\\]|\\\\[^{_NOT_IN_A_SCHEME_WORD}]"
+    f"|'[^{_NOT_IN_A_SCHEME_WORD}']*'|`[^{_NOT_IN_A_SCHEME_WORD}`]*`)*?\\\\?(?:"
+    + _SCHEME_WORD.pattern
+    + ")"
+)
+
 #: The bearer scheme words a value may open with, each with its blanks (#497), and the lead words a
 #: tab glues one to (#502): a quoted value after them is still the name's, and the parity pass takes
 #: it with them.
-_SCHEME_RUN = re.compile(
-    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*"
-)
+_SCHEME_RUN = re.compile("(?:\t*(?:" + _LEAD_WORD.pattern + ")*" + _SCHEME_WORD_READ + "[ \t]+)*")
 
 #: After a marker, only scheme words glued to it: the marker is no lead word.
-_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*")
+_GLUED_SCHEME_RUN = re.compile("(?:" + _SCHEME_WORD_READ + "[ \t]+)*")
+
+#: What a value may open with before its word (#510): a run of `,` and `}`.
+_OPENERS = re.compile("[,}]*")
 
 #: What may follow a quoted marker the parity pass keeps whole: anything that ends its word, the
 #: line's end included.
@@ -831,6 +848,8 @@ def _opens_a_quoted_value(line: str) -> str | None:
             continue  # a quoted marker, which the parity pass keeps as it is
         after = _after_marker(rest)
         at = len(line) - len(after)
+        if after is rest:
+            at = _OPENERS.match(line, at).end()
         at = (_GLUED_SCHEME_RUN if after is not rest else _SCHEME_RUN).match(line, at).end()
         while at < len(line) and line[at] != '"' and _VALUE_CHAR.match(line, at):
             if line[at] == "'":
@@ -862,7 +881,14 @@ def _ships_a_value(line: str) -> str | None:
             if after and _VALUE_CHAR.match(after) and after[0] != '"':
                 return line[name.start() : name.end() + 40]
             continue
-        if not rest or rest[0] in _EMPTY_VALUE_ENDS:
+        # A run of `,` and `}` opens a value only before a piece of its word (#510): before a
+        # blank, a stop, a record break or the end, the value is empty.
+        head = rest[_OPENERS.match(rest).end() :]
+        if (
+            not head
+            or head[0] in _EMPTY_VALUE_ENDS
+            or (len(head) < len(rest) and head[0] in _BREAK_CHARS)
+        ):
             continue
         return line[name.start() : name.end() + 24]
     return None
@@ -925,6 +951,9 @@ _ORACLE_PIECES = [
     "DB_PASSWORD=",
     "x'q'",
     "(a)\t",
+    "abc-bearer ",
+    "(a)Bearer ",
+    "\\Bearer ",
 ]
 
 
@@ -973,8 +1002,10 @@ def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> N
 # rest of its word; while the word read as the token ends in `bearer`, the next word is the token.
 # Every line below is a bearer header built by that definition, so where its token stands is known
 # by construction, and the token is the fabricated secret: it must never ship. Seeded fuzz over
-# every context a header reaches the box in but a credential-named assignment, whose value the
-# credential rule reads first by the print site's reading, which stops at fewer scheme words (#510).
+# every context a header reaches the box in. In a credential-named assignment's value, which the
+# credential rule reads first by the print site's reading, a scheme word is any word of closed
+# pieces ending in one: one definition, so a value never ends at a word the bearer rule reads as a
+# scheme word (#510). A scheme word glued after a piece left open is the stated limit below.
 
 _BEARER_SECRET = "eyJFab1catedSig"
 
@@ -1045,12 +1076,26 @@ _HEADER_CONTEXTS = [
     "https://h.example.com/heartbeat/K9x",
     "uptime.example.com/heartbeat/K9 ",
 ]
+
+#: A credential-named assignment's value, which the print site and the box's credential rule read
+#: before any header rule (#510): bare, exported, glued after a quote or a `,`, opening with a `,`,
+#: and after a lead word a tab glues to it.
+_CREDENTIAL_CONTEXTS = [
+    "A_TOKEN=",
+    "X_API_KEY=",
+    "export GH_TOKEN=",
+    "SECRET_KEY_BASE=",
+    "x,DB_PASSWORD=",
+    "'q'DB_PASSWORD=",
+    "A_TOKEN=,",
+    "A_TOKEN=x\t",
+]
 _HEADER_ENDS = ["", " next=1", '"}', "\nnext", " | other", "'", '"']
 
 
-def _bearer_header(rng: random.Random) -> str:
-    words = [rng.choice(_SCHEME_WORDS) for _ in range(rng.choice([1, 1, 2, 2, 3, 4]))]
-    header = rng.choice(_HEADER_CONTEXTS) + words[0]
+def _bearer_header(rng: random.Random, contexts: list[str], scheme_words: list[str]) -> str:
+    words = [rng.choice(scheme_words) for _ in range(rng.choice([1, 1, 2, 2, 3, 4]))]
+    header = rng.choice(contexts) + words[0]
     for word in words[1:]:
         header += rng.choice(_SCHEME_BLANKS) + word
     return header + rng.choice(_SCHEME_BLANKS) + rng.choice(_TOKENS) + rng.choice(_HEADER_ENDS)
@@ -1058,10 +1103,50 @@ def _bearer_header(rng: random.Random) -> str:
 
 def test_no_bearer_header_ships_its_token(tmp_path: Path) -> None:
     rng = random.Random(507)
-    lines = [_bearer_header(rng) for _ in range(4000)]
+    lines = [_bearer_header(rng, _HEADER_CONTEXTS, _SCHEME_WORDS) for _ in range(4000)]
+    lines += [_bearer_header(rng, _CREDENTIAL_CONTEXTS, _GLUED_SCHEME_WORDS) for _ in range(3000)]
     box = _scrub_lines(_vector(), tmp_path, lines)
     leaked = [(line, got) for line, got in zip(lines, box, strict=True) if "Fab1cated" in got]
     assert not leaked, leaked[:5]
+
+
+def test_no_credential_value_ends_between_a_scheme_word_and_its_token_at_the_print_site() -> None:
+    # The print site reads the same definition (#510): every header in a credential-named value
+    # loses its token there too, before any line reaches the box.
+    rng = random.Random(510)
+    lines = [_bearer_header(rng, _CREDENTIAL_CONTEXTS, _GLUED_SCHEME_WORDS) for _ in range(6000)]
+    leaked = [line for line in lines if "Fab1cated" in redact_credentials(line)]
+    assert not leaked, leaked[:5]
+
+
+#: The stated limit (deploy/README.md → "A Scheme Word Glued After a Piece Left Open"): in a
+#: credential-named value, a scheme word glued after a quote, a backquote or a substitution the
+#: word opens. The shell, and so the print site and the box, reads that piece to its own close;
+#: the bearer rule reads the scheme word and opens the token's quote after it. Where the two
+#: pairings disagree the value ends inside the token, and the rest of the token ships.
+_LIMIT = {
+    "SECRET_KEY_BASE='q''Bearer\t'a eyJFab1catedSig b'": (
+        f"SECRET_KEY_BASE={BOX_REDACTED_VALUE} eyJFab1catedSig b'"
+    ),
+    'X_API_KEY="Bearer\t"a eyJFab1catedSig b" next=1': (
+        f'X_API_KEY={BOX_REDACTED_VALUE} eyJFab1catedSig b" next=1'
+    ),
+}
+
+
+def test_a_scheme_word_glued_after_a_piece_left_open_is_the_stated_limit(tmp_path: Path) -> None:
+    # Pinned, so a change to either reading is seen, and the canary reads nothing in any of them:
+    # the name keeps its marker, and what ships is a token with no credential name before it.
+    lines = list(_LIMIT)
+    assert _scrub_lines(_vector(), tmp_path, lines) == list(_LIMIT.values())
+    for line in lines:
+        assert "eyJFab1catedSig" in redact_credentials(line), line
+    rng = random.Random(1510)
+    opened = [word for word in _SCHEME_WORDS if word not in _GLUED_SCHEME_WORDS]
+    lines = [_bearer_header(rng, _CREDENTIAL_CONTEXTS, opened) for _ in range(3000)]
+    canary = re.compile(NOC_CREDENTIAL_ASSIGNMENT)
+    shipped = [got for got in _scrub_lines(_vector(), tmp_path, lines) if canary.search(got)]
+    assert not shipped, shipped[:5]
 
 
 @pytest.mark.parametrize("host", HOSTS)

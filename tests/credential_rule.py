@@ -16,8 +16,11 @@ a canary stop (`"`, `,`, `}`) or a record break. The two passes:
    name outside every quote whose word holds a double-quoted piece has that whole word as its
    value. Every other piece here must close, so that no piece left open can reach a later quote.
 2. THE RUN, for every other value: the word, read with pieces that may stay open (each to its
-   close or to a bare `"` or a record break), and every run of bearer scheme words with its token,
-   a scheme word a tab glues to a value after lead words included (`LEAD_WORD`, #502).
+   close or to a bare `"` or a record break), and every run of bearer scheme words with its token.
+
+A scheme word is any word ending in `bearer` (#510), as the print site's `logfmt._SCHEME_WORD`
+reads one: a value never ends between a scheme word and its token. A value opens at a run of `,`
+and `}` when a piece of its word follows, as the print site's shell word does (#510).
 
 No piece crosses a bare `"`: on a JSON or logfmt line it is the line's own.
 """
@@ -31,7 +34,7 @@ from pathlib import Path
 from basecradle_router.logfmt import (
     CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
-    SCHEME_GLUE,
+    SCHEME_WORD,
 )
 
 #: Every record break, as each class spells it (`logfmt._BREAK_CHARS`, pinned by a test).
@@ -88,27 +91,30 @@ OPEN_PIECES = [
 CLOSED_PIECE = "(?:" + "|".join(CLOSED_PIECES) + ")"
 OPEN_PIECE = "(?:" + "|".join(OPEN_PIECES) + ")"
 
-#: What a bearer header may be glued to: a value of token characters (the print site's one
-#: spelling, `logfmt.SCHEME_GLUE`), and the scheme word as HTTP spells it, so a value merely ending
-#: in the letters (`abc-bearer`) is no header.
-GLUED = f"[{SCHEME_GLUE}]*?Bearer"
+#: A double-quoted piece that closes: the parity pass's, never left open.
+CLOSED_DOUBLE_QUOTED = DOUBLE_QUOTED.removesuffix("?")
+assert CLOSED_DOUBLE_QUOTED + "?" == DOUBLE_QUOTED, DOUBLE_QUOTED
 
-#: A scheme word, alone in any case or glued.
-SCHEME = f"(?:(?i:bearer)|{GLUED})"
+#: A scheme word (#510): any word of closed pieces ending in the scheme word as the print site
+#: spells it (`logfmt.SCHEME_WORD`), whatever comes before it (`abc-bearer`, `(a)Bearer`, a tab
+#: included: `x<TAB>Bearer`, `'q'<TAB>KBearer`, #502). Every piece before it closes, so none can
+#: stop inside a quote: one that could would let `'a<TAB>Bearer b'` read as a scheme word and open a
+#: quote that eats the line's fields. The parity pass's may hold a closed double-quoted piece
+#: (`x"q"bearer`); the run's never crosses a bare `"`. The six letters are read as written, so a
+#: backslash may stand right before them (`\Bearer`), which a piece would read with their first.
+SCHEME_END = rf"\\?{SCHEME_WORD}"
+SCHEME = f"(?:{CLOSED_PIECE}*?{SCHEME_END})"
+PARITY_SCHEME = f"(?:(?:{CLOSED_PIECE}|{CLOSED_DOUBLE_QUOTED})*?{SCHEME_END})"
 
-
-#: A run of scheme words, each with the blanks after it, in any order, as the print site's
-#: `logfmt._value_end` reads them (#497).
+#: A run of scheme words, each with the blanks after it, as the print site's `logfmt._value_end`
+#: reads them (#497).
 SCHEMES = rf"(?:{SCHEME}[\x20\t]+)"
+PARITY_SCHEMES = rf"(?:{PARITY_SCHEME}[\x20\t]+)"
 
-
-#: A run of scheme words reached across tabs, as well as blanks (#502): each one after any prefix of
-#: closed pieces that ends at a tab (`x<TAB>Bearer`, `'q'<TAB>KBearer`, `(a)<TAB>Bearer`), a
-#: backslash right before the tab included, as the print site's `logfmt._value_end` never ends a
-#: value between a scheme word and its token. Every piece of the prefix closes, so none can stop
-#: inside a quote: one that could would let `'a<TAB>Bearer b'` read as a scheme word and open a
-#: quote that eats the line's fields. The box reads at least what the print site does here.
-REACHED_SCHEMES = rf"(?:(?:{CLOSED_PIECE}*?\\?\t)?\t*{SCHEME}[\x20\t]+)"
+#: What a value may open with before its word, when a piece of the word follows (#510): a run of
+#: `,` and `}`, which the print site's shell word holds and which no well-formed JSON or logfmt line
+#: puts right after an `=` (inside a value they stay the line's structure, and end it).
+OPENERS = "[,}]*"
 
 
 #: The credential names a value holds outside every quote, each with its `=` (`'q'DB_PASSWORD=`):
@@ -118,20 +124,34 @@ REACHED_SCHEMES = rf"(?:(?:{CLOSED_PIECE}*?\\?\t)?\t*{SCHEME}[\x20\t]+)"
 INNER_NAMES = f"(?:{CLOSED_PIECE}*?{NAME}=)*"
 
 #: A run of scheme words, each with the inner names its token holds before the next.
-SCHEME_CHAIN = f"(?:{REACHED_SCHEMES}{INNER_NAMES})"
+SCHEME_CHAIN = f"(?:{SCHEMES}{INNER_NAMES})"
+PARITY_CHAIN = f"(?:{PARITY_SCHEMES}{INNER_NAMES})"
 
 #: Pass 1's value: a word holding a double-quoted piece, a marker at its head included, and the
 #: scheme words before it (`X_TOKEN=Bearer "…"`, `X_TOKEN=x<TAB>Bearer "…"`).
 #: After its double-quoted piece the word goes on to a tab, and past it only by a scheme word and its
-#: token (`X_TOKEN="a b"<TAB>Bearer tok`), so it never ends between the two.
+#: token (`X_TOKEN="a b"<TAB>Bearer tok`), so it never ends between the two. A scheme word ending the
+#: word itself (`X_TOKEN=x"q"bearer 'tok'`, #510) goes on to the token too: tried first at each
+#: piece, as a step past every scheme word after it to the token's first piece (`TOKEN_HEAD`), so a
+#: scheme word with no word after it on its record is the value alone and the blanks after it stay.
 _BARE = CLOSED_PIECES[-1]
 assert _BARE.startswith(r"[^\x20"), _BARE  # any other character, a tab included
 _TAIL = _BARE[len(r"[^\x20") :]
 CLOSED_PIECE_BEFORE_A_TAB = "(?:" + "|".join([*CLOSED_PIECES[:-1], r"[^\x20\t" + _TAIL]) + ")"
+
+#: A token's first piece after a scheme word in pass 1: any piece of the run's, which may stay open
+#: (`X_TOKEN="q"bearer 'tok`, #510) but never crosses a bare `"` or a record break, or a
+#: double-quoted one.
+TOKEN_HEAD = f"(?:{OPEN_PIECE}|{DOUBLE_QUOTED})"
+PARITY_STEP = (
+    f"(?:(?:{CLOSED_PIECE_BEFORE_A_TAB}|{CLOSED_DOUBLE_QUOTED})*?{SCHEME_END}"
+    rf"[\x20\t]+{INNER_NAMES}{PARITY_CHAIN}*{TOKEN_HEAD})"
+)
 PARITY_WORD = (
-    f"{INNER_NAMES}(?:{MARKERS}{SCHEMES}*|{SCHEME_CHAIN}*)"
-    f"{CLOSED_PIECE}*{DOUBLE_QUOTED}(?:{CLOSED_PIECE_BEFORE_A_TAB}|{DOUBLE_QUOTED})*"
-    f"(?:{SCHEME_CHAIN}+(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*)?"
+    f"{OPENERS}{INNER_NAMES}(?:{MARKERS}{PARITY_SCHEMES}*|{PARITY_CHAIN}*)"
+    f"{CLOSED_PIECE}*{DOUBLE_QUOTED}"
+    f"(?:{PARITY_STEP}|{CLOSED_PIECE_BEFORE_A_TAB}|{DOUBLE_QUOTED})*"
+    f"(?:{PARITY_CHAIN}+(?:{TOKEN_HEAD}(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*)?)?"
 )
 
 #: Where a kept marker ends: where the canary's run would.
@@ -167,14 +187,19 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       #   2. THE RUN, for every other value: a double-quoted value closed on its line before a word's
       #      end, whatever the parity (a stray quote earlier, an inch mark or a traceback's `'"'`,
       #      never lets one through); the word, with pieces that may stay open; and every run of
-      #      bearer scheme words with the token after it (a `Bearer` glued to a value included, the
-      #      words in any order), as the print site and the `api[-_]?key=` rule below take them: the
-      #      scheme word alone is the canary's whole value. The canary's run crosses a tab, so a
-      #      scheme word after one is reached too, after any prefix of pieces that all close
-      #      (`x<TAB>Bearer`, `'q'<TAB>KBearer`, `(a)<TAB>Bearer`, basecradle-router#502): a value
-      #      never ends between a scheme word and its token.
+      #      bearer scheme words with the token after it, as the print site and the `api[-_]?key=`
+      #      rule below take them: the scheme word alone is the canary's whole value.
+      #   A SCHEME WORD is any word ending in `bearer`, in any case, glued to anything before it
+      #   (basecradle-router#510): the fleet's one definition, basecradle-harness docs/telemetry.md
+      #   → Credential Scrubbing, which the print site reads too. So `abc-bearer`, `(a)Bearer`,
+      #   `x"q"bearer` (pass 1) and one a tab glues to the value (`x<TAB>Bearer`, `'q'<TAB>KBearer`,
+      #   basecradle-router#502) each hand on to the token after them, in both passes: a value never
+      #   ends between a scheme word and its token. Every piece before the six letters closes.
       #   Both passes read on into the value of a credential name the value holds outside every
-      #   quote (`'q'DB_PASSWORD=<TAB>…`, `'q'DB_PASSWORD=Bearer …`), as the print site does.
+      #   quote (`'q'DB_PASSWORD=<TAB>…`, `'q'DB_PASSWORD=Bearer …`), as the print site does, and
+      #   open at a run of `,` and `}` with a piece of the word after it (`A_TOKEN=,K9…`,
+      #   basecradle-router#510), as the print site's shell word does: no well-formed JSON or logfmt
+      #   line puts one right after an `=`, and inside a value they stay the line's structure.
       # An empty value is left as it is, except before a record break, which the canary's run
       # crosses: the marker stands between the `=` and the break, and nothing is taken.
       #
@@ -219,7 +244,7 @@ BLOCK = (
                   (?:
                       (?P<kept>{MARKERS}|"{MARKERS}")(?P<kept_end>{MARKER_END})
                     | (?P<value>
-                          {INNER_NAMES}
+                          {OPENERS}{INNER_NAMES}
                           (?:
                               {CLOSED_QUOTED_VALUE}
                             | {SCHEME_CHAIN}+{OPEN_PIECE}+

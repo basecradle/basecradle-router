@@ -11,7 +11,7 @@ the repository root (`uv run python tests/fallback_rule.py`), which writes `PROG
 `deploy/bin/wake-runner`, then run the suites.
 
 The value is the translator's reading of one, degraded only where a backtracking engine needs it:
-the scheme words before it (#497), the lead words a tab joins it across (#502), the value of every
+the scheme words before it (#497; any word ending in one, #510), the lead words a tab joins it across (#502), the value of every
 credential name it holds outside a quote (#504's review), then its last word, a quote or a
 substitution read one level deep. Every piece the engine tries and fails costs it a retry, of
 10,000,000 a search, and three choices keep them few: a piece before a credential name never
@@ -47,7 +47,7 @@ from basecradle_router.logfmt import (
     LEAD_OPENERS,
     RECORD_BREAKS,
     REDACTED_VALUE,
-    SCHEME_GLUE,
+    SCHEME_WORD,
 )
 
 WAKE_RUNNER = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "wake-runner"
@@ -138,15 +138,23 @@ LEAD_PIECE = (
 )
 LEAD = f"(?:{LEAD_PIECE}++(?:{BACKSLASH})?|{BACKSLASH})\\t+"
 
-#: A bearer scheme word (`logfmt._SCHEME_WORD`) and its blanks, a word reached after them.
-SCHEME = f"(?:(?i:bearer)|[{SCHEME_GLUE}]*Bearer)[ \\t]+(?={REACH})"
+#: Where a bearer scheme word ends: the scheme word, looked behind at the end of a word of closed
+#: pieces (`logfmt.SCHEME_WORD`, glued to anything before it, #510), then its blanks, a word reached
+#: after them.
+SCHEME_END = f"(?<={SCHEME_WORD})[ \\t]+(?={REACH})"
 
 #: The tabs a value opens with, before a word the canary's run reaches.
 OPENING_TABS = f"(?:\\t++(?={REACH}))?"
 
 #: An inner credential name: the closed pieces up to its `=`, possessive, then its value's tabs.
 TO_A_NAME = f"{CLOSED_PIECE}*+{A_NAMES_EQ}"
-ITEM = f"(?:{TO_A_NAME}{OPENING_TABS}|{SCHEME}|{LEAD}(?={REACH}))"
+
+#: One item: the closed pieces up to an inner name's `=` (and its value's tabs) or to the end of a
+#: scheme word (and its blanks), in one possessive reading, so a word that ends in neither costs one
+#: reading of it, as it did before the scheme word was any word ending in one (#510); or a lead word.
+#: A reading of no pieces never looks behind at a scheme word: an item ends at an `=`, a tab or a
+#: blank, and a value opens after an `=`.
+ITEM = f"(?:{CLOSED_PIECE}*+(?:{A_NAMES_EQ}{OPENING_TABS}|{SCHEME_END})|{LEAD}(?={REACH}))"
 
 #: A last inner name whose value is empty or tabs alone: the value ends there, past the tabs.
 LAST_INNER_NAME = f"{TO_A_NAME}(?:\\t+(?!{REACH})|(?=[ {BRK}]|\\\\z))"

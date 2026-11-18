@@ -1082,6 +1082,24 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1")
 
+  - name: "an x-api-key value ending at an api-key assignment puts its name back for the assignment rule"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#510, the NOC's differential (basecradle-noc#1570): the x-api-key rule's
+          # value stops at the quote after `api_key=`, so it puts back the fixed `apiKey=` and the
+          # assignment rule reads the quoted value. The mirror, an assignment whose value is an
+          # x-api-key label, still loses its key, because the x-api-key rule runs first. An empty
+          # assignment, a blank after it, puts nothing back.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key: api_key=\"K9fabricatedSecret03' next=1 | x-api-key: Bearer api_key='K9fabricatedSecret05' next=2 | api_key=x-api-key: \"K9fabricatedSecret04\" next=3 | x-api-key: api_key= next=4"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED]apiKey=[REDACTED] next=1 | x-api-key: [REDACTED]apiKey=[REDACTED] next=2 | apiKey=[REDACTED] [REDACTED]\" next=3 | x-api-key: [REDACTED] next=4")
+
   - name: "a header after an x-api-key value ending in a scheme word still loses its value"
     inputs:
       - insert_at: "ai_scrub"

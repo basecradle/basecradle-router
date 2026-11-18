@@ -17,7 +17,7 @@ from pathlib import Path
 
 import bearer_rule
 import credential_rule
-from basecradle_router.logfmt import _BREAK_CHARS, CANARY_VALUE_STOPS, REDACTED_VALUE
+from basecradle_router.logfmt import _BREAK_CHARS, CANARY_VALUE_STOPS, REDACTED_VALUE, SCHEME_WORD
 from conftest import BOX_REDACTED_VALUE, NOC_CREDENTIAL_ASSIGNMENT
 
 _DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
@@ -366,13 +366,17 @@ _API_KEY = (
 
 #: The `x-api-key` rule's whole closure: the fixed label, and the fixed word `Bearer` where the
 #: value ended at a scheme word with a blank after it, so the bearer rule reads the header after
-#: it (basecradle-router#507). Nothing of the value is ever put back, only the blank as matched.
+#: it (basecradle-router#507), or the fixed `apiKey=` where it ended at an assignment's name glued
+#: to its value, so the assignment rule reads that value (#510). Nothing of the value is ever put
+#: back, only the blank as matched.
 _X_API_KEY_PASS = f"msg = replace_with(msg, r'{_X_API_KEY}') -> |header| {{"
 _X_API_KEY_CLOSURE = [
     _X_API_KEY_PASS,
     'blank = string(header.blank) ?? ""',
     'if blank != "" && match(string(header.value) ?? "", r\'(?i)bearer\\z\') '
-    '{ "x-api-key: [REDACTED]Bearer" + blank } else { "x-api-key: [REDACTED]" + blank }',
+    '{ "x-api-key: [REDACTED]Bearer" + blank } else if blank == "" && '
+    "match(string(header.value) ?? \"\", r'(?i)api[-_]?key=\\z') "
+    '{ "x-api-key: [REDACTED]apiKey=" } else { "x-api-key: [REDACTED]" + blank }',
     "}",
 ]
 
@@ -669,29 +673,59 @@ def test_no_piece_crosses_a_bare_quote_or_a_record_break() -> None:
     assert credential_rule.OUTSIDE == r'(?:[^"\\]|\\[\s\S])'
 
 
-def test_a_scheme_word_a_tab_glues_to_a_value_is_reached_after_closed_pieces() -> None:
-    # A value never ends between a scheme word and its token (#502). The box reaches a scheme word
-    # after any prefix of pass 1's pieces that ends at a tab, and every one of them closes, so the
-    # prefix can never stop inside a quote: one that could would read `'a<TAB>Bearer b'` as a scheme
-    # word and open a quote that eats a line's fields.
-    reached = credential_rule.REACHED_SCHEMES
+def test_a_scheme_word_is_any_word_of_closed_pieces_ending_in_one() -> None:
+    # A value never ends between a scheme word and its token, and a scheme word is `bearer` in any
+    # case glued to anything before it (#510, the fleet's one definition, which the print site's
+    # `logfmt.SCHEME_WORD` spells). Every piece before the six letters closes, so a scheme word can
+    # never stop inside a quote: one that could would read `'a<TAB>Bearer b'` as a scheme word and
+    # open a quote that eats a line's fields. A tab is such a piece, so a scheme word a tab glues
+    # to a value (#502) is one too. The six letters are read as written: a lone backslash may stand
+    # before them, which an escape piece would read with their first.
     closed = credential_rule.CLOSED_PIECE
-    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}[\x20\t]+)"
+    assert rf"\\?{SCHEME_WORD}" == credential_rule.SCHEME_END
+    assert f"(?:{closed}*?{credential_rule.SCHEME_END})" == credential_rule.SCHEME
+    assert "\t" not in _negated_classes(closed)[-1]
+    # The parity pass's may hold a double-quoted piece, and only one that closes.
+    closed_quoted = credential_rule.CLOSED_DOUBLE_QUOTED
+    assert closed_quoted + "?" == credential_rule.DOUBLE_QUOTED
+    assert (
+        f"(?:(?:{closed}|{closed_quoted})*?{credential_rule.SCHEME_END})"
+    ) == credential_rule.PARITY_SCHEME
+    schemes = credential_rule.SCHEMES
+    assert schemes == rf"(?:{credential_rule.SCHEME}[\x20\t]+)"
     chain = credential_rule.SCHEME_CHAIN
-    assert chain == f"(?:{reached}{credential_rule.INNER_NAMES})"
+    assert chain == f"(?:{schemes}{credential_rule.INNER_NAMES})"
+    parity_chain = credential_rule.PARITY_CHAIN
+    assert parity_chain == (
+        rf"(?:(?:{credential_rule.PARITY_SCHEME}[\x20\t]+){credential_rule.INNER_NAMES})"
+    )
+    openers = credential_rule.OPENERS
+    assert openers == "[,}]*"
+    assert f"{openers}{credential_rule.INNER_NAMES}\n" in credential_rule.BLOCK
     assert f"| {chain}+{credential_rule.OPEN_PIECE}+\n" in credential_rule.BLOCK
     inner = credential_rule.INNER_NAMES
     # A credential name the value holds outside every quote goes on into its value (#504's
     # review): only closed pieces stand before it, so a name inside a quote is the quote's text.
     assert inner == f"(?:{closed}*?{credential_rule.NAME}=)*"
-    # Pass 1's word goes on past its quoted piece to a tab, and past one only by a scheme word.
+    # Pass 1's word goes on past its quoted piece to a tab, and past one only by a scheme word; a
+    # scheme word ending the word itself steps to its token's first piece, tried before any other.
     before_a_tab = credential_rule.CLOSED_PIECE_BEFORE_A_TAB
     assert _negated_classes(before_a_tab)[-1] == _negated_classes(closed)[-1] | {"\t"}
+    quoted = credential_rule.DOUBLE_QUOTED
+    # A token's first piece may be one of the run's, left open, which never crosses a bare `"`.
+    head = credential_rule.TOKEN_HEAD
+    assert head == f"(?:{credential_rule.OPEN_PIECE}|{quoted})"
+    step = credential_rule.PARITY_STEP
+    assert step == (
+        f"(?:(?:{before_a_tab}|{closed_quoted})*?{credential_rule.SCHEME_END}"
+        rf"[\x20\t]+{inner}{parity_chain}*{head})"
+    )
     assert (
-        f"{inner}(?:{credential_rule.MARKERS}{credential_rule.SCHEMES}*|{chain}*)"
-        f"{closed}*{credential_rule.DOUBLE_QUOTED}"
-        f"(?:{before_a_tab}|{credential_rule.DOUBLE_QUOTED})*"
-        f"(?:{chain}+(?:{closed}|{credential_rule.DOUBLE_QUOTED})*)?"
+        f"{openers}{inner}(?:{credential_rule.MARKERS}{credential_rule.PARITY_SCHEMES}*"
+        f"|{parity_chain}*)"
+        f"{closed}*{quoted}"
+        f"(?:{step}|{before_a_tab}|{quoted})*"
+        f"(?:{parity_chain}+(?:{head}(?:{closed}|{quoted})*)?)?"
     ) == credential_rule.PARITY_WORD
 
 
