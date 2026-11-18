@@ -296,10 +296,12 @@ transforms:
       #     run is put back for the bearer rule (basecradle-router#402, the harness's
       #     `_TRAILING_BEARER`): taken with the URL, the word left its token in the next run, which
       #     no rule matched, so compact JSON (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query
-      #     value (`…&access_token=Bearer eyJ…`) shipped the token. Only a word not glued to a
-      #     letter or digit is put back, so a secret whose last letters merely spell it
-      #     (`…/heartbeat/K9xbearer`) is redacted whole. The word is put back as captured, so what
-      #     ships is only ever the word the pattern matched.
+      #     value (`…&access_token=Bearer eyJ…`) shipped the token. What is put back is the fixed
+      #     word `Bearer`, never the bytes captured (basecradle-router#507): glued to a letter or
+      #     digit the word may be the secret's own tail (`…/heartbeat/K9xbearer`), and before #507
+      #     it was then redacted with the URL and left a scheme word glued to a value
+      #     (`…&auth=xBearer eyJ…`) without its token. Now no byte of the URL ships, and the bearer
+      #     rule takes the token after the word, whatever it is glued to.
       #     A kv value's closing quote ending the run is put back too (basecradle-router#423, the
       #     harness's `_CLOSING_QUOTE`, harness 0.186.0): taken with the URL, it left
       #     `url="[REDACTED_HEARTBEAT_URL] next=1`, a line with an unclosed value that no kv parser
@@ -321,7 +323,12 @@ transforms:
       #     not, and then `:`, `=`, `=>` or `,` (`"x-api-key": "…"`, JSON inside a JSON string, a
       #     `('x-api-key', '…')` header tuple). The value may open with a quote, an escaped quote, a
       #     bytes literal's `b'`, or bearer scheme words, and runs to the next space, quote, backslash
-      #     or `&`; a bearer header glued to it (`x-api-key: KBearer eyJ…`) is taken with its token.
+      #     or `&`; a bearer header glued to it (`x-api-key: KBearer eyJ…`) is taken with a bare
+      #     token. A value that ends at a scheme word with a blank after it puts the scheme word
+      #     back (basecradle-router#507), as the heartbeat rule does, so the bearer rule reads the
+      #     header after it (`x-api-key: Bearer 'eyJ…'`): a word after scheme words is the value's
+      #     only when the bearer rule would not read it as a token (it opens with no quote,
+      #     backquote, escaped quote, or dollar-sign quote or substitution).
       #     The unquoted `X-API-Key=…` is left to the assignment rule, which takes it with the wider
       #     value it allows. It runs before that rule so the header's name goes with its value, and
       #     its label carries a `:`, never a `=`, so the assignment rule never reads it again. A
@@ -334,21 +341,40 @@ transforms:
       #     a `"`, and a bearer header glued to the value goes with it, as the harness's does
       #     (basecradle-router#423, basecradle-harness#866): `API_KEY="…"` matched nothing, because
       #     the value could not start at the quote, and `api_key=KBearer eyJ…` ended the value at the
-      #     scheme word and left its token to no rule. The value is two alternatives, the first a
-      #     value ending in a glued `bearer` and its token. On the box this one rule is also the
+      #     scheme word and left its token to no rule. The value is a glued `bearer` and a bare
+      #     token, or any other value, bearer scheme words before either; one that ends at a scheme
+      #     word with a blank after it puts the word back for the bearer rule, as the `x-api-key`
+      #     rule does (basecradle-router#507). On the box this one rule is also the
       #     query-value rule (`?apiKey=…`); the harness's wider query rule for `token=` and `key=` is
       #     a shape the box does not carry.
-      #   * The bearer rule takes EVERY scheme word before the token, as the harness's does: a token
-      #     stored with its scheme and sent with another reads `Bearer Bearer eyJ…`, and one scheme
-      #     word taken alone is the value, leaving the token.
+      #   * The bearer rule takes a bearer header's token WHOLE, QUOTED OR NOT, and a run of scheme
+      #     words goes with the token after it (basecradle-router#507). The definition is the
+      #     harness's (basecradle-harness#929): the scheme word is `bearer` in any case, glued to
+      #     anything before it, followed by whitespace; the token is a run of
+      #     `[A-Za-z0-9._~+/-]` (any length on the box), or the whole shell word a quote, a
+      #     dollar-sign quote, a backquote or a substitution opens (to its close, or its line's end
+      #     when it never closes) and what is glued after it, or an escaped quote and the rest of
+      #     its word; while the word read as the token ends in `bearer`, the next word is the token
+      #     in its place. So `Bearer 'eyJ…'`, `Bearer Bearer "eyJ…"`, `Bearer x.Bearer 'eyJ…'` and
+      #     `Bearer \"Bearer eyJ…` lose the token, where before the first three shipped it whole.
+      #     It is the harness's stated minimum for a server, and one thing more: a word ending in
+      #     a scheme word may open with an escaped quote. Its limit is the minimum's: one quoted
+      #     piece or substitution, one level deep (no regular expression nests). It is the one rule
+      #     that reads a header: the three above put a scheme word back where their match ends at
+      #     one, never reading the header themselves, since a header read inside another rule's
+      #     value took a second `x-api-key` label as its quoted token and left that header's value
+      #     to no rule. The header is written once in tests/bearer_rule.py, which writes this
+      #     statement; tests/test_log_surface.py holds every host's to it, byte for byte. Change it
+      #     there, never here.
       msg = replace_with(msg, r'(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?') -> |hb| {
           url = string(hb.url) ?? ""
           closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}
           quote = string(closing.quote) ?? ""
           if quote == "\"" && hb.after == null { quote = "" }
           if quote != "" { url = string(closing.body) ?? url }
-          kept = parse_regex(url, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}
-          "[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "") + quote + (string(hb.after) ?? "")
+          word = ""
+          if match(url, r'(?i)bearer\z') { word = "Bearer" }
+          "[REDACTED_HEARTBEAT_URL]" + word + quote + (string(hb.after) ?? "")
       }
       # Any `apiKey=` value, whatever it looks like. A Steel (steel.dev) launcher, the browser backend
       # behind Playwright MCP (basecradle/basecradle#582, basecradle-noc#797), puts its key in the
@@ -358,11 +384,14 @@ transforms:
       # `NAME_apiKey=[REDACTED]`: the name is normalised, the value never ships. The launcher already
       # redacts the exact key from what it forwards to the harness; this is the journald layer.
       #
-      # Every replacement is built from fixed strings on purpose, and the two closures put back only
-      # what they captured: a capture-group back-reference needs a dollar sign, which Vector
-      # interpolates (see the header), and no pattern carries a single quote, which would close the
-      # raw string.
-      msg = replace(msg, r'(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?(?:(?i:bearer)\s+)*(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)', "x-api-key: [REDACTED]")
+      # Every replacement is built from fixed strings on purpose, and the three closures put back
+      # only what they captured and the fixed word `Bearer`, never a byte of a value: a
+      # capture-group back-reference needs a dollar sign, which Vector interpolates (see the
+      # header), and no pattern carries a single quote, which would close the raw string.
+      msg = replace_with(msg, r'(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?(?P<value>(?:(?i:bearer)\s+)+(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|(?:[^\s"\x27&\\`\x24]|\x24[^\s"\x27&\\({])[^\s"\x27&\\]*)|[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)(?P<blank>\s+)?') -> |header| {
+          blank = string(header.blank) ?? ""
+          if blank != "" && match(string(header.value) ?? "", r'(?i)bearer\z') { "x-api-key: [REDACTED]Bearer" + blank } else { "x-api-key: [REDACTED]" + blank }
+      }
       # A marker after the `=` is kept as it is (basecradle-router#494): it is a value already
       # redacted, by the print site or by the rule at the top of this program, and read as a value
       # the marker's `'<a` became `apiKey=[REDACTED] redacted value>'`, which is how the print site's
@@ -370,10 +399,11 @@ transforms:
       # alternative, so nothing else this rule matches changes, and it is kept only where the
       # canary's run would end after it, as the credential rule keeps one: a marker with anything
       # glued to it is a value, and goes whole.
-      msg = replace_with(msg, r'(?i)api[-_]?key=(?:(?P<kept>(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*|"?(?:bearer\s+)*(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+))') -> |assignment| {
-          if assignment.kept != null { assignment.string } else { "apiKey=[REDACTED]" }
+      msg = replace_with(msg, r'(?i)api[-_]?key=(?:(?P<kept>(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*|"?(?P<value>(?:bearer\s+)+(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*)|[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+)(?P<blank>\s+)?)') -> |assignment| {
+          blank = string(assignment.blank) ?? ""
+          if assignment.kept != null { assignment.string } else if blank != "" && match(string(assignment.value) ?? "", r'(?i)bearer\z') { "apiKey=[REDACTED]Bearer" + blank } else { "apiKey=[REDACTED]" + blank }
       }
-      msg = replace(msg, r'(?i)bearer\s+(?:bearer\s+)*[A-Za-z0-9._~+/\-]+=*', "Bearer [REDACTED]")
+      msg = replace(msg, r'(?i:bearer)\s+(?:(?:\\+["\x27]\S*?|(?:\x27[^\x27\n]*\x27|"[^"\n]*"|`[^`\n]*`|\\+["\x27]|[^\s\x27"`])*)(?i:bearer)\s+)*(?:(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)\S*|[A-Za-z0-9._~+/\-]+=*)', "Bearer [REDACTED]")
       # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is
       # never read again by another rule, where a pass per rule would let `hf_…` inside a kept word be
       # cut by the next one. The order of the alternatives is the harness's, and it decides only

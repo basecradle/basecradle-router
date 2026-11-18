@@ -199,15 +199,17 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          # Glued to a letter or digit, the word is the secret's own tail, never a scheme word, so
-          # it is never kept: a secret whose last letters merely spell it is redacted whole.
-          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9xbearer failed"}
+          # Glued to a letter or digit, the word may be the secret's own tail, so it is never put
+          # back as captured: a secret whose last letters merely spell it is redacted whole. It may
+          # also be a scheme word glued to a value (`auth=xBearer`), so the fixed word `Bearer`
+          # stands in for it, and the word after it goes as its token (basecradle-router#507).
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9xbearer failed | ping https://h.example.com/heartbeat/K9xbearer"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] | ping [REDACTED_HEARTBEAT_URL]Bearer")
 
   - name: "a doubled bearer scheme after a heartbeat run redacts the token after both"
     inputs:
@@ -948,3 +950,165 @@ tests:
           - type: "vrl"
             source: |
               assert_eq!(.message, "[basecradle-router] said \"[REDACTED_HEARTBEAT_URL] twice | url=\"[REDACTED_HEARTBEAT_URL]\" next=1")
+
+  # --- a bearer header's token is taken whole, quoted or not (basecradle-router#507) ----------
+
+  - name: "a quoted bearer token is taken whole (basecradle-harness#929)"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Outside a credential-named assignment nothing else on the box reads this token, so before
+          # basecradle-router#507 both lines shipped it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | auth: Bearer \"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\" next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
+
+  - name: "a doubled or glued scheme word before a quoted token goes with it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Rule 3: while the word read as the token ends in `bearer`, the next word is the token, a
+          # glued one (`x.Bearer`, `"q"bearer`) or an escaped one (`\"Bearer`) included.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer Bearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | auth: Bearer x.Bearer \"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\" next=1 | auth: KBearer\t'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | auth: Bearer \"q\"bearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | auth: Bearer \\\"Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: KBearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
+
+  - name: "a quote left open takes the token to the end of its line"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # No closing quote is trusted: the token runs to its line's end, and the next line stays.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1\nnext line"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED]\nnext line")
+
+  - name: "an escaped quote takes the rest of its word, compact json after it included"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "{\"auth\":\"Bearer \\\"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\\\"\"} next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] {\"auth\":\"Bearer [REDACTED] next=1")
+
+  - name: "a dollar-sign quote or a substitution is the token"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer \u{24}'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | auth: Bearer \u{24}(cat /run/eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig) next=1 | auth: Bearer \u{24}{eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig} next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
+
+  - name: "a short bearer word is a token on the box and the words after it stay"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The box takes a token of any length; the source needs eight, so there the words stay too.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "Bearer token missing"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] Bearer [REDACTED] missing")
+
+  - name: "a token in any other bracket is read by neither layer"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer (eyJhbGciOiJIUzI1NiJ9) next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer (eyJhbGciOiJIUzI1NiJ9) next=1")
+
+  - name: "an x-api-key or api-key value ending in a scheme word puts it back for the bearer rule"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Those rules run before the bearer rule. A value ending at a scheme word with a blank after it
+          # is redacted, and the fixed word `Bearer` is put back, so the bearer rule reads the header after
+          # it; taking the scheme word as the value, they once left a quoted token after it to no rule.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key: Bearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | x-api-key: KBearer \"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\" next=1 | api_key=Bearer \"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\" next=1 | api_key=KBearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' next=1 | api_key=Bearer \\\"eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig\\\" next=1 | x-api-key: Bearer \u{24}(cat eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig) next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1")
+
+  - name: "a header after an x-api-key value ending in a scheme word still loses its value"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Read inside the first value, the bearer header's quoted token would be the second label,
+          # and the second value would go to no rule. Put back, the scheme word is read only after
+          # the second header is redacted, so both values go.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "{\"x-api-key\": \"Bearer \", \"x-api-key\": \"K9fabricatedWiroKey01\"} | ('x-api-key', 'Bearer ', 'x-api-key', 'K9fabricatedWiroKey02')"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] {\"x-api-key: [REDACTED]Bearer [REDACTED] [REDACTED]\"} | ('x-api-key: [REDACTED]Bearer [REDACTED] [REDACTED]')")
+
+  - name: "a value word after scheme words is read whole before any glued header"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Scheme words, then the value, is tried first, as it always was: tried first, a glued
+          # header with no scheme word before it read `KBearerX` as an eight-character token and
+          # left `=fabricatedSecret01` to no rule.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key: Bearer KBearerX=fabricatedSecret01 next=1 | \"x-api-key\": \"Bearer\tKBearerapi_key=fabricatedSecret02\" | ?api_key=Bearer\tBearer x.Bearer=fabricatedSecret03 next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED] next=1 | \"x-api-key: [REDACTED]\" | ?apiKey=[REDACTED] next=1")
+
+  - name: "a scheme word glued to a heartbeat run is written as a fixed word, and its token goes"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # A word glued to a letter or digit may be the secret's own tail, so it is never put back as
+          # captured: the fixed word stands in for it, and the bearer rule takes the token after it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "ping https://h.example.com/heartbeat/K9&auth=xBearer 'eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig' failed | ping https://h.example.com/heartbeat/K9&auth=xBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig failed"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed | ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
