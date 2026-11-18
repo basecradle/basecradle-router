@@ -600,20 +600,24 @@ def test_every_hosts_bearer_rule_is_the_documented_construction() -> None:
         assert path.read_text().count(bearer_rule.TOKEN) == 1, path.parent.name
 
 
-def test_the_bearer_header_is_the_fleets_minimum_and_the_escaped_middle_word() -> None:
+def test_the_bearer_header_is_the_fleets_minimum_and_every_token_as_a_middle_word() -> None:
     # The harness states the least a server's bearer rule must take. The box's is that minimum,
     # spelled for a raw string (`\x27` for a single quote, `\x24` for an escaped dollar sign),
-    # with the scheme word case-folded where it stands, and one thing more: a middle word may be
-    # the escaped form of rule 2's token (`\"Bearer`, `x\"Bearer`), which under the minimum alone
-    # keeps the token after it. Nothing else differs, so every reading of the minimum is the box's.
+    # with the scheme word case-folded where it stands, and one thing more (rule 3): a middle word
+    # may be any word the rule reads as a token that ends in a scheme word, a quoted token's piece
+    # glued before it (`'q'`Bearer`) or an escaped quote among closed pieces (`x\"Bearer`). Under
+    # the minimum alone such a word is the token, and the token after it ships. Nothing else
+    # differs, so every reading of the minimum is the box's.
     spelled = _HARNESS_MINIMUM.replace("'", r"\x27").replace(r"\$", r"\x24")
     spelled = spelled.removeprefix("(?i)").replace("bearer", "(?i:bearer)")
     pieces = "|".join(bearer_rule.MINIMUM_PIECES)
     scheme = bearer_rule.SCHEME
     assert spelled == f"{scheme}(?:(?:{pieces})*{scheme})*{bearer_rule.TOKEN}"
-    middle = bearer_rule.MIDDLE_WORD.replace(f"{bearer_rule.ESCAPED_WORD}|", "", 1)
+    middle = bearer_rule.MIDDLE_WORD.replace(f"{bearer_rule.OPENED}\\S*?|", "", 1)
     middle = middle.replace(f"|{bearer_rule.ESCAPED_PIECE}", "", 1)
     assert middle == f"(?:(?:{pieces})*)"
+    # The token opens with what a middle word may open with, so a word read as either is one word.
+    assert bearer_rule.TOKEN.startswith(f"(?:{bearer_rule.OPENED}")
 
 
 def test_every_hosts_credential_rule_is_the_documented_construction() -> None:

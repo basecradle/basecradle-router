@@ -40,30 +40,35 @@ SCHEME = r"(?i:bearer)\s+"
 #: token, read by `TOKEN` to its line's end.
 MINIMUM_PIECES = [r"\x27[^\x27\n]*\x27", r'"[^"\n]*"', r"`[^`\n]*`", r"""[^\s\x27"`]"""]
 
-#: The escaped form of rule 2's token as a middle word, which the minimum leaves out (under it
-#: `Bearer \"Bearer eyJ…` keeps `eyJ…`): an escaped quote and the rest of its word to the scheme
-#: word (`\"Bearer`, `\\'Bearer`), or an escaped quote among the pieces (`x\"Bearer`). An escaped
-#: quote is `"` or `'`, as `TOKEN`'s is.
-ESCAPED_WORD = r"""\\+["\x27]\S*?"""
+#: An escaped quote among a middle word's pieces (`x\"Bearer`), which the minimum leaves out. An
+#: escaped quote is `"` or `'`, as `OPENED`'s is.
 ESCAPED_PIECE = r"""\\+["\x27]"""
 
-#: A middle word: the escaped form, or the pieces with an escaped quote among them.
+#: What opens a quoted token (rule 2): an escaped quote, a dollar-sign quote, a quote, a backquote
+#: or a substitution, each to its close or its line's end when it never closes.
+OPENED = (
+    r"""(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?"""
+    r"""|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)"""
+)
+
+#: The token (rule 2): a word that opens with `OPENED` is that piece and whatever is glued after
+#: it; any other token is a run of token characters, of any length on the box (the source needs
+#: eight, so `Bearer token missing` keeps its words there and only `missing` here). One piece, one
+#: level deep, is the stated limit: no regular expression nests.
+TOKEN = rf"""(?:{OPENED}\S*|[A-Za-z0-9._~+/\-]+=*)"""
+
+#: A middle word (rule 3): any word the rule would read as the token that ends in a scheme word,
+#: so the word after it is the token in its place. Either a quoted token's piece and the rest of
+#: its word to the scheme word (`\"Bearer`, `'q'`Bearer`, `$("<TAB>)Bearer`, an unclosed piece
+#: glued before it included), or closed pieces with an escaped quote among them (`"q"bearer`,
+#: `x\"Bearer`). The minimum reads only the second, without the escaped quote, so under it
+#: `Bearer 'q'`Bearer eyJ…` read `'q'`Bearer` as the token and left `eyJ…` to no rule.
 MIDDLE_WORD = (
-    f"(?:{ESCAPED_WORD}|(?:{'|'.join([*MINIMUM_PIECES[:3], ESCAPED_PIECE, MINIMUM_PIECES[3]])})*)"
+    rf"(?:{OPENED}\S*?|(?:{'|'.join([*MINIMUM_PIECES[:3], ESCAPED_PIECE, MINIMUM_PIECES[3]])})*)"
 )
 
 #: The scheme words after the first, each a middle word and its whitespace.
 SCHEME_RUN = f"(?:{MIDDLE_WORD}{SCHEME})*"
-
-#: The token (rule 2): a word that opens with an escaped quote, a dollar-sign quote, a quote, a
-#: backquote or a substitution is that piece, to its close or its line's end when it never closes,
-#: and whatever is glued after it; any other token is a run of token characters, of any length on
-#: the box (the source needs eight, so `Bearer token missing` keeps its words there and only
-#: `missing` here). One piece, one level deep, is the stated limit: no regular expression nests.
-TOKEN = (
-    r"""(?:(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?"""
-    r"""|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)\S*|[A-Za-z0-9._~+/\-]+=*)"""
-)
 
 #: A bearer header from its first scheme word to its token: the bearer rule's whole pattern.
 HEADER = f"{SCHEME}{SCHEME_RUN}{TOKEN}"

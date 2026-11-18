@@ -2158,11 +2158,14 @@ Caddy, no database) and has three load-bearing properties:
        in `bearer`, the next word is the token in its place. So `Bearer 'eyJ…'`, `Bearer "eyJ…"`,
        `Bearer Bearer 'eyJ…'` and `Bearer x.Bearer 'eyJ…'` lose the token, where the box once
        shipped it, and `Bearer token missing` ships as `Bearer [REDACTED] missing`. The rule is the
-       harness's stated minimum for a server and one thing more, a word ending in a scheme word that
-       opens with an escaped quote (`Bearer \"Bearer eyJ…`); its limit is the minimum's, one quoted
-       piece or substitution, one level deep. It is the one rule that reads a header. The rules
-       before it whose match can end at a scheme word (the heartbeat URL, the `x-api-key` header,
-       the `api_key=` assignment) put the fixed word `Bearer` back where it ends at one with a blank
+       harness's stated minimum for a server and one thing more: a word ending in a scheme word is
+       any word the rule reads as a token, so one opening with a quoted piece, closed or left open,
+       or an escaped quote hands on to the next word (`Bearer \"Bearer eyJ…`, and `Bearer 'q'` with
+       a backquote and `Bearer eyJ…` glued after it, where under the minimum that word was the token
+       and the token after it shipped); its limit is the minimum's, one quoted piece or
+       substitution, one level deep. It is the one rule that reads a header. The rules before it
+       whose match can end at a scheme word (the heartbeat URL, the `x-api-key` header, the
+       `api_key=` assignment) put the fixed word `Bearer` back where it ends at one with a blank
        after it, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token too; a
        header read inside another rule's value took a second `x-api-key` label as its quoted token
        and left that header's value to no rule. `tests/bearer_rule.py` writes the header once, and

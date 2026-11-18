@@ -983,6 +983,22 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: KBearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
 
+  - name: "a token's piece left open and glued before a scheme word hands on to the next word"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # Rule 3: whatever word is read as the token, if it ends in a scheme word, the next word
+          # is the token. A word whose piece never closes (`'q'` then an open backquote) was read
+          # as the token itself, and the token after it shipped (the NOC's differential, #507).
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "auth: Bearer 'q'`Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1 | auth: Bearer \"q\"'Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1 | auth: Bearer \u{24}(\"\t)Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1 | auth: Bearer ```KBearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1 | auth: Bearer \"\"K)`Bearer eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig next=1"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
+
   - name: "a quote left open takes the token to the end of its line"
     inputs:
       - insert_at: "ai_scrub"

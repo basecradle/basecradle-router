@@ -415,6 +415,7 @@ _LONG_TEXTS = {
     "bearer quoted middle words": "Bearer " + _fill('"q"bearer '),
     "bearer escaped middle words": "Bearer " + _fill('\\"Bearer '),
     "bearer open middle words": "Bearer " + _fill("'q'Bearer x\"bearer "),
+    "bearer unclosed middle words": "Bearer " + _fill("'q'`Bearer $(\"\tBearer "),
     "x-api-key glued bearers": _fill("x-api-key: KBearer '"),
     "api-key glued bearers": _fill('api_key=KBearer "'),
     "heartbeat glued bearers": _fill("/heartbeat/K9xBearer "),
@@ -978,8 +979,9 @@ def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> N
 _BEARER_SECRET = "eyJFab1catedSig"
 
 #: Words ending in a scheme word: bare in every case, glued to token characters, to a closed
-#: quote, a substitution, a bracket, or an escaped quote.
-_SCHEME_WORDS = [
+#: quote, a substitution, a bracket, or an escaped quote; and a word whose quoted piece is left
+#: open, or closed and followed by one left open, glued before it (#507: the NOC's differential).
+_GLUED_SCHEME_WORDS = [
     "Bearer",
     "bearer",
     "BEARER",
@@ -995,6 +997,10 @@ _SCHEME_WORDS = [
     "(a)Bearer",
     "$(x)Bearer",
     "[x]Bearer",
+]
+_OPEN_PIECES = ["'", '"', "`", "$(", "${", "$'", '\\"', "'q'", '"q"', "`q`", '""K)', '$("\t)']
+_SCHEME_WORDS = _GLUED_SCHEME_WORDS + [
+    first + second + "Bearer" for first in _OPEN_PIECES for second in ["", *_OPEN_PIECES[:3]]
 ]
 _SCHEME_BLANKS = [" ", "\t", "  ", " \t"]
 

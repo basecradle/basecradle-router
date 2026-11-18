@@ -358,7 +358,10 @@ transforms:
       #     in its place. So `Bearer 'eyJ…'`, `Bearer Bearer "eyJ…"`, `Bearer x.Bearer 'eyJ…'` and
       #     `Bearer \"Bearer eyJ…` lose the token, where before the first three shipped it whole.
       #     It is the harness's stated minimum for a server, and one thing more: a word ending in
-      #     a scheme word may open with an escaped quote. Its limit is the minimum's: one quoted
+      #     a scheme word is any word the rule reads as a token, so one opening with a quoted
+      #     piece, closed or left open, or an escaped quote (`'q'`+backquote+`Bearer`,
+      #     `\"Bearer`) hands on to the next word, where under the minimum it was the token and
+      #     the token after it shipped. Its limit is the minimum's: one quoted
       #     piece or substitution, one level deep (no regular expression nests). It is the one rule
       #     that reads a header: the three above put a scheme word back where their match ends at
       #     one, never reading the header themselves, since a header read inside another rule's
@@ -403,7 +406,7 @@ transforms:
           blank = string(assignment.blank) ?? ""
           if assignment.kept != null { assignment.string } else if blank != "" && match(string(assignment.value) ?? "", r'(?i)bearer\z') { "apiKey=[REDACTED]Bearer" + blank } else { "apiKey=[REDACTED]" + blank }
       }
-      msg = replace(msg, r'(?i:bearer)\s+(?:(?:\\+["\x27]\S*?|(?:\x27[^\x27\n]*\x27|"[^"\n]*"|`[^`\n]*`|\\+["\x27]|[^\s\x27"`])*)(?i:bearer)\s+)*(?:(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)\S*|[A-Za-z0-9._~+/\-]+=*)', "Bearer [REDACTED]")
+      msg = replace(msg, r'(?i:bearer)\s+(?:(?:(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)\S*?|(?:\x27[^\x27\n]*\x27|"[^"\n]*"|`[^`\n]*`|\\+["\x27]|[^\s\x27"`])*)(?i:bearer)\s+)*(?:(?:\\+["\x27]|\x24\x27(?:[^\x27\\\n]|\\.)*\x27?|\x27[^\x27\n]*\x27?|"(?:[^"\\\n]|\\.)*"?|`[^`\n]*`?|\x24\([^)\n]*\)?|\x24\{[^}\n]*\}?)\S*|[A-Za-z0-9._~+/\-]+=*)', "Bearer [REDACTED]")
       # Pass 2, the prefix rules, as ONE alternation, as the harness's is: a match kept as a word is
       # never read again by another rule, where a pass per rule would let `hf_…` inside a kept word be
       # cut by the next one. The order of the alternatives is the harness's, and it decides only
