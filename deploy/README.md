@@ -2128,8 +2128,11 @@ Caddy, no database) and has three load-bearing properties:
      (basecradle-router#402, the harness's `_TRAILING_BEARER`): taken with the URL, the word left
      its token in the next run, which no rule matched, so compact JSON
      (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query value (`…&access_token=Bearer eyJ…`)
-     shipped the token. A kv value's closing quote ending that run (a `"` followed by the next
-     `key=`, the line's end, or a colour reset) is put back as well (basecradle-router#423, the
+     shipped the token. What is put back is the fixed word `Bearer`, never the bytes captured
+     (basecradle-router#507): glued to a letter or digit the word may be the secret's own tail, so
+     `…&auth=xBearer eyJ…` loses its token too and no byte of the URL ships. A kv value's
+     closing quote ending that run (a `"` followed by the next `key=`, the line's end, or a colour
+     reset) is put back as well (basecradle-router#423, the
      harness's `_CLOSING_QUOTE`), so `url="…/heartbeat/K9" next=1` ships as
      `url="[REDACTED_HEARTBEAT_URL]" next=1`, a line a kv parser still reads. The URL is always
      redacted, even a quoted `/heartbeat/` with no secret after it, which the harness keeps: the
@@ -2144,8 +2147,29 @@ Caddy, no database) and has three load-bearing properties:
      are one alternation), so their order is load-bearing: the bearer rule's token class takes an
      assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`
      ships its secret. The assignment rule takes every bearer scheme in its value, as the harness's
-     does, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole, and the bearer rule takes every scheme
-     word before its token, so a doubled `Bearer Bearer eyJ…` is too.
+     does, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
+     - **The bearer header's token is taken whole, quoted or not, and a run of scheme words goes
+       with the token after it** (basecradle-router#507, the harness's definition from
+       basecradle-harness#929). The scheme word is `bearer` in any case, glued to anything before
+       it, followed by whitespace; the token is a run of `[A-Za-z0-9._~+/-]` (any length on the box;
+       the source needs eight), or the whole shell word a quote, a dollar-sign quote, a backquote or
+       a substitution opens (to its close, or its line's end when it never closes) and what is glued
+       after it, or an escaped quote and the rest of its word; while the word read as the token ends
+       in `bearer`, the next word is the token in its place. So `Bearer 'eyJ…'`, `Bearer "eyJ…"`,
+       `Bearer Bearer 'eyJ…'` and `Bearer x.Bearer 'eyJ…'` lose the token, where the box once
+       shipped it, and `Bearer token missing` ships as `Bearer [REDACTED] missing`. The rule is the
+       harness's stated minimum for a server and one thing more: a word ending in a scheme word is
+       any word the rule reads as a token, so one opening with a quoted piece, closed or left open,
+       or an escaped quote hands on to the next word (`Bearer \"Bearer eyJ…`, and `Bearer 'q'` with
+       a backquote and `Bearer eyJ…` glued after it, where under the minimum that word was the token
+       and the token after it shipped); its limit is the minimum's, one quoted piece or
+       substitution, one level deep. It is the one rule that reads a header. The rules before it
+       whose match can end at a scheme word (the heartbeat URL, the `x-api-key` header, the
+       `api_key=` assignment) put the fixed word `Bearer` back where it ends at one with a blank
+       after it, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token too; a
+       header read inside another rule's value took a second `x-api-key` label as its quoted token
+       and left that header's value to no rule. `tests/bearer_rule.py` writes the header once, and
+       `tests/test_log_surface.py` holds every host's bearer rule to it, byte for byte.
    - **Pass 2, the prefix rules** (`github_pat_`, `gh?_`, `bc_???_`, `bc_uat_`, `bc_isk_`, `sk-`,
      `xai-`, `AIza`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`, `tk_`), as **one** alternation, so a word
      one rule kept is never cut by the next. The `bc_` rules are the harness's two: any `bc_` +

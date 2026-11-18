@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import bearer_rule
 import credential_rule
 from basecradle_router.logfmt import _BREAK_CHARS, CANARY_VALUE_STOPS, REDACTED_VALUE
 from conftest import BOX_REDACTED_VALUE, NOC_CREDENTIAL_ASSIGNMENT
@@ -316,12 +317,13 @@ _HEARTBEAT_PASS = (
     r"(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?') -> |hb| {"
 )
 
-# The heartbeat rule's whole closure (basecradle-router#402, #423), pinned offline because the
-# `vector test` suite that asserts its bytes runs only on the boxes' Vector release. It returns
-# fixed strings and nothing of the URL but the one captured bearer word and a kv value's closing
-# quote (with the colour reset closing a coloured pair), so no part of the URL can ship; `after` is
-# put back as matched, spaces, a colour code and the next field's name, and every later rule
-# still reads it.
+# The heartbeat rule's whole closure (basecradle-router#402, #423, #507), pinned offline because
+# the `vector test` suite that asserts its bytes runs only on the boxes' Vector release. It returns
+# fixed strings and nothing of the URL: a bearer scheme word ending the run becomes the fixed word
+# `Bearer`, never the bytes captured, since glued to a letter or digit it may be the secret's own
+# tail, and the bearer rule still takes the token after it; a kv value's closing quote (with the
+# colour reset closing a coloured pair) is put back; `after` is put back as matched, spaces, a
+# colour code and the next field's name, and every later rule still reads it.
 _HEARTBEAT_CLOSURE = [
     _HEARTBEAT_PASS,
     r'url = string(hb.url) ?? ""',
@@ -329,33 +331,61 @@ _HEARTBEAT_CLOSURE = [
     r'quote = string(closing.quote) ?? ""',
     r'if quote == "\"" && hb.after == null { quote = "" }',
     r'if quote != "" { url = string(closing.body) ?? url }',
-    r"kept = parse_regex(url, r'(?i)(?:^|[^A-Za-z0-9])(?P<word>bearer)\z') ?? {}",
-    r'"[REDACTED_HEARTBEAT_URL]" + (string(kept.word) ?? "") + quote + (string(hb.after) ?? "")',
+    r'word = ""',
+    """if match(url, r'(?i)bearer\\z') { word = "Bearer" }""",
+    r'"[REDACTED_HEARTBEAT_URL]" + word + quote + (string(hb.after) ?? "")',
     "}",
 ]
 
 # The `x-api-key` header rule (basecradle-router#423, basecradle-harness#861) and the assignment
 # rule whose value may open with a quote and takes a glued bearer (basecradle-harness#866), as the
-# harness spells them; a single quote is `\x27`, which a raw string cannot hold.
+# harness spells them; a single quote is `\x27`, which a raw string cannot hold, and a dollar sign
+# `\x24`. Each value tries, in order: scheme words and then a glued bearer header or a value word,
+# a glued bearer header alone, any value word. A value word after a scheme word never opens with
+# what the bearer rule reads as a token (a quote, a backquote, a dollar-sign quote or substitution,
+# an escaped quote), so a value ending at a scheme word is left as `value`, and `blank` the blank
+# after it, for the closure to put the scheme word back (basecradle-router#507).
+_X_GLUED = r"""[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"""
+_X_WORD = r"""(?:[^\s"\x27&\\`\x24]|\x24[^\s"\x27&\\({])[^\s"\x27&\\]*"""
 _X_API_KEY = (
     r"""(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?"""
-    r"""(?:(?i:bearer)\s+)*(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+)"""
+    rf"""(?P<value>(?:(?i:bearer)\s+)+(?:{_X_GLUED}|{_X_WORD})|{_X_GLUED}|[^\s"\x27&\\]+)"""
+    r"""(?P<blank>\s+)?"""
 )
+_API_GLUED = r"""[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}"""
+_API_WORD = r"""(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*"""
 _API_KEY = (
     r"""(?i)api[-_]?key=(?:(?P<kept>(?-i:"""
     r"""\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
     r"""(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))"""
     r"""|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
     r"""[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*"""
-    r"""|"?(?:bearer\s+)*(?:[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}|[^&\s"]+))"""
+    rf"""|"?(?P<value>(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})|{_API_GLUED}|[^&\s"]+)"""
+    r"""(?P<blank>\s+)?)"""
 )
 
-#: The assignment rule's whole closure (basecradle-router#494): a marker after the `=`, the print
-#: site's or the box's own, is kept as it is; any other match is the fixed label it always was.
+#: The `x-api-key` rule's whole closure: the fixed label, and the fixed word `Bearer` where the
+#: value ended at a scheme word with a blank after it, so the bearer rule reads the header after
+#: it (basecradle-router#507). Nothing of the value is ever put back, only the blank as matched.
+_X_API_KEY_PASS = f"msg = replace_with(msg, r'{_X_API_KEY}') -> |header| {{"
+_X_API_KEY_CLOSURE = [
+    _X_API_KEY_PASS,
+    'blank = string(header.blank) ?? ""',
+    'if blank != "" && match(string(header.value) ?? "", r\'(?i)bearer\\z\') '
+    '{ "x-api-key: [REDACTED]Bearer" + blank } else { "x-api-key: [REDACTED]" + blank }',
+    "}",
+]
+
+#: The assignment rule's whole closure (basecradle-router#494, #507): a marker after the `=`, the
+#: print site's or the box's own, is kept as it is; any other match is the fixed label it always
+#: was, with the scheme word put back as the `x-api-key` rule puts it back.
 _API_KEY_PASS = f"msg = replace_with(msg, r'{_API_KEY}') -> |assignment| {{"
 _API_KEY_CLOSURE = [
     _API_KEY_PASS,
-    'if assignment.kept != null { assignment.string } else { "apiKey=[REDACTED]" }',
+    'blank = string(assignment.blank) ?? ""',
+    'if assignment.kept != null { assignment.string } else if blank != "" && '
+    "match(string(assignment.value) ?? \"\", r'(?i)bearer\\z') "
+    '{ "apiKey=[REDACTED]Bearer" + blank } else { "apiKey=[REDACTED]" + blank }',
     "}",
 ]
 
@@ -381,8 +411,9 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
     # The order is the fix (basecradle-router#398): a prefix rule's run is made of the characters
     # a literal rule's key name is, so a prefix rule that runs first swallows `api-key` or
     # `bearer` and leaves the secret after it for no rule to match. Every literal rule is a fixed
-    # `replace` in the one safe shape, and the prefix rules are ONE `replace_with` after all of
-    # them, never a rule per pass, so a word kept by one prefix rule is never cut by another.
+    # `replace` in the one safe shape or a closure pinned whole below, and the prefix rules are ONE
+    # `replace_with` after all of them, never a rule per pass, so a word kept by one prefix rule is
+    # never cut by another.
     statements = _statements(_scrub_source())
     prefix_passes = [i for i, line in enumerate(statements) if line.startswith(_PREFIX_PASS)]
     assert len(prefix_passes) == 1, f"ai_scrub must carry one prefix pass: {statements!r}"
@@ -400,28 +431,28 @@ def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
     # secret. The assignment takes every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…`
     # is redacted whole.
     #
-    # The heartbeat rule is the one closure in the pass (basecradle-router#402, #423): it puts back
-    # a bearer word ending its run, so the bearer rule still takes the word and its token, and a kv
-    # value's closing quote with what follows it. Its whole closure is pinned here; what it returns
-    # is pinned by the `vector test` suite, which asserts the shipped bytes. The other three are
-    # fixed `replace`s in the one safe shape.
+    # Three of the four are closures, each pinned whole here; what they return is pinned by the
+    # `vector test` suite, which asserts the shipped bytes. The heartbeat rule (#402, #423) puts
+    # back a kv value's closing quote with what follows it, and the `x-api-key` and assignment
+    # rules keep a marker (#494); all three put the fixed word `Bearer` back where their match ends
+    # at a scheme word (#507), so the bearer rule reads the header after it. The bearer rule is the
+    # one fixed `replace` in the one safe shape.
     assert literal[0] == _HEARTBEAT_PASS, f"pass 1 must open with the heartbeat rule: {literal!r}"
     lines = [line.strip() for line in _scrub_source().splitlines()]
     start = lines.index(_HEARTBEAT_PASS)
     assert lines[start : start + len(_HEARTBEAT_CLOSURE)] == _HEARTBEAT_CLOSURE
     # The `x-api-key` rule goes before the assignment rule, so the header's name goes with its
     # value: the assignment rule reads `x-api-key=>V` as `key=` and takes it under its own label.
-    # The assignment rule is a closure that keeps a marker (basecradle-router#494), pinned whole.
-    assert literal[1:] == [
-        f"msg = replace(msg, r'{_X_API_KEY}', \"x-api-key: [REDACTED]\")",
-        _API_KEY_PASS,
-        "msg = replace(msg, r'(?i)bearer\\s+(?:bearer\\s+)*[A-Za-z0-9._~+/\\-]+=*', "
-        '"Bearer [REDACTED]")',
-    ]
-    for line in (literal[1], literal[3]):
-        assert _REPLACE.match(line), f"not a closed raw string + fixed replacement: {line!r}"
-    start = lines.index(_API_KEY_PASS)
-    assert lines[start : start + len(_API_KEY_CLOSURE)] == _API_KEY_CLOSURE
+    # Both are closures, each pinned whole: the assignment rule keeps a marker (#494), and each
+    # puts back a scheme word its value ended at (#507). The bearer rule reads every header after
+    # them, and is the one fixed `replace` here.
+    assert literal[1:] == [_X_API_KEY_PASS, _API_KEY_PASS, bearer_rule.BEARER_PASS.strip()]
+    assert _REPLACE.match(literal[3]), (
+        f"not a closed raw string + fixed replacement: {literal[3]!r}"
+    )
+    for closure in (_X_API_KEY_CLOSURE, _API_KEY_CLOSURE):
+        start = lines.index(closure[0])
+        assert lines[start : start + len(closure)] == closure
 
 
 def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
@@ -435,7 +466,7 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
     for rule in (
         _PREFIX_PASS,
-        "msg = replace(msg, r'(?i:x[-_]api[-_]?key)",
+        "msg = replace_with(msg, r'(?i:x[-_]api[-_]?key)",
         "msg = replace_with(msg, r'(?i)api[-_]?key=",
     ):
         assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
@@ -543,6 +574,50 @@ def _negated_classes(pattern: str) -> list[set[str]]:
 
 def _spelled(marker: str) -> str:
     return marker.replace("'", r"\x27").replace(" ", r"\x20")
+
+
+#: The fleet's minimum for a server's bearer rule, verbatim from basecradle-harness
+#: `docs/telemetry.md` → Credential Scrubbing at `5bce26a` (basecradle-harness#929): with a raw
+#: single quote and an escaped dollar sign, neither of which this box's raw strings can carry.
+_HARNESS_MINIMUM = (
+    r"""(?i)bearer\s+(?:(?:'[^'\n]*'|"[^"\n]*"|`[^`\n]*`|[^\s'"`])*bearer\s+)*"""
+    r"""(?:(?:\\+["']|\$'(?:[^'\\\n]|\\.)*'?|'[^'\n]*'?|"(?:[^"\\\n]|\\.)*"?|`[^`\n]*`?"""
+    r"""|\$\([^)\n]*\)?|\$\{[^}\n]*\}?)\S*|[A-Za-z0-9._~+/\-]+=*)"""
+)
+
+
+def test_every_hosts_bearer_rule_is_the_documented_construction() -> None:
+    # VRL composes no pattern from parts, so the bearer rule spells the header out in full;
+    # `tests/bearer_rule.py` writes it once, and every host's rule is that construction, byte for
+    # byte (basecradle-router#507). No other rule reads a header: each one whose value can end at a
+    # scheme word puts the word back for it instead.
+    hosts = sorted((_DEPLOY / "hosts").glob("*/vector.yaml"))
+    assert len(hosts) == 3
+    for path in hosts:
+        assert bearer_rule.shipped(path.read_text()) == bearer_rule.BEARER_PASS, (
+            f"{path.parent.name}: rewrite it with `uv run python tests/bearer_rule.py`"
+        )
+        assert path.read_text().count(bearer_rule.TOKEN) == 1, path.parent.name
+
+
+def test_the_bearer_header_is_the_fleets_minimum_and_every_token_as_a_middle_word() -> None:
+    # The harness states the least a server's bearer rule must take. The box's is that minimum,
+    # spelled for a raw string (`\x27` for a single quote, `\x24` for an escaped dollar sign),
+    # with the scheme word case-folded where it stands, and one thing more (rule 3): a middle word
+    # may be any word the rule reads as a token that ends in a scheme word, a quoted token's piece
+    # glued before it (`'q'`Bearer`) or an escaped quote among closed pieces (`x\"Bearer`). Under
+    # the minimum alone such a word is the token, and the token after it ships. Nothing else
+    # differs, so every reading of the minimum is the box's.
+    spelled = _HARNESS_MINIMUM.replace("'", r"\x27").replace(r"\$", r"\x24")
+    spelled = spelled.removeprefix("(?i)").replace("bearer", "(?i:bearer)")
+    pieces = "|".join(bearer_rule.MINIMUM_PIECES)
+    scheme = bearer_rule.SCHEME
+    assert spelled == f"{scheme}(?:(?:{pieces})*{scheme})*{bearer_rule.TOKEN}"
+    middle = bearer_rule.MIDDLE_WORD.replace(f"{bearer_rule.OPENED}\\S*?|", "", 1)
+    middle = middle.replace(f"|{bearer_rule.ESCAPED_PIECE}", "", 1)
+    assert middle == f"(?:(?:{pieces})*)"
+    # The token opens with what a middle word may open with, so a word read as either is one word.
+    assert bearer_rule.TOKEN.startswith(f"(?:{bearer_rule.OPENED}")
 
 
 def test_every_hosts_credential_rule_is_the_documented_construction() -> None:

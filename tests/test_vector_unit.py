@@ -406,6 +406,19 @@ _LONG_TEXTS = {
     "credential bare names": _fill("KEY_BASE="),
     "credential names inside a value": "A_TOKEN=" + _fill("x'q'A_TOKEN="),
     "credential substitutions after tabs": "A_TOKEN=" + _fill("${x\t"),
+    # The bearer header (#507): tokens that keep opening a quote or a substitution, and runs of
+    # middle words, glued, quoted and escaped, in the bearer rule and the two rules that carry it.
+    "bearer single quotes": _fill("Bearer '"),
+    "bearer double quotes": _fill('Bearer "'),
+    "bearer escaped quotes": _fill('Bearer \\"'),
+    "bearer substitutions": _fill("Bearer $("),
+    "bearer quoted middle words": "Bearer " + _fill('"q"bearer '),
+    "bearer escaped middle words": "Bearer " + _fill('\\"Bearer '),
+    "bearer open middle words": "Bearer " + _fill("'q'Bearer x\"bearer "),
+    "bearer unclosed middle words": "Bearer " + _fill("'q'`Bearer $(\"\tBearer "),
+    "x-api-key glued bearers": _fill("x-api-key: KBearer '"),
+    "api-key glued bearers": _fill('api_key=KBearer "'),
+    "heartbeat glued bearers": _fill("/heartbeat/K9xBearer "),
 }
 
 
@@ -949,6 +962,105 @@ def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> N
     ]
     box = _scrub_lines(_vector(), tmp_path, lines)
     leaked = [(line, got) for line, got in zip(lines, box, strict=True) if secret in got]
+    assert not leaked, leaked[:5]
+
+
+# --- a bearer header's token is taken whole, quoted or not (#507) --------------------------------
+#
+# The fleet's definition (basecradle-harness docs/telemetry.md → Credential Scrubbing, #929): the
+# scheme word is `bearer` in any case glued to anything before it; the token is a run of token
+# characters, or the whole shell word a quote or substitution opens, or an escaped quote and the
+# rest of its word; while the word read as the token ends in `bearer`, the next word is the token.
+# Every line below is a bearer header built by that definition, so where its token stands is known
+# by construction, and the token is the fabricated secret: it must never ship. Seeded fuzz over
+# every context a header reaches the box in but a credential-named assignment, whose value the
+# credential rule reads first by the print site's reading, which stops at fewer scheme words (#510).
+
+_BEARER_SECRET = "eyJFab1catedSig"
+
+#: Words ending in a scheme word: bare in every case, glued to token characters, to a closed
+#: quote, a substitution, a bracket, or an escaped quote; and a word whose quoted piece is left
+#: open, or closed and followed by one left open, glued before it (#507: the NOC's differential).
+_GLUED_SCHEME_WORDS = [
+    "Bearer",
+    "bearer",
+    "BEARER",
+    "KBearer",
+    "x.Bearer",
+    "a=Bearer",
+    "abc-bearer",
+    '"q"bearer',
+    "'q'Bearer",
+    "`q`Bearer",
+    '\\"Bearer',
+    "\\'Bearer",
+    "(a)Bearer",
+    "$(x)Bearer",
+    "[x]Bearer",
+]
+_OPEN_PIECES = ["'", '"', "`", "$(", "${", "$'", '\\"', "'q'", '"q"', "`q`", '""K)', '$("\t)']
+_SCHEME_WORDS = _GLUED_SCHEME_WORDS + [
+    first + second + "Bearer" for first in _OPEN_PIECES for second in ["", *_OPEN_PIECES[:3]]
+]
+_SCHEME_BLANKS = [" ", "\t", "  ", " \t"]
+
+#: The token, holding the secret: bare, in every quote and substitution, escaped, left open,
+#: glued after a closing quote, with escapes inside, and with text glued after it.
+_TOKENS = [
+    _BEARER_SECRET,
+    f"{_BEARER_SECRET}==",
+    f"'{_BEARER_SECRET}'",
+    f'"{_BEARER_SECRET}"',
+    f"`{_BEARER_SECRET}`",
+    f"$'{_BEARER_SECRET}'",
+    f"$({_BEARER_SECRET})",
+    "${" + _BEARER_SECRET + "}",
+    f'\\"{_BEARER_SECRET}\\"',
+    f"\\'{_BEARER_SECRET}",
+    f'\\\\"{_BEARER_SECRET}\\\\"',
+    f"'a {_BEARER_SECRET} b'",
+    f'"a {_BEARER_SECRET} b"',
+    f"'{_BEARER_SECRET}",
+    f'"{_BEARER_SECRET}',
+    f'"x"{_BEARER_SECRET}',
+    f"'x'{_BEARER_SECRET}",
+    f'"a\\"{_BEARER_SECRET}\\""',
+    f"$'a\\'{_BEARER_SECRET}'",
+    f'"{_BEARER_SECRET}"next',
+]
+
+#: Where a header stands: prose, a header dump, compact JSON, the two literal rules that carry it,
+#: and after a heartbeat run, with the scheme word put back or written in its place.
+_HEADER_CONTEXTS = [
+    "",
+    "x",
+    "auth: ",
+    "Authorization: ",
+    '{"auth":"',
+    "x-api-key: ",
+    '"x-api-key": "',
+    "api_key=",
+    "?api_key=",
+    "https://h.example.com/heartbeat/K9&auth=",
+    "https://h.example.com/heartbeat/K9x",
+    "uptime.example.com/heartbeat/K9 ",
+]
+_HEADER_ENDS = ["", " next=1", '"}', "\nnext", " | other", "'", '"']
+
+
+def _bearer_header(rng: random.Random) -> str:
+    words = [rng.choice(_SCHEME_WORDS) for _ in range(rng.choice([1, 1, 2, 2, 3, 4]))]
+    header = rng.choice(_HEADER_CONTEXTS) + words[0]
+    for word in words[1:]:
+        header += rng.choice(_SCHEME_BLANKS) + word
+    return header + rng.choice(_SCHEME_BLANKS) + rng.choice(_TOKENS) + rng.choice(_HEADER_ENDS)
+
+
+def test_no_bearer_header_ships_its_token(tmp_path: Path) -> None:
+    rng = random.Random(507)
+    lines = [_bearer_header(rng) for _ in range(4000)]
+    box = _scrub_lines(_vector(), tmp_path, lines)
+    leaked = [(line, got) for line, got in zip(lines, box, strict=True) if "Fab1cated" in got]
     assert not leaked, leaked[:5]
 
 
