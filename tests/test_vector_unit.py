@@ -755,6 +755,7 @@ _FUZZ_PIECES = [
     "(a)Bearer ",
     'x"q"bearer ',
     "\\Bearer ",
+    '\\"a b\\"bearer ',
     "=",
     "==",
     REDACTED_VALUE,
@@ -1119,7 +1120,7 @@ def test_no_credential_value_ends_between_a_scheme_word_and_its_token_at_the_pri
     assert not leaked, leaked[:5]
 
 
-#: The stated limit (deploy/README.md → "A Scheme Word Glued After a Piece Left Open"): in a
+#: The stated limit (deploy/README.md → the credential rule's "One limit both read alike"): in a
 #: credential-named value, a scheme word glued after a quote, a backquote or a substitution the
 #: word opens. The shell, and so the print site and the box, reads that piece to its own close;
 #: the bearer rule reads the scheme word and opens the token's quote after it. Where the two

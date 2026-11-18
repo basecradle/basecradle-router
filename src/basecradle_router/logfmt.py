@@ -272,9 +272,10 @@ def _shell_word_end(text: str, start: int) -> tuple[int, bool]:
 #: comes before them: ``Bearer``, ``abc-bearer``, ``x"q"bearer``, ``(a)Bearer`` (#510). The box's
 #: rule (``tests/credential_rule.py``, ``SCHEME``) and ``wake-runner``'s ``jq`` fallback build their
 #: scheme word's end from this one spelling (pinned by a test).
-SCHEME_WORD = "(?i:bearer)"
+_SCHEME_LETTERS = "bearer"
+SCHEME_WORD = f"(?i:{_SCHEME_LETTERS})"
 _SCHEME_WORD = re.compile(SCHEME_WORD)
-_SCHEME_WORD_LENGTH = len("bearer")
+_SCHEME_WORD_LENGTH = len(_SCHEME_LETTERS)
 
 #: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
 _SCHEME_BLANKS = re.compile("[ \t]+")

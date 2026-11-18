@@ -680,10 +680,14 @@ def test_a_scheme_word_is_any_word_of_closed_pieces_ending_in_one() -> None:
     # never stop inside a quote: one that could would read `'a<TAB>Bearer b'` as a scheme word and
     # open a quote that eats a line's fields. A tab is such a piece, so a scheme word a tab glues
     # to a value (#502) is one too. The six letters are read as written: a lone backslash may stand
-    # before them, which an escape piece would read with their first.
+    # before them, which an escape piece would read with their first. A closed JSON-escaped piece
+    # may stand in one too (`\"a b\"bearer`): no other closed piece crosses its blank.
     closed = credential_rule.CLOSED_PIECE
     assert rf"\\?{SCHEME_WORD}" == credential_rule.SCHEME_END
-    assert f"(?:{closed}*?{credential_rule.SCHEME_END})" == credential_rule.SCHEME
+    escaped = credential_rule.CLOSED_JSON_ESCAPED
+    assert escaped == credential_rule.JSON_ESCAPED + r'\\"'
+    assert credential_rule.OPEN_PIECES[0] == credential_rule.JSON_ESCAPED + r'(?:\\")?'
+    assert f"(?:(?:{closed}|{escaped})*?{credential_rule.SCHEME_END})" == credential_rule.SCHEME
     assert "\t" not in _negated_classes(closed)[-1]
     # The parity pass's may hold a double-quoted piece, and only one that closes.
     closed_quoted = credential_rule.CLOSED_DOUBLE_QUOTED

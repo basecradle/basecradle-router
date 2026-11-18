@@ -74,10 +74,15 @@ CLOSED_PIECES = [
     r"[^\x20\",}\\\x27`" + BRK + "]",  # any other character, a tab included
 ]
 
+#: A JSON-escaped piece (`\"…`), up to its close: pass 2 reads one closed or not, and a scheme word
+#: may hold one that closes (`\"a b\"bearer`, #510).
+JSON_ESCAPED = r'\\"(?:[^"\\' + BRK + r']|\\[^"' + BRK + r"])*"
+CLOSED_JSON_ESCAPED = JSON_ESCAPED + r'\\"'
+
 #: Pass 2's pieces: each quote to its close or to a bare `"` or a record break, a `$(` too, a bare
 #: `(` only when it closes, a JSON-escaped `\"…\"` closed or not, and a lone backslash last.
 OPEN_PIECES = [
-    r'\\"(?:[^"\\' + BRK + r']|\\[^"' + BRK + r'])*(?:\\")?',  # JSON-escaped
+    JSON_ESCAPED + r'(?:\\")?',  # JSON-escaped
     r"\\[^\"" + BRK + "]",  # an escape
     r"\x24\x27(?:[^\x27\\\"" + BRK + r"]|\\[^" + BRK + r"])*\x27?",  # dollar-sign quoting
     r"\x27(?:[^\x27\"\\" + BRK + r"]|\\[^\x27" + BRK + r"])*(?:\\?\x27)?",  # single-quoted
@@ -99,11 +104,12 @@ assert CLOSED_DOUBLE_QUOTED + "?" == DOUBLE_QUOTED, DOUBLE_QUOTED
 #: spells it (`logfmt.SCHEME_WORD`), whatever comes before it (`abc-bearer`, `(a)Bearer`, a tab
 #: included: `x<TAB>Bearer`, `'q'<TAB>KBearer`, #502). Every piece before it closes, so none can
 #: stop inside a quote: one that could would let `'a<TAB>Bearer b'` read as a scheme word and open a
-#: quote that eats the line's fields. The parity pass's may hold a closed double-quoted piece
+#: quote that eats the line's fields. The run's may hold a closed JSON-escaped piece (`\"a b\"bearer`,
+#: whose blank no closed piece crosses), and the parity pass's a closed double-quoted piece
 #: (`x"q"bearer`); the run's never crosses a bare `"`. The six letters are read as written, so a
 #: backslash may stand right before them (`\Bearer`), which a piece would read with their first.
 SCHEME_END = rf"\\?{SCHEME_WORD}"
-SCHEME = f"(?:{CLOSED_PIECE}*?{SCHEME_END})"
+SCHEME = f"(?:(?:{CLOSED_PIECE}|{CLOSED_JSON_ESCAPED})*?{SCHEME_END})"
 PARITY_SCHEME = f"(?:(?:{CLOSED_PIECE}|{CLOSED_DOUBLE_QUOTED})*?{SCHEME_END})"
 
 #: A run of scheme words, each with the blanks after it, as the print site's `logfmt._value_end`
