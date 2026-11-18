@@ -19,8 +19,6 @@ a canary stop (`"`, `,`, `}`) or a record break. The two passes:
    close or to a bare `"` or a record break), and every run of bearer scheme words with its token,
    a scheme word a tab glues to a value after lead words included (`LEAD_WORD`, #502).
 
-A value ending at any other scheme word (#510) writes the word back for the bearer rule (`PUT_BACK`).
-
 No piece crosses a bare `"`: on a JSON or logfmt line it is the line's own.
 """
 
@@ -89,12 +87,12 @@ OPEN_PIECES = [
 CLOSED_PIECE = "(?:" + "|".join(CLOSED_PIECES) + ")"
 OPEN_PIECE = "(?:" + "|".join(OPEN_PIECES) + ")"
 
-#: What the credential value reads a bearer header through when one is glued to it (#497): a value
-#: of token characters, and the scheme word as HTTP spells it. Any other word ending in a scheme
-#: word (`abc-bearer`, `(a)Bearer`, `x"q"bearer`, the fleet's definition, #510) ends the value, and
-#: the scheme word is written back after the marker (`PUT_BACK`) for the bearer rule, which reads
-#: the header by that definition: this rule's match stays what it was, so nothing it took before is
-#: left to another rule now.
+#: What the box's value reads a bearer header through when one is glued to it (#497): a value of
+#: token characters, and the scheme word as HTTP spells it. The fleet's scheme word is any word
+#: ending in `bearer` (basecradle-router#510), which the print site and the `jq` fallback read; any
+#: other such word ends the box's value and leaves its token, a stated limit (deploy/README.md) until
+#: the box's literal rules run as one alternation, where reading it cannot consume another rule's
+#: label (basecradle-noc#1573).
 SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
 GLUED = f"[{SCHEME_GLUE}]*?Bearer"
 
@@ -139,29 +137,6 @@ PARITY_WORD = (
     f"(?:{SCHEME_CHAIN}+(?:{CLOSED_PIECE}|{DOUBLE_QUOTED})*)?"
 )
 
-#: The scheme word a value ended on, written back after the marker as a fixed word so the bearer
-#: rule, the one rule that reads a header, reads the token after it by the fleet's definition
-#: (basecradle-router#510): any word ending in `bearer`, with a blank after it. This rule never reads
-#: a header it does not already read (#497), so its match is what it always was, and the written
-#: word only gives the bearer rule, the last literal rule, more to take. Only where a token could
-#: follow on the record (`FOLLOWS`). `{indent}` is the closure's own indentation.
-PUT_BACK = (
-    'held = string({value}) ?? ""\n'
-    '{indent}label = ""\n'
-    '{indent}if {after}.stop == null && (string({after}.blank) ?? "") != "" && match(held, r\'(?i)bearer\\z\') {{ label = " Bearer" }}'
-)
-
-#: What follows a value, captured so the put-back can see it and written back as it came: its
-#: blanks, then a stop no token follows on the record: the text's end, a record break, a backslash
-#: before one, a `,` or a `}`, which no bearer token opens with, and in the run pass a bare `"` that
-#: closes the line's own string, before a `,`, `}`, `]`, `:`, a record break or the end (written back
-#: in front of it, the word let the bearer rule read across a JSON string's close and eat the line);
-#: a `"` before anything else opens a quoted token. In the parity pass a `"` after a value opens one
-#: by the count of quotes, and consuming it would shift that count.
-FOLLOWS_PARITY = rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{BRK}]|[,}}])?"
-CLOSING_QUOTE = rf'"[\x20\t]*(?:[,}}\]:{BRK}]|\z)'
-FOLLOWS = rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{BRK}]|[,}}]|{CLOSING_QUOTE})?"
-
 #: Where a kept marker ends: where the canary's run would.
 MARKER_END = r'[\x20\t",}' + BRK + r"]|\z"
 
@@ -201,13 +176,6 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       #      scheme word after one is reached too, after any prefix of pieces that all close
       #      (`x<TAB>Bearer`, `'q'<TAB>KBearer`, `(a)<TAB>Bearer`, basecradle-router#502): a value
       #      never ends between a scheme word and its token.
-      #   A value that ends at any other word ending in a scheme word (the fleet's definition:
-      #   `bearer` in any case glued to anything before it, so `abc-bearer`, `(a)Bearer`,
-      #   `x"q"bearer`) with a blank after it writes the fixed word ` Bearer` back after the marker
-      #   (basecradle-router#510), as the `x-api-key` and `api[-_]?key=` rules below do (#507), so
-      #   the bearer rule, the one rule that reads a header, takes the token after it. This rule
-      #   never reads that header itself: read here, the value consumed other rules' labels and
-      #   left their tokens to no rule (basecradle-noc#1573), and the match is what it was before.
       #   Both passes read on into the value of a credential name the value holds outside every
       #   quote (`'q'DB_PASSWORD=<TAB>…`, `'q'DB_PASSWORD=Bearer …`), as the print site does.
       # An empty value is left as it is, except before a record break, which the canary's run
@@ -240,13 +208,12 @@ BLOCK = (
               if contains(text, "\\"") {{
                   parity = replace_with(text, r'(?x)
                       (?P<head>{OUTSIDE}*?\\\\?{NAME}=)
-                      (?P<value>{PARITY_WORD}){FOLLOWS_PARITY}
+                      (?P<value>{PARITY_WORD})
                     | {OUTSIDE}*(?:{DOUBLE_QUOTED})?') -> |segment| {{
                       if segment.value == null || includes(["\\"'<a redacted value>'\\"", "\\"'<a value the box redacted>'\\""], segment.value) {{
                           segment.string
                       }} else {{
-                          {PUT_BACK.format(value="segment.value", after="segment", indent=" " * 26)}
-                          (string(segment.head) ?? "") + "'<a value the box redacted>'" + label + (string(segment.blank) ?? "") + (string(segment.stop) ?? "")
+                          (string(segment.head) ?? "") + "'<a value the box redacted>'"
                       }}
                   }}
               }}
@@ -263,12 +230,11 @@ BLOCK = (
                           )
                         | (?P<record_break>[{BRK}])
                       )
-                  ){FOLLOWS}') -> |assignment| {{
+                  )') -> |assignment| {{
                   if assignment.kept != null {{
                       assignment.string
                   }} else {{
-                      {PUT_BACK.format(value="assignment.value", after="assignment", indent=" " * 22)}
-                      (string(assignment.name) ?? "") + "'<a value the box redacted>'" + label + (string(assignment.quote_end) ?? string(assignment.record_break) ?? "") + (string(assignment.blank) ?? "") + (string(assignment.stop) ?? "")
+                      (string(assignment.name) ?? "") + "'<a value the box redacted>'" + (string(assignment.quote_end) ?? string(assignment.record_break) ?? "")
                   }}
               }}
           }} else {{

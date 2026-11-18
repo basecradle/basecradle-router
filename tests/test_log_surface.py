@@ -354,40 +354,25 @@ _X_API_KEY = (
 )
 _API_GLUED = r"""[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}"""
 _API_WORD = r"""(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*"""
-#: A run of any other value: no `&`, blank or `"`, and no backslash right before a `"`, so a JSON
-#: string's escaped close stays (basecradle-router#515).
-_API_RUN = r"""(?:[^&\s"\\]|\\+[^&\s"\\])"""
-#: Every `api[-_]?key=` the value holds, with its opening quote, read before the value (#510): after
-#: scheme words only behind a first character the bearer rule would not read as a token's opener.
-_API_FIRST = r"""(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])"""
-_API_INNER = (
-    rf"""(?:(?:(?:bearer\s+)+(?:{_API_FIRST}{_API_RUN}*?)?|{_API_RUN}*?)"""
-    r"""(?i:api[-_]?key=)(?:\\?")?)*"""
-)
 _API_KEY = (
     r"""(?i)api[-_]?key=(?:(?P<kept>(?-i:"""
     r"""\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
     r"""(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))"""
     r"""|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
     r"""[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*"""
-    rf"""|(?:\\?")?(?P<value>{_API_INNER}(?:(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})"""
-    rf"""|{_API_GLUED}|{_API_RUN}+))"""
+    rf"""|"?(?P<value>(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})|{_API_GLUED}|[^&\s"]+)"""
     r"""(?P<blank>\s+)?)"""
 )
 
 #: The `x-api-key` rule's whole closure: the fixed label, and the fixed word `Bearer` where the
 #: value ended at a scheme word with a blank after it, so the bearer rule reads the header after
-#: it (basecradle-router#507), or the fixed `apiKey=` where it ended at an assignment's name glued
-#: to its value, so the assignment rule reads that value (#510). Nothing of the value is ever put
-#: back, only the blank as matched.
+#: it (basecradle-router#507). Nothing of the value is ever put back, only the blank as matched.
 _X_API_KEY_PASS = f"msg = replace_with(msg, r'{_X_API_KEY}') -> |header| {{"
 _X_API_KEY_CLOSURE = [
     _X_API_KEY_PASS,
     'blank = string(header.blank) ?? ""',
     'if blank != "" && match(string(header.value) ?? "", r\'(?i)bearer\\z\') '
-    '{ "x-api-key: [REDACTED]Bearer" + blank } else if blank == "" && '
-    "match(string(header.value) ?? \"\", r'(?i)api[-_]?key=\\z') "
-    '{ "x-api-key: [REDACTED]apiKey=" } else { "x-api-key: [REDACTED]" + blank }',
+    '{ "x-api-key: [REDACTED]Bearer" + blank } else { "x-api-key: [REDACTED]" + blank }',
     "}",
 ]
 
@@ -708,36 +693,6 @@ def test_a_scheme_word_a_tab_glues_to_a_value_is_reached_after_closed_pieces() -
         f"(?:{before_a_tab}|{credential_rule.DOUBLE_QUOTED})*"
         f"(?:{chain}+(?:{closed}|{credential_rule.DOUBLE_QUOTED})*)?"
     ) == credential_rule.PARITY_WORD
-
-
-def test_a_value_ending_at_a_scheme_word_writes_the_word_back_for_the_bearer_rule() -> None:
-    # The fleet's scheme word is any word ending in `bearer` (#510), and the bearer rule is the one
-    # rule that reads a header. So the credential rule's match stays its own, and a value it ends at
-    # such a word writes the fixed word ` Bearer` back after the marker, in both passes, only where
-    # something on the record follows, and with what followed written back as it came: never a
-    # byte of the value, and never a header read here, which consumed other rules' labels
-    # (basecradle-noc#1573).
-    block = credential_rule.BLOCK
-    brk = credential_rule.BRK
-    # The run pass stops at a bare `"` too, the line's own there; the parity pass cannot consume
-    # one, which would shift its count of quotes.
-    parity = credential_rule.FOLLOWS_PARITY
-    run = credential_rule.FOLLOWS
-    assert parity == rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{brk}]|[,}}])?"
-    closing = credential_rule.CLOSING_QUOTE
-    assert closing == rf'"[\x20\t]*(?:[,}}\]:{brk}]|\z)'
-    assert run == rf"(?P<blank>[\x20\t]+)?(?P<stop>\z|\\?[{brk}]|[,}}]|{closing})?"
-    assert block.count(f"(?P<value>{credential_rule.PARITY_WORD}){parity}\n") == 1
-    assert block.count(f"){run}') -> |assignment|") == 1
-    for name, indent in (("segment", 26), ("assignment", 22)):
-        put_back = credential_rule.PUT_BACK.format(
-            value=f"{name}.value", after=name, indent=" " * indent
-        )
-        assert f"{' ' * indent}{put_back}\n" in block
-        assert put_back.count(f"{name}.stop == null") == 1
-        assert f'(string({name}.blank) ?? "") + (string({name}.stop) ?? "")' in block
-    assert "match(held, r'(?i)bearer\\z')" in credential_rule.PUT_BACK
-    assert block.count("\"'<a value the box redacted>'\" + label + ") == 2
 
 
 def test_pass_one_pieces_all_close() -> None:

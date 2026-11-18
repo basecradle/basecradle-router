@@ -2141,18 +2141,8 @@ Caddy, no database) and has three load-bearing properties:
      header value by its name, never its shape — `x-api-key: …`, `"x-api-key": "…"`, escaped JSON,
      a Ruby `=>`, a `('x-api-key', '…')` tuple, any case, `_` for either hyphen — and runs before
      the assignment rule so the name goes with its value; the unquoted `X-API-Key=…` stays the
-     assignment rule's. A header value that ends at an `api[-_]?key=` glued to what follows
-     (`x-api-key: api_key="K9…"`, stopped at the quote) puts back the fixed `apiKey=`, so the
-     assignment rule reads the quoted value after it (basecradle-router#510, from the NOC's
-     differential, basecradle-noc#1570). The order stays: with the header rule after the assignment
-     rule, `api_key=x-api-key: "K9…"` lost `x-api-key:` into the assignment's value and shipped the
-     key, the same class mirrored. The assignment rule's value may open with a `"` (`API_KEY="…"` matched
-     nothing before) or an escaped `\"` (basecradle-router#515: `api_key=\"K9…\"` took only the
-     backslash and shipped the key); its run stops at a backslash before a `"`, so inside a JSON
-     string the escaped close survives and the line still parses. It reads through every
-     `api[-_]?key=` its value holds, scheme words before one included, each as it reads its own,
-     so a second label never keeps a value for no rule (basecradle-router#510:
-     `api_key=x,api_key="K9…"` shipped `"K9…"` before). A bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
+     assignment rule's. The assignment rule's value may open with a `"` (`API_KEY="…"` matched
+     nothing before), and a bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
      (basecradle-router#423, basecradle-harness#866). Inside the pass the rules run one after another (the harness's
      are one alternation), so their order is load-bearing: the bearer rule's token class takes an
      assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`
@@ -2359,23 +2349,15 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   scheme word after one is the value's too, with its token (`x<TAB>Bearer …`, `'q'<TAB>KBearer …`,
   `(a)<TAB>Bearer …`, basecradle-router#502): **a value never ends between a scheme word and its
   token**, whatever stands before the tab. A backslash right before the tab is its word's last
-  character, since the run crosses the tab. **A scheme word is any word ending in `bearer`, in any
-  case, glued to anything before it** (basecradle-router#510): the fleet's one definition,
-  basecradle-harness `docs/telemetry.md` → Credential Scrubbing, read as written (`Bear'er'` is
-  none). The print site and the `jq` fallback read every such word into the value with its token.
-  **The box's credential rule never reads one it did not read before:** a value that ends at any
-  other word ending in `bearer`, with a token able to follow on the record (not before the line's
-  own closing `"`, a `,` or `}`, a record break or the end), writes the fixed word ` Bearer` back
-  after the marker, and the bearer rule, the one rule that reads a header (#507),
-  takes the token by the fleet's definition. Reading the header in this rule's value instead
-  consumed other rules' labels (`x-api-key:`, `apiKey=`) and left their tokens to no rule, 3,199
-  regressions in the NOC's differential (basecradle-noc#1573), and the rule's match is what it was
-  before #510, so nothing it took is left to another rule now. Each copy reads it its own way, each
-  at least as far as the print site where a regular expression can: the print site
-  (`logfmt._value_end`) walks the words the run reaches; the box reaches the scheme word after any
-  prefix of its closed pieces, none of which can stop inside a quote; and `wake-runner`'s `jq`
-  fallback reads a word of closed pieces once, possessively, and looks behind at its end for a
-  scheme word; it also reads **lead words**
+  character, since the run crosses the tab. **The fleet's scheme word is any word ending in
+  `bearer`, in any case, glued to anything before it** (basecradle-router#510; basecradle-harness
+  `docs/telemetry.md` → Credential Scrubbing), read as written (`Bear'er'` is none). The print site
+  and the `jq` fallback read every such word into the value with its token: nothing runs after
+  them, so reading it there hands no boundary to another rule. The box's credential rule reads only
+  the two forms above, a stated limit below. Each copy reads it its own way, each at least as far as
+  the print site where a regular expression can: the print site (`logfmt._value_end`) walks the
+  words the run reaches; the box reaches the scheme word after any prefix of its closed pieces,
+  none of which can stop inside a quote; and `wake-runner`'s `jq` fallback reads **lead words**
   (`logfmt._LEAD_WORD`: words whose every piece closes inside the run, built from one spelling,
   `logfmt.LEAD_OPENERS`), generated by `tests/fallback_rule.py` and held to it byte for byte. A
   quoted `'a<TAB>Bearer b'` is one word, so it opens no quote that could eat the fields after it. A word after a tab is reached unless it starts at a
@@ -2420,35 +2402,39 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   with a blank (`a="X_TOKEN=" b=" y"`), loses that field. The print site over-reads one more, which
   the box reads by parity: a name whose `=` closes a JSON string (`{"sig":"dGVzdKEY=","b":"x y"}`,
   base64 padding after a bare `KEY` since #504), where its shell reading opens a quote at the `"`.
-  The box also reads less after a scheme word it writes back: the token is the bearer rule's, which
-  ends at a blank, so a word the print site reaches past a tab after it ships with no name before it
-  (`_DIFFERENT`).
-  **Two limits, stated (basecradle-router#510).** *A value opening with a `,` or a `}`*
-  (`A_TOKEN=,K9…`, from the NOC's differential, basecradle-noc#1570): the print site's shell word
-  takes it, and the box leaves it as it came. Opening the box's value there let it consume another
-  rule's label (1,970 of basecradle-noc#1573's regressions), the canary's run stops there too so it
-  reads nothing, and inside a value a `,` or `}` is the line's structure. Pinned in
-  `tests/vector/ai_credentials.yaml`.
-  *A scheme word glued after a piece the word leaves open.* In
-  `SECRET_KEY_BASE='q''Bearer<TAB>'a eyJ… b'` the shell, and so the print
-  site and the box, pairs the second `'` with the third and ends the value at `a`; the bearer rule
-  reads `'Bearer` as a scheme word glued to an open quote and pairs the third `'` with the fourth,
-  so its token `'a eyJ… b'` runs past the value, and `eyJ… b'` ships after the marker. The two
-  readings pair one quote differently, and no regular expression reads both pairings at once; the
-  harness, which runs both rules on the text as it came, takes it. What ships is a token with no
-  credential name before it, so the canary reads nothing, and a quote glued before a scheme word
-  and closed inside the token after it is a shape nothing in the fleet is known to write. On the box
-  an escaped quote opens a JSON-escaped piece (above), so a scheme word glued after one
-  (`\"Bearer`) is this limit there. Pinned, with a 3,000-line fuzz showing the canary reads
-  nothing, in `tests/test_vector_unit.py` (`_LIMIT`).
-  **Five properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
+  **What the box does not take, stated (basecradle-router#510),** until its literal rules run as one
+  alternation, the harness's shape, the next change to this program. The box's rules run one after
+  another, so a rule that reads into another rule's text can consume that rule's label and leave
+  its value to no rule: reading wider in the credential rule did so 3,199 times in the NOC's
+  differential, and writing a scheme word back for a later rule 43 times (basecradle-noc#1573). Each
+  line below is pinned in `tests/test_vector_unit.py` (`_LIMIT`) with what the box ships, and a
+  3,000-line fuzz shows the canary reads nothing in what ships, a token with no name before it:
+  1. A credential value ending in a word the fleet reads as a scheme word and the box does not
+     (`A_TOKEN=abc-bearer eyJ…`, `A_TOKEN=Bearer x"q"bearer 'eyJ…'`, `X_API_KEY=(a)Bearer eyJ…`):
+     the token after it ships. The print site takes it.
+  2. A credential value opening with a `,` or a `}` (`A_TOKEN=,K9…`, from the NOC's differential,
+     basecradle-noc#1570): the box's value never opens at a canary stop, and the canary's run stops
+     there too. The print site takes it.
+  3. An `x-api-key` header whose value is an `api_key=` assignment with a quoted token
+     (`x-api-key: api_key="K9…'`): the header rule takes the label, and the assignment rule never
+     sees the token. The harness takes it at its source.
+  4. An `api[-_]?key=` value opening with an escaped quote (`api_key=\"K9…\"`,
+     basecradle-router#515): the assignment rule takes only the backslash. Letting it open there,
+     and reading through the second label it then reached, left other values to no rule
+     (basecradle-noc#1573, and this repository's own differential). The harness at 0.198.2 ships it
+     too.
+  5. A scheme word glued after a piece the word leaves open (`SECRET_KEY_BASE='q''Bearer<TAB>'a eyJ…
+     b'`): the shell, and so the print site and the box, pairs the open quote with a later one; the
+     bearer rule opens the token's quote instead. No regular expression reads both pairings; the
+     harness, which runs both rules on the text as it came, takes it.
+  **Four properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
   written): the canary reads nothing the box ships; no credential-named assignment the rule leaves
   is followed by a value, by the rule's own reading of quotes; a quoted value closed before a word's
   end goes whatever junk came before it, which holds that reading to account; and, on every
   construct the two read alike, the box never leaves more of a fabricated secret than the print
-  site does; and every bearer header the fleet's definition builds from words of closed pieces, in
-  every credential-named context, loses its token, at the print site and on the box, whose bearer
-  rule reads it after the word written back (basecradle-router#510).
+  site does. The print site holds a fifth by its own fuzz: every bearer header the fleet's
+  definition builds from words of closed pieces, in every credential-named context, loses its token
+  (basecradle-router#510).
 - **Every field, because a writer chooses far more of the record than its message:** the identifier,
   the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
   name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule
