@@ -2459,10 +2459,11 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   box's `ai_scrub` on the boxes' Vector, the print site, and the harness's own scrub at the release
   the fleet runs (its published wheel, pinned by version and checksum and fetched in CI, never a
   locked dependency). Its generator is the union of every piece set the suite holds, the NOC's
-  differential (basecradle-noc#1573), and the shapes #510's three rounds found. A secret the harness
-  takes and the box or the print site leaves fails CI, unless a row of its table names the text's
-  shape. Each row carries a predicate, a reason, where it is written down (a phrase this file holds,
-  or #516 for a finding), and a fabricated example that must still differ, so a closed row fails
+  differential (basecradle-noc#1573), the shapes #510's three rounds found, and a credential-named
+  JSON member inside none to six JSON strings. A secret the harness takes and the box or the print
+  site leaves fails CI, unless a row of its table names the text's shape. Each row carries a
+  predicate, a reason, where it is written down (a phrase this file holds, or #516 for a finding),
+  and a fabricated example that must still differ, so a closed row fails
   until it is removed. Against the previous commit (on a pull request, the base branch's), any
   secret a host's old `ai_scrub` took and its new one leaves fails, with no table and no row; and
   so does any the old print site took and the new one leaves, unless a row states the shape (the
@@ -2520,8 +2521,13 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   value ends at its first quote. A value that is a marker already (the box's, the print site's, the
   harness's `[redacted]`) is left as it is. The message is read so; every other field, by the
   credential rule alone. No scrub in the fleet had this rule (a shapeless secret in a JSON member
-  shipped everywhere), and the harness takes it next, so until then it is a shape the box takes and
-  the harness leaves.
+  shipped everywhere); the harness has carried it since 0.198.4 (basecradle-harness#943), the same
+  eight names, and the standing differential holds the box to it. The two read a value's end alike
+  but in three shapes: deeper than five strings the box's value ends at its first quote, where the
+  harness reads the close at any depth; a quote behind a shorter run than the opener's, the close
+  of a string the member sits in and so a line no encoder wrote, ends the box's value, where the
+  harness reads on to a quote its own run closes, into the field after it; and a raw control
+  character, which no JSON string holds, ends the harness's value and not the box's.
 - **Every field, because a writer chooses far more of the record than its message:** the identifier,
   the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
   name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule
