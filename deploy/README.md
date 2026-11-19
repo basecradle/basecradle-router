@@ -2464,25 +2464,13 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   shape. Each row carries a predicate, a reason, where it is written down (a phrase this file holds,
   or #516 for a finding), and a fabricated example that must still differ, so a closed row fails
   until it is removed. Against the previous commit (on a pull request, the base branch's), any
-  secret a host's old `ai_scrub` took and its new one leaves fails, with no table; and so does any
-  the old print site took and the new one leaves, unless a row states the shape (the one above). Run it deeper
-  by hand: `uv run python tests/scrub_differential.py --seed 1 --lines 400000 --base main`, with
+  secret a host's old `ai_scrub` took and its new one leaves fails, with no table and no row; and
+  so does any the old print site took and the new one leaves, unless a row states the shape (the
+  one above). Run it deeper by hand:
+  `uv run python tests/scrub_differential.py --seed 1 --lines 400000 --base main`, with
   `VECTOR_BIN`, `HARNESS_WHEEL` and `HARNESS_PYTHON` set (`--help`). Move its pin with the fleet's
-  harness roll.
-  **Two rows are excused against the previous commit** (decided on #516, 2026-11-19), each
-  counted and printed. **By the quote**, while the previous commit's heartbeat run reads past a
-  `"`: a secret it took only so, which the tree's own block with `scrub_heartbeat_to_quote = false`
-  takes too (the parameter alone leaves it, and the table's `a heartbeat URL read to a quote` row
-  is the same mechanism against the harness). **By order**, only while that commit is the
-  sequential pass: a secret the previous `ai_scrub` took only by the order of
-  its rules, its rules each reading the text as it came leaving it. One rule's rewrite exposed it
-  to the next (`Bearer 'Kapi_key=,'a eyJ… b',` lost its secret only because the `api_key=` rule
-  removed `,'a` before the bearer rule paired the quotes), and a union reads no rule into it.
-  Nothing else is excused, and against a previous commit that carries the block nothing can be by
-  order (its rules' union is its own output), nor by the quote where its parameter is already
-  `true`; the legacy reader goes once `main` carries the block. `tests/scrub_compare.py` (standard
-  library only) reads it for the NOC (`excused OLD.yaml < [[text, secret], …]`), and reads two
-  configs over a server's own journal as counts
+  harness roll. `tests/scrub_compare.py` (standard library only) reads two configs over a server's
+  own journal as counts
   (`journalctl -o json | python3 -I tests/scrub_compare.py counts OLD.yaml NEW.yaml`):
   records read, records the two write differently, records whose candidate output holds eight
   characters `main`'s redacted, and records whose message `main` leaves JSON and the candidate does
