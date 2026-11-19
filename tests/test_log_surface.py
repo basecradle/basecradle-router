@@ -339,7 +339,9 @@ def test_every_rule_of_the_block_runs_for_every_writer() -> None:
     # A redaction nested inside a conditional holds only for what that conditional names. Every
     # rule's statement sits in the body of the one guard (an empty message, or one the pass refuses
     # whole), except the credential rule's, whose two guards are only that a value needs an `=`
-    # and that the parity pass needs a `"` to have a parity to read.
+    # and that the parity pass needs a `"` to have a parity to read, and the heartbeat rule's,
+    # whose one guard is a host's parameter choosing between its two readings, so one of them
+    # runs for every writer on every host.
     source = _scrub_source()
     indent = _rule_indent(source)
     starts = [
@@ -349,11 +351,22 @@ def test_every_rule_of_the_block_runs_for_every_writer() -> None:
         )
     ]
     # Every rule but the run over the parity pass's output, which reads `scrub_parity`.
-    assert len(starts) == 9, len(starts)
+    assert len(starts) == 10, len(starts)
     credential = source.index('if contains(scrub_text, "=") {')
     end = source.index("\n" + " " * indent + "}\n", credential)
+    guard = " " * indent + "if scrub_heartbeat_to_quote {\n"
+    assert source.count(guard) == 1
+    to_quote = source.index(guard) + len(guard)
+    otherwise = source.index("\n" + " " * indent + "} else {\n", to_quote) + 1
+    guard_end = source.index("\n" + " " * indent + "}\n", otherwise + 1) + 1
+    branches = [m for m in starts if to_quote <= m.start() < guard_end]
+    assert [m.start() < otherwise for m in branches] == [True, False], branches
     for m in starts:
         if credential < m.start() < end:
+            continue
+        if m in branches:
+            assert len(m.group(1)) == indent + 4
+            assert "/heartbeat/" in source[m.start() : source.index("\n", m.start())]
             continue
         assert len(m.group(1)) == indent, source[m.start() : m.start() + 80]
 

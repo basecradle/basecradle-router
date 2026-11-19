@@ -159,11 +159,14 @@ transforms:
       # THE FLEET'S SCRUB'S PARAMETERS ON THIS HOST (basecradle-router#516): the only lines that
       # differ between the hosts that carry the block below. `scrub_bearer_least` is the shortest
       # bare bearer token taken (any length here); `scrub_vendor_keys` runs the vendors' prefix
-      # rules beside the GitHub and BaseCradle ones; `scrub_longest` is the longest message read,
-      # in bytes, and `scrub_most` the most spans one message may hold: past either the message
-      # ships as the block's failure marker.
+      # rules beside the GitHub and BaseCradle ones; `scrub_heartbeat_to_quote` ends a heartbeat
+      # URL at a `"` (a host whose lines are JSON parsed after the scrub), where here its run
+      # takes the `"` and puts a kv value's closing quote back; `scrub_longest` is the longest
+      # message read, in bytes, and `scrub_most` the most spans one message may hold: past either
+      # the message ships as the block's failure marker.
       scrub_bearer_least = 1
       scrub_vendor_keys = true
+      scrub_heartbeat_to_quote = false
       scrub_longest = 1048576
       scrub_most = 1024
       # THE FLEET'S SCRUB, PASS 1 (basecradle-router#516). One block, the same bytes
@@ -401,32 +404,57 @@ transforms:
                   scrub_pos = 0
               }
           }
-          replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?)') -> |hb| {
-              if !scrub_failed {
-                  span_at = scrub_pos + length(string(hb.pre) ?? "")
-                  url = string(hb.url) ?? ""
-                  closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}
-                  quote = string(closing.quote) ?? ""
-                  if quote == "\"" && hb.after == null { quote = "" }
-                  span_to = span_at + length(url) - length(quote)
-                  if scrub_count >= scrub_most { scrub_failed = true } else {
-                      span_key = slice("000000000" + to_string(span_at), -9) ?? ""
-                      span_had = -1
-                      span_prior = get(scrub_spans, [span_key, 0]) ?? null
-                      if span_prior != null { span_had = to_int(span_prior) ?? -1 }
-                      if span_had < 0 || span_to > span_had {
-                          span_kind = "h"
-                          if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "h") ?? "h" }
-                          span_new, span_err = set(scrub_spans, [span_key], [span_to, span_kind])
-                          if span_err == null { scrub_spans = span_new } else { scrub_failed = true }
-                          if span_had < 0 { scrub_count = scrub_count + 1 }
+          if scrub_heartbeat_to_quote {
+              replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<url>(?:https?://(?:[^\s"\\]|\\+[^\s"\\])*)?/heartbeat/(?:[^\s"\\]|\\+[^\s"\\])+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?)') -> |hb| {
+                  if !scrub_failed {
+                      span_at = scrub_pos + length(string(hb.pre) ?? "")
+                      span_to = span_at + length(string(hb.url) ?? "")
+                      if scrub_count >= scrub_most { scrub_failed = true } else {
+                          span_key = slice("000000000" + to_string(span_at), -9) ?? ""
+                          span_had = -1
+                          span_prior = get(scrub_spans, [span_key, 0]) ?? null
+                          if span_prior != null { span_had = to_int(span_prior) ?? -1 }
+                          if span_had < 0 || span_to > span_had {
+                              span_kind = "h"
+                              if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "h") ?? "h" }
+                              span_new, span_err = set(scrub_spans, [span_key], [span_to, span_kind])
+                              if span_err == null { scrub_spans = span_new } else { scrub_failed = true }
+                              if span_had < 0 { scrub_count = scrub_count + 1 }
+                          }
                       }
                   }
+                  scrub_pos = scrub_pos + length(hb.string)
+                  ""
               }
-              scrub_pos = scrub_pos + length(hb.string)
-              ""
+              scrub_pos = 0
+          } else {
+              replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?)') -> |hb| {
+                  if !scrub_failed {
+                      span_at = scrub_pos + length(string(hb.pre) ?? "")
+                      url = string(hb.url) ?? ""
+                      closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}
+                      quote = string(closing.quote) ?? ""
+                      if quote == "\"" && hb.after == null { quote = "" }
+                      span_to = span_at + length(url) - length(quote)
+                      if scrub_count >= scrub_most { scrub_failed = true } else {
+                          span_key = slice("000000000" + to_string(span_at), -9) ?? ""
+                          span_had = -1
+                          span_prior = get(scrub_spans, [span_key, 0]) ?? null
+                          if span_prior != null { span_had = to_int(span_prior) ?? -1 }
+                          if span_had < 0 || span_to > span_had {
+                              span_kind = "h"
+                              if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "h") ?? "h" }
+                              span_new, span_err = set(scrub_spans, [span_key], [span_to, span_kind])
+                              if span_err == null { scrub_spans = span_new } else { scrub_failed = true }
+                              if span_had < 0 { scrub_count = scrub_count + 1 }
+                          }
+                      }
+                  }
+                  scrub_pos = scrub_pos + length(hb.string)
+                  ""
+              }
+              scrub_pos = 0
           }
-          scrub_pos = 0
           replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?i:x[-_]api[-_]?key)(?:\\*["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\*["\x27])?(?:(?:(?i:bearer)\s+)*[^\s"\x27&\\]*?(?:(?i:bearer)\s+[^\s"\x27&\\]*?)?(?i:x[-_]api[-_]?key)(?:\\*["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\*["\x27])?)*(?:(?:(?i:bearer)\s+)+(?:[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|(?:[^\s"\x27&\\`\x24]|\x24[^\s"\x27&\\({])[^\s"\x27&\\]*)|[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s"\x27&\\]+))') -> |header| {
               if !scrub_failed {
                   span_at = scrub_pos + length(string(header.pre) ?? "")

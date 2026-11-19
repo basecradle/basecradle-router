@@ -1,4 +1,4 @@
-"""The fleet's scrub block fails closed (basecradle-router#516, requirement 2).
+"""The fleet's scrub block fails closed (basecradle-router#516, requirement 2), and its parameters.
 
 A pass that cannot vouch for what it would ship writes `scrub_block.FAILED` in place of the whole
 message, never the message as it came: a message longer than `scrub_longest`, more spans than
@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import subprocess
 from pathlib import Path
 
 import pytest
 
 import scrub_block
+import scrub_compare
 import test_vector_unit as tvu
 
 SECRET = "Fab1catedQ7ZkW9xDiffVq3Lm8Rt"
@@ -108,3 +110,86 @@ def test_a_query_key_after_a_kept_marker_loses_its_value(vector: str, tmp_path: 
         vector, _program(), f"GET /cb?token='<a redacted value>'&token={SECRET}", tmp_path
     )
     assert SECRET[:8] not in shipped and shipped.endswith("&token=[REDACTED]")
+
+
+#: A web host's request line, as the capital's web read of #516 fabricated it: a path an outside
+#: caller chose, holding a heartbeat URL, then the request's own fields.
+REQUEST = (
+    '{"method":"GET","path":"/heartbeat/K9fabricatedHeartbeat01","status":404,'
+    '"remote_ip":"203.0.113.9","request_id":"0190f3a2-7c4e-7b1a-9d2e-5f6a7b8c9d0e"}'
+)
+
+
+def test_a_heartbeat_url_read_to_a_quote_keeps_a_json_line_and_its_fields(
+    vector: str, tmp_path: Path
+) -> None:
+    # `scrub_heartbeat_to_quote` (the web hosts' value): the URL ends at the `"` closing the path,
+    # so the line stays JSON and every field after the path, the caller's address included, stays.
+    program = _program(
+        **{"scrub_heartbeat_to_quote = false\n": "scrub_heartbeat_to_quote = true\n"}
+    )
+    shipped = _shipped(vector, program, REQUEST, tmp_path).removeprefix("[x] ")
+    assert json.loads(shipped) == {
+        **json.loads(REQUEST),
+        "path": "[REDACTED_HEARTBEAT_URL]",
+    }
+    kv = 'ping url="https://hc.example.com/heartbeat/K9fabricatedHeartbeat01" next=1'
+    assert _shipped(vector, program, kv, tmp_path) == (
+        '[x] ping url="[REDACTED_HEARTBEAT_URL]" next=1'
+    )
+    # A quote escaped inside a JSON string ends the URL before its backslash (the review of the
+    # parameter: the run took the backslash and left the quote bare).
+    nested = json.dumps({"msg": 'ping url="https://hc.example.com/heartbeat/K9fab01" next=1'})
+    shipped = _shipped(vector, program, nested, tmp_path).removeprefix("[x] ")
+    assert json.loads(shipped) == {"msg": 'ping url="[REDACTED_HEARTBEAT_URL]" next=1'}
+
+
+#: What a caller may put in a request's path around a heartbeat URL: every character the JSON
+#: encoder escapes or a run could end at.
+_PATH_PIECES = ('"', "\\", "\\\\", "'", " ", "\t", "/", "?", "&", "=", "%22", "x", "\u00e9", "\n")
+
+
+def test_a_caller_chosen_heartbeat_path_never_breaks_a_web_request_line(
+    vector: str, tmp_path: Path
+) -> None:
+    # The property the web hosts' value exists for, over 2,000 seeded paths: the request line
+    # stays JSON, every field but the path is as it came, and no eight characters of the
+    # heartbeat token ship.
+    rng = random.Random(516)
+    token = "K9fabricatedHeartbeat01"
+    program = _program(
+        **{"scrub_heartbeat_to_quote = false\n": "scrub_heartbeat_to_quote = true\n"}
+    )
+    lines = []
+    for _ in range(2000):
+        around = ["".join(rng.choices(_PATH_PIECES, k=rng.randint(0, 4))) for _ in range(3)]
+        path = f"{around[0]}/heartbeat/{token}{around[1]}"
+        if rng.random() < 0.5:
+            path = f"https://hc.example.com{path}"
+        request = {"method": "GET", "path": around[2] + path, "status": 404}
+        request["remote_ip"] = "203.0.113.9"
+        lines.append(request)
+    events = [{"SYSLOG_IDENTIFIER": "x", "message": json.dumps(r)} for r in lines]
+    shipped = scrub_compare.run(vector, program, events, tmp_path)
+    for request, out in zip(lines, shipped, strict=True):
+        assert out is not None and out.startswith("[x] "), (request, out)
+        got = json.loads(out.removeprefix("[x] "))
+        assert {k: v for k, v in got.items() if k != "path"} == {
+            k: v for k, v in request.items() if k != "path"
+        }, (request, out)
+        assert "[REDACTED_HEARTBEAT_URL]" in got["path"], (request, out)
+        assert not any(token[i : i + 8] in out for i in range(len(token) - 7)), (request, out)
+
+
+def test_a_heartbeat_url_on_the_fleet_runs_past_a_quote_as_before(
+    vector: str, tmp_path: Path
+) -> None:
+    # The fleet's value (`false`) reads exactly as the block did before the parameter, so its
+    # output does not move: the run takes the `"` and what is glued to it, and a kv value's closing
+    # quote is put back. On a JSON line that takes the rest of the line, as `main` does.
+    shipped = _shipped(vector, _program(), REQUEST, tmp_path)
+    assert shipped == '[x] {"method":"GET","path":"[REDACTED_HEARTBEAT_URL]'
+    kv = 'ping url="https://hc.example.com/heartbeat/K9fabricatedHeartbeat01" next=1'
+    assert _shipped(vector, _program(), kv, tmp_path) == (
+        '[x] ping url="[REDACTED_HEARTBEAT_URL]" next=1'
+    )

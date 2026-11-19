@@ -123,6 +123,17 @@ HEARTBEAT = (
     r"(?P<url>(?:https?://\S*)?/heartbeat/\S+)"
     r"(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?"
 )
+#: The same URL read only to a `"`, where `scrub_heartbeat_to_quote` is set (the web hosts): their
+#: request lines are JSON parsed after the scrub, and a path is text an outside caller chooses, so
+#: a run that took the `"` closing the path would take the rest of the line with it and erase the
+#: request's own fields, the caller's address included (the capital's web read of #516). A
+#: backslash goes into the URL only before another character of it, never before the quote it
+#: escapes (`API_RUN`), so a URL inside a JSON string (`\"…/heartbeat/K9\"`) keeps its line JSON.
+#: The run never holds a `"`, so no closing quote is put back. A pattern is a literal in VRL, so
+#: the two readings are two statements, and the block one sha256.
+HB_RUN = r"""(?:[^\s"\\]|\\+[^\s"\\])"""
+HEARTBEAT_TO_QUOTE = HEARTBEAT.replace(r"\S", HB_RUN)
+assert HEARTBEAT_TO_QUOTE.count(HB_RUN) == 2, HEARTBEAT_TO_QUOTE
 
 #: The `x-api-key` header (basecradle-router#423, basecradle-harness#861): its label, a quote at
 #: any depth of escaping (basecradle-harness#935), and a value that reads on through every header
@@ -534,16 +545,24 @@ def _body(only: str | None = None) -> str:
         )
         + f"{_I}        }}\n"
     )
-    heartbeat = _rule(
-        HEARTBEAT,
-        "hb",
+    heartbeat_body = (
         f'{_R}url = string(hb.url) ?? ""\n'
         f"{_R}closing = parse_regex(url, "
         "r'\\A(?P<body>[\\s\\S]*?)(?P<quote>\"\\x1b\\[0m|\")\\z') ?? {}\n"
         f'{_R}quote = string(closing.quote) ?? ""\n'
         f'{_R}if quote == "\\"" && hb.after == null {{ quote = "" }}\n'
         f"{_R}span_to = span_at + length(url) - length(quote)\n"
-        + _add(_R, "span_at", "span_to", "h"),
+        + _add(_R, "span_at", "span_to", "h")
+    )
+    heartbeat_to_quote_body = f'{_R}span_to = span_at + length(string(hb.url) ?? "")\n' + _add(
+        _R, "span_at", "span_to", "h"
+    )
+    heartbeat = (
+        f"{_I}    if scrub_heartbeat_to_quote {{\n"
+        + _rule(HEARTBEAT_TO_QUOTE, "hb", heartbeat_to_quote_body, i=_I + "        ")
+        + f"{_I}    }} else {{\n"
+        + _rule(HEARTBEAT, "hb", heartbeat_body, i=_I + "        ")
+        + f"{_I}    }}\n"
     )
     x_api_key = _rule(
         X_API_KEY,
@@ -689,11 +708,14 @@ PARAMETERS = """\
       # THE FLEET'S SCRUB'S PARAMETERS ON THIS HOST (basecradle-router#516): the only lines that
       # differ between the hosts that carry the block below. `scrub_bearer_least` is the shortest
       # bare bearer token taken (any length here); `scrub_vendor_keys` runs the vendors' prefix
-      # rules beside the GitHub and BaseCradle ones; `scrub_longest` is the longest message read,
-      # in bytes, and `scrub_most` the most spans one message may hold: past either the message
-      # ships as the block's failure marker.
+      # rules beside the GitHub and BaseCradle ones; `scrub_heartbeat_to_quote` ends a heartbeat
+      # URL at a `"` (a host whose lines are JSON parsed after the scrub), where here its run
+      # takes the `"` and puts a kv value's closing quote back; `scrub_longest` is the longest
+      # message read, in bytes, and `scrub_most` the most spans one message may hold: past either
+      # the message ships as the block's failure marker.
       scrub_bearer_least = 1
       scrub_vendor_keys = true
+      scrub_heartbeat_to_quote = false
       scrub_longest = 1048576
       scrub_most = 1024
 """
