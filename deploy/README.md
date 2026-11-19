@@ -2163,7 +2163,10 @@ Caddy, no database) and has three load-bearing properties:
        or an escaped quote hands on to the next word (`Bearer \"Bearer eyJ…`, and `Bearer 'q'` with
        a backquote and `Bearer eyJ…` glued after it, where under the minimum that word was the token
        and the token after it shipped); its limit is the minimum's, one quoted piece or
-       substitution, one level deep. It is the one rule that reads a header. The rules before it
+       substitution, one level deep. **Every record break ends a bearer token on the box**, as it
+       ends a credential's value, where the source's opened word runs on through a `\r`, a NUL or a
+       U+2028 outside a quote (`Bearer `q`<CR>eyJ…` keeps `eyJ…`; basecradle-router#516). It is
+       the one rule that reads a header. The rules before it
        whose match can end at a scheme word (the heartbeat URL, the `x-api-key` header, the
        `api_key=` assignment) put the fixed word `Bearer` back where it ends at one with a blank
        after it, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token too; a

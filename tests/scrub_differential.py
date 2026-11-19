@@ -882,9 +882,8 @@ STATED: list[Row] = [
             ),
         ),
         "Every record break ends the box's bearer token, as it ends a value; the harness's shell"
-        " word runs on through all but a newline outside a quote. Stated for a value, not yet for"
-        " the bearer rule.",
-        "basecradle-router#516 (finding)",
+        " word runs on through all but a newline outside a quote.",
+        "deploy/README.md “Every record break ends a bearer token on the box”",
         "Bearer `q`\rFab1catedQ7ZkW9xDiffVq3Lm8Rt",
     ),
     Row(
