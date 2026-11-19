@@ -2110,44 +2110,50 @@ Caddy, no database) and has three load-bearing properties:
    through here — nothing is *known* to print one, and a traceback that did would otherwise ship
    it. The drop rules and every redaction shape are NOC's `noc_scrub` plus these additions; do not
    weaken them.
-   **The redaction runs in two passes, in this order, with one word rule** (basecradle-router#398).
-   The one definition of both is the harness's: basecradle-harness `docs/telemetry.md` → Credential
-   Scrubbing (`_observability.scrub` and `_is_word`, harness 0.186.0). `ai_scrub` follows it and
-   never varies it; only the box's rules (a subset of the harness's shapes), minimum lengths and labels differ.
-   - **Pass 1, the literal rules** — the heartbeat URL, then the `x-api-key` header, then
-     `api[-_]?key=`, then bearer — each
-     redacted wherever it matches. They go first because a prefix rule's run is made of the
-     characters their literals are: with `sk-` first, `task-runner-pipeline-api-key=abc123secret`
-     lost `api-key` into the run, and the secret after `=` shipped. The heartbeat rule anchors on
+   **The redaction is one union: every rule reads the message as it came, and the scrub takes what
+   any of them takes** (basecradle-router#516), with one word rule (basecradle-router#398). The one
+   definition is the harness's: basecradle-harness `docs/telemetry.md` → Credential Scrubbing
+   (`_observability.scrub` and `_is_word`). Each rule records the spans it would take; the spans are
+   merged where they overlap or touch, and the message is rebuilt once, each merged span written as
+   the marker of the rule whose span starts it (a credential value's where its name ends, the name
+   kept). No rule reads another's output, so no rule's value, marker or written-back word is another
+   rule's boundary, which is what cost #510 its three rounds; and no rule takes less beside another
+   than alone. Only the box's rules (a subset of the harness's shapes), minimum lengths and labels
+   differ from the harness's. The block is the fleet's scrub (below).
+   - **The literal rules** — the heartbeat URL, the `x-api-key` header, `api[-_]?key=`, a key in a
+     URL's query, and bearer — each take what they match. A prefix rule can no longer take one's
+     label, as `sk-` once took `api-key` from `task-runner-pipeline-api-key=abc123secret`: every rule
+     reads the text as it came. The heartbeat rule anchors on
      the literal `/heartbeat/`, as the harness's does, so a URL logged without its scheme
      (`curl uptime.betterstack.com/api/v1/heartbeat/SECRET`) is redacted too, its host left in place
      since it is not the secret. A URL with a scheme is still taken from the scheme on, so userinfo
-     (`https://john:…@host/…`) never ships, and the rule runs first because the bearer rule's token
-     class takes a scheme's `https`. Its match runs to the end of the space-free run, and a bearer
-     scheme word ending that run, not glued to a letter or digit, is put back for the bearer rule
-     (basecradle-router#402, the harness's `_TRAILING_BEARER`): taken with the URL, the word left
-     its token in the next run, which no rule matched, so compact JSON
-     (`…/heartbeat/K9","auth":"Bearer eyJ…`) and a query value (`…&access_token=Bearer eyJ…`)
-     shipped the token. What is put back is the fixed word `Bearer`, never the bytes captured
-     (basecradle-router#507): glued to a letter or digit the word may be the secret's own tail, so
-     `…&auth=xBearer eyJ…` loses its token too and no byte of the URL ships. A kv value's
-     closing quote ending that run (a `"` followed by the next `key=`, the line's end, or a colour
-     reset) is put back as well (basecradle-router#423, the
+     (`https://john:…@host/…`) never ships. Its match runs to the end of the space-free run, a
+     scheme word ending it included, and the bearer rule takes the token after that word from the
+     text as it came, so compact JSON (`…/heartbeat/K9","auth":"Bearer eyJ…`), a query value
+     (`…&access_token=Bearer eyJ…`) and `…&auth=xBearer eyJ…` lose the token and no byte of the URL
+     ships (basecradle-router#402, #507). That is this repository's hosts' reading; a host that
+     sets `scrub_heartbeat_to_quote` (the web hosts) ends the run at a `"` instead (the block's
+     parameters, below). A kv value's closing quote ending that run (a `"`
+     followed by the next `key=`, the line's end, or a colour reset) stays out of the span
+     (basecradle-router#423, the
      harness's `_CLOSING_QUOTE`), so `url="…/heartbeat/K9" next=1` ships as
      `url="[REDACTED_HEARTBEAT_URL]" next=1`, a line a kv parser still reads. The URL is always
      redacted, even a quoted `/heartbeat/` with no secret after it, which the harness keeps: the
      match from the scheme on is what keeps userinfo from shipping, so the guard only ever restores
      a quote. The `x-api-key` header rule (basecradle-router#423, basecradle-harness#861) redacts a
      header value by its name, never its shape — `x-api-key: …`, `"x-api-key": "…"`, escaped JSON,
-     a Ruby `=>`, a `('x-api-key', '…')` tuple, any case, `_` for either hyphen — and runs before
-     the assignment rule so the name goes with its value; the unquoted `X-API-Key=…` stays the
-     assignment rule's. The assignment rule's value may open with a `"` (`API_KEY="…"` matched
-     nothing before), and a bearer header glued to a value (`api_key=KBearer eyJ…`) goes with it
-     (basecradle-router#423, basecradle-harness#866). Inside the pass the rules run one after another (the harness's
-     are one alternation), so their order is load-bearing: the bearer rule's token class takes an
-     assignment's `api_key=`, so the assignment rule goes before it, or `Bearer api_key=SECRET`
-     ships its secret. The assignment rule takes every bearer scheme in its value, as the harness's
-     does, so `AUTH_API_KEY=Bearer eyJ…` is redacted whole.
+     a Ruby `=>`, a `('x-api-key', '…')` tuple, any case, `_` for either hyphen, a quote escaped to
+     any depth (basecradle-harness#935) — and its value reads on through every header whose label
+     it holds, by a repetition in its own pattern, as the harness's `_x_api_key_spans` does
+     (`x-api-key: "x-api-key": "K9…"`). The assignment rule's value may open with a `"` or a quote
+     escaped to any depth (`api_key=\"K9…\"`, basecradle-router#515), a bearer header glued to it
+     (`api_key=KBearer eyJ…`) goes with it (basecradle-router#423, basecradle-harness#866), it
+     reads on through every `api_key=` label it holds, so each label's value is read, and it takes a
+     backslash only before another character of the value, never before the quote it escapes, so a
+     value inside a JSON string keeps its line JSON. **A key in a URL's query** (`?token=`, `&key=`,
+     `?access_token=`, `?api_key=`, any case; basecradle-router#516, the harness's `_QUERY`, the
+     web hosts' rule) loses its value to the next `&`, blank or `"`, the label kept
+     (`?token=[REDACTED]`).
      - **The bearer header's token is taken whole, quoted or not, and a run of scheme words goes
        with the token after it** (basecradle-router#507, the harness's definition from
        basecradle-harness#929). The scheme word is `bearer` in any case, glued to anything before
@@ -2162,20 +2168,23 @@ Caddy, no database) and has three load-bearing properties:
        any word the rule reads as a token, so one opening with a quoted piece, closed or left open,
        or an escaped quote hands on to the next word (`Bearer \"Bearer eyJ…`, and `Bearer 'q'` with
        a backquote and `Bearer eyJ…` glued after it, where under the minimum that word was the token
-       and the token after it shipped); its limit is the minimum's, one quoted piece or
-       substitution, one level deep. **Every record break ends a bearer token on the box**, as it
+       and the token after it shipped). **It is read two ways, and the scrub takes the union**
+       (basecradle-router#516): the header above, and a shell-word reading whose token is the whole
+       shell word a quote opens, to its close, its line's end or the line's next bare `"` (no piece
+       but a double-quoted one crosses one), and whose middle words' pieces all close, so a token
+       whose quote never closes runs on rather than ending at a scheme word inside it
+       (`Bearer 'q KBearer x eyJ…`). Each reading takes what the other misses; a substitution is
+       read one level deep in both. **Every record break ends a bearer token on the box**, as it
        ends a credential's value, where the source's opened word runs on through a `\r`, a NUL or a
-       U+2028 outside a quote (`Bearer `q`<CR>eyJ…` keeps `eyJ…`; basecradle-router#516). It is
-       the one rule that reads a header. The rules before it
-       whose match can end at a scheme word (the heartbeat URL, the `x-api-key` header, the
-       `api_key=` assignment) put the fixed word `Bearer` back where it ends at one with a blank
-       after it, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token too; a
-       header read inside another rule's value took a second `x-api-key` label as its quoted token
-       and left that header's value to no rule. `tests/bearer_rule.py` writes the header once, and
-       `tests/test_log_surface.py` holds every host's bearer rule to it, byte for byte.
-   - **Pass 2, the prefix rules** (`github_pat_`, `gh?_`, `bc_???_`, `bc_uat_`, `bc_isk_`, `sk-`,
+       U+2028 outside a quote (`Bearer `q`<CR>eyJ…` keeps `eyJ…`; basecradle-router#516), though the
+       gap after a scheme word is any whitespace, as the harness's is, so a scheme word ending a
+       line takes the first word of the next (`Bearer <LF>word`). It is
+       the one rule that reads a header, and it reads every one, wherever another rule's match
+       ends, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token. Its pieces
+       are stated once in `tests/bearer_rule.py`.
+   - **The prefix rules** (`github_pat_`, `gh?_`, `bc_???_`, `bc_uat_`, `bc_isk_`, `sk-`,
      `xai-`, `AIza`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`, `tk_`), as **one** alternation, so a word
-     one rule kept is never cut by the next. The `bc_` rules are the harness's two: any `bc_` +
+     one rule kept is never cut by another. The `bc_` rules are the harness's two: any `bc_` +
      three lowercase letters + `_` with a run of eight or more that takes `_` and `-`, tried first,
      so a key glued onto another (`bc_uat_ABCbc_isk_DEF123`) is redacted whole; then `bc_uat_` and `bc_isk_` with a run
      of any length. A match is **kept as a word** only when **both** hold: a letter, digit or
@@ -2183,7 +2192,7 @@ Caddy, no database) and has three load-bearing properties:
      digit and no uppercase letter. So `risk-assessment-pending-review` survives, and
      `密钥sk-ant-api03-…`, `ESC[33msk-…` and `Bearer%20sk-…` are still redacted. Never a left
      boundary: a serialization glues a key to a letter or digit, and a random key holds a digit or a
-     capital with overwhelming certainty. VRL's regex has no lookbehind, so the pass is a
+     capital with overwhelming certainty. VRL's regex has no lookbehind, so the rule is a
      `replace_with` closure that captures the one character before the match and applies both tests.
    The stated residuals, as the harness's: a glued word whose run holds a digit or a capital is
    redacted (the scrub errs toward redaction), and a glued key made only of lowercase letters, `_`
@@ -2398,7 +2407,8 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   An empty value is left as it is, except right before a record break: the canary's run crosses a
   break, so the marker stands between the `=` and the break, and nothing is taken.
   **The patterns are generated.** VRL composes no pattern from parts, so each host's file spells
-  every piece out many times; `tests/credential_rule.py` writes each piece once, with what it reads,
+  every piece out many times; `tests/credential_rule.py` writes each piece once, with what it reads
+  (the fleet's scrub block, `tests/scrub_block.py`, carries the same two patterns for the message),
   writes the block into every host's file (`uv run python tests/credential_rule.py`), and the tests
   hold every host's block to it byte for byte. Change the rule there.
   **Where the box reads less than the print site, by design** (each named and pinned in
@@ -2414,31 +2424,28 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   with a blank (`a="X_TOKEN=" b=" y"`), loses that field. The print site over-reads one more, which
   the box reads by parity: a name whose `=` closes a JSON string (`{"sig":"dGVzdKEY=","b":"x y"}`,
   base64 padding after a bare `KEY` since #504), where its shell reading opens a quote at the `"`.
-  **What the box does not take, stated (basecradle-router#510),** until its literal rules run as one
-  alternation, the harness's shape, the next change to this program. The box's rules run one after
-  another, so a rule that reads into another rule's text can consume that rule's label and leave
-  its value to no rule: reading wider in the credential rule did so 3,199 times in the NOC's
-  differential, and writing a scheme word back for a later rule 43 times (basecradle-noc#1573). Each
-  line below is pinned in `tests/test_vector_unit.py` (`_LIMIT`) with what the box ships, and a
-  3,000-line fuzz shows the canary reads nothing in what ships, a token with no name before it:
-  1. A credential value ending in a word the fleet reads as a scheme word and the box does not
-     (`A_TOKEN=abc-bearer eyJ…`, `A_TOKEN=Bearer x"q"bearer 'eyJ…'`, `X_API_KEY=(a)Bearer eyJ…`):
-     the token after it ships. The print site takes it.
-  2. A credential value opening with a `,` or a `}` (`A_TOKEN=,K9…`, from the NOC's differential,
-     basecradle-noc#1570): the box's value never opens at a canary stop, and the canary's run stops
-     there too. The print site takes it.
-  3. An `x-api-key` header whose value is an `api_key=` assignment with a quoted token
-     (`x-api-key: api_key="K9…'`): the header rule takes the label, and the assignment rule never
-     sees the token. The harness takes it at its source.
-  4. An `api[-_]?key=` value opening with an escaped quote (`api_key=\"K9…\"`,
-     basecradle-router#515): the assignment rule takes only the backslash. Letting it open there,
-     and reading through the second label it then reached, left other values to no rule
-     (basecradle-noc#1573, and this repository's own differential). The harness at 0.198.2 ships it
-     too.
-  5. A scheme word glued after a piece the word leaves open (`SECRET_KEY_BASE='q''Bearer<TAB>'a eyJ…
-     b'`): the shell, and so the print site and the box, pairs the open quote with a later one; the
-     bearer rule opens the token's quote instead. No regular expression reads both pairings; the
-     harness, which runs both rules on the text as it came, takes it.
+  **The five limits stated on basecradle-router#510 are closed** (basecradle-router#516). Each came
+  from rules running one after another, so a rule that read into another rule's text consumed that
+  rule's label and left its value to no rule. Under the union each rule reads the line as it came:
+  a value ending in any word the fleet reads as a scheme word loses the token after it, a value
+  may open at a `,` or a `}` (a third reading of the run, for the message alone, which also reads a
+  `${…}` piece), the assignment rule reads an `api_key=` inside an `x-api-key` header, an
+  `api_key=` value opens at a quote escaped to any depth, and a piece left open before a scheme
+  word is read both ways. `tests/test_vector_unit.py` (`_LIMIT`) pins each line with what the box
+  ships now. One shape of the first stays, stated: a value whose token opens otherwise than a
+  bearer token of the box's does (`=`, `(`, a tab) after a scheme word only #510 reads ships
+  that token on the box (`A_TOKEN=abc-bearer =eyJ…`), since the credential rule reads a scheme word
+  only as HTTP spells it and the bearer rule a token only from a token character, a quote, a
+  substitution or an escape after blanks; the print site, and the harness on #514's reading since
+  0.198.3, take it. Every field but the message is read by the credential rule alone, so there its
+  own first two limits stand: a value ends at a scheme word it reads only as HTTP spells it, and
+  never opens at a `,` or a `}`.
+  **The credential rule's own two passes stay one rule.** Its run reads the parity pass's output,
+  where each value the parity pass took stands as the box's marker (the marker and what is glued to
+  it are read as one word), and the union carries that reading as it is: the run over the parity
+  pass's output, its spans mapped back to the message. A merged span that writes the box's marker
+  and ends inside a word reads on once more, as a value whose first piece is the marker (the
+  harness's `_past_marker`), as does every credential span at its own end.
   **Four properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
   written): the canary reads nothing the box ships; no credential-named assignment the rule leaves
   is followed by a value, by the rule's own reading of quotes; a quoted value closed before a word's
@@ -2462,6 +2469,71 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   by hand: `uv run python tests/scrub_differential.py --seed 1 --lines 400000 --base main`, with
   `VECTOR_BIN`, `HARNESS_WHEEL` and `HARNESS_PYTHON` set (`--help`). Move its pin with the fleet's
   harness roll.
+  **Two rows are excused against the previous commit** (decided on #516, 2026-11-19), each
+  counted and printed. **By the quote**, while the previous commit's heartbeat run reads past a
+  `"`: a secret it took only so, which the tree's own block with `scrub_heartbeat_to_quote = false`
+  takes too (the parameter alone leaves it, and the table's `a heartbeat URL read to a quote` row
+  is the same mechanism against the harness). **By order**, only while that commit is the
+  sequential pass: a secret the previous `ai_scrub` took only by the order of
+  its rules, its rules each reading the text as it came leaving it. One rule's rewrite exposed it
+  to the next (`Bearer 'Kapi_key=,'a eyJ… b',` lost its secret only because the `api_key=` rule
+  removed `,'a` before the bearer rule paired the quotes), and a union reads no rule into it.
+  Nothing else is excused, and against a previous commit that carries the block nothing can be by
+  order (its rules' union is its own output), nor by the quote where its parameter is already
+  `true`; the legacy reader goes once `main` carries the block. `tests/scrub_compare.py` (standard
+  library only) reads it for the NOC (`excused OLD.yaml < [[text, secret], …]`), and reads two
+  configs over a server's own journal as counts
+  (`journalctl -o json | python3 -I tests/scrub_compare.py counts OLD.yaml NEW.yaml`):
+  records read, records the two write differently, records whose candidate output holds eight
+  characters `main`'s redacted, and records whose message `main` leaves JSON and the candidate does
+  not; `--where` adds each counted record's position, never its text.
+- **The fleet's scrub is one block, copied by bytes** (basecradle-router#516). Pass 1 reads only
+  `.message` and the parameter lines just above it, and leaves the scrubbed message in `msg`, so
+  every host that runs it (these three, the NOC's `noc_scrub`, the web hosts' `web_scrub`) carries
+  the same bytes between `THE FLEET'S SCRUB, PASS 1` and its end, which one sha256 holds
+  (`tests/scrub_block.py` `BLOCK_SHA256`), plus its own parameters: `scrub_bearer_least` (the
+  shortest bare bearer token taken; any length here, 8 on the web hosts), `scrub_vendor_keys` (the
+  vendors' prefix rules beside the GitHub and BaseCradle ones), `scrub_heartbeat_to_quote` (a
+  heartbeat URL ends at a `"`; `true` here and on the web hosts, whose request lines are JSON with
+  a path a caller chose, Caddy's access lines on these three included, so a path that holds
+  `/heartbeat/` never takes the rest of its line and the request's own fields with it, an escaped
+  quote included, and one with a scheme is redacted from the scheme on even with nothing after
+  `/heartbeat/`, so its userinfo never ships; `false`, for a host with no request lines, lets the
+  run take the `"` and puts a kv value's closing quote back), `scrub_longest` (the longest
+  message read, 1 MiB) and `scrub_most` (the most spans one message may hold, 1,024). A pattern is
+  a literal in VRL, so the heartbeat parameter chooses between two statements in the block. **At
+  `true` a secret glued to a heartbeat URL past its closing quote is no longer the URL's**
+  (`url="…/heartbeat/K9"eyJ…`): the `\S` run took it with the quote, and now what is glued past
+  the quote ships unless another rule reads it (decided on #516, 2026-11-19, for the request lines'
+  sake). **A heartbeat URL whose slashes are JSON-escaped (`\/heartbeat\/`, as PHP's
+  `json_encode` writes it) is read by neither value**, and its token ships; no writer in the fleet
+  escapes a slash. Generated by `uv run python tests/scrub_block.py`; `tests/test_log_surface.py`
+  holds every host's copy to it.
+  **It fails closed:** no call in it can raise, and a pass that cannot vouch for its output (an
+  offset that does not fit the text, a message past `scrub_longest`, more spans than
+  `scrub_most`) ships `[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]` in place of the message, never the
+  message as it came, its identifier and writer check unchanged (`tests/test_scrub_block.py`
+  forces each). It reads the message through one lossy reading first, each byte that is not UTF-8
+  one U+FFFD as the box always shipped it, so every offset counts the bytes the rebuild cuts. The
+  bounds keep the pass linear in the line: VRL copies the span object on every write, so their
+  number is capped, and once the pass has failed no rule does more than scan; journald's own stream line is 48 KiB by default
+  (`LineMax=`), so `scrub_longest` binds only a message a writer sends whole through the native
+  protocol.
+- **A credential-named JSON member loses its value** (decided by @origin on basecradle-router#516,
+  2026-11-19), a rule of the block: a string value of a member named exactly `api_key`, `apikey`,
+  `access_token`, `refresh_token`, `client_secret`, `password`, `secret` or `authorization`, in any
+  case, with `-` or `_` or nothing between its words (never a bare `key` or `token`, and never a
+  name that only holds one: `my_password` keeps its value). The name stays, and the value becomes
+  the box's marker, `'<a value the box redacted>'`, to the JSON string's close, which stays, so the
+  line stays JSON: `{"password":"…","n":1}` ships as `{"password":"'<a value the box
+  redacted>'","n":1}`. The member's quotes may be escaped at any depth, its three at the same one:
+  unescaped the value is read as JSON reads a string, and inside one to five JSON strings a quote
+  behind a longer run of backslashes than the opener's is the value's own; at any other depth the
+  value ends at its first quote. A value that is a marker already (the box's, the print site's, the
+  harness's `[redacted]`) is left as it is. The message is read so; every other field, by the
+  credential rule alone. No scrub in the fleet had this rule (a shapeless secret in a JSON member
+  shipped everywhere), and the harness takes it next, so until then it is a shape the box takes and
+  the harness leaves.
 - **Every field, because a writer chooses far more of the record than its message:** the identifier,
   the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
   name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule

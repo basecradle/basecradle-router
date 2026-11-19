@@ -131,8 +131,8 @@ jobs:
       # the fleet's harness roll; Dependabot does not see a download.
       - name: Fetch the Harness's Scrub
         env:
-          HARNESS_VERSION: "0.198.2"
-          HARNESS_WHEEL_SHA256: "3bd085826bbc6f78a3ad7a02e129b68769839d878f83b1620e61095d2baedf61"
+          HARNESS_VERSION: "0.198.3"
+          HARNESS_WHEEL_SHA256: "eea932bc4e4320611aaeda51ba896931fcb945267da5e39e4915fa601bd9c982"
         run: |
           set -euo pipefail
           wheel="$RUNNER_TEMP/basecradle_harness-${HARNESS_VERSION}-py3-none-any.whl"

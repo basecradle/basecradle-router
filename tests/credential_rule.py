@@ -193,9 +193,9 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       # so every string is read, a field sent more than once included, and a field whose own name is
       # a credential's has its value replaced unless empty or a marker.
       #
-      # FIRST, before every token-shape rule, so each value is read as written and carries the one
-      # marker the NOC counts (after them `X_API_KEY=…` shipped as `X_apiKey=[REDACTED]`), and before
-      # the writer check, so a line marked `UNVERIFIED` is redacted exactly as one that is not.
+      # EVERY FIELD BUT THE MESSAGE, which the fleet's scrub above reads with this same rule among
+      # its own (basecradle-router#516), and before the writer check, so a line marked `UNVERIFIED`
+      # is redacted exactly as one that is not.
 """
 
 BLOCK = (
@@ -262,7 +262,7 @@ BLOCK = (
 
 #: Where the block starts and what follows it, in every host's file.
 START = "      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRITER"
-AFTER = "      # Redact secret-shaped patterns from the message"
+AFTER = "      # PRESENTATION — prefix the message"
 
 HOSTS = Path(__file__).resolve().parents[1] / "deploy" / "hosts"
 
