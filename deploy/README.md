@@ -2432,9 +2432,14 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   `${…}` piece), the assignment rule reads an `api_key=` inside an `x-api-key` header, an
   `api_key=` value opens at a quote escaped to any depth, and a piece left open before a scheme
   word is read both ways. `tests/test_vector_unit.py` (`_LIMIT`) pins each line with what the box
-  ships now. Every field but the message is read by the credential rule alone, so there its own
-  first two limits stand: a value ends at a scheme word it reads only as HTTP spells it, and never
-  opens at a `,` or a `}`.
+  ships now. One shape of the first stays, stated: a value whose token opens otherwise than a
+  bearer token of the box's does (`=`, `(`, a tab) after a scheme word only #510 reads ships
+  that token on the box (`A_TOKEN=abc-bearer =eyJ…`), since the credential rule reads a scheme word
+  only as HTTP spells it and the bearer rule a token only from a token character, a quote, a
+  substitution or an escape after blanks; the print site, and the harness on #514's reading since
+  0.198.3, take it. Every field but the message is read by the credential rule alone, so there its
+  own first two limits stand: a value ends at a scheme word it reads only as HTTP spells it, and
+  never opens at a `,` or a `}`.
   **The credential rule's own two passes stay one rule.** Its run reads the parity pass's output,
   where each value the parity pass took stands as the box's marker (the marker and what is glued to
   it are read as one word), and the union carries that reading as it is: the run over the parity
@@ -2464,16 +2469,21 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   by hand: `uv run python tests/scrub_differential.py --seed 1 --lines 400000 --base main`, with
   `VECTOR_BIN`, `HARNESS_WHEEL` and `HARNESS_PYTHON` set (`--help`). Move its pin with the fleet's
   harness roll.
-  **One row is excused against the previous commit, and only while that commit is the sequential
-  pass** (decided on #516, 2026-11-19): a secret the previous `ai_scrub` took only by the order of
+  **Two rows are excused against the previous commit** (decided on #516, 2026-11-19), each
+  counted and printed. **By the quote**, while the previous commit's heartbeat run reads past a
+  `"`: a secret it took only so, which the tree's own block with `scrub_heartbeat_to_quote = false`
+  takes too (the parameter alone leaves it, and the table's `a heartbeat URL read to a quote` row
+  is the same mechanism against the harness). **By order**, only while that commit is the
+  sequential pass: a secret the previous `ai_scrub` took only by the order of
   its rules, its rules each reading the text as it came leaving it. One rule's rewrite exposed it
   to the next (`Bearer 'Kapi_key=,'a eyJ… b',` lost its secret only because the `api_key=` rule
   removed `,'a` before the bearer rule paired the quotes), and a union reads no rule into it.
-  Nothing else is excused, the count is printed, and against a previous commit that carries the
-  block nothing can be (its rules' union is its own output); the legacy reader goes once `main`
-  carries the block. `tests/scrub_compare.py` (standard library only) reads it for the NOC
-  (`excused OLD.yaml < [[text, secret], …]`), and reads two configs over a server's own journal
-  as counts (`journalctl -o json | python3 -I tests/scrub_compare.py counts OLD.yaml NEW.yaml`):
+  Nothing else is excused, and against a previous commit that carries the block nothing can be by
+  order (its rules' union is its own output), nor by the quote where its parameter is already
+  `true`; the legacy reader goes once `main` carries the block. `tests/scrub_compare.py` (standard
+  library only) reads it for the NOC (`excused OLD.yaml < [[text, secret], …]`), and reads two
+  configs over a server's own journal as counts
+  (`journalctl -o json | python3 -I tests/scrub_compare.py counts OLD.yaml NEW.yaml`):
   records read, records the two write differently, records whose candidate output holds eight
   characters `main`'s redacted, and records whose message `main` leaves JSON and the candidate does
   not; `--where` adds each counted record's position, never its text.
@@ -2484,14 +2494,21 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   (`tests/scrub_block.py` `BLOCK_SHA256`), plus its own parameters: `scrub_bearer_least` (the
   shortest bare bearer token taken; any length here, 8 on the web hosts), `scrub_vendor_keys` (the
   vendors' prefix rules beside the GitHub and BaseCradle ones), `scrub_heartbeat_to_quote` (a
-  heartbeat URL ends at a `"`; `false` here and on the NOC's box, where the run takes the `"` and
-  puts a kv value's closing quote back; the web hosts take `true` with their copy of the block,
-  since their request lines are JSON parsed after the scrub, so a path a caller chose that holds
+  heartbeat URL ends at a `"`; `true` here and on the web hosts, whose request lines are JSON with
+  a path a caller chose, Caddy's access lines on these three included, so a path that holds
   `/heartbeat/` never takes the rest of its line and the request's own fields with it, an escaped
-  quote included), `scrub_longest` (the longest message read,
-  1 MiB) and `scrub_most` (the most spans one message may hold, 1,024). A pattern is a literal in
-  VRL, so the heartbeat parameter chooses between two statements in the block. Generated by
-  `uv run python tests/scrub_block.py`; `tests/test_log_surface.py` holds every host's copy to it.
+  quote included, and one with a scheme is redacted from the scheme on even with nothing after
+  `/heartbeat/`, so its userinfo never ships; `false`, for a host with no request lines, lets the
+  run take the `"` and puts a kv value's closing quote back), `scrub_longest` (the longest
+  message read, 1 MiB) and `scrub_most` (the most spans one message may hold, 1,024). A pattern is
+  a literal in VRL, so the heartbeat parameter chooses between two statements in the block. **At
+  `true` a secret glued to a heartbeat URL past its closing quote is no longer the URL's**
+  (`url="…/heartbeat/K9"eyJ…`): the `\S` run took it with the quote, and now what is glued past
+  the quote ships unless another rule reads it (decided on #516, 2026-11-19, for the request lines'
+  sake). **A heartbeat URL whose slashes are JSON-escaped (`\/heartbeat\/`, as PHP's
+  `json_encode` writes it) is read by neither value**, and its token ships; no writer in the fleet
+  escapes a slash. Generated by `uv run python tests/scrub_block.py`; `tests/test_log_surface.py`
+  holds every host's copy to it.
   **It fails closed:** no call in it can raise, and a pass that cannot vouch for its output (an
   offset that does not fit the text, a message past `scrub_longest`, more spans than
   `scrub_most`) ships `[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]` in place of the message, never the
@@ -2502,6 +2519,21 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   number is capped, and once the pass has failed no rule does more than scan; journald's own stream line is 48 KiB by default
   (`LineMax=`), so `scrub_longest` binds only a message a writer sends whole through the native
   protocol.
+- **A credential-named JSON member loses its value** (decided by @origin on basecradle-router#516,
+  2026-11-19), a rule of the block: a string value of a member named exactly `api_key`, `apikey`,
+  `access_token`, `refresh_token`, `client_secret`, `password`, `secret` or `authorization`, in any
+  case, with `-` or `_` or nothing between its words (never a bare `key` or `token`, and never a
+  name that only holds one: `my_password` keeps its value). The name stays, and the value becomes
+  the box's marker, `'<a value the box redacted>'`, to the JSON string's close, which stays, so the
+  line stays JSON: `{"password":"…","n":1}` ships as `{"password":"'<a value the box
+  redacted>'","n":1}`. The member's quotes may be escaped at any depth, its three at the same one:
+  unescaped the value is read as JSON reads a string, and inside one to five JSON strings a quote
+  behind a longer run of backslashes than the opener's is the value's own; at any other depth the
+  value ends at its first quote. A value that is a marker already (the box's, the print site's, the
+  harness's `[redacted]`) is left as it is. The message is read so; every other field, by the
+  credential rule alone. No scrub in the fleet had this rule (a shapeless secret in a JSON member
+  shipped everywhere), and the harness takes it next, so until then it is a shape the box takes and
+  the harness leaves.
 - **Every field, because a writer chooses far more of the record than its message:** the identifier,
   the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
   name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule

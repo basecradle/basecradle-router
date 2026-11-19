@@ -120,14 +120,17 @@ REQUEST = (
 )
 
 
+#: The parameter flipped to `false`, for a host with no request lines.
+_RUN_PAST_A_QUOTE = {"scrub_heartbeat_to_quote = true\n": "scrub_heartbeat_to_quote = false\n"}
+
+
 def test_a_heartbeat_url_read_to_a_quote_keeps_a_json_line_and_its_fields(
     vector: str, tmp_path: Path
 ) -> None:
-    # `scrub_heartbeat_to_quote` (the web hosts' value): the URL ends at the `"` closing the path,
-    # so the line stays JSON and every field after the path, the caller's address included, stays.
-    program = _program(
-        **{"scrub_heartbeat_to_quote = false\n": "scrub_heartbeat_to_quote = true\n"}
-    )
+    # `scrub_heartbeat_to_quote` (this repository's hosts' value since #516's last round, and the
+    # web hosts'): the URL ends at the `"` closing the path, so the line stays JSON and every
+    # field after the path, the caller's address included, stays.
+    program = _program()
     shipped = _shipped(vector, program, REQUEST, tmp_path).removeprefix("[x] ")
     assert json.loads(shipped) == {
         **json.loads(REQUEST),
@@ -148,18 +151,20 @@ def test_a_heartbeat_url_read_to_a_quote_keeps_a_json_line_and_its_fields(
 #: encoder escapes or a run could end at.
 _PATH_PIECES = ('"', "\\", "\\\\", "'", " ", "\t", "/", "?", "&", "=", "%22", "x", "\u00e9", "\n")
 
+#: The member names the property test puts beside a path.
+_MEMBERS = ("password", "Authorization", "api-key", "ACCESS_TOKEN", "clientSecret")
 
-def test_a_caller_chosen_heartbeat_path_never_breaks_a_web_request_line(
+
+def test_a_caller_chosen_heartbeat_path_never_breaks_a_request_line(
     vector: str, tmp_path: Path
 ) -> None:
-    # The property the web hosts' value exists for, over 2,000 seeded paths: the request line
+    # The property the parameter's `true` exists for, over 2,000 seeded paths: the request line
     # stays JSON, every field but the path is as it came, and no eight characters of the
-    # heartbeat token ship.
+    # heartbeat token ship. Half the lines carry a credential-named member too (#516's last round):
+    # its value goes and every other field stays.
     rng = random.Random(516)
     token = "K9fabricatedHeartbeat01"
-    program = _program(
-        **{"scrub_heartbeat_to_quote = false\n": "scrub_heartbeat_to_quote = true\n"}
-    )
+    program = _program()
     lines = []
     for _ in range(2000):
         around = ["".join(rng.choices(_PATH_PIECES, k=rng.randint(0, 4))) for _ in range(3)]
@@ -168,28 +173,98 @@ def test_a_caller_chosen_heartbeat_path_never_breaks_a_web_request_line(
             path = f"https://hc.example.com{path}"
         request = {"method": "GET", "path": around[2] + path, "status": 404}
         request["remote_ip"] = "203.0.113.9"
+        if rng.random() < 0.5:
+            # A credential-named member beside the path, its value as unruly as the path.
+            request[rng.choice(_MEMBERS)] = rng.choice(around) + SECRET + rng.choice(around)
         lines.append(request)
     events = [{"SYSLOG_IDENTIFIER": "x", "message": json.dumps(r)} for r in lines]
     shipped = scrub_compare.run(vector, program, events, tmp_path)
     for request, out in zip(lines, shipped, strict=True):
         assert out is not None and out.startswith("[x] "), (request, out)
         got = json.loads(out.removeprefix("[x] "))
-        assert {k: v for k, v in got.items() if k != "path"} == {
-            k: v for k, v in request.items() if k != "path"
+        members = [k for k in request if k in _MEMBERS]
+        assert {k: v for k, v in got.items() if k != "path" and k not in members} == {
+            k: v for k, v in request.items() if k != "path" and k not in members
         }, (request, out)
+        assert all(got[k] == MARK for k in members), (request, out)
         assert "[REDACTED_HEARTBEAT_URL]" in got["path"], (request, out)
-        assert not any(token[i : i + 8] in out for i in range(len(token) - 7)), (request, out)
+        for secret in (token, SECRET):
+            assert not any(secret[i : i + 8] in out for i in range(len(secret) - 7)), (request, out)
 
 
-def test_a_heartbeat_url_on_the_fleet_runs_past_a_quote_as_before(
+def test_a_heartbeat_url_read_past_a_quote_where_the_parameter_is_false(
     vector: str, tmp_path: Path
 ) -> None:
-    # The fleet's value (`false`) reads exactly as the block did before the parameter, so its
-    # output does not move: the run takes the `"` and what is glued to it, and a kv value's closing
-    # quote is put back. On a JSON line that takes the rest of the line, as `main` does.
-    shipped = _shipped(vector, _program(), REQUEST, tmp_path)
+    # `false`, kept for a host with no request lines, reads as the sequential pass did: the run
+    # takes the `"` and what is glued to it, and a kv value's closing quote is put back. On a JSON
+    # line that takes the rest of the line.
+    program = _program(**_RUN_PAST_A_QUOTE)
+    shipped = _shipped(vector, program, REQUEST, tmp_path)
     assert shipped == '[x] {"method":"GET","path":"[REDACTED_HEARTBEAT_URL]'
     kv = 'ping url="https://hc.example.com/heartbeat/K9fabricatedHeartbeat01" next=1'
-    assert _shipped(vector, _program(), kv, tmp_path) == (
+    assert _shipped(vector, program, kv, tmp_path) == (
         '[x] ping url="[REDACTED_HEARTBEAT_URL]" next=1'
     )
+
+
+MARK = "'<a value the box redacted>'"
+
+
+@pytest.mark.parametrize(
+    ("member", "kept"),
+    [
+        ({"password": SECRET}, None),
+        ({"API_KEY": SECRET}, None),
+        ({"apikey": SECRET}, None),
+        ({"Api-Key": SECRET}, None),
+        ({"access_token": SECRET}, None),
+        ({"accessToken": SECRET}, None),
+        ({"refresh-token": SECRET}, None),
+        ({"CLIENT_SECRET": SECRET}, None),
+        ({"secret": SECRET}, None),
+        ({"Authorization": f"Basic {SECRET}"}, None),
+        ({"password": f'a"b\\c{SECRET}'}, None),
+        # Never a bare `key` or `token`, and never a name that only holds one of the words.
+        ({"key": SECRET}, SECRET),
+        ({"token": SECRET}, SECRET),
+        ({"my_password": SECRET}, SECRET),
+        ({"password_hint": SECRET}, SECRET),
+        ({"access token": SECRET}, SECRET),
+    ],
+)
+def test_a_credential_named_json_member_loses_its_value_and_keeps_its_name(
+    vector: str, tmp_path: Path, member: dict[str, str], kept: str | None
+) -> None:
+    # @origin's rule (2026-11-19, #516): the value goes, the name and every other field stay, and
+    # the line stays JSON.
+    line = json.dumps({**member, "status": 200, "remote_ip": "203.0.113.9"})
+    got = json.loads(_shipped(vector, _program(), line, tmp_path).removeprefix("[x] "))
+    ((name, value),) = member.items()
+    assert got == {name: kept or MARK, "status": 200, "remote_ip": "203.0.113.9"}
+    if kept is None:
+        assert SECRET[:8] not in json.dumps(got) and value != MARK
+
+
+def test_a_credential_named_member_escaped_at_any_depth_keeps_every_line_json(
+    vector: str, tmp_path: Path
+) -> None:
+    # JSON inside one, two, three and four JSON strings: each level's value goes, its close stays
+    # as deep as it came, so every level still parses, a quote inside the value included.
+    inner: object = {"password": f'x"{SECRET}', "user": "john"}
+    nested = [inner]
+    for _ in range(4):
+        inner = {"msg": json.dumps(inner), "n": 1}
+        nested.append(inner)
+    for depth, line in enumerate(nested):
+        out = _shipped(vector, _program(), json.dumps(line), tmp_path).removeprefix("[x] ")
+        assert SECRET[:8] not in out, (depth, out)
+        got: object = json.loads(out)
+        for _ in range(depth):
+            got = json.loads(got["msg"])  # type: ignore[index]
+        assert got == {"password": MARK, "user": "john"}, (depth, out)
+
+
+def test_a_member_value_already_redacted_is_left_as_it_is(vector: str, tmp_path: Path) -> None:
+    for marker in (MARK, "'<a redacted value>'", "[redacted]", "[REDACTED]", ""):
+        line = json.dumps({"password": marker, "n": 1})
+        assert _shipped(vector, _program(), line, tmp_path) == f"[x] {line}"

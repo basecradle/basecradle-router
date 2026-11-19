@@ -107,15 +107,19 @@ def test_nothing_the_previous_commit_took_is_left(
         assert not os.environ.get("CI"), f"{base} is not in the CI clone"
         pytest.skip(f"{base} is not in this clone")
     before = sd.host_sources(base)
-    found, excused = sd.by_order(
-        vector, before, sd.regressions(vector, before, sd.host_sources(), corpus), tmp_path
+    found, quoted = sd.by_quote(
+        vector, before, sd.regressions(vector, before, sd.host_sources(), corpus)
     )
+    found, excused = sd.by_order(vector, before, found, tmp_path)
     assert not found, found[:5]
-    # The one excused row is counted, never silent (decided on #516): a secret the previous
-    # sequential pass took only by the order of its rules.
+    # The two excused rows are counted, never silent (decided on #516): a secret the previous
+    # sequential pass took only by the order of its rules, and one its heartbeat run took only by
+    # reading past a `"`, which the tree's ends at.
     with capsys.disabled():
         print(
             f"\nexcused by order against {base}: {len({row[1] for row in excused})}"
+            f" of {len(corpus)} texts"
+            f"\nexcused by the quote against {base}: {len({row[1] for row in quoted})}"
             f" of {len(corpus)} texts"
         )
 
@@ -198,20 +202,26 @@ def test_every_row_still_explains_its_example(vector: str) -> None:
     harness, harness_credentials = sd.harness_readings(examples)
     rules = sd.harness_rules(examples)
     readings = [
-        (sd.box_readings(vector, source, examples), sd.taken_apart(vector, source, examples))
+        (
+            sd.box_readings(vector, source, examples),
+            sd.taken_apart(vector, source, examples),
+            sd.taken_past_a_quote(vector, source, examples),
+        )
         for source in sd.scrub_sources()
     ]
     for i, row in enumerate(stated):
         if row.reading == "print":
-            seen = [(redact_credentials(row.example), harness_credentials[i], False)]
+            seen = [(redact_credentials(row.example), harness_credentials[i], False, False)]
         else:
-            seen = [(box[i], harness[i], apart[i]) for box, apart in readings]
+            seen = [(box[i], harness[i], apart[i], past[i]) for box, apart, past in readings]
         differing = [
-            (got, whole) for got, ref, whole in seen if sd.leaks(got) and not sd.leaks(ref)
+            (got, whole, past)
+            for got, ref, whole, past in seen
+            if sd.leaks(got) and not sd.leaks(ref)
         ]
         assert differing, (row.name, seen)
-        for _, whole in differing:
-            facts = sd.Facts(taken_apart=whole, harness_rules=rules[i])
+        for _, whole, past in differing:
+            facts = sd.Facts(taken_apart=whole, harness_rules=rules[i], taken_past_a_quote=past)
             assert sd.explained(row.reading, row.example, facts) is row, row.name
 
 

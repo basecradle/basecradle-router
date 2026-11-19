@@ -129,11 +129,16 @@ HEARTBEAT = (
 #: request's own fields, the caller's address included (the capital's web read of #516). A
 #: backslash goes into the URL only before another character of it, never before the quote it
 #: escapes (`API_RUN`), so a URL inside a JSON string (`\"…/heartbeat/K9\"`) keeps its line JSON.
-#: The run never holds a `"`, so no closing quote is put back. A pattern is a literal in VRL, so
-#: the two readings are two statements, and the block one sha256.
+#: The run never holds a `"`, so no closing quote is put back. With a scheme the URL may end right
+#: after `/heartbeat/` (`url="https://john:…@host/heartbeat/"`), so userinfo before the host never
+#: ships where the `\S` run took the quote after the path. A pattern is a literal in VRL, so the
+#: two readings are two statements, and the block one sha256.
 HB_RUN = r"""(?:[^\s"\\]|\\+[^\s"\\])"""
-HEARTBEAT_TO_QUOTE = HEARTBEAT.replace(r"\S", HB_RUN)
-assert HEARTBEAT_TO_QUOTE.count(HB_RUN) == 2, HEARTBEAT_TO_QUOTE
+HEARTBEAT_TO_QUOTE = (
+    rf"(?P<url>https?://{HB_RUN}*/heartbeat/{HB_RUN}*|/heartbeat/{HB_RUN}+)"
+    + HEARTBEAT[HEARTBEAT.index("(?P<after>") :]
+)
+assert HEARTBEAT.startswith(r"(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>"), HEARTBEAT
 
 #: The `x-api-key` header (basecradle-router#423, basecradle-harness#861): its label, a quote at
 #: any depth of escaping (basecradle-harness#935), and a value that reads on through every header
@@ -170,6 +175,38 @@ API_KEY = (
 QUERY = (
     "(?i)(?P<label>[?&](?:api[-_]?key|access[-_]?token|token|key)=)"
     f"(?:{KEPT}|{GLUED_MARKER}|{API_VALUE})"
+)
+
+#: A credential-named JSON member (decided by `@origin` on basecradle-router#516, 2026-11-19): a
+#: string value of a member named exactly one of these words, in any case, with `-` or `_` or
+#: nothing between its words, never a bare `key` or `token`. The name stays, and the value is the
+#: JSON string to its close, so the line stays JSON. The member's quotes are escaped at any depth,
+#: as the block's other openers are, and its three quotes (the name's two and the value's opener) at
+#: the same depth: unescaped, the value is read as JSON reads a string (a backslash escapes the next
+#: character); escaped as JSON inside one to five JSON strings (a run of `2**d - 1` backslashes, 1
+#: to 31), a quote behind a longer run is the value's own and one behind the opener's run or a
+#: shorter one closes it; at any other run the value ends at its first quote. The close is never
+#: taken, so it stays as deep as it came. (A value ending in a backslash, escaped once or deeper,
+#: reads past its close to the next quote that run allows: more is taken, and the outermost string
+#: still parses.)
+MEMBER_NAME = (
+    "(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret"
+    "|authorization)"
+)
+MEMBER_DEPTHS = (1, 3, 7, 15, 31)
+MEMBER = "|".join(
+    [
+        rf"""(?P<member_0>"{MEMBER_NAME}"\s*:\s*")(?:[^"\\]|\\[\s\S])*""",
+        *(
+            rf"""(?P<member_{n}>\\{{{n}}}"{MEMBER_NAME}\\{{{n}}}"\s*:\s*\\{{{n}}}")"""
+            rf"""(?:[^"\\]|\\+[^"\\]|\\{{{n + 1},}}")*"""
+            for n in MEMBER_DEPTHS
+        ),
+        rf"""(?P<member_any>\\+"{MEMBER_NAME}\\+"\s*:\s*\\+")(?:[^"\\]|\\+[^"\\])*""",
+    ]
+)
+_MEMBER_HEADS = " ?? ".join(
+    f"string(member.member_{n})" for n in ("0", *map(str, MEMBER_DEPTHS), "any")
 )
 
 #: The bearer header (`tests/bearer_rule.py`), with one fix (basecradle-router#516, F2): a piece
@@ -281,7 +318,14 @@ MARKS = {
     "i": "[REDACTED_BC_INTEGRATION_SECRET]",
     "u": "[REDACTED_BC_TOKEN]",
     "k": "[REDACTED_API_KEY]",
+    "m": "'<a value the box redacted>'",
 }
+
+#: A member's value that is already a marker, the box's, the print site's or the harness's, is left
+#: as it is: there is nothing in it to hide, and a line a scrub already wrote does not change.
+MEMBER_KEPT = (
+    """["'<a value the box redacted>'", "'<a redacted value>'", "[redacted]", "[REDACTED]"]"""
+)
 
 #: The whole message, when the pass cannot vouch for what it would ship.
 FAILED = "[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]"
@@ -623,6 +667,16 @@ def _body(only: str | None = None) -> str:
         + f"{_R}}}\n",
         flags="(?x)",
     )
+    member = _rule(
+        MEMBER,
+        "member",
+        f'{_R}span_from = span_at + length({_MEMBER_HEADS} ?? "")\n'
+        f"{_R}span_to = scrub_pos + length(member.string)\n"
+        f'{_R}member_value = slice(scrub_text, span_from, span_to) ?? ""\n'
+        f"{_R}if span_to > span_from && !includes({MEMBER_KEPT}, member_value) {{\n"
+        + _add(_R + "    ", "span_from", "span_to", "m")
+        + f"{_R}}}\n",
+    )
     rules = {
         "credential": (credential_parity, credential_run),
         "heartbeat": heartbeat,
@@ -631,6 +685,7 @@ def _body(only: str | None = None) -> str:
         "query": query,
         "bearer": bearer,
         "prefix": prefix,
+        "member": member,
     }
     if only is not None:
         rules = {
@@ -638,7 +693,7 @@ def _body(only: str | None = None) -> str:
             for name, rule in rules.items()
         }
     credential_parity, credential_run = rules.pop("credential")
-    heartbeat, x_api_key, api_key, query, bearer, prefix = rules.values()
+    heartbeat, x_api_key, api_key, query, bearer, prefix, member = rules.values()
     credential = (
         f'{_I}    if contains(scrub_text, "=") {{\n'
         f'{_I}        if contains(scrub_text, "\\"") {{\n'
@@ -659,7 +714,7 @@ def _body(only: str | None = None) -> str:
 {_I}scrub_pos = 0
 {_I}scrub_failed = scrub_size > scrub_longest
 {_I}if !scrub_failed && scrub_text != "" {{
-{credential}{heartbeat}{x_api_key}{api_key}{query}{bearer}{prefix}{_I}}}
+{credential}{heartbeat}{x_api_key}{api_key}{query}{bearer}{prefix}{member}{_I}}}
 {_I}scrub_parts = []
 {_I}scrub_done = 0
 {_I}scrub_open = -1
@@ -692,7 +747,7 @@ def _body(only: str | None = None) -> str:
 
 BLOCK = COMMENT + _body() + END
 #: Each rule's statements alone, in the block's frame (the differential's `rules_alone`).
-RULES = ("credential", "heartbeat", "x-api-key", "api_key", "query", "bearer", "prefix")
+RULES = ("credential", "heartbeat", "x-api-key", "api_key", "query", "bearer", "prefix", "member")
 
 
 def alone(rule: str) -> str:
@@ -709,13 +764,13 @@ PARAMETERS = """\
       # differ between the hosts that carry the block below. `scrub_bearer_least` is the shortest
       # bare bearer token taken (any length here); `scrub_vendor_keys` runs the vendors' prefix
       # rules beside the GitHub and BaseCradle ones; `scrub_heartbeat_to_quote` ends a heartbeat
-      # URL at a `"` (a host whose lines are JSON parsed after the scrub), where here its run
-      # takes the `"` and puts a kv value's closing quote back; `scrub_longest` is the longest
-      # message read, in bytes, and `scrub_most` the most spans one message may hold: past either
-      # the message ships as the block's failure marker.
+      # URL at a `"`, so a JSON line whose path a caller chose (Caddy's access lines here) keeps
+      # its fields, where `false` lets the run take the `"` and puts a kv value's closing quote
+      # back; `scrub_longest` is the longest message read, in bytes, and `scrub_most` the most
+      # spans one message may hold: past either the message ships as the block's failure marker.
       scrub_bearer_least = 1
       scrub_vendor_keys = true
-      scrub_heartbeat_to_quote = false
+      scrub_heartbeat_to_quote = true
       scrub_longest = 1048576
       scrub_most = 1024
 """

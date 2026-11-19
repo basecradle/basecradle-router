@@ -160,13 +160,13 @@ transforms:
       # differ between the hosts that carry the block below. `scrub_bearer_least` is the shortest
       # bare bearer token taken (any length here); `scrub_vendor_keys` runs the vendors' prefix
       # rules beside the GitHub and BaseCradle ones; `scrub_heartbeat_to_quote` ends a heartbeat
-      # URL at a `"` (a host whose lines are JSON parsed after the scrub), where here its run
-      # takes the `"` and puts a kv value's closing quote back; `scrub_longest` is the longest
-      # message read, in bytes, and `scrub_most` the most spans one message may hold: past either
-      # the message ships as the block's failure marker.
+      # URL at a `"`, so a JSON line whose path a caller chose (Caddy's access lines here) keeps
+      # its fields, where `false` lets the run take the `"` and puts a kv value's closing quote
+      # back; `scrub_longest` is the longest message read, in bytes, and `scrub_most` the most
+      # spans one message may hold: past either the message ships as the block's failure marker.
       scrub_bearer_least = 1
       scrub_vendor_keys = true
-      scrub_heartbeat_to_quote = false
+      scrub_heartbeat_to_quote = true
       scrub_longest = 1048576
       scrub_most = 1024
       # THE FLEET'S SCRUB, PASS 1 (basecradle-router#516). One block, the same bytes
@@ -405,7 +405,7 @@ transforms:
               }
           }
           if scrub_heartbeat_to_quote {
-              replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<url>(?:https?://(?:[^\s"\\]|\\+[^\s"\\])*)?/heartbeat/(?:[^\s"\\]|\\+[^\s"\\])+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?)') -> |hb| {
+              replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<url>https?://(?:[^\s"\\]|\\+[^\s"\\])*/heartbeat/(?:[^\s"\\]|\\+[^\s"\\])*|/heartbeat/(?:[^\s"\\]|\\+[^\s"\\])+)(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?)') -> |hb| {
                   if !scrub_failed {
                       span_at = scrub_pos + length(string(hb.pre) ?? "")
                       span_to = span_at + length(string(hb.url) ?? "")
@@ -617,6 +617,32 @@ transforms:
               ""
           }
           scrub_pos = 0
+          replace_with(scrub_text, r'(?P<pre>[\s\S]*?)(?:(?P<member_0>"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)"\s*:\s*")(?:[^"\\]|\\[\s\S])*|(?P<member_1>\\{1}"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\{1}"\s*:\s*\\{1}")(?:[^"\\]|\\+[^"\\]|\\{2,}")*|(?P<member_3>\\{3}"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\{3}"\s*:\s*\\{3}")(?:[^"\\]|\\+[^"\\]|\\{4,}")*|(?P<member_7>\\{7}"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\{7}"\s*:\s*\\{7}")(?:[^"\\]|\\+[^"\\]|\\{8,}")*|(?P<member_15>\\{15}"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\{15}"\s*:\s*\\{15}")(?:[^"\\]|\\+[^"\\]|\\{16,}")*|(?P<member_31>\\{31}"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\{31}"\s*:\s*\\{31}")(?:[^"\\]|\\+[^"\\]|\\{32,}")*|(?P<member_any>\\+"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret|authorization)\\+"\s*:\s*\\+")(?:[^"\\]|\\+[^"\\])*)') -> |member| {
+              if !scrub_failed {
+                  span_at = scrub_pos + length(string(member.pre) ?? "")
+                  span_from = span_at + length(string(member.member_0) ?? string(member.member_1) ?? string(member.member_3) ?? string(member.member_7) ?? string(member.member_15) ?? string(member.member_31) ?? string(member.member_any) ?? "")
+                  span_to = scrub_pos + length(member.string)
+                  member_value = slice(scrub_text, span_from, span_to) ?? ""
+                  if span_to > span_from && !includes(["'<a value the box redacted>'", "'<a redacted value>'", "[redacted]", "[REDACTED]"], member_value) {
+                      if scrub_count >= scrub_most { scrub_failed = true } else {
+                          span_key = slice("000000000" + to_string(span_from), -9) ?? ""
+                          span_had = -1
+                          span_prior = get(scrub_spans, [span_key, 0]) ?? null
+                          if span_prior != null { span_had = to_int(span_prior) ?? -1 }
+                          if span_had < 0 || span_to > span_had {
+                              span_kind = "m"
+                              if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "m") ?? "m" }
+                              span_new, span_err = set(scrub_spans, [span_key], [span_to, span_kind])
+                              if span_err == null { scrub_spans = span_new } else { scrub_failed = true }
+                              if span_had < 0 { scrub_count = scrub_count + 1 }
+                          }
+                      }
+                  }
+              }
+              scrub_pos = scrub_pos + length(member.string)
+              ""
+          }
+          scrub_pos = 0
       }
       scrub_parts = []
       scrub_done = 0
@@ -725,7 +751,7 @@ transforms:
                       scrub_failed = true
                   } else {
                       scrub_parts = push(scrub_parts, scrub_kept)
-                      scrub_mark = if scrub_open_kind == "c" { "'<a value the box redacted>'" } else if scrub_open_kind == "h" { "[REDACTED_HEARTBEAT_URL]" } else if scrub_open_kind == "x" { "x-api-key: [REDACTED]" } else if scrub_open_kind == "a" { "apiKey=[REDACTED]" } else if scrub_open_kind == "q" { "[REDACTED]" } else if scrub_open_kind == "b" { "Bearer [REDACTED]" } else if scrub_open_kind == "g" { "[REDACTED_GH_TOKEN]" } else if scrub_open_kind == "i" { "[REDACTED_BC_INTEGRATION_SECRET]" } else if scrub_open_kind == "u" { "[REDACTED_BC_TOKEN]" } else if scrub_open_kind == "k" { "[REDACTED_API_KEY]" } else { "[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]" }
+                      scrub_mark = if scrub_open_kind == "c" { "'<a value the box redacted>'" } else if scrub_open_kind == "h" { "[REDACTED_HEARTBEAT_URL]" } else if scrub_open_kind == "x" { "x-api-key: [REDACTED]" } else if scrub_open_kind == "a" { "apiKey=[REDACTED]" } else if scrub_open_kind == "q" { "[REDACTED]" } else if scrub_open_kind == "b" { "Bearer [REDACTED]" } else if scrub_open_kind == "g" { "[REDACTED_GH_TOKEN]" } else if scrub_open_kind == "i" { "[REDACTED_BC_INTEGRATION_SECRET]" } else if scrub_open_kind == "u" { "[REDACTED_BC_TOKEN]" } else if scrub_open_kind == "k" { "[REDACTED_API_KEY]" } else if scrub_open_kind == "m" { "'<a value the box redacted>'" } else { "[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]" }
                       scrub_parts = push(scrub_parts, scrub_mark)
                   }
                   scrub_done = scrub_open_end
@@ -799,7 +825,7 @@ transforms:
                   scrub_failed = true
               } else {
                   scrub_parts = push(scrub_parts, scrub_kept)
-                  scrub_mark = if scrub_open_kind == "c" { "'<a value the box redacted>'" } else if scrub_open_kind == "h" { "[REDACTED_HEARTBEAT_URL]" } else if scrub_open_kind == "x" { "x-api-key: [REDACTED]" } else if scrub_open_kind == "a" { "apiKey=[REDACTED]" } else if scrub_open_kind == "q" { "[REDACTED]" } else if scrub_open_kind == "b" { "Bearer [REDACTED]" } else if scrub_open_kind == "g" { "[REDACTED_GH_TOKEN]" } else if scrub_open_kind == "i" { "[REDACTED_BC_INTEGRATION_SECRET]" } else if scrub_open_kind == "u" { "[REDACTED_BC_TOKEN]" } else if scrub_open_kind == "k" { "[REDACTED_API_KEY]" } else { "[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]" }
+                  scrub_mark = if scrub_open_kind == "c" { "'<a value the box redacted>'" } else if scrub_open_kind == "h" { "[REDACTED_HEARTBEAT_URL]" } else if scrub_open_kind == "x" { "x-api-key: [REDACTED]" } else if scrub_open_kind == "a" { "apiKey=[REDACTED]" } else if scrub_open_kind == "q" { "[REDACTED]" } else if scrub_open_kind == "b" { "Bearer [REDACTED]" } else if scrub_open_kind == "g" { "[REDACTED_GH_TOKEN]" } else if scrub_open_kind == "i" { "[REDACTED_BC_INTEGRATION_SECRET]" } else if scrub_open_kind == "u" { "[REDACTED_BC_TOKEN]" } else if scrub_open_kind == "k" { "[REDACTED_API_KEY]" } else if scrub_open_kind == "m" { "'<a value the box redacted>'" } else { "[REDACTED_A_LINE_THE_BOX_COULD_NOT_SCRUB]" }
                   scrub_parts = push(scrub_parts, scrub_mark)
               }
               scrub_done = scrub_open_end

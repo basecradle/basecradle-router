@@ -350,8 +350,10 @@ def test_every_rule_of_the_block_runs_for_every_writer() -> None:
             r"^( *)replace_with\(scrub_text, r'(?:\(\?x\))?\(\?P<pre>", source, re.M
         )
     ]
-    # Every rule but the run over the parity pass's output, which reads `scrub_parity`.
-    assert len(starts) == 10, len(starts)
+    # Every rule but the run over the parity pass's output, which reads `scrub_parity`; the
+    # credential-named JSON member's is the eleventh (#516's last round).
+    assert len(starts) == 11, len(starts)
+    assert "(?P<member_0>" in source[starts[-1].start() : source.index("\n", starts[-1].start())]
     credential = source.index('if contains(scrub_text, "=") {')
     end = source.index("\n" + " " * indent + "}\n", credential)
     guard = " " * indent + "if scrub_heartbeat_to_quote {\n"

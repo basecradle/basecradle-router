@@ -158,15 +158,17 @@ tests:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          # The heartbeat match runs to the end of the space-free run, which ends in `Bearer`. Taken
-          # with the URL, the word left its token in the next run, which no rule matched.
+          # Read past the quote (`scrub_heartbeat_to_quote = false`), the heartbeat match ran to the
+          # end of the space-free run, which ends in `Bearer`, and taken with the URL the word left
+          # its token in the next run, which no rule matched. Read to the quote, as these hosts do,
+          # the URL ends at its `"` and the `auth` field stays, its token taken by the bearer rule.
           . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": s'{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}'}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, s'[basecradle-router] {"url":"[REDACTED_HEARTBEAT_URL]"}')
+              assert_eq!(.message, s'[basecradle-router] {"url":"[REDACTED_HEARTBEAT_URL]","auth":"Bearer [REDACTED]"}')
 
   - name: "a bearer word ending a heartbeat run in a query value redacts its token"
     inputs:
@@ -935,21 +937,22 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] \u{1b}[31murl=\"[REDACTED_HEARTBEAT_URL]\"\u{1b}[0m next=1 | url=\"[REDACTED_HEARTBEAT_URL]\" \u{1b}[32moutcome=ok | url=\"[REDACTED_HEARTBEAT_URL]\"\nsecond line")
 
-  - name: "only a closing quote is put back and the url is always redacted"
+  - name: "a quoted url ends at its quote and is redacted from the scheme on with nothing after its path"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
         source: |
-          # A quote followed by prose is not a kv value's closing quote, so it goes with the URL as it
-          # always did. A quoted URL with nothing after `/heartbeat/` is still redacted from the
-          # scheme on (the harness keeps it), because that match is what keeps userinfo from shipping.
+          # Read to the quote (`scrub_heartbeat_to_quote = true`), a quote followed by prose stays,
+          # as a kv value's closing quote does. A quoted URL with nothing after `/heartbeat/` is
+          # still redacted from the scheme on (the harness keeps it), because that match is what
+          # keeps userinfo from shipping.
           . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "said \"https://h.example.com/heartbeat/K9fab1cated\" twice | url=\"https://john:hunter2@uptime.example.com/api/v1/heartbeat/\" next=1"}
     outputs:
       - extract_from: "ai_scrub"
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] said \"[REDACTED_HEARTBEAT_URL] twice | url=\"[REDACTED_HEARTBEAT_URL]\" next=1")
+              assert_eq!(.message, "[basecradle-router] said \"[REDACTED_HEARTBEAT_URL]\" twice | url=\"[REDACTED_HEARTBEAT_URL]\" next=1")
 
   # --- a bearer header's token is taken whole, quoted or not (basecradle-router#507) ----------
 

@@ -92,12 +92,13 @@ def rule_spans(observability: types.ModuleType, text: str) -> dict[str, list[lis
     (`_observability.scrub`, which names its five rules and reads them so). These are the module's
     private names at the pinned release, so a harness roll that renames one fails here, loudly."""
     o = observability
+    values = {start for start, _ in o._credential_spans(text)}
     spans = {
         "credential": [s for s in o._credential_spans(text) if s[1] > s[0]],
         "heartbeat": [o._heartbeat_span(m) for m in o._HEARTBEAT_RUN.finditer(text)],
-        "x-api-key": list(o._x_api_key_spans(text)),
-        "query": [m.span() for m in o._QUERY.finditer(text)],
-        "api_key": [m.span() for m in o._API_KEY.finditer(text)],
+        "x-api-key": list(o._literal_spans(o._X_API_KEY, text, values)),
+        "query": list(o._literal_spans(o._QUERY, text, values)),
+        "api_key": list(o._literal_spans(o._API_KEY, text, values)),
         "bearer": list(o._bearer_spans(text)),
         "prefix": [m.span() for m in o._PREFIX_RULES.finditer(text) if not o._is_word(m)],
     }
