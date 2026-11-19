@@ -298,9 +298,14 @@ _TIME_BOUND_SECONDS = 10.0
 
 
 def _scrub_vrl(host: str) -> str:
-    """The `ai_scrub` remap's VRL, exactly as the host's vector.yaml ships it (a YAML literal block,
-    taken to the first line indented less than its own)."""
-    text = (HOSTS_DIR / host / "vector.yaml").read_text()
+    """The `ai_scrub` remap's VRL, exactly as the host's vector.yaml ships it."""
+    return scrub_vrl_of((HOSTS_DIR / host / "vector.yaml").read_text())
+
+
+def scrub_vrl_of(text: str) -> str:
+    """The `ai_scrub` remap's VRL in a vector.yaml's `text` (a YAML literal block, taken to the
+    first line indented less than its own): the tree's, or an older commit's (the differential's
+    regression bar, `tests/scrub_differential.py`)."""
     component = text.index("\n  ai_scrub:\n")
     start = text.index("    source: |\n", component) + len("    source: |\n")
     lines = []
