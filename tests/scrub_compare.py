@@ -13,17 +13,8 @@ the two write differently; `unredacted`, those where the candidate's message hol
 eight or more characters that `main`'s redacted; and `json_broken`, those whose message (after
 its `[identifier] ` prefix) `main` leaves valid JSON and the candidate does not. With `--where`
 it also prints the 1-based position of each `unredacted` and each `json_broken` record in the
-stream, so the NOC reads that record on the server
-and names its mechanism; no text is ever printed.
-
-    python3 -I tests/scrub_compare.py excused OLD.yaml  < regressions.json
-
-reads a JSON list of `[text, secret]` pairs, lines a candidate leaves the secret of where `OLD`
-took it, and prints how many `OLD`'s own rules, each reading the text as it came, leave the
-secret: a secret only `OLD`'s sequence took, which the union reads no rule into. That is the one
-row the regression bar excuses while `main` is the sequential pass (decided on #516,
-2026-11-19), and the differential reads it through `taken_apart_sequential` here. It refuses a
-config that already carries the fleet's scrub block: against a union, no row excuses anything.
+stream, so the NOC reads that record on the server and names its mechanism; no text is ever
+printed.
 """
 
 from __future__ import annotations
@@ -41,8 +32,6 @@ import tempfile
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-#: The fleet's scrub block's first line (`tests/scrub_block.py` `START`), dedented.
-BLOCK_START = "# THE FLEET'S SCRUB, PASS 1 (basecradle-router#516)."
 WRITER_CHECK_OPEN = 'if starts_with(ident, "basecradle-wake-")'
 #: The least run of a secret read as that secret (the NOC's bar).
 RUN = 8
@@ -179,45 +168,6 @@ def counts(vector: str, old: str, new: str, stream: Iterable[str], batch: int = 
     return result
 
 
-# --- the one excused row -------------------------------------------------------------------------
-
-_CREDENTIAL_OPEN = "scrubbed = map_values(., recursive: true) -> |value| {"
-_FIELD_CHECK = "for_each(scrubbed) -> |field, value| {"
-
-
-def sequential_rules(source: str) -> list[str]:
-    """Each rule of a sequential `ai_scrub` (the pass before #516) as a program of its own over
-    `.message`, reading the text as it came: the credential rule, then every `msg = ` statement
-    of the message passes."""
-    if BLOCK_START in source:
-        raise SystemExit("this config carries the fleet's scrub block: no row excuses anything")
-    start = source.index(_CREDENTIAL_OPEN)
-    end = source.index("\n}\n", source.index(_FIELD_CHECK, start)) + 3
-    programs = [source[start:end]]
-    body = source[source.index("msg = to_string(.message)") : source.index('\nident = ""\n')]
-    statements = re.split(r"\n(?=msg = )", body)[1:]
-    assert statements, "no message pass"
-    programs += ['msg = to_string(.message) ?? ""\n' + s + "\n.message = msg\n" for s in statements]
-    return programs
-
-
-def taken_apart_sequential(
-    vector: str, source: str, pairs: list[tuple[str, str]], workdir: Path | None = None
-) -> list[bool]:
-    """For each `(text, secret)`, whether the sequential `source`'s rules, each alone on the text
-    as it came, take the secret between them: every `RUN` characters of it gone from at least one
-    rule's output. False is the excused row."""
-    if not pairs:
-        return []
-    events = [{"SYSLOG_IDENTIFIER": "x", "message": text} for text, _ in pairs]
-    outputs = [run(vector, program, events, workdir) for program in sequential_rules(source)]
-    taken = []
-    for i, (_, secret) in enumerate(pairs):
-        windows = [secret[j : j + RUN] for j in range(len(secret) - RUN + 1)]
-        taken.append(all(any(w not in (out[i] or "") for out in outputs) for w in windows))
-    return taken
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--vector", default="vector", help="the server's Vector (default: on PATH)")
@@ -227,21 +177,13 @@ def main() -> None:
     one.add_argument("old")
     one.add_argument("new")
     one.add_argument("--where", action="store_true", help="also print where each counted one is")
-    two = sub.add_parser("excused", help="[text, secret] pairs on stdin; the excused row's count")
-    two.add_argument("old")
     args = parser.parse_args()
     old = transform_vrl(Path(args.old).read_text(), args.transform)
-    if args.command == "counts":
-        new = transform_vrl(Path(args.new).read_text(), args.transform)
-        result = counts(args.vector, old, new, sys.stdin)
-        if not args.where:
-            del result["where"]
-        print(json.dumps(result))
-        return
-    pairs = [(text, secret) for text, secret in json.load(sys.stdin)]
-    taken = taken_apart_sequential(args.vector, old, pairs)
-    left = [i + 1 for i, t in enumerate(taken) if t]
-    print(json.dumps({"regressions": len(pairs), "excused": len(pairs) - len(left), "left": left}))
+    new = transform_vrl(Path(args.new).read_text(), args.transform)
+    result = counts(args.vector, old, new, sys.stdin)
+    if not args.where:
+        del result["where"]
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

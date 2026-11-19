@@ -5,8 +5,8 @@ runs deeper by hand. Here CI reads one seed of it and holds:
 
 * every secret the harness takes, the box and the print site take too, unless a row of the table
   names the text's shape (`STATED`);
-* each host's `ai_scrub` leaves nothing its own at the previous commit took (no table: any
-  regression fails), and the print site nothing its previous commit's took, unless a
+* each host's `ai_scrub` leaves nothing its own at the previous commit took (no table and no row:
+  any regression fails), and the print site nothing its previous commit's took, unless a
   `print-history` row states the shape;
 * every row still explains a difference, so a closed one is removed rather than left to excuse
   more than it should, and every row anchored in `deploy/README.md` names a phrase it carries;
@@ -84,11 +84,11 @@ def test_every_text_carries_the_secret_once() -> None:
 
 
 def test_the_box_and_the_print_site_leave_nothing_the_harness_takes(
-    vector: str, corpus: list[str]
+    vector: str, corpus: list[str], tmp_path: Path
 ) -> None:
     # The property the differential exists for: a text the harness redacts and the box or the
     # print site ships fails here, with the text, unless a row of the table names it.
-    box, print_site = sd.differences(vector, corpus)
+    box, print_site = sd.differences(vector, corpus, tmp_path)
     unexplained = box.get(None, []) + print_site.get(None, [])
     assert not unexplained, unexplained[:5]
     # It reads something: the table explains differences, it does not stand in for them.
@@ -96,35 +96,21 @@ def test_the_box_and_the_print_site_leave_nothing_the_harness_takes(
 
 
 def test_nothing_the_previous_commit_took_is_left(
-    vector: str, corpus: list[str], capsys: pytest.CaptureFixture[str], tmp_path: Path
+    vector: str, corpus: list[str], tmp_path: Path
 ) -> None:
     # The bar #510's three rounds were held to: against the previous commit's ai_scrub (on a
     # pull request, the base branch's), any secret it took and the tree's leaves fails, with no
-    # table. Nothing to read when the two are the same bytes.
+    # table and no row. Nothing to read when the two are the same bytes.
     base = sd.base_ref()
     known = subprocess.run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd=sd.REPO)
     if known.returncode != 0:
         assert not os.environ.get("CI"), f"{base} is not in the CI clone"
         pytest.skip(f"{base} is not in this clone")
-    before = sd.host_sources(base)
-    found, quoted = sd.by_quote(
-        vector, before, sd.regressions(vector, before, sd.host_sources(), corpus)
-    )
-    found, excused = sd.by_order(vector, before, found, tmp_path)
+    found = sd.regressions(vector, sd.host_sources(base), sd.host_sources(), corpus, tmp_path)
     assert not found, found[:5]
-    # The two excused rows are counted, never silent (decided on #516): a secret the previous
-    # sequential pass took only by the order of its rules, and one its heartbeat run took only by
-    # reading past a `"`, which the tree's ends at.
-    with capsys.disabled():
-        print(
-            f"\nexcused by order against {base}: {len({row[1] for row in excused})}"
-            f" of {len(corpus)} texts"
-            f"\nexcused by the quote against {base}: {len({row[1] for row in quoted})}"
-            f" of {len(corpus)} texts"
-        )
 
 
-def test_the_regression_check_bites(vector: str) -> None:
+def test_the_regression_check_bites(vector: str, tmp_path: Path) -> None:
     # Proven, not assumed: one host's ai_scrub with its bearer rule taken out is a regression
     # against its own, the check names that host and no other, and the tree against itself is
     # none.
@@ -138,9 +124,9 @@ def test_the_regression_check_bites(vector: str) -> None:
         host: source.replace(scrub_block.BEARER, never).replace(scrub_block.BEARER_WORDS, never),
     }
     lines = sd.texts(sd.SEED, 2000)
-    found = sd.regressions(vector, sources, weakened, lines)
+    found = sd.regressions(vector, sources, weakened, lines, tmp_path)
     assert found and {row[0] for row in found} == {host}
-    assert not sd.regressions(vector, sources, sources, lines)
+    assert not sd.regressions(vector, sources, sources, lines, tmp_path)
 
 
 def test_nothing_the_previous_commits_print_site_took_is_left(corpus: list[str]) -> None:
@@ -190,7 +176,7 @@ def git_empty_tree() -> str:
     ).stdout.strip()
 
 
-def test_every_row_still_explains_its_example(vector: str) -> None:
+def test_every_row_still_explains_its_example(vector: str, tmp_path: Path) -> None:
     # A row stays only while its difference does: its example must still be one the harness takes
     # and the reading leaves, and the row must be the one that explains it. A row whose difference
     # is closed fails here until it is removed, so the table never excuses more than it should.
@@ -203,9 +189,9 @@ def test_every_row_still_explains_its_example(vector: str) -> None:
     rules = sd.harness_rules(examples)
     readings = [
         (
-            sd.box_readings(vector, source, examples),
-            sd.taken_apart(vector, source, examples),
-            sd.taken_past_a_quote(vector, source, examples),
+            sd.box_readings(vector, source, examples, tmp_path),
+            sd.taken_apart(vector, source, examples, tmp_path),
+            sd.taken_past_a_quote(vector, source, examples, tmp_path),
         )
         for source in sd.scrub_sources()
     ]

@@ -24,11 +24,10 @@ alone, to the harness's `redact_credentials` (the same rule alone).
 
 **Three failures.** A secret the harness takes and the box or the print site leaves, unless a row of
 `STATED` names the text; against the previous commit's `ai_scrub`, any regression at all, a secret a
-host's old config took and its new one leaves, with no table (the bar #510's rounds were held to),
-but for two mechanical rows, each counted (`by_quote`, `by_order`); and against the previous
-commit's print site, the same, unless a `print-history` row states the shape (the capital,
-2026-11-19 on #516: #514's print-site change had no second seat's differential, and this is the
-check that would have named its one shape before the merge word).
+host's old config took and its new one leaves, with no table and no row (the bar #510's rounds were
+held to); and against the previous commit's print site, the same, unless a `print-history` row
+states the shape (the capital, 2026-11-19 on #516: #514's print-site change had no second seat's
+differential, and this is the check that would have named its one shape before the merge word).
 
 **The table** (`STATED`): each row a name, a predicate, its reason, where the difference is written
 down (a phrase `deploy/README.md` holds, or the issue a finding was reported on), and a fabricated
@@ -66,7 +65,6 @@ if str(REPO / "tests") not in sys.path:  # run as a script, the suite's helpers 
     sys.path.insert(0, str(REPO / "tests"))
 
 import scrub_block  # noqa: E402
-import scrub_compare  # noqa: E402
 import test_vector_unit as tvu  # noqa: E402
 from basecradle_router import logfmt  # noqa: E402
 from basecradle_router.logfmt import redact_credentials  # noqa: E402
@@ -531,10 +529,12 @@ def scrub_sources(ref: str | None = None) -> list[str]:
     return list(dict.fromkeys(host_sources(ref).values()))
 
 
-def box_readings(vector: str, source: str, lines: list[str]) -> list[str]:
+def box_readings(
+    vector: str, source: str, lines: list[str], workdir: Path | None = None
+) -> list[str]:
     """Every line's message after the `ai_scrub` VRL `source`, its `[identifier] ` prefix taken
-    off, run by the boxes' Vector."""
-    out = _run_vrl(vector, source, lines)
+    off, run by the boxes' Vector, which writes to `workdir` (`_run_vrl`)."""
+    out = _run_vrl(vector, source, lines, workdir)
     assert all(row.startswith("[x] ") for row in out)
     return [row[len("[x] ") :] for row in out]
 
@@ -560,25 +560,29 @@ PAST_A_QUOTE = "scrub_heartbeat_to_quote = false\n"
 
 def past_a_quote(source: str) -> str | None:
     """`source` with its heartbeat run reading past a `"` (the parameter `false`), or None for a
-    source that does not end its heartbeat URL at a quote (the sequential pass, or `false`)."""
+    source whose heartbeat run already reads past one (`false`)."""
     if TO_QUOTE not in source:
         return None
     assert source.count(TO_QUOTE) == 1
     return source.replace(TO_QUOTE, PAST_A_QUOTE)
 
 
-def taken_past_a_quote(vector: str, source: str, lines: list[str]) -> list[bool]:
+def taken_past_a_quote(
+    vector: str, source: str, lines: list[str], workdir: Path | None = None
+) -> list[bool]:
     """For each line, whether `source` with its heartbeat run reading past a `"` takes the secret:
     the parameter alone is why `source` leaves it (the two readings differ in nothing else)."""
     flipped = past_a_quote(source)
     if flipped is None or not lines:
         return [False] * len(lines)
-    return [not leaks(out) for out in box_readings(vector, flipped, lines)]
+    return [not leaks(out) for out in box_readings(vector, flipped, lines, workdir)]
 
 
-def _run_vrl(vector: str, program: str, lines: list[str]) -> list[str]:
-    """`.message` after `program` for each line, raw (no identifier prefix to take off)."""
-    with tempfile.TemporaryDirectory() as tmp:
+def _run_vrl(vector: str, program: str, lines: list[str], workdir: Path | None = None) -> list[str]:
+    """`.message` after `program` for each line, raw (no identifier prefix to take off). The
+    program and the lines are written to `workdir` (a test's `tmp_path`), or to a temporary
+    directory removed when the run ends."""
+    with tempfile.TemporaryDirectory(dir=workdir) as tmp:
         path = Path(tmp) / "rule.vrl"
         path.write_text(program + "encode_base64(string!(.message))\n")
         events = Path(tmp) / "events.json"
@@ -600,13 +604,17 @@ def _run_vrl(vector: str, program: str, lines: list[str]) -> list[str]:
     return out
 
 
-def taken_apart(vector: str, source: str, lines: list[str]) -> list[bool]:
+def taken_apart(
+    vector: str, source: str, lines: list[str], workdir: Path | None = None
+) -> list[bool]:
     """For each line, whether the box's rules, each reading the line as it came, take the secret
     between them: every eight characters of it are gone from at least one rule's output. That is
     the union the harness takes (its `scrub`), and what the box takes once its pass reads so."""
     if not lines:
         return []
-    outputs = [_run_vrl(vector, program, lines) for program in rules_alone(source).values()]
+    outputs = [
+        _run_vrl(vector, program, lines, workdir) for program in rules_alone(source).values()
+    ]
     return [
         all(any(window not in out[i] for out in outputs) for window in _WINDOWS)
         for i in range(len(lines))
@@ -1006,21 +1014,23 @@ def _sort(
     return groups
 
 
-def differences(vector: str, lines: list[str]) -> tuple[Sorted, Sorted]:
+def differences(
+    vector: str, lines: list[str], workdir: Path | None = None
+) -> tuple[Sorted, Sorted]:
     """What the box and the print site leave of `lines` that the harness takes, each sorted by
-    the row of `STATED` that explains it."""
+    the row of `STATED` that explains it. Vector writes to `workdir` (`_run_vrl`)."""
     harness, harness_credentials = harness_readings(lines)
     box: Sorted = {}
     for source in scrub_sources():
         differ = [
             (text, got, ref)
             for text, got, ref in zip(
-                lines, box_readings(vector, source, lines), harness, strict=True
+                lines, box_readings(vector, source, lines, workdir), harness, strict=True
             )
             if leaks(got) and not leaks(ref)
         ]
-        apart = taken_apart(vector, source, [text for text, _, _ in differ])
-        past = taken_past_a_quote(vector, source, [text for text, _, _ in differ])
+        apart = taken_apart(vector, source, [text for text, _, _ in differ], workdir)
+        past = taken_past_a_quote(vector, source, [text for text, _, _ in differ], workdir)
         for name, rows in _sort("box", differ, apart, past).items():
             box.setdefault(name, []).extend(rows)
     differ = [
@@ -1033,17 +1043,22 @@ def differences(vector: str, lines: list[str]) -> tuple[Sorted, Sorted]:
 
 
 def regressions(
-    vector: str, before: dict[str, str], after: dict[str, str], lines: list[str]
+    vector: str,
+    before: dict[str, str],
+    after: dict[str, str],
+    lines: list[str],
+    workdir: Path | None = None,
 ) -> list[tuple[str, str, str, str]]:
     """Every line whose secret a host's `ai_scrub` in `before` took and the same host's in
     `after` leaves: the host, the text, what the old one left and what the new one left. Each host
     is held to its own old config; one new to `after` is held to nothing. Nothing is read twice:
-    a config is run once whatever hosts share it, and a host whose bytes did not move is skipped."""
+    a config is run once whatever hosts share it, and a host whose bytes did not move is skipped.
+    Vector writes to `workdir` (`_run_vrl`)."""
     readings: dict[str, list[str]] = {}
 
     def read(source: str) -> list[str]:
         if source not in readings:
-            readings[source] = box_readings(vector, source, lines)
+            readings[source] = box_readings(vector, source, lines, workdir)
         return readings[source]
 
     found = []
@@ -1055,57 +1070,6 @@ def regressions(
             if not leaks(was) and leaks(now):
                 found.append((host, text, was, now))
     return found
-
-
-def by_order(
-    vector: str,
-    before: dict[str, str],
-    found: list[tuple[str, str, str, str]],
-    workdir: Path | None = None,
-) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]:
-    """`found` (from `regressions`) split into the real and the one row the bar excuses (decided
-    on #516, 2026-11-19): a line whose secret the host's previous `ai_scrub` took only by the
-    order of its rules, its rules each reading the text as it came leaving it
-    (`scrub_compare.taken_apart_sequential`). A union reads no rule into such a secret. Against
-    a previous config that carries the fleet's scrub block nothing is excused: its rules' union
-    is its own output."""
-    real, excused = [], []
-    for host in sorted({row[0] for row in found}):
-        rows = [row for row in found if row[0] == host]
-        if scrub_compare.BLOCK_START in before[host]:
-            real += rows
-            continue
-        taken = scrub_compare.taken_apart_sequential(
-            vector, before[host], [(row[1], SECRET) for row in rows], workdir
-        )
-        for row, whole in zip(rows, taken, strict=True):
-            (real if whole else excused).append(row)
-    return real, excused
-
-
-def by_quote(
-    vector: str,
-    before: dict[str, str],
-    found: list[tuple[str, str, str, str]],
-) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]:
-    """`found` (from `regressions`) split into the real and the second row the bar
-    excuses (decided on #516, 2026-11-19): a line whose secret the host's previous `ai_scrub` took
-    only because its heartbeat run read past a `"`, which the tree's ends at (the parameter
-    `scrub_heartbeat_to_quote = true`): the tree's own block, the parameter flipped to `false`,
-    takes it. Against a previous config whose heartbeat run already ends at a quote nothing is
-    excused. Read before `by_order`, so a secret the parameter alone leaves is counted here even
-    when the previous pass took it only by the order of its rules too."""
-    real, excused = [], []
-    tree = host_sources()
-    for host in sorted({row[0] for row in found}):
-        rows = [row for row in found if row[0] == host]
-        if TO_QUOTE in before[host]:
-            real += rows
-            continue
-        taken = taken_past_a_quote(vector, tree[host], [row[1] for row in rows])
-        for row, past in zip(rows, taken, strict=True):
-            (excused if past else real).append(row)
-    return real, excused
 
 
 def print_site_at(ref: str) -> str:
@@ -1190,14 +1154,8 @@ def main() -> None:
                 _show(name or "UNEXPLAINED", rows, args.show if name is None else 0)
         found = []
         if args.base:
-            before = host_sources(args.base)
-            found, quoted = by_quote(
-                vector, before, regressions(vector, before, host_sources(), lines)
-            )
-            found, excused = by_order(vector, before, found)
+            found = regressions(vector, host_sources(args.base), host_sources(), lines)
             _show(f"regressions against {args.base}", [row[1:] for row in found], args.show)
-            _show(f"excused by order against {args.base}", [row[1:] for row in excused], 0)
-            _show(f"excused by the quote against {args.base}", [row[1:] for row in quoted], 0)
             for name, rows in print_regressions(print_site_at(args.base), lines).items():
                 _show(f"print site against {args.base}: {name or 'UNEXPLAINED'}", rows, args.show)
         dump[str(seed)] = {
