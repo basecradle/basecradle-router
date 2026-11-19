@@ -2353,7 +2353,16 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   `bearer`, in any case, glued to anything before it** (basecradle-router#510; basecradle-harness
   `docs/telemetry.md` → Credential Scrubbing), read as written (`Bear'er'` is none). The print site
   and the `jq` fallback read every such word into the value with its token: nothing runs after
-  them, so reading it there hands no boundary to another rule. The box's credential rule reads only
+  them, so reading it there hands no boundary to another rule. One shape moved with it, stated
+  (decided on basecradle-router#516, 2026-11-19): **a word that holds a credential name after a
+  scheme word only #510 reads** is that scheme word's token, and a name inside it is its text, so
+  the word after the token ships, where the reading before #510's ended the value at the scheme
+  word, read the name as an assignment from inside the word and took the word after it
+  (`A_TOKEN=abc-bearer 'B_TOKEN=x' eyJ… next=1` ships as `A_TOKEN='<a redacted value>' eyJ…
+  next=1`, and `MY_API_KEY=}abc-bearer "DB_SECRET=-"a eyJ… b"` as `MY_API_KEY='<a redacted
+  value>' eyJ… b"`). The word that ships is no credential's value under the fleet's reading, which
+  the harness gave up reading so in 0.198.1, and the same shape after a plain `Bearer` shipped
+  before. The box's credential rule reads only
   the two forms above, a stated limit below. Each copy reads it its own way, each at least as far as
   the print site where a regular expression can: the print site (`logfmt._value_end`) walks the
   words the run reaches; the box reaches the scheme word after any prefix of its closed pieces,
@@ -2435,6 +2444,21 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   site does. The print site holds a fifth by its own fuzz: every bearer header the fleet's
   definition builds from words of closed pieces, in every credential-named context, loses its token
   (basecradle-router#510).
+  **A standing differential holds the box and the print site to the harness**
+  (basecradle-router#516). `tests/scrub_differential.py` reads every fuzzed text three ways: the
+  box's `ai_scrub` on the boxes' Vector, the print site, and the harness's own scrub at the release
+  the fleet runs (its published wheel, pinned by version and checksum and fetched in CI, never a
+  locked dependency). Its generator is the union of every piece set the suite holds, the NOC's
+  differential (basecradle-noc#1573), and the shapes #510's three rounds found. A secret the harness
+  takes and the box or the print site leaves fails CI, unless a row of its table names the text's
+  shape. Each row carries a predicate, a reason, where it is written down (a phrase this file holds,
+  or #516 for a finding), and a fabricated example that must still differ, so a closed row fails
+  until it is removed. Against the previous commit (on a pull request, the base branch's), any
+  secret a host's old `ai_scrub` took and its new one leaves fails, with no table; and so does any
+  the old print site took and the new one leaves, unless a row states the shape (the one above). Run it deeper
+  by hand: `uv run python tests/scrub_differential.py --seed 1 --lines 400000 --base main`, with
+  `VECTOR_BIN`, `HARNESS_WHEEL` and `HARNESS_PYTHON` set (`--help`). Move its pin with the fleet's
+  harness roll.
 - **Every field, because a writer chooses far more of the record than its message:** the identifier,
   the `CODE_*` fields, any field it names itself (journald's native protocol takes any upper-case
   name), and, by the binary it runs and the name it gives its process, `_EXE` and `_COMM`. The rule

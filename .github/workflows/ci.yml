@@ -121,6 +121,30 @@ jobs:
           dpkg-deb -x "$deb" "$RUNNER_TEMP/vector"
           echo "VECTOR_BIN=$RUNNER_TEMP/vector/usr/bin/vector" >> "$GITHUB_ENV"
 
+      # THE HARNESS'S SCRUB (#516). tests/test_scrub_differential.py holds the box's ai_scrub and
+      # the print site to the harness's own scrub, at the release the fleet runs (the pin in
+      # tests/scrub_differential.py, which that test holds this step to). Only the wheel is
+      # fetched, pinned by version AND checksum like Vector above, and never installed:
+      # tests/harness_scrub.py verifies the bytes again and runs two of its modules from the zip
+      # under the runner's own Python 3.12 (the harness needs 3.11 or later; the router runs on
+      # 3.10). It is not a locked dependency, so nothing of it reaches a box. Move the pin with
+      # the fleet's harness roll; Dependabot does not see a download.
+      - name: Fetch the Harness's Scrub
+        env:
+          HARNESS_VERSION: "0.198.2"
+          HARNESS_WHEEL_SHA256: "3bd085826bbc6f78a3ad7a02e129b68769839d878f83b1620e61095d2baedf61"
+        run: |
+          set -euo pipefail
+          wheel="$RUNNER_TEMP/basecradle_harness-${HARNESS_VERSION}-py3-none-any.whl"
+          curl -fsSL --retry 3 --max-time 120 -o "$wheel" \
+            "https://files.pythonhosted.org/packages/py3/b/basecradle_harness/basecradle_harness-${HARNESS_VERSION}-py3-none-any.whl"
+          echo "${HARNESS_WHEEL_SHA256}  $wheel" | sha256sum --check --strict -
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+          {
+            echo "HARNESS_WHEEL=$wheel"
+            echo "HARNESS_PYTHON=$(command -v python3)"
+          } >> "$GITHUB_ENV"
+
       - name: Test
         run: uv run pytest
 
