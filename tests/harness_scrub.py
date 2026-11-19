@@ -101,6 +101,7 @@ def rule_spans(observability: types.ModuleType, text: str) -> dict[str, list[lis
         "api_key": list(o._literal_spans(o._API_KEY, text, values)),
         "bearer": list(o._bearer_spans(text)),
         "prefix": [m.span() for m in o._PREFIX_RULES.finditer(text) if not o._is_word(m)],
+        "member": list(o._member_spans(text)),
     }
     return {name: [list(span) for span in found] for name, found in spans.items()}
 

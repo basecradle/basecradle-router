@@ -11,7 +11,9 @@ CI, before a server runs it.
 pieces of this repository's #510 prototype, and the NOC's differential (basecradle-noc#1573: its
 scheme words, names, openers, glue and closes, and its contexts), plus the three shapes the rounds
 found: every rule's label after a credential value, an opener and a scheme word; a bearer header
-with an opened piece before a credential assignment; `api_key=`-heavy contexts. Every text carries
+with an opened piece before a credential assignment; `api_key=`-heavy contexts. From a stream of
+its own it adds a credential-named JSON member inside none to six JSON strings (the block's member
+rule, the harness's since 0.198.4), now and then with a stray piece in the line. Every text carries
 one fabricated secret (`SECRET`, in a bearer token, a quoted value, a vendor-prefixed key, …), and
 a reading *takes* it when no eight characters of it survive (the NOC's measure). The rounds'
 reproductions are read on every run too (`REPRODUCTIONS`).
@@ -74,8 +76,8 @@ from basecradle_router.logfmt import redact_credentials  # noqa: E402
 #: The harness release the fleet runs (the NOC's inventory pin), and its wheel's sha256 as PyPI
 #: publishes it. Move both with the fleet's harness roll; CI downloads exactly this file
 #: (ci.yml → "Fetch the Harness's Scrub"), and `tests/harness_scrub.py` refuses any other bytes.
-HARNESS_VERSION = "0.198.3"
-HARNESS_WHEEL_SHA256 = "eea932bc4e4320611aaeda51ba896931fcb945267da5e39e4915fa601bd9c982"
+HARNESS_VERSION = "0.198.4"
+HARNESS_WHEEL_SHA256 = "ba0741a2302ccf97b122679324e6ebe6bde903b6d10813ce628bef421ed49aa1"
 
 # --- the secret ----------------------------------------------------------------------------------
 
@@ -290,8 +292,43 @@ ENDS = sorted(
     }
 )
 
+#: Credential-named JSON members (the block's member rule, the harness's since 0.198.4): the rule's
+#: eight names (`scrub_block.MEMBER_NAME`) in the spellings `tests/test_scrub_block.py` puts beside
+#: a path and more; what stands around the secret in the value; and a stray piece dropped into the
+#: line, as a line no encoder wrote has one.
+MEMBERS = sorted(
+    {
+        "password",
+        "Authorization",
+        "api-key",
+        "api_key",
+        "apikey",
+        "ACCESS_TOKEN",
+        "Refresh-Token",
+        "clientSecret",
+        "client_secret",
+        "secret",
+    }
+)
+MEMBER_AROUND = ["", "a", "a b", 'a"b', "a\\b", "a\\\\", "\\", '"', "a\nb", "a\tb", "x,y", "}"]
+MEMBER_AROUND += ["Bearer ", "[redacted]", "\x01", "é"]
+MEMBER_STRAYS = ['"', '\\"', ",", " ", '","b":"']
+#: How deep a member stands: inside none to five JSON strings, the depths the box reads, and six.
+MEMBER_NESTING = [0, 0, 1, 1, 2, 3, 4, 5, 6]
+
+
+def _json_inside(text: str, depth: int) -> str:
+    """`text` as a string value `depth` JSON lines deep."""
+    for _ in range(depth):
+        text = json.dumps({"log": text, "k": "v"})
+    return text
+
+
 _ALL_PIECES = [
     *NAMES,
+    *MEMBERS,
+    *MEMBER_AROUND,
+    *MEMBER_STRAYS,
     *OPENERS,
     *LABELS,
     *SCHEME_WORDS,
@@ -358,15 +395,32 @@ def _text(rng: random.Random) -> str:
     return text
 
 
-#: What CI reads: one seed and 40,000 texts (about five seconds). A deeper run is by hand.
+#: What CI reads: one seed, 40,000 texts and 4,000 members (about five seconds). A deeper run is by
+#: hand.
 SEED = 516
 LINES = 40_000
 
 
+def _member_text(rng: random.Random) -> str:
+    """A credential-named JSON member, at every depth the box reads and one past it, now and then
+    with a stray piece in the line, never inside the secret."""
+    value = rng.choice(MEMBER_AROUND) + rng.choice(TOKENS).replace("{s}", SECRET)
+    value += rng.choice(MEMBER_AROUND)
+    text = json.dumps({rng.choice(MEMBERS): value, "n": 1}, ensure_ascii=rng.random() < 0.5)
+    text = _json_inside(text, rng.choice(MEMBER_NESTING))
+    if rng.random() < 0.15:
+        at = text.find(SECRET)
+        cut = rng.choice([rng.randint(0, at), rng.randint(at + len(SECRET), len(text))])
+        text = text[:cut] + rng.choice(MEMBER_STRAYS) + text[cut:]
+    return text
+
+
 def texts(seed: int, count: int) -> list[str]:
-    """`count` fabricated texts from `seed`, each holding `SECRET` once."""
-    rng = random.Random(seed)
-    return [_text(rng) for _ in range(count)]
+    """`count` fabricated texts from `seed`, then a tenth as many credential-named JSON members
+    from a stream of their own, so a shape added never moves the texts the checks already read;
+    each holds `SECRET` once."""
+    rng, members = random.Random(seed), random.Random(f"member:{seed}")
+    return [_text(rng) for _ in range(count)] + [_member_text(members) for _ in range(count // 10)]
 
 
 #: The rounds' reproductions, read on every run: #510's and #515's lines, the box's stated limits,
@@ -843,6 +897,40 @@ def _past_a_scheme_word_only_510_reads(text: str, facts: Facts) -> bool:
     return False
 
 
+#: A credential-named JSON member's opener as the harness's `_MEMBER` spells one: no run of
+#: backslashes or an odd one before the name's quote, taken whole, and the same run before each of
+#: its quotes.
+_MEMBER_OPENER = re.compile(
+    rf'(?<!\\)(?P<escape>(?:\\(?:\\\\)*)?)"{scrub_block.MEMBER_NAME}(?P=escape)"\s*:\s*(?P=escape)"'
+)
+
+
+def _member_to_secret(text: str) -> tuple[int, str] | None:
+    """The run of backslashes escaping the last credential-named member opened before the secret,
+    and its value from the opener to the secret; None when no member opens before it. (The
+    harness reads a name inside an earlier member's value as that value's text; a row reading this
+    also requires the harness's member rule to take the secret, so a member did.)"""
+    at = text.find(SECRET)
+    openers = list(_MEMBER_OPENER.finditer(text, 0, at))
+    if not openers:
+        return None
+    return len(openers[-1]["escape"]), text[openers[-1].end() : at]
+
+
+def _member_deeper_than_the_box_reads(text: str, facts: Facts) -> bool:
+    member = _member_to_secret(text)
+    return (
+        member is not None and member[0] not in (0, *scrub_block.MEMBER_DEPTHS) and '"' in member[1]
+    )
+
+
+def _quote_behind_a_shorter_run(text: str, facts: Facts) -> bool:
+    member = _member_to_secret(text)
+    return member is not None and any(
+        len(quote["run"]) < member[0] for quote in re.finditer(r'(?P<run>\\*)"', member[1])
+    )
+
+
 #: Stated differences and findings, in the order they are tried. A finding's anchor is this issue:
 #: it is reported there before anything is built for it.
 STATED: list[Row] = [
@@ -966,6 +1054,27 @@ STATED: list[Row] = [
         " harness, on #514's reading since 0.198.3, takes it.",
         "deploy/README.md “after a scheme word only #510 reads ships that token on the box”",
         "A_TOKEN=abc-bearer =Fab1catedQ7ZkW9xDiffVq3Lm8Rt next=1",
+    ),
+    Row(
+        "box",
+        "a JSON member deeper than five strings",
+        _in("member", _member_deeper_than_the_box_reads),
+        "The box reads a member's close inside none to five JSON strings and, at any other run of"
+        " backslashes, ends the value at its first quote; the harness reads the close at every"
+        " depth, so a quote of the value's own before the secret ends the box's value and not the"
+        " harness's.",
+        "deploy/README.md “deeper than five strings the box's value ends at its first quote”",
+        _json_inside(json.dumps({"password": 'a"b' + SECRET}), 6),
+    ),
+    Row(
+        "box",
+        "a quote behind a shorter run in a member's value",
+        _in("member", _quote_behind_a_shorter_run),
+        "A quote behind a shorter run of backslashes than the member's opener is the close of a"
+        " string the member sits in, and ends the box's value there; the harness closes the value"
+        " only at a quote its own run closes, and reads past that one into what follows it.",
+        "deploy/README.md “a quote behind a shorter run than the opener's”",
+        '{"log": "{\\"password\\": \\"a" ' + SECRET + '\\"}", "k": "v"}',
     ),
     Row(
         "print-history",
@@ -1137,7 +1246,9 @@ def _show(title: str, rows: list[tuple[str, str, str]], limit: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seed", type=int, action="append", help=f"repeatable; default {SEED}")
-    parser.add_argument("--lines", type=int, default=LINES, help="per seed")
+    parser.add_argument(
+        "--lines", type=int, default=LINES, help="per seed, plus a tenth as many members"
+    )
     parser.add_argument("--base", help="a commit to hold the tree's ai_scrub to (no regressions)")
     parser.add_argument("--show", type=int, default=8, help="unexplained texts printed per group")
     parser.add_argument("--dump", help="write every difference as JSON to this file")
