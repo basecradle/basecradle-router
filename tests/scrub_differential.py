@@ -64,6 +64,8 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO / "tests") not in sys.path:  # run as a script, the suite's helpers are siblings
     sys.path.insert(0, str(REPO / "tests"))
 
+import scrub_block  # noqa: E402
+import scrub_compare  # noqa: E402
 import test_vector_unit as tvu  # noqa: E402
 from basecradle_router import logfmt  # noqa: E402
 from basecradle_router.logfmt import redact_credentials  # noqa: E402
@@ -536,37 +538,17 @@ def box_readings(vector: str, source: str, lines: list[str]) -> list[str]:
     return [row[len("[x] ") :] for row in out]
 
 
-#: The box's literal rules, each by a literal its statement alone carries, in the order they run.
-_RULE_MARKS = {
-    "heartbeat": "/heartbeat/",
-    "x-api-key": "(?i:x[-_]api[-_]?key)",
-    "api_key": "r'(?i)api[-_]?key=",
-    "bearer": "msg = replace(msg, r'(?i:bearer)",
-    "prefix": "r'(?x)",
-}
-_CREDENTIAL_OPEN = "scrubbed = map_values(., recursive: true) -> |value| {"
-_FIELD_CHECK = "for_each(scrubbed) -> |field, value| {"
-
-
 def rules_alone(source: str) -> dict[str, str]:
-    """Each rule of the `ai_scrub` VRL `source` as a program of its own over `.message`: the
-    credential-named rule, then every literal rule's statement, each reading the text as it came.
+    """Each rule of the fleet's scrub (`tests/scrub_block.py`) as a program of its own over
+    `.message`, reading the text as it came: the block with that rule's statements alone.
 
-    Exactly the rules `_RULE_MARKS` names, one statement each, or this fails: a rule added to the
-    box is a rule the differential must learn to read alone."""
-    start = source.index(_CREDENTIAL_OPEN)
-    end = source.index("\n}\n", source.index(_FIELD_CHECK, start)) + 3
-    programs = {"credential": source[start:end]}
-    body = source[source.index("msg = to_string(.message)") : source.index('\nident = ""\n')]
-    statements = re.split(r"\n(?=msg = )", body)[1:]
-    assert len(statements) == len(_RULE_MARKS), [s[:60] for s in statements]
-    for (name, mark), statement in zip(_RULE_MARKS.items(), statements, strict=True):
-        assert mark in statement.split("\n", 1)[0] or mark in statement[:200], (
-            name,
-            statement[:80],
-        )
-        programs[name] = 'msg = to_string(.message) ?? ""\n' + statement + "\n.message = msg\n"
-    return programs
+    Only for a source that carries the block the tree's generator writes, or this fails: a rule
+    added to the box is a rule the differential must learn to read alone."""
+    framed = "\n".join(
+        line[6:] for line in (scrub_block.PARAMETERS + scrub_block.BLOCK).split("\n")
+    )
+    assert framed in source, "not the tree's scrub block"
+    return {rule: scrub_block.alone(rule) + ".message = msg\n" for rule in scrub_block.RULES}
 
 
 def _run_vrl(vector: str, program: str, lines: list[str]) -> list[str]:
@@ -825,41 +807,20 @@ def _past_a_scheme_word_only_510_reads(text: str, facts: Facts) -> bool:
 STATED: list[Row] = [
     Row(
         "box",
-        "pass order",
-        lambda text, facts: facts.taken_apart,
-        "The box's literal rules run one after another, so one rule's match consumes another's"
-        " label or boundary and leaves its value to no rule. Its own rules, each reading the text"
-        " as it came, take the secret between them, as the harness's do: pass 1 as one alternation"
-        " closes it.",
-        "deploy/README.md “What the box does not take, stated (basecradle-router#510)” (limits 1, 3"
-        " and 5); basecradle-router#516, piece 2",
-        "A_TOKEN=abc-bearer eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt next=1",
-    ),
-    Row(
-        "box",
         "a marker read again",
         lambda text, facts: not facts.harness_rules,
         "No one rule of the harness's takes the secret: it merges the spans its rules take and"
-        " reads on past a marker as a shell word (`_observability._past_marker`). The box writes"
-        " each rule's redaction apart and never reads one again.",
-        "basecradle-router#516 (finding)",
-        "API-KEY=}x-api-key: :\\'Fab1catedQ7ZkW9xDiffVq3Lm8Rt",
-    ),
-    Row(
-        "box",
-        "a value opening at a canary stop",
-        _credential(lambda value: value[:1] in (",", "}")),
-        "The box's value never opens at a `,` or a `}`, and the canary's run stops there too; the"
-        " harness reads the shell word.",
-        "deploy/README.md “A credential value opening with a `,` or a `}`” (limit 2)",
-        "A_TOKEN=,Fab1catedQ7ZkW9xDiffVq3Lm8Rt next=1",
+        " reads on past a marker as a shell word, again while it can (`_past_marker`). The box"
+        " reads a marker again once, at a merged span's end and at each credential span's own.",
+        "deploy/README.md “reads on once more, as a value whose first piece is the marker”",
+        'MY_API_KEY=\\"\\X-API-KEY: .\'"Fab1catedQ7ZkW9xDiffVq3Lm8Rt\\',
     ),
     Row(
         "box",
         "a canary stop inside a value",
         _credential(lambda value: bool(set(value) & set(",}"))),
         "The box's value ends at a `,` or a `}`, structure on a JSON line, as the canary's run"
-        " does; the harness reads the shell word.",
+        " does (one opening the value is read past, #516); the harness reads the shell word.",
         "deploy/README.md “Where the box reads less than the print site, by design”",
         "A_TOKEN=x,Fab1catedQ7ZkW9xDiffVq3Lm8Rt next=1",
     ),
@@ -897,15 +858,6 @@ STATED: list[Row] = [
     ),
     Row(
         "box",
-        "a parameter expansion inside a value",
-        _credential(lambda value: "${" in value),
-        "The box's value reads no `${…}`: `$` and `{` are plain characters, so one holding a blank"
-        " ends the value there; the harness reads it whole.",
-        "basecradle-router#516 (finding)",
-        "A_TOKEN=${a Fab1catedQ7ZkW9xDiffVq3Lm8Rt} next=1",
-    ),
-    Row(
-        "box",
         "a piece left open in a value",
         _credential(lambda value: _word(value).open_piece and bool(re.search(r"[ \t]", value))),
         "The box's first pass reads only pieces that close, so a substitution or quote left open"
@@ -917,60 +869,39 @@ STATED: list[Row] = [
     Row(
         "box",
         "a substitution read one level deep",
-        _credential(_one_level_deep),
-        "The box reads a substitution one level deep and a bare `(` left open as a plain"
-        " character; the harness nests.",
+        _credential(lambda value: _one_level_deep(value) or "${" in value),
+        "The box reads a substitution or a `${…}` one level deep, with no quote or piece tracked"
+        " inside it, and a bare `(` left open as a plain character; the harness nests.",
         "deploy/README.md “a substitution is read one level deep”",
         "A_TOKEN=a(b Fab1catedQ7ZkW9xDiffVq3Lm8Rt next=1",
     ),
     Row(
         "box",
-        "a bearer token one piece deep",
+        "a bearer token read to a bare quote or one level deep",
         _in("bearer", _one_piece_deep),
-        "The box's bearer rule reads one quoted piece or substitution, one level deep, the"
-        " harness's stated minimum for a server; a second piece in the token's word, or one inside"
-        " another, ends it early.",
-        "deploy/README.md “its limit is the minimum's, one quoted piece or substitution, one level"
-        " deep”",
-        "Bearer 'a'b' c Fab1catedQ7ZkW9xDiffVq3Lm8Rt'",
+        "The bearer rule's pieces stop at a bare `\"`, the line's own on a JSON line, and read a"
+        " substitution one level deep, in both its readings; the harness's shell word crosses the"
+        " quote and nests, so its token runs on where the box's ends.",
+        "deploy/README.md “no piece but a double-quoted one crosses one”",
+        "Bearer $(Bearer q$(Fab1catedQ7ZkW9xDiffVq3Lm8Rt))",
     ),
     Row(
         "box",
-        "a scheme word inside the token's piece",
+        "a scheme word past a bare quote in the token",
         _in("bearer", _scheme_word_inside_a_piece),
-        "The box's bearer rule lets a quoted piece or substitution in a run of scheme words close"
-        " anywhere (`'…'?`, `$(…)?`), so a scheme word inside the token's own piece ends it and"
-        " the rest ships; the harness reads the piece to its close or its line's end.",
-        "basecradle-router#516 (finding)",
-        "Bearer 'q KBearer x Fab1catedQ7ZkW9xDiffVq3Lm8Rt",
+        "A scheme word the harness reads inside the token's own piece lies past a bare `\"`, where"
+        " the box's piece stops, so the box reads it as a scheme word and ends the token there.",
+        "deploy/README.md “no piece but a double-quoted one crosses one”",
+        'Bearer `\\"a b\\"bearer  q(eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt`',
     ),
     Row(
         "box",
-        "an x-api-key value ending in an inner header",
-        _in("x-api-key", _inner_header),
-        "The harness reads an `x-api-key` value on through a header its value ends in"
-        " (`_x_api_key_spans`); the box's rule is one regular expression read leftmost-first.",
-        "basecradle-router#516 (the capital's first rows, from #510)",
-        "x-api-key: x-api-key: Fab1catedQ7ZkW9xDiffVq3Lm8Rt",
-    ),
-    Row(
-        "box",
-        "key-in-query",
+        "a double quote in a query value",
         _in("query", _in_a_query_value),
-        "The box carries no key-in-query rule (`?token=`, `&key=`, `?access_token=`, and"
-        " `?api_key=` read to the next `&` or blank, quotes included); the harness does.",
-        "basecradle-router#516 (finding)",
-        "GET /hook?token=Fab1catedQ7ZkW9xDiffVq3Lm8Rt",
-    ),
-    Row(
-        "box",
-        "a second api_key= label in an api_key= value",
-        _in("api_key", _second_api_key_label),
-        "The box's `api_key=` value takes a second `api_key=` label into its own run (a marker's"
-        " glued run, a scheme word's token), so that label's value goes to no rule; the harness"
-        " reads each label's value apart.",
-        "basecradle-router#516 (finding)",
-        "api_key='<a redacted value>'Kapi_key=x,Fab1catedQ7ZkW9xDiffVq3Lm8Rt",
+        "A query value stops at a `\"`, as the web hosts' rule does, so a URL inside a JSON string"
+        " keeps its line JSON; the harness's `_QUERY` reads quotes into the value.",
+        'deploy/README.md “loses its value to the next `&`, blank or `"`”',
+        '&key=\\""Fab1catedQ7ZkW9xDiffVq3Lm8Rt"\nnext',
     ),
     Row(
         "print",
@@ -1084,6 +1015,32 @@ def regressions(
     return found
 
 
+def by_order(
+    vector: str,
+    before: dict[str, str],
+    found: list[tuple[str, str, str, str]],
+    workdir: Path | None = None,
+) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]:
+    """`found` (from `regressions`) split into the real and the one row the bar excuses (decided
+    on #516, 2026-11-19): a line whose secret the host's previous `ai_scrub` took only by the
+    order of its rules, its rules each reading the text as it came leaving it
+    (`scrub_compare.taken_apart_sequential`). A union reads no rule into such a secret. Against
+    a previous config that carries the fleet's scrub block nothing is excused: its rules' union
+    is its own output."""
+    real, excused = [], []
+    for host in sorted({row[0] for row in found}):
+        rows = [row for row in found if row[0] == host]
+        if scrub_compare.BLOCK_START in before[host]:
+            real += rows
+            continue
+        taken = scrub_compare.taken_apart_sequential(
+            vector, before[host], [(row[1], SECRET) for row in rows], workdir
+        )
+        for row, whole in zip(rows, taken, strict=True):
+            (real if whole else excused).append(row)
+    return real, excused
+
+
 def print_site_at(ref: str) -> str:
     """The print site's source (`logfmt.py`, standard library only) at `ref`."""
     return subprocess.run(
@@ -1166,8 +1123,12 @@ def main() -> None:
                 _show(name or "UNEXPLAINED", rows, args.show if name is None else 0)
         found = []
         if args.base:
-            found = regressions(vector, host_sources(args.base), host_sources(), lines)
+            before = host_sources(args.base)
+            found, excused = by_order(
+                vector, before, regressions(vector, before, host_sources(), lines)
+            )
             _show(f"regressions against {args.base}", [row[1:] for row in found], args.show)
+            _show(f"excused by order against {args.base}", [row[1:] for row in excused], 0)
             for name, rows in print_regressions(print_site_at(args.base), lines).items():
                 _show(f"print site against {args.base}: {name or 'UNEXPLAINED'}", rows, args.show)
         dump[str(seed)] = {

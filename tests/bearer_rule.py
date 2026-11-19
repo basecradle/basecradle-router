@@ -9,16 +9,12 @@ scheme words goes with the token after it.**
    opens, or an escaped quote and the rest of its word.
 3. While the word read as the token ends in `bearer`, the next word is the token in its place.
 
-Only the bearer rule reads the header. The rules before it whose match can end at a scheme
-word (the heartbeat URL, the `x-api-key` header, the `api_key=` assignment) put the fixed word
-`Bearer` back where their match ends at one followed by a blank, so the bearer rule reads the
-header after them by this definition, and no rule ever reads a header of its own: a header read
-inside another rule's value once took a second `x-api-key` label as its quoted token and left
-that header's value to no rule. VRL composes no pattern from parts, so the bearer rule spells the
-header out in full. This module writes it once; `tests/test_log_surface.py` holds every host's
-bearer rule to it, byte for byte. To change the header, change it here and run this module from
-the repository root (`uv run python tests/bearer_rule.py`), which writes the statement into every
-host's file, then run the suites.
+This module states the header once. The fleet's scrub (`tests/scrub_block.py`,
+basecradle-router#516) reads it twice, as two readings of one rule whose union it takes: this
+header (its bare token captured for a host's minimum) and a shell-word reading built from these
+pieces, whose token is the whole shell word a quote opens and whose every middle word's pieces
+close. Change a piece here and run `uv run python tests/scrub_block.py`, which writes the block
+into every host's file, then run the suites.
 
 The patterns are for Rust's regex under VRL, which is linear. Python's `re` backtracks, and the
 scheme run's nested repetition is quadratic there: never read box text with them in Python.
@@ -27,8 +23,6 @@ and Vector interpolates the other across the whole file.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 #: The scheme word and the whitespace after it (rule 1). Unanchored on its left, so a word glued
 #: to anything before it is one (`x.Bearer`, `a=Bearer`, `KBearer`, `abc-bearer`).
@@ -72,29 +66,3 @@ SCHEME_RUN = f"(?:{MIDDLE_WORD}{SCHEME})*"
 
 #: A bearer header from its first scheme word to its token: the bearer rule's whole pattern.
 HEADER = f"{SCHEME}{SCHEME_RUN}{TOKEN}"
-
-#: The bearer rule, one line of every host's `ai_scrub`, as the file carries it.
-BEARER_PASS = f"      msg = replace(msg, r'{HEADER}', \"Bearer [REDACTED]\")"
-
-#: How the statement's line ends, which no other line of the file does.
-BEARER_END = ', "Bearer [REDACTED]")'
-
-HOSTS = Path(__file__).resolve().parents[1] / "deploy" / "hosts"
-
-
-def shipped(text: str) -> str:
-    """The bearer rule's line as a host's file carries it."""
-    lines = [
-        line
-        for line in text.splitlines()
-        if line.startswith("      msg = ") and line.endswith(BEARER_END)
-    ]
-    assert len(lines) == 1, len(lines)
-    return lines[0]
-
-
-if __name__ == "__main__":
-    for path in sorted(HOSTS.glob("*/vector.yaml")):
-        text = path.read_text()
-        path.write_text(text.replace(shipped(text), BEARER_PASS))
-        print(f"wrote {path.relative_to(HOSTS.parents[1])}")

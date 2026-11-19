@@ -17,6 +17,7 @@ from pathlib import Path
 
 import bearer_rule
 import credential_rule
+import scrub_block
 from basecradle_router.logfmt import _BREAK_CHARS, CANARY_VALUE_STOPS, REDACTED_VALUE
 from conftest import BOX_REDACTED_VALUE, NOC_CREDENTIAL_ASSIGNMENT
 
@@ -156,8 +157,8 @@ def test_the_prefix_is_applied_after_redaction_not_before() -> None:
 # stays here is what holds offline, with no Vector on the machine: which rules exist, where they
 # sit, and in what order.
 
-#: The statement that opens the prefix pass, the one `replace_with` in `ai_scrub`.
-_PREFIX_PASS = "msg = replace_with(msg, r'(?x)"
+#: What opens the prefix rules' statement in the fleet's scrub block (`tests/scrub_block.py`).
+_PREFIX_PASS = r"replace_with(scrub_text, r'(?x)(?P<pre>[\s\S]*?)(?:(?P<before>"
 
 #: The widest run class, the one a rule's run takes when it already takes a glued key whole.
 _WIDE = "[A-Za-z0-9_-]"
@@ -217,8 +218,8 @@ def _prefix_pattern() -> str:
     """The shipped prefix pattern with the free-spacing whitespace taken out, which `(?x)` ignores
     (no class in it holds a space)."""
     source = _scrub_source()
-    start = source.index(_PREFIX_PASS) + len(_PREFIX_PASS)
-    return re.sub(r"\s+", "", source[start : source.index("') -> |key| {", start)])
+    start = source.index(_PREFIX_PASS) + len(_PREFIX_PASS) - len("(?P<before>")
+    return re.sub(r"\s+", "", source[start : source.index(")') -> |key| {", start)])
 
 
 def _has_rule(prefix: str) -> bool:
@@ -271,7 +272,7 @@ def test_every_prefix_rule_hands_its_run_to_the_word_rule() -> None:
     chain = re.search(r"^ *run = (?P<chain>.+)$", source[end:], re.MULTILINE)
     assert chain, "the prefix pass has no `run` chain"
     runs = re.findall(r"string\(key\.(\w+)\)", chain.group("chain"))
-    not_runs = ("before", "bc_kind")
+    not_runs = ("pre", "before", "bc_kind")
     assert runs == [n for n in captures if n not in not_runs and not n.endswith("_glued")]
     assert chain.group("chain").endswith('?? ""'), "an unmatched run must come back empty"
 
@@ -289,7 +290,7 @@ def test_a_match_that_took_a_glued_key_is_never_a_word_and_keeps_its_first_label
     assert chain, "the prefix pass has no `glued` chain"
     assert re.findall(r"string\(key\.(\w+)\)", chain.group("chain")) == glued
     assert chain.group("chain").endswith('?? ""')
-    assert re.search(r'^ *if glued == "" && run != "" && match\(before,', source[end:], re.M)
+    assert re.search(r'^ *word = glued == "" && run != "" && match\(before,', source[end:], re.M)
     # A rule whose plain capture names its own label carries its glued capture beside it; every
     # other rule's plain and glued captures alike fall to the default `[REDACTED_API_KEY]`.
     for name in glued:
@@ -302,157 +303,59 @@ def test_a_match_that_took_a_glued_key_is_never_a_word_and_keeps_its_first_label
     assert labelled == ["pat_glued", "gh_glued", "bc_uat_glued", "bc_isk_glued"]
 
 
-# One `msg = replace(msg, r'…', "…")` statement, the shape every fixed rule carries (the two
-# closures, the heartbeat rule and the prefix pass, are pinned on their own): a raw
-# string with no single quote inside it (one would close it early), and a fixed replacement
-# with no dollar sign (a capture-group back-reference needs one, and Vector interpolates every
-# dollar sign in the file before parsing it — basecradle-router#305).
-_REPLACE = re.compile(
-    r"""^ *msg = replace\(msg, r'(?P<pattern>[^']*)', "(?P<replacement>[^"$]*)"\)$"""
-)
+def _rule_indent(source: str) -> int:
+    """The indent of a rule's statement in the fleet's scrub block: the body of the one guard that
+    skips an empty message or one past `scrub_longest`, where a rule runs for every writer."""
+    guard = 'if !scrub_failed && scrub_text != "" {'
+    return _statement_indent(source, guard) + 4
 
 
-_HEARTBEAT_PASS = (
-    r"msg = replace_with(msg, r'(?P<url>(?:https?://\S*)?/heartbeat/\S+)"
-    r"(?P<after>[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|[ \t]*(?:\n|\z))?') -> |hb| {"
-)
-
-# The heartbeat rule's whole closure (basecradle-router#402, #423, #507), pinned offline because
-# the `vector test` suite that asserts its bytes runs only on the boxes' Vector release. It returns
-# fixed strings and nothing of the URL: a bearer scheme word ending the run becomes the fixed word
-# `Bearer`, never the bytes captured, since glued to a letter or digit it may be the secret's own
-# tail, and the bearer rule still takes the token after it; a kv value's closing quote (with the
-# colour reset closing a coloured pair) is put back; `after` is put back as matched, spaces, a
-# colour code and the next field's name, and every later rule still reads it.
-_HEARTBEAT_CLOSURE = [
-    _HEARTBEAT_PASS,
-    r'url = string(hb.url) ?? ""',
-    r"""closing = parse_regex(url, r'\A(?P<body>[\s\S]*?)(?P<quote>"\x1b\[0m|")\z') ?? {}""",
-    r'quote = string(closing.quote) ?? ""',
-    r'if quote == "\"" && hb.after == null { quote = "" }',
-    r'if quote != "" { url = string(closing.body) ?? url }',
-    r'word = ""',
-    """if match(url, r'(?i)bearer\\z') { word = "Bearer" }""",
-    r'"[REDACTED_HEARTBEAT_URL]" + word + quote + (string(hb.after) ?? "")',
-    "}",
-]
-
-# The `x-api-key` header rule (basecradle-router#423, basecradle-harness#861) and the assignment
-# rule whose value may open with a quote and takes a glued bearer (basecradle-harness#866), as the
-# harness spells them; a single quote is `\x27`, which a raw string cannot hold, and a dollar sign
-# `\x24`. Each value tries, in order: scheme words and then a glued bearer header or a value word,
-# a glued bearer header alone, any value word. A value word after a scheme word never opens with
-# what the bearer rule reads as a token (a quote, a backquote, a dollar-sign quote or substitution,
-# an escaped quote), so a value ending at a scheme word is left as `value`, and `blank` the blank
-# after it, for the closure to put the scheme word back (basecradle-router#507).
-_X_GLUED = r"""[^\s"\x27&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"""
-_X_WORD = r"""(?:[^\s"\x27&\\`\x24]|\x24[^\s"\x27&\\({])[^\s"\x27&\\]*"""
-_X_API_KEY = (
-    r"""(?i:x[-_]api[-_]?key)(?:\\?["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?["\x27])?"""
-    rf"""(?P<value>(?:(?i:bearer)\s+)+(?:{_X_GLUED}|{_X_WORD})|{_X_GLUED}|[^\s"\x27&\\]+)"""
-    r"""(?P<blank>\s+)?"""
-)
-_API_GLUED = r"""[^&\s"]*?bearer\s+[A-Za-z0-9._~+/\-]{8,}"""
-_API_WORD = r"""(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({]|\\+[^&\s"\x27\\])[^&\s"]*"""
-_API_KEY = (
-    r"""(?i)api[-_]?key=(?:(?P<kept>(?-i:"""
-    r"""\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
-    r"""(?:[\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]|\z))"""
-    r"""|(?-i:\x27<a redacted value>\x27|\x27<a value the box redacted>\x27)"""
-    r"""[^&\x20\t",}\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}]*"""
-    rf"""|"?(?P<value>(?:bearer\s+)+(?:{_API_GLUED}|{_API_WORD})|{_API_GLUED}|[^&\s"]+)"""
-    r"""(?P<blank>\s+)?)"""
-)
-
-#: The `x-api-key` rule's whole closure: the fixed label, and the fixed word `Bearer` where the
-#: value ended at a scheme word with a blank after it, so the bearer rule reads the header after
-#: it (basecradle-router#507). Nothing of the value is ever put back, only the blank as matched.
-_X_API_KEY_PASS = f"msg = replace_with(msg, r'{_X_API_KEY}') -> |header| {{"
-_X_API_KEY_CLOSURE = [
-    _X_API_KEY_PASS,
-    'blank = string(header.blank) ?? ""',
-    'if blank != "" && match(string(header.value) ?? "", r\'(?i)bearer\\z\') '
-    '{ "x-api-key: [REDACTED]Bearer" + blank } else { "x-api-key: [REDACTED]" + blank }',
-    "}",
-]
-
-#: The assignment rule's whole closure (basecradle-router#494, #507): a marker after the `=`, the
-#: print site's or the box's own, is kept as it is; any other match is the fixed label it always
-#: was, with the scheme word put back as the `x-api-key` rule puts it back.
-_API_KEY_PASS = f"msg = replace_with(msg, r'{_API_KEY}') -> |assignment| {{"
-_API_KEY_CLOSURE = [
-    _API_KEY_PASS,
-    'blank = string(assignment.blank) ?? ""',
-    'if assignment.kept != null { assignment.string } else if blank != "" && '
-    "match(string(assignment.value) ?? \"\", r'(?i)bearer\\z') "
-    '{ "apiKey=[REDACTED]Bearer" + blank } else { "apiKey=[REDACTED]" + blank }',
-    "}",
-]
-
-
-#: Where the message passes begin. The credential rule, which rewrites every field before this, is
-#: pinned on its own (below).
-_MESSAGE_READ = 'msg = to_string(.message) ?? ""'
-
-
-def _statements(source: str) -> list[str]:
-    """Every non-comment line of the message passes that mentions `replace`, in file order: every
-    such line after `msg` is read, whatever it assigns to, so a `replace` written into `.message`
-    or `ident` after the prefix pass is one the order guard below still sees."""
-    assert source.count(_MESSAGE_READ) == 1
-    return [
-        line.strip()
-        for line in source[source.index(_MESSAGE_READ) :].splitlines()
-        if "replace" in line and not line.lstrip().startswith("#")
-    ]
-
-
-def test_the_scrub_is_literal_rules_then_one_prefix_pass() -> None:
-    # The order is the fix (basecradle-router#398): a prefix rule's run is made of the characters
-    # a literal rule's key name is, so a prefix rule that runs first swallows `api-key` or
-    # `bearer` and leaves the secret after it for no rule to match. Every literal rule is a fixed
-    # `replace` in the one safe shape or a closure pinned whole below, and the prefix rules are ONE
-    # `replace_with` after all of them, never a rule per pass, so a word kept by one prefix rule is
-    # never cut by another.
-    statements = _statements(_scrub_source())
-    prefix_passes = [i for i, line in enumerate(statements) if line.startswith(_PREFIX_PASS)]
-    assert len(prefix_passes) == 1, f"ai_scrub must carry one prefix pass: {statements!r}"
-    literal = statements[: prefix_passes[0]]
-    assert statements[prefix_passes[0] + 1 :] == [], "no rule may run after the prefix pass"
-    # Nor anything else that rewrites `msg`: the prefix pass is the last assignment to it, so
-    # nothing after it can undo or bypass the order, whatever function it calls.
-    assignments = [
-        line.strip() for line in _scrub_source().splitlines() if re.match(r"^ *msg *=", line)
-    ]
-    assert assignments[-1].startswith(_PREFIX_PASS), assignments
-    # The heartbeat URL, then the `x-api-key` header, then the assignment, then bearer: the bearer
-    # rule's token class takes a URL's `https` and an assignment's `api_key=`. After it, a
-    # heartbeat URL would keep its userinfo out of the redaction, and an assignment would ship its
-    # secret. The assignment takes every bearer scheme in its value, so `AUTH_API_KEY=Bearer eyJ…`
-    # is redacted whole.
-    #
-    # Three of the four are closures, each pinned whole here; what they return is pinned by the
-    # `vector test` suite, which asserts the shipped bytes. The heartbeat rule (#402, #423) puts
-    # back a kv value's closing quote with what follows it, and the `x-api-key` and assignment
-    # rules keep a marker (#494); all three put the fixed word `Bearer` back where their match ends
-    # at a scheme word (#507), so the bearer rule reads the header after it. The bearer rule is the
-    # one fixed `replace` in the one safe shape.
-    assert literal[0] == _HEARTBEAT_PASS, f"pass 1 must open with the heartbeat rule: {literal!r}"
-    lines = [line.strip() for line in _scrub_source().splitlines()]
-    start = lines.index(_HEARTBEAT_PASS)
-    assert lines[start : start + len(_HEARTBEAT_CLOSURE)] == _HEARTBEAT_CLOSURE
-    # The `x-api-key` rule goes before the assignment rule, so the header's name goes with its
-    # value: the assignment rule reads `x-api-key=>V` as `key=` and takes it under its own label.
-    # Both are closures, each pinned whole: the assignment rule keeps a marker (#494), and each
-    # puts back a scheme word its value ended at (#507). The bearer rule reads every header after
-    # them, and is the one fixed `replace` here.
-    assert literal[1:] == [_X_API_KEY_PASS, _API_KEY_PASS, bearer_rule.BEARER_PASS.strip()]
-    assert _REPLACE.match(literal[3]), (
-        f"not a closed raw string + fixed replacement: {literal[3]!r}"
+def test_every_hosts_scrub_block_is_the_generated_one() -> None:
+    # The fleet's scrub, pass 1 (#516), is one block copied by bytes to every host that runs it:
+    # `tests/scrub_block.py` writes it with each host's parameters above it, and every host here
+    # carries exactly that, once. It is the one thing that writes `msg`, which the shipped line is
+    # built from after the writer check.
+    hosts = sorted((_DEPLOY / "hosts").glob("*/vector.yaml"))
+    assert len(hosts) == 3
+    for path in hosts:
+        text = path.read_text()
+        assert text.count(scrub_block.PARAMETERS + scrub_block.BLOCK) == 1, (
+            f"{path.parent.name}: rewrite it with `uv run python tests/scrub_block.py`"
+        )
+        assert scrub_block.shipped(text) == scrub_block.PARAMETERS + scrub_block.BLOCK
+    source = _scrub_source()
+    block = source[source.index(scrub_block.START.strip()) : source.index(scrub_block.END.strip())]
+    assignments = [line.strip() for line in source.splitlines() if re.match(r"^ *msg *=", line)]
+    assert assignments == ['msg = join(scrub_parts) ?? ""'] and assignments[0] in block
+    assert f'if scrub_failed {{ msg = "{scrub_block.FAILED}" }}' in block
+    # Every rule reads the message as it came, never `msg`, and no rule writes it.
+    assert "replace_with(msg" not in source and "replace(msg" not in source
+    assert source.index(scrub_block.END.strip()) < source.index(
+        '.message = "[" + ident + "] " + marker + msg'
     )
-    for closure in (_X_API_KEY_CLOSURE, _API_KEY_CLOSURE):
-        start = lines.index(closure[0])
-        assert lines[start : start + len(closure)] == closure
+
+
+def test_every_rule_of_the_block_runs_for_every_writer() -> None:
+    # A redaction nested inside a conditional holds only for what that conditional names. Every
+    # rule's statement sits in the body of the one guard (an empty message, or one the pass refuses
+    # whole), except the credential rule's, whose two guards are only that a value needs an `=`
+    # and that the parity pass needs a `"` to have a parity to read.
+    source = _scrub_source()
+    indent = _rule_indent(source)
+    starts = [
+        m
+        for m in re.finditer(
+            r"^( *)replace_with\(scrub_text, r'(?:\(\?x\))?\(\?P<pre>", source, re.M
+        )
+    ]
+    # Every rule but the run over the parity pass's output, which reads `scrub_parity`.
+    assert len(starts) == 9, len(starts)
+    credential = source.index('if contains(scrub_text, "=") {')
+    end = source.index("\n" + " " * indent + "}\n", credential)
+    for m in starts:
+        if credential < m.start() < end:
+            continue
+        assert len(m.group(1)) == indent, source[m.start() : m.start() + 80]
 
 
 def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
@@ -462,14 +365,7 @@ def test_steel_api_keys_and_the_api_key_query_shape_are_redacted() -> None:
     # rule catches `apiKey=` whatever its value, so a future key format in a URL is covered.
     source = _scrub_source()
     assert _has_rule("ste-")
-    assert _API_KEY in source
-    top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    for rule in (
-        _PREFIX_PASS,
-        "msg = replace_with(msg, r'(?i:x[-_]api[-_]?key)",
-        "msg = replace_with(msg, r'(?i)api[-_]?key=",
-    ):
-        assert _statement_indent(source, rule) == top_level, f"{rule!r} must be unconditional"
+    assert scrub_block.API_KEY in source and scrub_block.X_API_KEY in source
 
 
 # The only dollar signs in a host's vector.yaml are its sink tokens: pinned for every host,
@@ -586,18 +482,18 @@ _HARNESS_MINIMUM = (
 )
 
 
-def test_every_hosts_bearer_rule_is_the_documented_construction() -> None:
-    # VRL composes no pattern from parts, so the bearer rule spells the header out in full;
-    # `tests/bearer_rule.py` writes it once, and every host's rule is that construction, byte for
-    # byte (basecradle-router#507). No other rule reads a header: each one whose value can end at a
-    # scheme word puts the word back for it instead.
-    hosts = sorted((_DEPLOY / "hosts").glob("*/vector.yaml"))
-    assert len(hosts) == 3
-    for path in hosts:
-        assert bearer_rule.shipped(path.read_text()) == bearer_rule.BEARER_PASS, (
-            f"{path.parent.name}: rewrite it with `uv run python tests/bearer_rule.py`"
-        )
-        assert path.read_text().count(bearer_rule.TOKEN) == 1, path.parent.name
+def test_every_hosts_bearer_rule_is_its_two_readings() -> None:
+    # VRL composes no pattern from parts, so the bearer rule spells the header out in full, twice:
+    # the box's reading before #516 (`tests/bearer_rule.py`, its bare token captured for a host's
+    # minimum) and the shell-word reading (`scrub_block.BEARER`). The union takes both, so the box
+    # never takes less of a bearer header than either reading alone (#516).
+    source = _scrub_source()
+    assert (
+        bearer_rule.HEADER.replace(r"[A-Za-z0-9._~+/\-]+=*)", r"(?P<bare>[A-Za-z0-9._~+/\-]+)=*)")
+        == scrub_block.BEARER_WORDS
+    )
+    assert source.count(scrub_block.BEARER_WORDS) == 1
+    assert source.count(scrub_block.BEARER) == 1
 
 
 def test_the_bearer_header_is_the_fleets_minimum_and_every_token_as_a_middle_word() -> None:
@@ -635,8 +531,8 @@ def test_every_hosts_credential_rule_is_the_documented_construction() -> None:
     # No class in either pattern holds a raw space, which `(?x)` drops even inside a class.
     _pattern(_PARITY_OPEN, _PARITY_CLOSE)
     _pattern(_RUN_OPEN, _RUN_CLOSE)
-    # The assignment rule keeps a marker where the credential rule does: one end, spelled alike.
-    assert f"(?:{credential_rule.MARKER_END}))" in _API_KEY
+    # The assignment and query rules keep a marker where the credential rule does: one end.
+    assert scrub_block.KEPT.endswith(f"(?:{credential_rule.MARKER_END}))")
 
 
 def test_the_credential_rule_reads_the_canarys_own_name() -> None:
@@ -735,29 +631,31 @@ def test_both_markers_are_kept_and_neither_is_a_canary_match(canary: re.Pattern[
     assert f'if {keep}element) {{ element }} else {{ "{BOX_REDACTED_VALUE}" }}' in source
     assert f"}} else if !{keep}value) {{" in source
     assert f'. = set!(., [field], "{BOX_REDACTED_VALUE}")' in source
-    assert source.count(f'"{BOX_REDACTED_VALUE}"') == 6
-    assert source.count(f'"{REDACTED_VALUE}"') == 2
-    # The one rule after it that reads an assignment keeps both markers.
-    assert _spelled(REDACTED_VALUE).replace(r"\x20", " ") in _API_KEY
-    assert _spelled(BOX_REDACTED_VALUE).replace(r"\x20", " ") in _API_KEY
+    assert credential_rule.BLOCK.count(f'"{BOX_REDACTED_VALUE}"') == 6
+    assert credential_rule.BLOCK.count(f'"{REDACTED_VALUE}"') == 2
+    # The fleet's scrub writes the same marker, and its assignment rules keep both.
+    assert scrub_block.MARKS["c"] == BOX_REDACTED_VALUE
+    assert _spelled(REDACTED_VALUE) in scrub_block.KEPT
+    assert _spelled(BOX_REDACTED_VALUE) in scrub_block.KEPT
 
 
-def test_the_credential_rule_runs_first_over_every_field_and_before_the_writer_check() -> None:
-    # Before the token-shape rules, so every credential-named assignment carries the one marker the
-    # NOC counts and each value is read as its writer wrote it; over every field, because a writer
-    # chooses far more of the record than its message; before the writer check, so a marked line is
-    # redacted as an unmarked one; after `_CMDLINE` is gone, which is never shipped at all. And
-    # unconditional: no identifier is exempt, the box layer exists for writers the fleet is not.
+def test_the_fleets_scrub_then_the_credential_rule_run_before_the_writer_check() -> None:
+    # The fleet's scrub reads the message, the credential rule among its own (#516); then the
+    # credential rule reads every other field, because a writer chooses far more of the record than
+    # its message; both before the writer check, so a marked line is redacted as an unmarked one,
+    # and after `_CMDLINE` is gone, which is never shipped at all. And unconditional: no identifier
+    # is exempt, the box layer exists for writers the fleet is not.
     source = _scrub_source()
     order = [
         'del(."_CMDLINE")',
+        scrub_block.START.strip(),
+        scrub_block.END.strip(),
+        "del(.message)",
         _CREDENTIAL_PASS,
         _PARITY_OPEN,
         _RUN_OPEN,
         ". = scrubbed",
         "for_each(scrubbed) -> |field, value| {",
-        _MESSAGE_READ,
-        _HEARTBEAT_PASS,
         'if starts_with(ident, "basecradle-wake-")',
     ]
     at = [source.index(statement) for statement in order]
@@ -765,7 +663,7 @@ def test_the_credential_rule_runs_first_over_every_field_and_before_the_writer_c
     top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
     field_check = 'if match(join(keys(.), "\\n"), r\''
     assert source.index(field_check) < source.index("for_each(scrubbed) -> |field, value| {")
-    for statement in (_CREDENTIAL_PASS, ". = scrubbed", field_check):
+    for statement in (_CREDENTIAL_PASS, ". = scrubbed", field_check, "del(.message)"):
         assert _statement_indent(source, statement) == top_level, statement
 
 
@@ -789,8 +687,7 @@ def test_the_integration_signing_key_redaction_is_unconditional() -> None:
     # holds only for the programs that conditional happens to name. Read structurally,
     # off indentation, against the `sudo` drop which is known to sit at the top level.
     source = _scrub_source()
-    top_level = _statement_indent(source, 'if .SYSLOG_IDENTIFIER == "sudo"')
-    assert _statement_indent(source, _PREFIX_PASS) == top_level
+    assert _statement_indent(source, _PREFIX_PASS) == _rule_indent(source)
 
 
 def test_the_pre_existing_scrub_rules_survive() -> None:

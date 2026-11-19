@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+import scrub_block
 import scrub_differential as sd
 import test_vector_unit as tvu
 from basecradle_router.logfmt import redact_credentials
@@ -94,7 +95,9 @@ def test_the_box_and_the_print_site_leave_nothing_the_harness_takes(
     assert sum(len(rows) for rows in box.values()) > 1000
 
 
-def test_nothing_the_previous_commit_took_is_left(vector: str, corpus: list[str]) -> None:
+def test_nothing_the_previous_commit_took_is_left(
+    vector: str, corpus: list[str], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
     # The bar #510's three rounds were held to: against the previous commit's ai_scrub (on a
     # pull request, the base branch's), any secret it took and the tree's leaves fails, with no
     # table. Nothing to read when the two are the same bytes.
@@ -103,8 +106,18 @@ def test_nothing_the_previous_commit_took_is_left(vector: str, corpus: list[str]
     if known.returncode != 0:
         assert not os.environ.get("CI"), f"{base} is not in the CI clone"
         pytest.skip(f"{base} is not in this clone")
-    found = sd.regressions(vector, sd.host_sources(base), sd.host_sources(), corpus)
+    before = sd.host_sources(base)
+    found, excused = sd.by_order(
+        vector, before, sd.regressions(vector, before, sd.host_sources(), corpus), tmp_path
+    )
     assert not found, found[:5]
+    # The one excused row is counted, never silent (decided on #516): a secret the previous
+    # sequential pass took only by the order of its rules.
+    with capsys.disabled():
+        print(
+            f"\nexcused by order against {base}: {len({row[1] for row in excused})}"
+            f" of {len(corpus)} texts"
+        )
 
 
 def test_the_regression_check_bites(vector: str) -> None:
@@ -113,9 +126,13 @@ def test_the_regression_check_bites(vector: str) -> None:
     # none.
     sources = sd.host_sources()
     host = sorted(sources)[-1]
-    statement = sd.rules_alone(sources[host])["bearer"].split("\n")[1]
-    assert statement.startswith("msg = replace(msg, r'(?i:bearer)")
-    weakened = {**sources, host: sources[host].replace(statement, "")}
+    source = sources[host]
+    assert source.count(scrub_block.BEARER) == 1 and source.count(scrub_block.BEARER_WORDS) == 1
+    never = r"[^\s\S]"
+    weakened = {
+        **sources,
+        host: source.replace(scrub_block.BEARER, never).replace(scrub_block.BEARER_WORDS, never),
+    }
     lines = sd.texts(sd.SEED, 2000)
     found = sd.regressions(vector, sources, weakened, lines)
     assert found and {row[0] for row in found} == {host}

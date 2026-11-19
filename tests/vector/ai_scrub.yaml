@@ -39,7 +39,7 @@ tests:
             source: |
               # The secret is gone. The word before it is cut as well, because the box's label
               # `apiKey=` carries a capital that the word rule reads as evidence of a key.
-              assert_eq!(.message, "[basecradle-router] failed: ta[REDACTED_API_KEY]=[REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: task-runner-pipeline-apiKey=[REDACTED] rejected")
 
   - name: "an api-key assignment inside an sk- run redacts its secret"
     inputs:
@@ -52,7 +52,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] failed: [REDACTED_API_KEY]=[REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: [REDACTED_API_KEY] rejected")
 
   - name: "an underscored api_key assignment glued to a prefix run redacts its secret"
     inputs:
@@ -65,7 +65,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] failed: ri[REDACTED_API_KEY]=[REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: risk-model-pipeline_apiKey=[REDACTED] rejected")
 
   - name: "a bearer glued to a github-token run redacts its credential"
     inputs:
@@ -78,7 +78,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] failed: wei[REDACTED_GH_TOKEN] [REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] failed: weighs_requestauthorizationBearer [REDACTED] rejected")
 
   - name: "a bearer glued to a short prefix run redacts its credential"
     inputs:
@@ -119,7 +119,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] token bearer [REDACTED_HEARTBEAT_URL] done")
+              assert_eq!(.message, "[basecradle-router] token Bearer [REDACTED] done")
 
   - name: "a heartbeat url logged without its scheme redacts its secret"
     inputs:
@@ -166,7 +166,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, s'[basecradle-router] {"url":"[REDACTED_HEARTBEAT_URL]Bearer [REDACTED]"}')
+              assert_eq!(.message, s'[basecradle-router] {"url":"[REDACTED_HEARTBEAT_URL]"}')
 
   - name: "a bearer word ending a heartbeat run in a query value redacts its token"
     inputs:
@@ -179,9 +179,9 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
 
-  - name: "a bearer word ending a heartbeat run is kept in any case"
+  - name: "a bearer word ending a heartbeat run goes with the run in any case"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
@@ -192,7 +192,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping uptime.example.com[REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+              assert_eq!(.message, "[basecradle-router] ping uptime.example.com[REDACTED_HEARTBEAT_URL] failed")
 
   - name: "a heartbeat secret glued to a bearer word is redacted whole"
     inputs:
@@ -209,7 +209,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] | ping [REDACTED_HEARTBEAT_URL]Bearer")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] | ping [REDACTED_HEARTBEAT_URL]")
 
   - name: "a doubled bearer scheme after a heartbeat run redacts the token after both"
     inputs:
@@ -222,9 +222,9 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed")
 
-  - name: "a bearer word ending a heartbeat run at the end of the line ships as the word alone"
+  - name: "a bearer word ending a heartbeat run at the end of the line goes with the run"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
@@ -236,7 +236,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]")
 
   - name: "a bearer word inside a heartbeat run, not ending it, is redacted with the url"
     inputs:
@@ -266,7 +266,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED][REDACTED] rejected")
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] rejected")
 
   - name: "a doubled bearer scheme redacts the token after both"
     inputs:
@@ -905,7 +905,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] AUTH_API_KEY='<a value the box redacted>' | GET /v1?apiKey=[REDACTED] HTTP/1.1 | GET /v1?token=KBearer [REDACTED] HTTP/1.1")
+              assert_eq!(.message, "[basecradle-router] AUTH_API_KEY='<a value the box redacted>' | GET /v1?apiKey=[REDACTED] HTTP/1.1 | GET /v1?token=[REDACTED] HTTP/1.1")
 
   # --- harness 0.186.0: a heartbeat URL never takes a kv value's closing quote (basecradle-router#423)
 
@@ -983,7 +983,7 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: KBearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
 
-  - name: "a token's piece left open and glued before a scheme word hands on to the next word"
+  - name: "a token's piece left open runs on to its line's next quote, the next word with it"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
@@ -997,7 +997,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
+              assert_eq!(.message, "[basecradle-router] auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1 | auth: Bearer [REDACTED] next=1")
 
   - name: "a quote left open takes the token to the end of its line"
     inputs:
@@ -1066,7 +1066,7 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] auth: Bearer (eyJhbGciOiJIUzI1NiJ9) next=1")
 
-  - name: "an x-api-key or api-key value ending in a scheme word puts it back for the bearer rule"
+  - name: "an x-api-key or api-key value ending in a scheme word goes with the bearer token after it"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
@@ -1080,7 +1080,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | apiKey=[REDACTED]Bearer [REDACTED] next=1 | x-api-key: [REDACTED]Bearer [REDACTED] next=1")
+              assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED] next=1 | x-api-key: [REDACTED] next=1 | apiKey=[REDACTED] next=1 | apiKey=[REDACTED] next=1 | apiKey=[REDACTED] next=1 | x-api-key: [REDACTED] next=1")
 
   - name: "a header after an x-api-key value ending in a scheme word still loses its value"
     inputs:
@@ -1096,7 +1096,7 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] {\"x-api-key: [REDACTED]Bearer [REDACTED] [REDACTED]\"} | ('x-api-key: [REDACTED]Bearer [REDACTED] [REDACTED]')")
+              assert_eq!(.message, "[basecradle-router] {\"x-api-key: [REDACTED]")
 
   - name: "a value word after scheme words is read whole before any glued header"
     inputs:
@@ -1114,7 +1114,7 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] x-api-key: [REDACTED] next=1 | \"x-api-key: [REDACTED]\" | ?apiKey=[REDACTED] next=1")
 
-  - name: "a scheme word glued to a heartbeat run is written as a fixed word, and its token goes"
+  - name: "a scheme word glued to a heartbeat run goes with the run and its token"
     inputs:
       - insert_at: "ai_scrub"
         type: "vrl"
@@ -1127,4 +1127,4 @@ tests:
         conditions:
           - type: "vrl"
             source: |
-              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed | ping [REDACTED_HEARTBEAT_URL]Bearer [REDACTED] failed")
+              assert_eq!(.message, "[basecradle-router] ping [REDACTED_HEARTBEAT_URL] failed | ping [REDACTED_HEARTBEAT_URL] failed")
