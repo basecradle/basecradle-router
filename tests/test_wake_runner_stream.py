@@ -396,7 +396,8 @@ _SCHEME_PIECES = [
     "A_TOKEN=", "MY_API_KEY=", "PASSWORD=", "Bearer ", "Bearer\t", "BEARER ", "bearer ",
     "KBearer ", "x.Bearer ", "abc-bearer ", "eyJabc", "abc", " ", "=", ".", ":", "next=1",
     "\t", "x\t", "\tBearer ", "'q'\t", "`a`\t", "\\\t", ",", "}",
-    "DB_PASSWORD=", "x,", "'q'", "(a)\t",
+    "DB_PASSWORD=", "x,", "'q'", "(a)\t", "(a)Bearer ", "'q'Bearer ", "\\Bearer ",
+    'x"q"bearer ',
 ]  # fmt: skip
 
 
@@ -421,7 +422,7 @@ def test_the_fallback_reads_scheme_words_as_the_translator_does(tmp_path: Path) 
         ("Bearer\t", ""),
         ("xBearer", ""),
         ("A_TOKEN=Bearer", ""),
-        ("xbearer", " x"),
+        ("xbearer", ""),
         # Lead words before a scheme word a tab glues to a value (#502), and tabs alone.
         ("x\t", " x"),
         ("'q'\t", " x"),
@@ -439,7 +440,7 @@ def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
     tmp_path: Path, run: str, left: str
 ) -> None:
     # A backtracking engine reads the scheme words before a value: none of these may stall it. A
-    # run of scheme words takes the word after it; a value ending in `bearer` is no header.
+    # run of scheme words takes the word after it, and so does a word ending in one (#510).
     reply = "A_TOKEN=" + run * 40_000 + " x"
     started = time.monotonic()
     out = _fallback(tmp_path, reply)
@@ -606,7 +607,7 @@ def test_the_fallback_is_its_generated_program_byte_for_byte() -> None:
 
 def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
     import fallback_rule
-    from basecradle_router.logfmt import CREDENTIAL_NAME, LEAD_OPENERS, REDACTED_VALUE, SCHEME_GLUE
+    from basecradle_router.logfmt import CREDENTIAL_NAME, LEAD_OPENERS, REDACTED_VALUE, SCHEME_WORD
 
     script = _run_stream()
     assert f'\\"{CREDENTIAL_NAME}\\" as \\$n' in script
@@ -614,6 +615,7 @@ def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
     assert f'\\"{marker}\\" as \\$r' in script
     # Every piece the value reads is the translator's (#497, #502, #504's review), one spelling.
     program = fallback_rule.PROGRAM_JQ
-    assert f"[{SCHEME_GLUE}]*Bearer" in program
+    assert f"{fallback_rule.CLOSED_PIECE}*+(?:{fallback_rule.A_NAMES_EQ}" in fallback_rule.ITEM
+    assert f"(?<={SCHEME_WORD})[ \\t]+" in program
     assert fallback_rule.run_char("\t" + LEAD_OPENERS + "=") in fallback_rule.LEAD
     assert all(f"(?<={s})" in program and f"(?<!{s})" in program for s in fallback_rule.SPELLINGS)

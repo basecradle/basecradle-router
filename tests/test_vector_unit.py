@@ -55,10 +55,10 @@ from pathlib import Path
 
 import pytest
 
+import credential_rule
 from basecradle_router.logfmt import (
     _BREAK_CHARS,
     _LEAD_WORD,
-    _SCHEME_WORD,
     CANARY_VALUE_STOPS,
     REDACTED_VALUE,
     log_fields,
@@ -506,19 +506,20 @@ _AGREED = [
     "L_TOKEN=abc'def ghi' next=1 | M_TOKEN=abc\\ def next=2 | N_TOKEN=$'abc def' next=3",
     "O_TOKEN=`cat /run/fabricated` next=1 | P_TOKEN=$(cat /run/fabricated) next=2",
     # A bearer value goes with its token (#497): a scheme word in any case, one glued to a value
-    # as HTTP spells it, and any run of the two, in any order. A value merely ending in the
-    # letters is no header, and a scheme word with no word after it on its line is the value.
+    # as HTTP spells it, and any run of the two, in any order. A scheme word with no word after it
+    # on its line is the value. (A word merely ending in the letters is a scheme word too, #510: the
+    # print site reads it and the box does not, a stated limit below.)
     "A_TOKEN=Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig next=1",
     "X_API_KEY=KBearer abcdefgh:fabricatedTail0003 next=1",
     "A_TOKEN=Bearer Bearer eyJabc next=1 | B_TOKEN=bearer\tBEARER fabricated next=2",
     "C_TOKEN=Bearer KBearer fabricated next=1 | D_TOKEN=KBearer Bearer fabricated next=2",
-    "E_TOKEN=abc-bearer fabricated next=1 | F_TOKEN=x.Bearer fabricated next=2",
+    "F_TOKEN=x.Bearer fabricated next=2",
     "G_TOKEN=Bearer \nfabricated next=1 | H_TOKEN=Bearer",
     # A double-quoted token, which the parity pass takes where the name is outside every quote,
     # after a space or a tab; and a scheme word inside a quoted piece or an escape, which is none.
     'L_TOKEN=Bearer "fabricated quoted" next=1 | M_TOKEN=Bearer KBearer "fabricated" next=2',
     "N_TOKEN=Bearer\t\"fabricated quoted\" next=1 | O_TOKEN=Bearer\t'fabricated quoted' next=2",
-    "P_TOKEN='a Bearer' fabricated next=1 | Q_TOKEN=a\\ Bearer fabricated next=2",
+    "P_TOKEN='a Bearer' fabricated next=1",
     "X_TOKEN=Bearer fabricatedSecret=x next=1",
     "X_TOKEN=Bearer abc123=xyz789fabricated next=1",
     # The token is the whole run, an `=` included, so a scheme word with a bare field after it
@@ -583,6 +584,11 @@ _RENDERED = [
 #: the line's own structure: the close of the quoted value an assignment sits in, a `"` a
 #: single-quoted value would cross, a `,` or `}`, a record break, a shell substitution.
 _DIFFERENT = {
+    # The stated limit (#510, `_LIMIT`): the print site reads any word ending in `bearer` as a
+    # scheme word and takes its token; the box reads one only alone or glued as HTTP spells it
+    # (#497), so its value ends at any other, and the token ships with no name before it.
+    "E_TOKEN=abc-bearer fabricatedTok next=1": f"E_TOKEN={BOX_REDACTED_VALUE} fabricatedTok next=1",
+    "Q_TOKEN=a\\ Bearer fabricated next=2": f"Q_TOKEN={BOX_REDACTED_VALUE} fabricated next=2",
     # The canary stops at a `,` or a `}`, and so does the box, in either pass: in a JSON line they
     # are structure.
     'Q_TOKEN=v1,next="x y" end=1': f'Q_TOKEN={BOX_REDACTED_VALUE},next="x y" end=1',
@@ -751,6 +757,11 @@ _FUZZ_PIECES = [
     "DB_PASSWORD=",
     "x'q'",
     "(a)\t",
+    "abc-bearer ",
+    "(a)Bearer ",
+    'x"q"bearer ',
+    "\\Bearer ",
+    '\\"a b\\"bearer ',
     "=",
     "==",
     REDACTED_VALUE,
@@ -793,15 +804,20 @@ def _quote_open_at(record: str, at: int) -> bool:
 _VALUE_CHAR = re.compile("[^" + re.escape(" \t" + CANARY_VALUE_STOPS + _BREAK_CHARS) + "]")
 _MARKERS = (REDACTED_VALUE, BOX_REDACTED_VALUE)
 
+#: The bearer scheme words the box's credential value reads through (#497): alone in any case, or
+#: glued to token characters as HTTP spells it. Any other word ending in one ends the value, the
+#: stated limit (#510, `_LIMIT`).
+_BOX_SCHEME_WORD = f"(?i:bearer)|[{credential_rule.SCHEME_GLUE}]*Bearer"
+
 #: The bearer scheme words a value may open with, each with its blanks (#497), and the lead words a
 #: tab glues one to (#502): a quoted value after them is still the name's, and the parity pass takes
 #: it with them.
 _SCHEME_RUN = re.compile(
-    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*"
+    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _BOX_SCHEME_WORD + ")[ \t]+)*"
 )
 
 #: After a marker, only scheme words glued to it: the marker is no lead word.
-_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _SCHEME_WORD.pattern + ")[ \t]+)*")
+_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _BOX_SCHEME_WORD + ")[ \t]+)*")
 
 #: What may follow a quoted marker the parity pass keeps whole: anything that ends its word, the
 #: line's end included.
@@ -928,14 +944,29 @@ _ORACLE_PIECES = [
 ]
 
 
+def _box_leaves_a_scheme_word(line: str) -> bool:
+    """Whether `line` holds a scheme word the box's credential rule does not read through (#510): a
+    word ending in `bearer` that is not one alone or glued as HTTP spells it. The print site reads
+    the token after it and the box leaves it, the stated limit (`_LIMIT`), so the two do not read
+    that token alike."""
+    return any(
+        not re.fullmatch(_BOX_SCHEME_WORD, word)
+        for word in re.findall(r"\S*?(?i:bearer)(?=[ \t])", line)
+    )
+
+
 def test_the_box_never_leaves_more_of_a_value_than_the_print_site(tmp_path: Path) -> None:
     # The reference holds the box to itself, not only to the lines picked above: on every
-    # construct the two read alike, the box takes at least what the print site takes. Seeded fuzz,
-    # 3,000 lines; a fabricated secret the print site redacts must not survive the box.
+    # construct the two read alike, the box's credential rule alone takes at least what the print
+    # site takes. Seeded fuzz, 3,000 lines; a fabricated secret the print site redacts must not
+    # survive the rule. A scheme word the rule leaves is no construct the two read alike: it is the
+    # stated limit (`_LIMIT`).
     rng = random.Random(877)
     lines = [
         "".join(rng.choice(_ORACLE_PIECES) for _ in range(rng.randint(1, 30))) for _ in range(3000)
     ]
+    lines = [line for line in lines if not _box_leaves_a_scheme_word(line)]
+    assert len(lines) > 1500
     box = _scrub_lines(_vector(), tmp_path, lines, alone="rule")
     leaked = [
         (line, got)
@@ -973,8 +1004,10 @@ def test_a_closed_quoted_value_goes_whatever_came_before_it(tmp_path: Path) -> N
 # rest of its word; while the word read as the token ends in `bearer`, the next word is the token.
 # Every line below is a bearer header built by that definition, so where its token stands is known
 # by construction, and the token is the fabricated secret: it must never ship. Seeded fuzz over
-# every context a header reaches the box in but a credential-named assignment, whose value the
-# credential rule reads first by the print site's reading, which stops at fewer scheme words (#510).
+# every context a header reaches the box in, outside a credential-named assignment's value. In one,
+# the print site reads the fleet's scheme word (any word of closed pieces ending in `bearer`) and
+# holds the same by its own fuzz (#510); the box's credential rule reads it only as #497 did, the
+# stated limit below, where the canary reads nothing the box ships.
 
 _BEARER_SECRET = "eyJFab1catedSig"
 
@@ -1045,12 +1078,26 @@ _HEADER_CONTEXTS = [
     "https://h.example.com/heartbeat/K9x",
     "uptime.example.com/heartbeat/K9 ",
 ]
+
+#: A credential-named assignment's value, which the print site and the box's credential rule read
+#: before any header rule (#510): bare, exported, glued after a quote or a `,`, opening with a `,`,
+#: and after a lead word a tab glues to it.
+_CREDENTIAL_CONTEXTS = [
+    "A_TOKEN=",
+    "X_API_KEY=",
+    "export GH_TOKEN=",
+    "SECRET_KEY_BASE=",
+    "x,DB_PASSWORD=",
+    "'q'DB_PASSWORD=",
+    "A_TOKEN=,",
+    "A_TOKEN=x\t",
+]
 _HEADER_ENDS = ["", " next=1", '"}', "\nnext", " | other", "'", '"']
 
 
-def _bearer_header(rng: random.Random) -> str:
-    words = [rng.choice(_SCHEME_WORDS) for _ in range(rng.choice([1, 1, 2, 2, 3, 4]))]
-    header = rng.choice(_HEADER_CONTEXTS) + words[0]
+def _bearer_header(rng: random.Random, contexts: list[str], scheme_words: list[str]) -> str:
+    words = [rng.choice(scheme_words) for _ in range(rng.choice([1, 1, 2, 2, 3, 4]))]
+    header = rng.choice(contexts) + words[0]
     for word in words[1:]:
         header += rng.choice(_SCHEME_BLANKS) + word
     return header + rng.choice(_SCHEME_BLANKS) + rng.choice(_TOKENS) + rng.choice(_HEADER_ENDS)
@@ -1058,10 +1105,79 @@ def _bearer_header(rng: random.Random) -> str:
 
 def test_no_bearer_header_ships_its_token(tmp_path: Path) -> None:
     rng = random.Random(507)
-    lines = [_bearer_header(rng) for _ in range(4000)]
+    lines = [_bearer_header(rng, _HEADER_CONTEXTS, _SCHEME_WORDS) for _ in range(4000)]
     box = _scrub_lines(_vector(), tmp_path, lines)
     leaked = [(line, got) for line, got in zip(lines, box, strict=True) if "Fab1cated" in got]
     assert not leaked, leaked[:5]
+
+
+def test_no_credential_value_ends_between_a_scheme_word_and_its_token_at_the_print_site() -> None:
+    # The print site reads the same definition (#510): every header in a credential-named value
+    # loses its token there too, before any line reaches the box.
+    rng = random.Random(510)
+    lines = [_bearer_header(rng, _CREDENTIAL_CONTEXTS, _GLUED_SCHEME_WORDS) for _ in range(6000)]
+    leaked = [line for line in lines if "Fab1cated" in redact_credentials(line)]
+    assert not leaked, leaked[:5]
+
+
+#: What the box does not take until its literal rules run as one alternation (deploy/README.md →
+#: the credential rule's stated limits, basecradle-router#510). Each line, with what the box ships.
+#: The print site closes the first four at the source; the rest it leaves as the box does.
+#:
+#: 1. The issue's three reproductions: a credential value ending in a word that the fleet's
+#:    definition reads as a scheme word (any word ending in `bearer`) and the box's value reads
+#:    only alone or glued as HTTP spells it. Reading it there consumed other rules' labels, and a
+#:    word written back for the bearer rule landed inside other headers (basecradle-noc#1573).
+#: 2. A credential value opening with a `,` or a `}`, where the box's value never opens: opening
+#:    there consumed other rules' labels too.
+#: 3. An `x-api-key` header whose value is an `api_key=` assignment with a quoted token: the header
+#:    rule takes the label, and the assignment rule never sees the token.
+#: 4. An `api_key=` value opening with an escaped quote (#515): the assignment rule takes only the
+#:    backslash, and letting it open there left a second label's value to no rule.
+#: 5. A scheme word glued after a piece the word leaves open: the shell, and so the print site and
+#:    the box, pairs that quote with a later one; the bearer rule opens the token's quote instead.
+_LIMIT = {
+    "A_TOKEN=abc-bearer eyJFab1catedSig.e30.sig next=1": (
+        f"A_TOKEN={BOX_REDACTED_VALUE} eyJFab1catedSig.e30.sig next=1"
+    ),
+    "A_TOKEN=Bearer x\"q\"bearer 'eyJFab1catedSig' next=1": (
+        f"A_TOKEN={BOX_REDACTED_VALUE} 'eyJFab1catedSig' next=1"
+    ),
+    "X_API_KEY=(a)Bearer eyJFab1catedSig next=1": (
+        f"X_API_KEY={BOX_REDACTED_VALUE} eyJFab1catedSig next=1"
+    ),
+    "A_TOKEN=,K9Fab1catedSecret01 next=1": "A_TOKEN=,K9Fab1catedSecret01 next=1",
+    "x-api-key: api_key=\"K9Fab1catedSecret03' next=1": (
+        "x-api-key: [REDACTED]\"K9Fab1catedSecret03' next=1"
+    ),
+    'api_key=\\"K9Fab1catedSecret07\\" next=1': 'apiKey=[REDACTED]"K9Fab1catedSecret07\\" next=1',
+    "SECRET_KEY_BASE='q''Bearer\t'a eyJFab1catedSig b'": (
+        f"SECRET_KEY_BASE={BOX_REDACTED_VALUE} eyJFab1catedSig b'"
+    ),
+    'X_API_KEY="Bearer\t"a eyJFab1catedSig b" next=1': (
+        f'X_API_KEY={BOX_REDACTED_VALUE} eyJFab1catedSig b" next=1'
+    ),
+}
+
+#: The lines the print site closes at the source: the first four.
+_LIMIT_CLOSED_AT_THE_SOURCE = list(_LIMIT)[:4]
+
+
+def test_the_boxs_stated_limits_ship_nothing_the_canary_reads(tmp_path: Path) -> None:
+    # Pinned, so a change to either reading is seen; the print site takes the ones it closes, and
+    # the canary reads nothing in any line the box ships: the name keeps its marker or its empty
+    # value, and what ships is a token with no credential name before it. The fuzz holds the same
+    # over every scheme word in every credential-named context.
+    lines = list(_LIMIT)
+    assert _scrub_lines(_vector(), tmp_path, lines) == list(_LIMIT.values())
+    for line in lines:
+        closed = "Fab1cated" not in redact_credentials(line)
+        assert closed == (line in _LIMIT_CLOSED_AT_THE_SOURCE), line
+    rng = random.Random(1510)
+    lines = [_bearer_header(rng, _CREDENTIAL_CONTEXTS, _SCHEME_WORDS) for _ in range(3000)]
+    canary = re.compile(NOC_CREDENTIAL_ASSIGNMENT)
+    shipped = [got for got in _scrub_lines(_vector(), tmp_path, lines) if canary.search(got)]
+    assert not shipped, shipped[:5]
 
 
 @pytest.mark.parametrize("host", HOSTS)

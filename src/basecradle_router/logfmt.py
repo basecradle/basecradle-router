@@ -265,16 +265,17 @@ def _shell_word_end(text: str, start: int) -> tuple[int, bool]:
     return min(i, n), False
 
 
-#: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
-#: a token's, as a header value spells one. The box's rule builds its glued scheme word from this
-#: one spelling (``tests/credential_rule.py``, ``GLUED``), and ``wake-runner``'s ``jq`` fallback
-#: carries it verbatim (pinned by a test).
-SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
-
 #: A bearer header's scheme word, which is never a credential's whole value: the token after it is
-#: (#497). Alone it is the word in any case; glued to a value only as HTTP spells it, so a value
-#: merely ending in the letters (``abc-bearer``) is no header.
-_SCHEME_WORD = re.compile(f"(?i:bearer)|[{SCHEME_GLUE}]*Bearer")
+#: (#497). The fleet's one definition is basecradle-harness ``docs/telemetry.md`` → Credential
+#: Scrubbing (basecradle-harness#929): ``bearer`` in any case, glued to anything before it, followed
+#: by whitespace. So a word is a scheme word when it ends in these six letters as written, whatever
+#: comes before them: ``Bearer``, ``abc-bearer``, ``x"q"bearer``, ``(a)Bearer`` (#510). The box's
+#: rule (``tests/credential_rule.py``, ``SCHEME``) and ``wake-runner``'s ``jq`` fallback build their
+#: scheme word's end from this one spelling (pinned by a test).
+_SCHEME_LETTERS = "bearer"
+SCHEME_WORD = f"(?i:{_SCHEME_LETTERS})"
+_SCHEME_WORD = re.compile(SCHEME_WORD)
+_SCHEME_WORD_LENGTH = len(_SCHEME_LETTERS)
 
 #: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
 _SCHEME_BLANKS = re.compile("[ \t]+")
@@ -338,15 +339,15 @@ def _reached(text: str, at: int) -> bool:
     return at < len(text) and text[at] not in _UNREACHED
 
 
-def _token_after_a_glued_scheme_word(text: str, floor: int, end: int) -> int | None:
-    """Where the token starts, when a value read from ``floor`` ends at ``end`` just after a bearer
-    scheme word a tab glues to it (``(a)<TAB>Bearer tok``: the canary's run takes the scheme word),
-    with a word on its record after its blanks; else ``None``. A value never ends between a scheme
-    word and its token, whatever stands before the tab (the review of #502). The lead words are
-    the shapes the box and the ``jq`` fallback read word by word; this rule is the print site's net
-    under every other."""
-    tab = text.rfind("\t", floor, end)
-    if tab < 0 or not _SCHEME_WORD.fullmatch(text, tab + 1, end):
+def _token_after_a_scheme_word(text: str, floor: int, end: int) -> int | None:
+    """Where the token starts, when what was read from ``floor`` ends at ``end`` in a bearer scheme
+    word (:data:`_SCHEME_WORD`), with a word on its record after its blanks; else ``None``. A value
+    never ends between a scheme word and its token, whatever the scheme word is glued to: a word
+    the shell reads (``x"q"bearer``), or one a tab glues to the value (``(a)<TAB>Bearer``, the
+    canary's run taking the scheme word, the review of #502)."""
+    if end - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
+        text, end - _SCHEME_WORD_LENGTH, end
+    ):
         return None
     if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
         return None
@@ -363,11 +364,11 @@ def _value_end(text: str, start: int) -> int:
     1. **Across a tab** to the next word, while the word is a lead word (:data:`_LEAD_WORD`): the
        canary's run crosses a tab, so a word after one is still the value's (#502). The next word
        must start where a run could go on (:func:`_reached`).
-    2. **Across blanks** to the next word, while the word is a bearer scheme word
-       (:data:`_SCHEME_WORD`), so a doubled scheme word goes with the token after both (#497), and
-       wherever the value would end just after a scheme word a tab glues to it, whatever stands
-       before the tab (:func:`_token_after_a_glued_scheme_word`). A scheme word with nothing after
-       it on its record is the value alone.
+    2. **Across blanks** to the next word, while the word ends in a bearer scheme word
+       (:data:`_SCHEME_WORD`, glued to anything before it, #510), so a doubled scheme word goes with
+       the token after both (#497), and wherever the value would end just after one, a scheme word
+       a tab glues to it included (:func:`_token_after_a_scheme_word`). A scheme word with nothing
+       after it on its record is the value alone.
     3. **Into a value of its own** at a credential name's ``=`` outside every quote in the word
        (``x,DB_PASSWORD=<TAB>…``): the redactor's next search starts past that ``=``, so the name's
        value is read here, by this same reading, and goes with this one (#504's review).
@@ -394,21 +395,17 @@ def _value_end(text: str, start: int) -> int:
             end = max(end, word_end)
             if at_a_name:
                 break  # a credential name's `=`: its value is read as one from here
-            if _SCHEME_WORD.fullmatch(text, at, word_end) and (
-                blanks := _SCHEME_BLANKS.match(text, word_end)
-            ):
-                token = blanks.end()
-                if _reached(text, token):  # a word after the blanks, on the same record
-                    at = token
-                    if at >= run_end:
-                        run_end = _CANARY_RUN.match(text, at).end()
-                        end = max(end, run_end)
-                    continue
+            if (token := _token_after_a_scheme_word(text, at, word_end)) is not None:
+                at = token  # a word after the blanks, on the same record
+                if at >= run_end:
+                    run_end = _CANARY_RUN.match(text, at).end()
+                    end = max(end, run_end)
+                continue
             lead = _LEAD_WORD.match(text, at)
             if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
                 # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
-                # unless it ends just after a scheme word a tab glues to it.
-                if (token := _token_after_a_glued_scheme_word(text, floor, end)) is None:
+                # unless it ends just after a scheme word.
+                if (token := _token_after_a_scheme_word(text, floor, end)) is None:
                     return end
                 at = floor = token
                 if at >= run_end:
@@ -429,9 +426,10 @@ def redact_credentials(text: str) -> str:
     character after the ``=`` (:func:`_shell_word_end`), so a quoted value or a ``"$(…)"`` goes
     whole, and the canary's own run, so whatever the canary would read as the value is gone in every
     record the text is written into, a prose line that keeps a tab included. It reaches across a tab
-    after a lead word (#502), past a bearer scheme word to its token (#497), and into the value of a
-    credential name standing in it outside a quote (#504's review). An empty value (a space, a
-    record break or the text's end follows the ``=``) has nothing to hide and is left as it is.
+    after a lead word (#502), past a bearer scheme word to its token (#497: any word ending in one,
+    #510), and into the value of a credential name standing in it outside a quote (#504's review).
+    An empty value (a space, a record break or the text's end follows the ``=``) has nothing to
+    hide and is left as it is.
     Linear in ``text``, and idempotent: a marker where the canary's run would end after it is a
     whole value, so a value redacted where it is bounded and again where it is rendered stays one
     marker.

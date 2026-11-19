@@ -250,11 +250,17 @@ FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
         ('A_TOKEN=Bearer "a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
         ('A_TOKEN=Bearer\t"a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
         ("A_TOKEN=Bearer\t'a b' next=1", "A_TOKEN='<a redacted value>' next=1"),
-        # Glued only as HTTP spells it: a value merely ending in the letters is no header, nor is
-        # a scheme word inside a quoted piece.
-        ("A_TOKEN=abc-bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Glued to anything before it (#510, the fleet's one definition): any word ending in the
+        # six letters as written is a scheme word, the issue's three reproductions included, and
+        # an escaped blank is its word's. A scheme word inside a quoted piece is not its word's end.
+        (f"A_TOKEN=abc-bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=Bearer x\"q\"bearer '{FAKE_JWT}' next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"X_API_KEY=(a)Bearer {FAKE_JWT} next=1", "X_API_KEY='<a redacted value>' next=1"),
+        (f"A_TOKEN=$(x)Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=\\Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN='a Bearer' next=1", "A_TOKEN='<a redacted value>' next=1"),
-        ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=Bear'er' next=1", "A_TOKEN='<a redacted value>' next=1"),
         # A scheme word with no word after it on its line is the value.
         ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),

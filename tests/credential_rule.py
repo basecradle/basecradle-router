@@ -31,7 +31,6 @@ from pathlib import Path
 from basecradle_router.logfmt import (
     CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
-    SCHEME_GLUE,
 )
 
 #: Every record break, as each class spells it (`logfmt._BREAK_CHARS`, pinned by a test).
@@ -88,9 +87,13 @@ OPEN_PIECES = [
 CLOSED_PIECE = "(?:" + "|".join(CLOSED_PIECES) + ")"
 OPEN_PIECE = "(?:" + "|".join(OPEN_PIECES) + ")"
 
-#: What a bearer header may be glued to: a value of token characters (the print site's one
-#: spelling, `logfmt.SCHEME_GLUE`), and the scheme word as HTTP spells it, so a value merely ending
-#: in the letters (`abc-bearer`) is no header.
+#: What the box's value reads a bearer header through when one is glued to it (#497): a value of
+#: token characters, and the scheme word as HTTP spells it. The fleet's scheme word is any word
+#: ending in `bearer` (basecradle-router#510), which the print site and the `jq` fallback read; any
+#: other such word ends the box's value and leaves its token, a stated limit (deploy/README.md) until
+#: the box's literal rules run as one alternation, where reading it cannot consume another rule's
+#: label (basecradle-noc#1573).
+SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
 GLUED = f"[{SCHEME_GLUE}]*?Bearer"
 
 #: A scheme word, alone in any case or glued.
