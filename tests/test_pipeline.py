@@ -24,7 +24,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeError, WakeResult, WakeStopped
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeStopped
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -75,7 +75,7 @@ class _StubWaker:
         self.fail_times = fail_times
         self.calls: list[tuple[Agent, Event]] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         self.calls.append((agent, event))
         if len(self.calls) <= self.fail_times:
             raise WakeError("transient blip", exit_code=2)
@@ -720,7 +720,9 @@ def test_same_agent_is_locked_during_a_wake() -> None:
     release = threading.Event()
 
     class _BlockingWaker:
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
+        def wake(
+            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        ) -> WakeResult:
             in_wake.set()
             release.wait(timeout=5)
             return WakeResult(exit_code=0)
@@ -828,8 +830,8 @@ def test_a_transient_wake_failure_is_logged_as_it_happens_not_only_at_exhaustion
     retries = [r for r in caplog.records if "event=wake_retry" in r.getMessage()]
     assert len(retries) == 2  # the two failures a retry FOLLOWED; the 3rd succeeded
     assert all(r.levelname == "WARNING" for r in retries)
-    assert "attempt=1/3" in retries[0].getMessage()
-    assert "attempt=2/3" in retries[1].getMessage()
+    assert "try=1/3" in retries[0].getMessage()
+    assert "try=2/3" in retries[1].getMessage()
     for message in (r.getMessage() for r in retries):
         assert f"agent={NOVA.harness_key}" in message
         assert f"delivery={DELIVERY_A}" in message
@@ -1173,9 +1175,9 @@ class _WatchingWaker(_StubWaker):
         self._caplog = caplog
         self.journal_at_call: list[list[str]] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         self.journal_at_call.append([r.getMessage() for r in self._caplog.records])
-        return super().wake(agent, event)
+        return super().wake(agent, event, attempt)
 
 
 def test_the_wake_start_line_is_emitted_before_the_first_attempt(caplog) -> None:
@@ -1193,7 +1195,7 @@ def test_the_wake_start_line_is_emitted_before_the_first_attempt(caplog) -> None
     # the silence it replaces once two agents are woken at once.
     start = _uncoloured(_bookends(caplog, "wake_start")[0])
     assert start == (
-        f"event=wake_start delivery={DELIVERY_A} agent={NOVA.harness_key} source=github"
+        f"event=wake_start delivery={DELIVERY_A} agent={NOVA.harness_key} source=github attempt=1/4"
     )
 
 
@@ -1204,7 +1206,7 @@ def test_the_wake_end_line_closes_a_clean_wake_with_its_verdict(caplog) -> None:
 
     end = _uncoloured(_bookends(caplog, "wake_end")[0])
     assert end == (
-        f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} source=github "
+        f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} source=github attempt=1/4 "
         "outcome=ok exit=0 duration=93.4s"
     )
 
@@ -1222,7 +1224,7 @@ def test_the_wake_end_line_closes_an_exhausted_wake_too(caplog) -> None:
     assert record.levelname == "WARNING"
     end = _uncoloured(record.getMessage())
     assert end.startswith(
-        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github "
+        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github attempt=1/4 "
         "outcome=failed attempts=3 duration=4.1s error="
     )
     assert "transient blip" in end
@@ -1234,7 +1236,9 @@ def test_the_bracket_closes_even_when_the_wake_path_raises_unexpectedly(caplog) 
     # would read, forever, as a wake still running — the worst possible lie for a line
     # whose whole job is saying whether an agent is awake.
     class _ExplodingWaker(_StubWaker):
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
+        def wake(
+            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        ) -> WakeResult:
             raise RuntimeError("the wake path is broken")
 
     pipeline, _ = _pipeline(waker=_ExplodingWaker())
@@ -1340,7 +1344,7 @@ def test_the_wake_end_bookend_paints_its_own_verdict_token(caplog) -> None:
         # run of tokens, in the same order, that it read before the token was painted.
         assert _uncoloured(end).startswith(
             f"event=wake_end delivery={DELIVERY_A} agent={NOVA.harness_key} "
-            f"source=github outcome={outcome} "
+            f"source=github attempt=1/4 outcome={outcome} "
         )
 
 
@@ -1356,7 +1360,7 @@ def test_the_wake_start_bookend_has_no_verdict_token_to_paint(caplog) -> None:
     start = _bookends(caplog, "wake_start")[0]
     assert start == (
         f"{GREEN}event=wake_start{RESET} "
-        f"delivery={DELIVERY_A} agent={NOVA.harness_key} source=github"
+        f"delivery={DELIVERY_A} agent={NOVA.harness_key} source=github attempt=1/4"
     )
 
 
@@ -1407,7 +1411,7 @@ class _StoppedWaker(_StubWaker):
         self.signal = signal
         self.exit_code = exit_code
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         if len(self.calls) + 1 == self.stop_on:
             self.calls.append((agent, event))
             raise WakeStopped(
@@ -1415,7 +1419,7 @@ class _StoppedWaker(_StubWaker):
                 signal=self.signal,
                 exit_code=self.exit_code,
             )
-        return super().wake(agent, event)
+        return super().wake(agent, event, attempt)
 
 
 def test_a_stopped_wake_is_never_retried_and_never_failed(caplog) -> None:
@@ -1491,7 +1495,7 @@ def test_the_bracket_closes_a_stopped_wake_with_its_own_verdict(caplog) -> None:
     # INFO, not WARNING: the bookend is not the failure tier. The warning is wake_stopped.
     assert record.levelname == "INFO"
     assert _uncoloured(record.getMessage()) == (
-        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github "
+        f"event=wake_end delivery={DELIVERY_B} agent={NOVA.harness_key} source=github attempt=1/4 "
         "outcome=stopped signal=KILL exit=-9 duration=23.1s"
     )
 

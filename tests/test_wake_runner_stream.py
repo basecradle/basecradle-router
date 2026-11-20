@@ -95,8 +95,8 @@ def test_a_missing_translator_refuses_the_wake_rather_than_run_it_unlogged() -> 
 def test_the_stream_helpers_ride_into_the_drop_as_inert_positionals() -> None:
     assert re.search(
         r'drop=\(runuser -u "\$user" -- /bin/bash -c "\$AGENT_SCRIPT" wake-runner "\$real_cwd"'
-        r' "\$delivery"\n\t"\$stream_python" "\$stream_translate" "\$stream_jq" "\$stream_cat"'
-        r' "\$launch_bin" "\$@"\)',
+        r' "\$delivery"\n\t"\$attempt" "\$attempts" "\$stream_python" "\$stream_translate"'
+        r' "\$stream_jq" "\$stream_cat" "\$launch_bin" "\$@"\)',
         _script(),
     )
 

@@ -30,13 +30,17 @@ from basecradle_router.config import (
     load_dedup_ttl,
     load_evidence_path,
     load_github_trusted_actors,
+    load_retry_path,
     load_wake_lanes,
     load_wake_lock_dir,
     route_secret_var,
 )
 from basecradle_router.dedup import DeliveryDeduper
 from basecradle_router.evidence import EvidenceStore
+from basecradle_router.models import Agent, Event
 from basecradle_router.pipeline import Pipeline
+from basecradle_router.resolve import resolve_agent
+from basecradle_router.retry import RetrySchedule
 from basecradle_router.routes import RouteRegistry, route_requires_secret
 from basecradle_router.routes.basecradle import BasecradleRoute, load_recipient_keyring
 from basecradle_router.routes.github import GithubRoute
@@ -62,16 +66,32 @@ def create_app(
     ``read_open_pulls`` are injectable for the same reason (see :func:`build_registry`).
     """
     config = load_config(env)
+    registry = build_registry(
+        config, env, read_open_handoffs=read_open_handoffs, read_open_pulls=read_open_pulls
+    )
+
+    def resolve(event: Event) -> Agent | None:
+        """A restored retry's agent, by the routes and registry this daemon runs now (#527).
+
+        A route since disabled resolves nothing: the router no longer accepts that source,
+        so it must not wake anyone for it either.
+        """
+        if event.source not in registry:
+            return None
+        try:
+            return resolve_agent(event, config)
+        except ConfigError:
+            return None
+
     pipeline = Pipeline(
-        registry=build_registry(
-            config, env, read_open_handoffs=read_open_handoffs, read_open_pulls=read_open_pulls
-        ),
+        registry=registry,
         config=config,
         waker=waker or HomeServerWaker(),
         breaker=WakeRateBreaker(load_breaker_config(env)),
         deduper=DeliveryDeduper(load_dedup_ttl(env)),
         wake_lock=WakeLockGuard(lock_dir=load_wake_lock_dir(env)),
         evidence=EvidenceStore(load_evidence_path(env)),
+        retries=RetrySchedule(load_retry_path(env), resolve=resolve),
     )
     return WebhookServer(pipeline, lanes=load_wake_lanes(env))
 

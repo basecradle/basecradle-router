@@ -83,6 +83,7 @@ PALETTE: Mapping[str, str] = MappingProxyType(
         "event=wake_retry": YELLOW,
         "event=wake_refused": YELLOW,
         "event=wake_lock_stale": YELLOW,
+        "outcome=deferred": YELLOW,
         # Operator's Choice tier — an operator stopped the wake; nothing failed
         "event=wake_stopped": YELLOW,
         "outcome=stopped": YELLOW,

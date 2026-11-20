@@ -47,7 +47,13 @@ _OPERATORS_CHOICE = {"event=wake_stopped", "outcome=stopped"}
 _DECIDED = {
     GREEN: {"event=wake_start", "outcome=ok", "event=breaker_reset"},
     BLUE: {"event=wake_end"},
-    YELLOW: {"event=wake_retry", "event=wake_refused", "event=wake_lock_stale"} | _OPERATORS_CHOICE,
+    YELLOW: {
+        "event=wake_retry",
+        "event=wake_refused",
+        "event=wake_lock_stale",
+        "outcome=deferred",
+    }
+    | _OPERATORS_CHOICE,
     RED: {
         "outcome=failed",
         "outcome=rejected",

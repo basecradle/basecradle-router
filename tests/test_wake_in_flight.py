@@ -23,7 +23,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeError, WakeResult, WakeStopped
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeStopped
 from basecradle_router.wakelock import WakeLockGuard
 
 NOVA = Agent(
@@ -79,7 +79,7 @@ class _ReadingWaker:
         self.outcomes = list(outcomes) or [None]
         self.seen: list[tuple] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         self.seen.append(_group(read_evidence(self.path).agent_wakes[agent.harness_key]))
         outcome = self.outcomes[len(self.seen) - 1]
         if outcome is not None:

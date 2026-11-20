@@ -39,6 +39,22 @@ logger = logging.getLogger("basecradle_router.wake")
 #: optional-when-absent, so the two sides ship independently.
 DELIVERY_ID_ENV = "BASECRADLE_DELIVERY_ID"
 
+#: Which attempt at its delivery a wake is, and how many the delivery gets (#527). The
+#: router retries a wake that failed for a temporary reason at about 1, 5 and 30 minutes
+#: (:mod:`basecradle_router.retry`), so a wake can know when it is the last one and say so
+#: on its timeline: the two are equal then. Set on every real wake, on either runtime,
+#: and on no probe. Like :data:`DELIVERY_ID_ENV`, a wake that reads neither is unaffected.
+ATTEMPT_ENV = "BASECRADLE_WAKE_ATTEMPT"
+ATTEMPTS_ENV = "BASECRADLE_WAKE_ATTEMPTS"
+
+#: The exit status a wake gives when it gave up for a temporary reason: a vendor's rate
+#: limit, a vendor that is down, a dropped connection. ``EX_TEMPFAIL`` from
+#: ``sysexits.h``, the status a mail transfer agent has always used for "try again later",
+#: which is the whole of what it asks for here. Only this status earns the delivery its
+#: retries at about 1, 5 and 30 minutes; every other non-zero exit is the crash it always
+#: was (basecradle-router#527).
+TEMPFAIL_EXIT = 75
+
 # The delivery id is observability, never authority — but it *is* source-supplied,
 # and on the home-server path it crosses a `sudo` boundary as an argv element. So
 # it is shape-checked here, at the router's edge, and pinned to the inert charset
@@ -145,6 +161,41 @@ class WakeStopped(Exception):
         self.exit_code = exit_code
 
 
+class WakeTempFailed(WakeError):
+    """A wake gave up for a temporary reason, and said so by exiting :data:`TEMPFAIL_EXIT`.
+
+    A :class:`WakeError` still, so every ``except WakeError`` that handled the exit before
+    #527 handles it unchanged. The pipeline alone looks for this subclass: it is what gets
+    a delivery its retries at about 1, 5 and 30 minutes instead of three tries in ten
+    seconds, which is exactly the time a vendor's outage outlasts.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class WakeAttempt:
+    """Which attempt at its delivery a wake is: ``number`` of ``of`` (#527).
+
+    The first wake of a delivery is attempt 1; each retry the router schedules after a
+    temporary failure is the next. ``of`` is every attempt the delivery gets, so a wake
+    can tell when it is the last one.
+    """
+
+    number: int
+    of: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.number <= self.of:
+            raise ValueError(f"a wake attempt is 1..{self.of}, got {self.number}")
+
+    @property
+    def last(self) -> bool:
+        """Whether no retry follows this attempt, whatever it ends in."""
+        return self.number == self.of
+
+    def __str__(self) -> str:
+        return f"{self.number}/{self.of}"
+
+
 # The exit statuses that mean "this wake was stopped by a signal", and the signal each
 # names. A wake reaches the router through `sudo -> wake-runner -> runuser -> <binary>`,
 # and the router's direct child is `sudo`. Proven on Ubuntu 24.04's sudo and util-linux
@@ -218,11 +269,15 @@ EnvProvider = Callable[[Agent], Mapping[str, str]]
 class Waker(Protocol):
     """Wake an agent for an event. The pipeline depends only on this protocol."""
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         """Run ``agent``'s headless ``claude`` for ``event``.
 
+        ``attempt`` is which attempt at the delivery this is, handed to the wake as
+        :data:`ATTEMPT_ENV` and :data:`ATTEMPTS_ENV`; ``None`` hands it neither.
+
         Returns a :class:`WakeResult` on a clean (exit 0) run; raises
-        :class:`WakeStopped` when the wake was killed by a stop signal, and
+        :class:`WakeStopped` when the wake was killed by a stop signal,
+        :class:`WakeTempFailed` when it exited :data:`TEMPFAIL_EXIT`, and
         :class:`WakeError` on any other non-zero exit or a launch failure.
         """
         ...
@@ -263,9 +318,11 @@ def _result_or_raise(result: WakeResult, agent: Agent) -> WakeResult:
     """Return a clean (exit 0) result, or raise naming the agent.
 
     The shared tail of every waker, so both classify an exit identically: a stop
-    signal's status (:data:`STOP_SIGNALS`) becomes a :class:`WakeStopped`; any other
-    non-zero exit becomes a ``WakeError`` carrying the exit code and the best available
-    detail (stderr, then stdout, then a clear placeholder — never an empty message)."""
+    signal's status (:data:`STOP_SIGNALS`) becomes a :class:`WakeStopped`;
+    :data:`TEMPFAIL_EXIT` becomes a :class:`WakeTempFailed`; any other non-zero exit
+    becomes a ``WakeError``. Both errors carry the exit code and the best available detail
+    (stderr, then stdout, then a clear placeholder — never an empty message), in one
+    message shape, so a reader of the recorded reason cannot tell the two apart by it."""
     if not result.ok:
         detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
         stopped_by = STOP_SIGNALS.get(result.exit_code)
@@ -276,7 +333,8 @@ def _result_or_raise(result: WakeResult, agent: Agent) -> WakeResult:
                 signal=stopped_by,
                 exit_code=result.exit_code,
             )
-        raise WakeError(
+        error = WakeTempFailed if result.exit_code == TEMPFAIL_EXIT else WakeError
+        raise error(
             f"wake of {agent.key} exited {result.exit_code}: {detail}",
             exit_code=result.exit_code,
         )
@@ -303,12 +361,17 @@ class SubprocessWaker:
     runner: Runner = _run_subprocess
     env_provider: EnvProvider = _empty_env
 
-    def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
+    def invocation_for(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+    ) -> WakeInvocation:
         """Assemble the command to wake ``agent`` for ``event`` — pure, no I/O."""
         env = dict(self.env_provider(agent))
         delivery = _correlation_id(event)
         if delivery is not None:
             env[DELIVERY_ID_ENV] = delivery
+        if attempt is not None:
+            env[ATTEMPT_ENV] = str(attempt.number)
+            env[ATTEMPTS_ENV] = str(attempt.of)
         return WakeInvocation(
             argv=wake_command(agent, event),
             cwd=agent.clone_path,
@@ -316,8 +379,8 @@ class SubprocessWaker:
             run_as_user=agent.os_user,
         )
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
-        return _result_or_raise(self.runner(self.invocation_for(agent, event)), agent)
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+        return _result_or_raise(self.runner(self.invocation_for(agent, event, attempt)), agent)
 
 
 # The root-owned wrapper the home-server waker escalates through (see deploy/).
@@ -376,7 +439,10 @@ class HomeServerWaker:
     ``--delivery`` is how the delivery id reaches the child *given* that the router
     passes no environment: the wrapper exports it as :data:`DELIVERY_ID_ENV` after
     the privilege drop. It sits before the ``--`` because everything after ``--`` is
-    the inert wake command the wrapper pins against its registry.
+    the inert wake command the wrapper pins against its registry. ``--attempt N/M``
+    rides the same way for the same reason, exported as :data:`ATTEMPT_ENV` and
+    :data:`ATTEMPTS_ENV` (#527); a probe never carries it, because a probe is never
+    retried and never launches anything that could read it.
 
     **A synthetic probe takes the wrapper's ``--probe`` mode instead of a command.**
     The wrapper then performs every step a real wake performs — validate the request
@@ -393,9 +459,12 @@ class HomeServerWaker:
     runner: Runner = _run_subprocess
     wrapper: str = WAKE_RUNNER
 
-    def invocation_for(self, agent: Agent, event: Event) -> WakeInvocation:
+    def invocation_for(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+    ) -> WakeInvocation:
         """Assemble the sudo+wrapper command — pure, no I/O."""
         delivery = _correlation_id(event)
+        attempt_args = () if attempt is None or event.synthetic else ("--attempt", str(attempt))
         return WakeInvocation(
             argv=(
                 "sudo",
@@ -405,6 +474,7 @@ class HomeServerWaker:
                 "--cwd",
                 agent.clone_path,
                 *(() if delivery is None else ("--delivery", delivery)),
+                *attempt_args,
                 *_mode_args(agent, event),
             ),
             # The wrapper cd's into the clone as the agent; the router's own cwd is
@@ -415,5 +485,5 @@ class HomeServerWaker:
             run_as_user=agent.os_user,
         )
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
-        return _result_or_raise(self.runner(self.invocation_for(agent, event)), agent)
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+        return _result_or_raise(self.runner(self.invocation_for(agent, event, attempt)), agent)

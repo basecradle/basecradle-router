@@ -52,7 +52,7 @@ from basecradle_router.synthetic import (
     SyntheticMarks,
     mint,
 )
-from basecradle_router.wake import WakeResult
+from basecradle_router.wake import WakeAttempt, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
 PROBE_SECRET = "fake-probe-route-secret-" + "1" * 32
@@ -229,7 +229,7 @@ class _Waker:
     def __init__(self) -> None:
         self.woken: list[Event] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         # The wake runs on a scheduler lane, so this line is written on that thread: it
         # must read as the request's lines do.
         logging.getLogger("basecradle_router.wake").info(

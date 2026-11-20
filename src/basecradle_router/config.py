@@ -17,6 +17,7 @@ from types import MappingProxyType
 from basecradle_router.breaker import BreakerConfig
 from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
 from basecradle_router.models import Agent, Recipient, WakeKind, _require_repo
+from basecradle_router.retry import DEFAULT_RETRY_FILE
 from basecradle_router.secret import Secret
 from basecradle_router.wakelock import DEFAULT_LOCK_DIR
 
@@ -43,6 +44,7 @@ _DEDUP_TTL_VAR = f"{ENV_PREFIX}DEDUP_TTL"
 
 _WAKE_LOCK_DIR_VAR = f"{ENV_PREFIX}WAKE_LOCK_DIR"
 _EVIDENCE_FILE_VAR = f"{ENV_PREFIX}EVIDENCE_FILE"
+_RETRY_FILE_VAR = f"{ENV_PREFIX}RETRY_FILE"
 _ADMIN_CMD_VAR = f"{ENV_PREFIX}ADMIN_CMD"
 _SELF_URL_VAR = f"{ENV_PREFIX}SELF_URL"
 
@@ -496,6 +498,24 @@ def load_evidence_path(env: Mapping[str, str] | None = None) -> str | None:
     raw = env.get(_EVIDENCE_FILE_VAR)
     if raw is None:
         return DEFAULT_EVIDENCE_FILE
+    stripped = raw.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    return stripped
+
+
+def load_retry_path(env: Mapping[str, str] | None = None) -> str | None:
+    """The waiting retries' file, from ``BASECRADLE_ROUTER_RETRY_FILE`` (#527).
+
+    Optional, defaulting to :data:`~basecradle_router.retry.DEFAULT_RETRY_FILE`. The
+    literal ``"none"`` (or an empty value) keeps the retries in memory, for a laptop or a
+    throwaway run, exactly as :func:`load_evidence_path` does; never on the fleet box,
+    where a restart would then drop every delivery waiting to be tried again.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(_RETRY_FILE_VAR)
+    if raw is None:
+        return DEFAULT_RETRY_FILE
     stripped = raw.strip()
     if not stripped or stripped.lower() == "none":
         return None

@@ -71,7 +71,7 @@ An agent's identity is **singular across every input path** (`constitution.md` �
 
 The router is the **single chokepoint for every wake**, so it holds the cross-agent backstop for a runaway loop the harness's own self-breaker cannot catch: `breaker.WakeRateBreaker`, consulted in `pipeline.Pipeline.execute` **inside the per-agent lock and immediately before the wake** — that placement is what makes it count dispatch rate rather than delivery rate, so it stays there. It caps wakes per agent and per (agent, stream) (`Event.stream_key`); a trip is **loud, never silent** (a `BREAKER`/`IGNORED` decision plus an `event=breaker_tripped` `ERROR` the NOC alarms on); it auto-resets after the cooldown; and it shares no protocol with the harness-side layer. Thresholds are tunable in `router.env` (`deploy/README.md`).
 
-Before changing `pipeline.py`, `scheduler.py`, `concurrency.py`, `coalesce.py`, `breaker.py`, `Event.stream_key`, a route's coalesce/recheck opt-ins, or the breaker or wake-lane settings, or before adding a route module, invoke the `router-wake-pipeline` skill.
+Before changing `pipeline.py`, `scheduler.py`, `concurrency.py`, `coalesce.py`, `breaker.py`, `retry.py`, `Event.stream_key`, a route's coalesce/recheck opt-ins, or the breaker or wake-lane settings, or before adding a route module, invoke the `router-wake-pipeline` skill.
 
 ### Proving the router's own claims — the green-while-absent instrument
 

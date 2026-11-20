@@ -245,8 +245,10 @@ def parse_wake(argv: tuple[str, ...]) -> tuple[str, str | None] | None:
     """``(agent, delivery)`` if ``argv`` is the daemon's real-wake ``sudo`` call, else ``None``.
 
     The exact argv :class:`~basecradle_router.wake.HomeServerWaker` assembles:
-    ``sudo <WAKE_RUNNER> --user <slug> --cwd <clone> [--delivery <id>] -- <command>``.
-    A probe (``--probe``) and anything unrecognised before the ``--`` are not wakes.
+    ``sudo <WAKE_RUNNER> --user <slug> --cwd <clone> [--delivery <id>] [--attempt <n>/<of>]
+    -- <command>``. A probe (``--probe``) and anything unrecognised before the ``--`` are not
+    wakes. ``--attempt`` (#527) is read past and nothing more: a stop ends the wake whichever
+    attempt it is, and the router then schedules nothing after it.
     """
     if len(argv) < 2 or os.path.basename(argv[0]) != "sudo" or argv[1] != WAKE_RUNNER:
         return None
@@ -257,7 +259,7 @@ def parse_wake(argv: tuple[str, ...]) -> tuple[str, str | None] | None:
         flag = rest.pop(0)
         if flag == "--":
             return (user, delivery) if user else None
-        if flag not in ("--user", "--cwd", "--delivery") or not rest:
+        if flag not in ("--user", "--cwd", "--delivery", "--attempt") or not rest:
             return None
         value = rest.pop(0)
         if flag == "--user":

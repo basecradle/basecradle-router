@@ -18,7 +18,7 @@ from basecradle_router.config import ConfigError, load_config
 from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX
 from basecradle_router.secret import Secret
-from basecradle_router.wake import HomeServerWaker, WakeResult
+from basecradle_router.wake import HomeServerWaker, WakeAttempt, WakeResult
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
 NOVA = Agent(
@@ -33,7 +33,7 @@ class _RecordingWaker:
     def __init__(self) -> None:
         self.calls: list[tuple[Agent, Event]] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         self.calls.append((agent, event))
         return WakeResult(exit_code=0, stdout="opened PR")
 
@@ -62,6 +62,9 @@ def _env(tmp_path) -> dict[str, str]:
         "BASECRADLE_ROUTER_AGENTS": _registry_file(tmp_path),
         "BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET": SECRET,
         "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": HANDOFF_SENDER,
+        # The daemon's state files live under tmp_path, never the box's state dir.
+        "BASECRADLE_ROUTER_EVIDENCE_FILE": str(tmp_path / "evidence.json"),
+        "BASECRADLE_ROUTER_RETRY_FILE": str(tmp_path / "wake-retries.json"),
     }
 
 
@@ -523,6 +526,9 @@ def _env_with_harness_agent(tmp_path) -> dict[str, str]:
         "BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS": HANDOFF_SENDER,
         "BASECRADLE_ROUTER_ENABLED_ROUTES": "github,basecradle",
         "BASECRADLE_ROUTER_BASECRADLE_WEBHOOK_SECRET": SECRET,
+        # The daemon's state files live under tmp_path, never the box's state dir.
+        "BASECRADLE_ROUTER_EVIDENCE_FILE": str(tmp_path / "evidence.json"),
+        "BASECRADLE_ROUTER_RETRY_FILE": str(tmp_path / "wake-retries.json"),
     }
 
 

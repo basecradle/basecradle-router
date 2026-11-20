@@ -26,7 +26,7 @@ from basecradle_router.routes import InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.scheduler import WakeScheduler
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeError, WakeResult
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
 NOVA = Agent(
@@ -44,7 +44,7 @@ class _StubWaker:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         if self.fail:
             raise WakeError("claude exited 1", exit_code=1)
         return WakeResult(exit_code=0, stdout="woke")
