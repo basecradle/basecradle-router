@@ -17,8 +17,7 @@ name: Public Repository Lockdown
 #   permission GITHUB_TOKEN can be granted, so it is a standing secret, provisioned by @origin.
 #   It never writes an issue: anything it posted would carry its owner's name.
 # - This repository's own bot's App token (basecradle-router-ai, basecradle#870), minted per
-#   run with issues: write and scoped to exactly the public repositories, files the gap issue
-#   and closes the renewal reminders the job used to keep (once, #524).
+#   run with issues: write and scoped to this repository alone, reads and files the gap issue.
 #
 # It reads repository secrets, so it never runs on a pull request.
 
@@ -64,22 +63,20 @@ jobs:
           test -n "$ADMIN_TOKEN" || { echo "::error::FLEET_ADMIN_TOKEN is not set: nothing can be renewed" >&2; exit 1; }
 
       - name: List the Public Repositories
-        id: repositories
         env:
           ADMIN_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}
           ORG: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           python3 .github/scripts/public_repository_lockdown.py repositories --org "$ORG" --out "$RUNNER_TEMP/repositories.txt"
-          echo "names=$(sed 's|.*/||' "$RUNNER_TEMP/repositories.txt" | paste -sd, -)" >> "$GITHUB_OUTPUT"
 
-      # The gap issue and the one-time reminder closes are written by this repository's own
-      # bot, basecradle-router-ai[bot] (basecradle#870), never by FLEET_ADMIN_TOKEN and never by
-      # GITHUB_TOKEN (which cannot reach the other repositories, and whose label events start
-      # no workflow). FLEET_BOT_* hold this repository's captain's App, with no fallback to
-      # the capital's key. Scoped to the repositories just listed. Allowed to fail, so a
-      # repository the App is not installed on never stops a renewal: the audit still renews
-      # everything, then dies at the gap issue, and nothing is pinged.
+      # The gap issue is written by this repository's own bot, basecradle-router-ai[bot]
+      # (basecradle#870), never by FLEET_ADMIN_TOKEN and never by GITHUB_TOKEN (whose label
+      # events start no workflow). FLEET_BOT_* hold this repository's captain's App, with no
+      # fallback to the capital's key. Scoped to this repository alone: the gap issue is the
+      # only issue the job writes (#524). Allowed to fail, so a failed mint never stops a
+      # renewal: the audit still renews everything, then dies at the gap issue, and nothing is
+      # pinged.
       # Pinned to a full commit SHA, its version in the comment: this step holds this
       # repository's App private key, so a moved tag would run someone else's code with it
       # (Dependabot bumps a SHA pin with its comment).
@@ -91,7 +88,7 @@ jobs:
           client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
           private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ steps.repositories.outputs.names }}
+          repositories: basecradle-router
           permission-issues: write
 
       - name: Renew, Read Back, and Record

@@ -181,6 +181,8 @@ def test_the_heartbeat_is_the_lock_alone_whatever_issues_are_open() -> None:
     result = audit(github)
     assert result.verdict == "clean" and result.heartbeat == "ping"
     assert result.state == {}
+    # Only this repository's issues are read, for the gap issue, and nothing is written.
+    assert github.kinds() == ["renew"] * len(FLEET)
 
 
 def test_the_result_records_what_each_repository_read_back() -> None:
@@ -310,6 +312,17 @@ def test_an_app_token_that_could_not_be_minted_never_costs_a_renewal() -> None:
     assert sorted(w[1] for w in github.writes if w[0] == "renew") == sorted(FLEET)
 
 
+def test_the_job_never_reads_or_writes_another_repositorys_issues() -> None:
+    class HomeOnly(FakeGitHub):
+        def open_issues(self, repository: str) -> list[dict[str, Any]]:
+            assert repository == HOME, repository
+            return super().open_issues(repository)
+
+    github = HomeOnly(issues={r: [reminder_issue(10, "2027-05-17", CAPITAL)] for r in FLEET})
+    assert audit(github).heartbeat == "ping"
+    assert github.kinds() == ["renew"] * len(FLEET)
+
+
 def test_every_renewal_happens_before_any_issue_is_read() -> None:
     order: list[str] = []
 
@@ -323,131 +336,13 @@ def test_every_renewal_happens_before_any_issue_is_read() -> None:
             return super().open_issues(repository)
 
     audit(Ordered())
-    assert order == ["renew"] * len(FLEET) + ["issues"] * len(FLEET)
+    assert order == ["renew"] * len(FLEET) + ["issues"]
 
 
 def test_the_home_repositorys_issues_are_read_once() -> None:
     github = FakeGitHub()
     audit(github)
     assert github.home_reads == 1
-
-
-# --- the one-time cleanup (#524): the job closes the reminders it kept ------------------
-
-
-def _reminders(date: str = "2027-05-17") -> dict[str, Any]:
-    # As they stand: one per public repository, every one the capital's bot's.
-    return {repo: [reminder_issue(10 + i, date, CAPITAL)] for i, repo in enumerate(FLEET)}
-
-
-def test_the_first_run_closes_every_reminder_and_still_pings() -> None:
-    github = FakeGitHub(issues=_reminders())
-    result = audit(github)
-    assert result.heartbeat == "ping"
-    for i, repository in enumerate(FLEET):
-        number = str(10 + i)
-        on_it = [w for w in github.writes if w[1] == repository and w[0] != "renew"]
-        assert [w[0] for w in on_it] == ["comment", "edit"], repository
-        assert on_it[0][2] == on_it[1][2] == number
-        assert json.loads(on_it[1][3]) == {"state": "closed", "state_reason": "completed"}
-    assert "create" not in github.kinds()
-
-
-def test_the_closing_comment_is_one_line_naming_the_job_its_heartbeat_and_the_run() -> None:
-    github = FakeGitHub(issues=_reminders())
-    audit(github)
-    comment = next(w[3] for w in github.writes if w[0] == "comment")
-    assert "\n" not in comment
-    assert "Public Repository Lockdown job, which replaces this reminder" in comment
-    assert "heartbeat" in comment and comment.endswith(RUN_URL)
-
-
-def test_the_second_run_finds_no_reminder_and_writes_nothing() -> None:
-    github = FakeGitHub()
-    result = audit(github)
-    assert result.heartbeat == "ping"
-    assert github.kinds() == ["renew"] * len(FLEET)
-
-
-def test_the_gap_issue_is_filed_before_any_reminder_is_closed() -> None:
-    github = lapsed("basecradle/.github", issues=_reminders())
-    audit(github)
-    kinds = [w[0] for w in github.writes if w[0] != "renew"]
-    assert kinds[0] == "create"
-
-
-def test_a_reminder_that_cannot_be_closed_or_read_never_touches_the_verdict() -> None:
-    class Refuses(FakeGitHub):
-        def comment(self, repository: str, number: int, body: str) -> None:
-            if repository == HOME:
-                raise lockdown.GitHubError("HTTP 403")
-            super().comment(repository, number, body)
-
-    issues = {**_reminders(), "basecradle/.github": lockdown.GitHubError("HTTP 502")}
-    github = Refuses(issues=issues)
-    result = audit(github)
-    assert result.verdict == "clean" and result.heartbeat == "ping"
-    # The one it could read and close is closed all the same.
-    rest = [w[:3] for w in github.writes if w[0] != "renew"]
-    assert rest == [
-        ("comment", "basecradle/basecradle-python", "11"),
-        ("edit", "basecradle/basecradle-python", "11"),
-    ]
-
-
-def test_a_dry_run_closes_no_reminder(capsys: pytest.CaptureFixture[str]) -> None:
-    github = FakeGitHub(issues=_reminders())
-    audit(github, dry_run=True)
-    assert github.writes == []
-    assert "would close the reminder basecradle/.github#10" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("author", [OWN_BOT, CAPITAL, "drawkkwast"])
-def test_a_reminder_any_of_its_writers_filed_is_closed(author: str) -> None:
-    assert lockdown.reminders_in([reminder_issue(10, "2027-05-14", author)]) == [10]
-
-
-@pytest.mark.parametrize("author", ["john", "basecradle-ruby-ai[bot]"], ids=["stranger", "sibling"])
-def test_an_issue_with_the_reminders_title_from_anyone_else_is_never_closed(author: str) -> None:
-    issues = [reminder_issue(70, "2027-05-14", author=author), reminder_issue(10, "2027-05-14")]
-    assert lockdown.reminders_in(issues) == [10]
-
-
-def test_the_issue_449_title_is_not_a_reminder() -> None:
-    # GitHub's search read this title as a second reminder on this repository.
-    issue = reminder_issue(449, "2027-05-01")
-    issue["title"] = (
-        "The Monthly Interaction-Limit Audit Failed Four Times and Told Nobody: Give It a "
-        "Heartbeat, and Renew Every Public Repository"
-    )
-    assert lockdown.reminders_in([issue, reminder_issue(61, "2027-05-01")]) == [61]
-
-
-@pytest.mark.parametrize(
-    "title",
-    [
-        "⏰ Renew interaction limit before 2027-05-14 (public-repo write-lockdown) — draft",
-        "Renew interaction limit before 2027-05-14 (public-repo write-lockdown)",
-        "⏰ Renew interaction limit before 2027-05-140 (public-repo write-lockdown)",
-    ],
-)
-def test_only_the_exact_reminder_title_counts(title: str) -> None:
-    issue = reminder_issue(10, "2027-05-14")
-    issue["title"] = title
-    assert lockdown.reminders_in([issue]) == []
-
-
-def test_an_entry_with_no_usable_number_is_skipped_never_raised() -> None:
-    broken = reminder_issue(10, "2027-05-14")
-    del broken["number"]
-    odd = {**reminder_issue(11, "2027-05-14"), "number": "11"}
-    assert lockdown.reminders_in([broken, odd, reminder_issue(12, "2027-05-14")]) == [12]
-
-
-def test_a_pull_request_is_never_a_reminder() -> None:
-    assert (
-        lockdown.reminders_in([reminder_issue(11, "2027-05-14", pull_request={"url": "x"})]) == []
-    )
 
 
 # --- the dry run -------------------------------------------------------------------------
@@ -785,7 +680,7 @@ def test_main_dry_run_writes_a_withheld_result(
         [
             (0, "HTTP/2.0 200 OK\n\n{}", ""),  # credential: rate_limit
             (0, json.dumps({"limit": "collaborators_only", "expires_at": expires}), ""),
-            (0, issues, ""),  # reminders, and the gap issue's read
+            (0, issues, ""),  # the gap issue's read
         ]
     )
     code = lockdown.main(
@@ -841,7 +736,9 @@ def test_the_workflow_pings_only_on_the_scripts_word_and_fails_on_any_gap() -> N
 def test_the_admin_token_never_reaches_an_issue_write() -> None:
     text = _workflow()
     assert "permission-issues: write" in text
-    assert "repositories: ${{ steps.repositories.outputs.names }}" in text
+    # This repository alone: the gap issue is the only issue the job writes (#524).
+    assert f"repositories: {HOME.split('/')[1]}\n" in text
+    assert "outputs.names" not in text
     assert "ISSUES_TOKEN: ${{ steps.app-token.outputs.token }}" in text
     assert "GH_TOKEN: ${{ secrets.FLEET_ADMIN_TOKEN }}" not in text
     assert "secrets.GITHUB_TOKEN" not in text and "github.token" not in text

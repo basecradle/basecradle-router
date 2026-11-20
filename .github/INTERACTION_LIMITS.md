@@ -38,12 +38,6 @@ is automated, read back, and watched (#449):
   `needs-capital` issue here, *Public Repository Lockdown Found a Gap*, which the
   run that finds none closes.
 
-The job used to keep one renewal-reminder issue per public repository
-(`⏰ Renew interaction limit before <YYYY-MM-DD> (public-repo write-lockdown)`) and
-withheld its heartbeat unless each existed. Each run after #524 closes any that
-are still open, and once they are all closed the code that closes them is removed
-(#524 stays open until it is).
-
 ### Credentials
 
 Two, each for its own half:
@@ -61,8 +55,8 @@ Two, each for its own half:
   last 60 days.
 - **This repository's own `basecradle-router-ai` App token** (basecradle#870),
   minted per run from `FLEET_BOT_CLIENT_ID` and `FLEET_BOT_APP_PRIVATE_KEY` with
-  `issues: write` and scoped to exactly the public repositories, files the gap
-  issue and closes the old reminders (once, #524).
+  `issues: write` and scoped to this repository alone, reads and files the gap
+  issue.
 - **`PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL`** is the heartbeat's write-only ping URL.
   Unset, the run fails after its renewals, so a missing monitor never stops the
   guard itself.
@@ -73,10 +67,10 @@ When a new public fleet repo is stood up (the capital's new-repository recipe):
 
 1. Apply the limit once:
    `gh api -X PUT /repos/basecradle/<repo>/interaction-limits -f limit=collaborators_only -f expiry=six_months`
-2. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-router-ai` App reach it. The audit
-   finds every public repository on its own: one it cannot renew or read is a gap
-   within the week, and one the App cannot reach fails the run (every other
-   repository is still renewed), so the heartbeat pages either way.
+2. Make sure `FLEET_ADMIN_TOKEN` reaches it. The audit finds every public
+   repository on its own, and one it cannot renew or read is a gap within the
+   week, so the heartbeat pages. The `basecradle-router-ai` App needs nothing
+   there: it writes only this repository's gap issue.
 
 ## Capital-owned (handed off, not enacted here)
 
