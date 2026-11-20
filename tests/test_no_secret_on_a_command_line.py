@@ -369,7 +369,8 @@ def _lockdown_seam(tree: ast.Module) -> None:
     Held from both sides. The script's only way to start a program is ``subprocess.run``,
     and it appears only as the injectable ``run`` default, never called. And the injected
     runner is called exactly once, in ``GitHub._api``, wherever a call could hide (a
-    module-level function, a nested or ``async`` one).
+    module-level function, a nested or ``async`` one). ``subprocess.TimeoutExpired`` is
+    allowed only as what an ``except`` clause catches: naming the class there starts nothing.
     """
     defaults = {
         id(default)
@@ -378,9 +379,16 @@ def _lockdown_seam(tree: ast.Module) -> None:
         for default in (*node.args.defaults, *node.args.kw_defaults)
         if default is not None
     }
+    caught = {
+        id(node.type)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler) and node.type is not None
+    }
     for reference, node in _exec_references(tree):
-        allowed = reference == "import subprocess" or (
-            reference == "subprocess.run" and id(node) in defaults
+        allowed = (
+            reference == "import subprocess"
+            or (reference == "subprocess.run" and id(node) in defaults)
+            or (reference == "subprocess.TimeoutExpired" and id(node) in caught)
         )
         assert allowed, f"the audit can start a program outside GitHub._api: {reference}"
     calls: list[str] = []
@@ -904,8 +912,9 @@ def test_a_file_that_cannot_start_a_program_is_not_discovered() -> None:
         "\n\nasync def leak(self):\n    self._run(['gh'])\n",
         "\n\ndef leak():\n    subprocess.check_output(['gh'])\n",
         "\n\nimport os\n\n\ndef leak():\n    os.system('gh')\n",
+        "\n\ndef leak():\n    raise subprocess.TimeoutExpired(['gh'], 1)\n",
     ],
-    ids=["free-function", "async-method", "check-output", "os-system"],
+    ids=["free-function", "async-method", "check-output", "os-system", "timeout-not-caught"],
 )
 def test_the_lockdown_seam_refuses_a_second_way_to_start_a_program(planted: str) -> None:
     source = (REPO / ".github" / "scripts" / "public_repository_lockdown.py").read_text()

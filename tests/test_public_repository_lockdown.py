@@ -59,7 +59,9 @@ def reminder_issue(number: int, date: str, author: str = OWN_BOT, **extra: Any) 
 
 class FakeGitHub:
     """A fabricated organization. ``limits`` maps a repository to its GET answer, or to an
-    exception to raise; a renewal sets the limit six months out unless ``refuse`` names it."""
+    exception to raise; a renewal sets the limit six months out unless ``refuse`` names it
+    (GitHub refuses it) or ``stale`` does (GitHub accepts it and still reads back the old
+    answer: a gap that no refusal explains)."""
 
     def __init__(
         self,
@@ -68,6 +70,7 @@ class FakeGitHub:
         limits: dict[str, Any] | None = None,
         issues: dict[str, Any] | None = None,
         refuse: set[str] | None = None,
+        stale: set[str] | None = None,
     ) -> None:
         self.repositories = list(FLEET if repositories is None else repositories)
         self.limits: dict[str, Any] = {
@@ -75,12 +78,10 @@ class FakeGitHub:
             for r in self.repositories
         }
         self.limits.update(limits or {})
-        self.issues: dict[str, Any] = {
-            r: [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}")]
-            for r in self.repositories
-        }
+        self.issues: dict[str, Any] = {r: [] for r in self.repositories}
         self.issues.update(issues or {})
         self.refuse = refuse or set()
+        self.stale = stale or set()
         self.writes: list[tuple[str, ...]] = []
         self.home_reads = 0
 
@@ -91,7 +92,7 @@ class FakeGitHub:
         self.writes.append(("renew", repository))
         if repository in self.refuse:
             raise lockdown.GitHubError("HTTP 403: Resource not accessible by personal access token")
-        if isinstance(self.limits[repository], Exception):
+        if isinstance(self.limits[repository], Exception) or repository in self.stale:
             return  # a read that fails keeps failing after the write
         self.limits[repository] = {
             "limit": "collaborators_only",
@@ -132,6 +133,11 @@ class FakeGitHub:
         return [write[0] for write in self.writes]
 
 
+def lapsed(*repositories: str, **kwargs: Any) -> FakeGitHub:
+    """An organization where each named repository reads back no limit after its renewal."""
+    return FakeGitHub(limits={r: {} for r in repositories}, stale=set(repositories), **kwargs)
+
+
 def audit(github: FakeGitHub, *, dry_run: bool = False) -> Any:
     return lockdown.run_audit(
         github,  # type: ignore[arg-type]
@@ -161,25 +167,20 @@ def test_the_all_clear_renews_every_public_repository_and_pings() -> None:
     assert "create" not in github.kinds()
 
 
-def test_after_a_renewal_each_reminder_is_moved_to_the_limits_new_date() -> None:
+def test_the_all_clear_needs_no_issue_and_writes_none() -> None:
+    # The job is the reminder (#524): no repository needs an issue for the heartbeat to ping.
     github = FakeGitHub()
-    audit(github)
-    new_date = f"{NOW + timedelta(days=181):%Y-%m-%d}"
-    edits = [w for w in github.writes if w[0] == "edit"]
-    assert sorted(w[1] for w in edits) == sorted(FLEET)
-    fields = json.loads(edits[0][3])
-    assert fields["title"] == (
-        f"⏰ Renew interaction limit before {new_date} (public-repo write-lockdown)"
-    )
-    assert f"expires `{new_date}`" in fields["body"]
-    assert fields["body"].startswith("Standing reminder.")
+    assert audit(github).heartbeat == "ping"
+    assert github.kinds() == ["renew"] * len(FLEET)
 
 
-def test_a_reminder_already_on_the_limits_date_is_left_alone() -> None:
-    date = f"{NOW + timedelta(days=181):%Y-%m-%d}"
-    github = FakeGitHub(issues={r: [reminder_issue(10, date)] for r in FLEET})
-    audit(github)
-    assert "edit" not in github.kinds()
+def test_the_heartbeat_is_the_lock_alone_whatever_issues_are_open() -> None:
+    date = f"{NOW + timedelta(days=170):%Y-%m-%d}"
+    two = [reminder_issue(10, date), reminder_issue(12, date)]
+    github = FakeGitHub(issues={HOME: two, "basecradle/.github": lockdown.GitHubError("HTTP 502")})
+    result = audit(github)
+    assert result.verdict == "clean" and result.heartbeat == "ping"
+    assert result.state == {}
 
 
 def test_the_result_records_what_each_repository_read_back() -> None:
@@ -188,8 +189,8 @@ def test_the_result_records_what_each_repository_read_back() -> None:
     row = result["repositories"]["basecradle/.github"]
     assert row["renewed"] is True
     assert row["limit"] == "collaborators_only"
-    assert row["reminders"] == [10]
     assert row["findings"] == []
+    assert set(row) == {"renewed", "limit", "expires_at", "findings"}
 
 
 # --- the gaps: each one withholds the ping and files the issue ---------------------------
@@ -245,21 +246,6 @@ def test_a_weaker_limit_is_a_gap() -> None:
     _assert_gap(FakeGitHub(limits={HOME: weaker}), HOME, "limit-wrong", dry_run=True)
 
 
-def test_a_repository_with_no_reminder_is_a_gap() -> None:
-    github = FakeGitHub(issues={"basecradle/basecradle-python": []})
-    _assert_gap(github, "basecradle/basecradle-python", "reminder-missing")
-    assert "no open renewal reminder" in created(github)[3]
-
-
-def test_a_repository_with_two_reminders_is_a_gap_and_neither_is_moved() -> None:
-    date = f"{NOW + timedelta(days=170):%Y-%m-%d}"
-    two = [reminder_issue(10, date), reminder_issue(12, date)]
-    github = FakeGitHub(issues={"basecradle/basecradle-python": two})
-    result = _assert_gap(github, "basecradle/basecradle-python", "reminders-duplicate")
-    assert "#10, #12" in result.found["basecradle/basecradle-python"][0].detail
-    assert ("basecradle/basecradle-python") not in [w[1] for w in github.writes if w[0] == "edit"]
-
-
 def test_an_unreadable_limit_is_never_a_pass() -> None:
     github = FakeGitHub(limits={HOME: lockdown.GitHubError("gh: HTTP 503: Service Unavailable")})
     result = _assert_gap(github, HOME, "limit-unreadable")
@@ -276,11 +262,6 @@ def test_an_unreadable_limit_is_never_a_pass() -> None:
 )
 def test_a_limit_whose_expiry_does_not_read_is_never_a_pass(answer: dict[str, Any]) -> None:
     _assert_gap(FakeGitHub(limits={HOME: answer}), HOME, "limit-unreadable", dry_run=True)
-
-
-def test_unreadable_reminders_are_never_a_pass() -> None:
-    github = FakeGitHub(issues={"basecradle/.github": lockdown.GitHubError("HTTP 502")})
-    _assert_gap(github, "basecradle/.github", "reminders-unreadable")
 
 
 def test_a_refused_renewal_is_a_gap_even_while_the_old_limit_stands() -> None:
@@ -301,15 +282,6 @@ def test_a_renewal_that_fails_without_a_refusal_says_what_github_said() -> None:
 
     result = _assert_gap(Outage(), HOME, "renewal-refused")
     assert "HTTP 502: Bad Gateway" in result.found[HOME][0].detail
-
-
-def test_a_reminder_that_cannot_be_moved_is_a_gap() -> None:
-    class RefusesEdits(FakeGitHub):
-        def edit_issue(self, repository: str, number: int, fields: dict[str, Any]) -> None:
-            raise lockdown.GitHubError("HTTP 403")
-
-    github = RefusesEdits()
-    _assert_gap(github, HOME, "reminder-not-moved")
 
 
 def test_no_repositories_is_never_clean() -> None:
@@ -360,7 +332,85 @@ def test_the_home_repositorys_issues_are_read_once() -> None:
     assert github.home_reads == 1
 
 
-# --- what counts as a reminder -----------------------------------------------------------
+# --- the one-time cleanup (#524): the job closes the reminders it kept ------------------
+
+
+def _reminders(date: str = "2027-05-17") -> dict[str, Any]:
+    # As they stand: one per public repository, every one the capital's bot's.
+    return {repo: [reminder_issue(10 + i, date, CAPITAL)] for i, repo in enumerate(FLEET)}
+
+
+def test_the_first_run_closes_every_reminder_and_still_pings() -> None:
+    github = FakeGitHub(issues=_reminders())
+    result = audit(github)
+    assert result.heartbeat == "ping"
+    for i, repository in enumerate(FLEET):
+        number = str(10 + i)
+        on_it = [w for w in github.writes if w[1] == repository and w[0] != "renew"]
+        assert [w[0] for w in on_it] == ["comment", "edit"], repository
+        assert on_it[0][2] == on_it[1][2] == number
+        assert json.loads(on_it[1][3]) == {"state": "closed", "state_reason": "completed"}
+    assert "create" not in github.kinds()
+
+
+def test_the_closing_comment_is_one_line_naming_the_job_its_heartbeat_and_the_run() -> None:
+    github = FakeGitHub(issues=_reminders())
+    audit(github)
+    comment = next(w[3] for w in github.writes if w[0] == "comment")
+    assert "\n" not in comment
+    assert "Public Repository Lockdown job, which replaces this reminder" in comment
+    assert "heartbeat" in comment and comment.endswith(RUN_URL)
+
+
+def test_the_second_run_finds_no_reminder_and_writes_nothing() -> None:
+    github = FakeGitHub()
+    result = audit(github)
+    assert result.heartbeat == "ping"
+    assert github.kinds() == ["renew"] * len(FLEET)
+
+
+def test_the_gap_issue_is_filed_before_any_reminder_is_closed() -> None:
+    github = lapsed("basecradle/.github", issues=_reminders())
+    audit(github)
+    kinds = [w[0] for w in github.writes if w[0] != "renew"]
+    assert kinds[0] == "create"
+
+
+def test_a_reminder_that_cannot_be_closed_or_read_never_touches_the_verdict() -> None:
+    class Refuses(FakeGitHub):
+        def comment(self, repository: str, number: int, body: str) -> None:
+            if repository == HOME:
+                raise lockdown.GitHubError("HTTP 403")
+            super().comment(repository, number, body)
+
+    issues = {**_reminders(), "basecradle/.github": lockdown.GitHubError("HTTP 502")}
+    github = Refuses(issues=issues)
+    result = audit(github)
+    assert result.verdict == "clean" and result.heartbeat == "ping"
+    # The one it could read and close is closed all the same.
+    rest = [w[:3] for w in github.writes if w[0] != "renew"]
+    assert rest == [
+        ("comment", "basecradle/basecradle-python", "11"),
+        ("edit", "basecradle/basecradle-python", "11"),
+    ]
+
+
+def test_a_dry_run_closes_no_reminder(capsys: pytest.CaptureFixture[str]) -> None:
+    github = FakeGitHub(issues=_reminders())
+    audit(github, dry_run=True)
+    assert github.writes == []
+    assert "would close the reminder basecradle/.github#10" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("author", [OWN_BOT, CAPITAL, "drawkkwast"])
+def test_a_reminder_any_of_its_writers_filed_is_closed(author: str) -> None:
+    assert lockdown.reminders_in([reminder_issue(10, "2027-05-14", author)]) == [10]
+
+
+@pytest.mark.parametrize("author", ["john", "basecradle-ruby-ai[bot]"], ids=["stranger", "sibling"])
+def test_an_issue_with_the_reminders_title_from_anyone_else_is_never_closed(author: str) -> None:
+    issues = [reminder_issue(70, "2027-05-14", author=author), reminder_issue(10, "2027-05-14")]
+    assert lockdown.reminders_in(issues) == [10]
 
 
 def test_the_issue_449_title_is_not_a_reminder() -> None:
@@ -370,20 +420,7 @@ def test_the_issue_449_title_is_not_a_reminder() -> None:
         "The Monthly Interaction-Limit Audit Failed Four Times and Told Nobody: Give It a "
         "Heartbeat, and Renew Every Public Repository"
     )
-    assert lockdown.reminders_in([issue, reminder_issue(61, "2027-05-01")]) == [
-        lockdown.Reminder(
-            number=61,
-            title=reminder_issue(61, "2027-05-01")["title"],
-            body=reminder_issue(61, "2027-05-01")["body"],
-            date="2027-05-01",
-        )
-    ]
-
-
-def test_a_strangers_issue_with_the_reminders_title_is_not_a_reminder() -> None:
-    issues = [reminder_issue(70, "2027-05-14", author="john"), reminder_issue(10, "2027-05-14")]
-    assert [r.number for r in lockdown.reminders_in(issues)] == [10]
-    assert lockdown.reminders_in([reminder_issue(70, "2027-05-14", author="john")]) == []
+    assert lockdown.reminders_in([issue, reminder_issue(61, "2027-05-01")]) == [61]
 
 
 @pytest.mark.parametrize(
@@ -400,19 +437,25 @@ def test_only_the_exact_reminder_title_counts(title: str) -> None:
     assert lockdown.reminders_in([issue]) == []
 
 
-def test_origins_own_reminder_counts_and_a_pull_request_never_does() -> None:
-    issues = [
-        reminder_issue(10, "2027-05-14", author="drawkkwast"),
-        reminder_issue(11, "2027-05-14", pull_request={"url": "x"}),
-    ]
-    assert [r.number for r in lockdown.reminders_in(issues)] == [10]
+def test_an_entry_with_no_usable_number_is_skipped_never_raised() -> None:
+    broken = reminder_issue(10, "2027-05-14")
+    del broken["number"]
+    odd = {**reminder_issue(11, "2027-05-14"), "number": "11"}
+    assert lockdown.reminders_in([broken, odd, reminder_issue(12, "2027-05-14")]) == [12]
+
+
+def test_a_pull_request_is_never_a_reminder() -> None:
+    assert (
+        lockdown.reminders_in([reminder_issue(11, "2027-05-14", pull_request={"url": "x"})]) == []
+    )
 
 
 # --- the dry run -------------------------------------------------------------------------
 
 
 def test_a_dry_run_writes_nothing_and_never_pings() -> None:
-    github = FakeGitHub(issues={"basecradle/.github": []})
+    date = f"{NOW + timedelta(days=170):%Y-%m-%d}"
+    github = lapsed("basecradle/.github", issues={HOME: [reminder_issue(61, date)]})
     result = audit(github, dry_run=True)
     assert github.writes == []
     assert result.heartbeat == "withhold"
@@ -443,25 +486,22 @@ def _gap_issue(
     }
 
 
-def _second_run(issues: dict[str, Any], open_gap: dict[str, Any], **kwargs: Any) -> FakeGitHub:
-    home = [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), open_gap]
-    return FakeGitHub(issues={**issues, HOME: home}, **kwargs)
+def _second_run(lapsing: list[str], open_gap: dict[str, Any]) -> FakeGitHub:
+    return lapsed(*lapsing, issues={HOME: [open_gap]})
 
 
 def test_a_standing_gap_is_said_once() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
-    again = _second_run({"basecradle/.github": []}, _gap_issue(first))
+    again = _second_run(["basecradle/.github"], _gap_issue(first))
     audit(again)
     assert not [w for w in again.writes if w[0] in {"create", "comment", "label", "unlabel"}]
 
 
 def test_a_changed_gap_comments_then_relabels_then_rewrites_the_body() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
-    again = _second_run(
-        {"basecradle/.github": [], "basecradle/basecradle-python": []}, _gap_issue(first)
-    )
+    again = _second_run(["basecradle/.github", "basecradle/basecradle-python"], _gap_issue(first))
     audit(again)
     home = [w for w in again.writes if w[1] == HOME and w[0] != "renew" and w[2] == "500"]
     assert [w[0] for w in home] == ["comment", "unlabel", "label", "edit"]
@@ -471,9 +511,9 @@ def test_a_changed_gap_comments_then_relabels_then_rewrites_the_body() -> None:
 
 
 def test_a_repository_that_became_clean_is_said_without_paging_again() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": [], "basecradle/basecradle-python": []})
+    first = lapsed("basecradle/.github", "basecradle/basecradle-python")
     audit(first)
-    again = _second_run({"basecradle/.github": []}, _gap_issue(first))
+    again = _second_run(["basecradle/.github"], _gap_issue(first))
     audit(again)
     home = [w for w in again.writes if w[0] != "renew" and w[1] == HOME and w[2] == "500"]
     assert [w[0] for w in home] == ["comment", "edit"]
@@ -482,10 +522,10 @@ def test_a_repository_that_became_clean_is_said_without_paging_again() -> None:
 
 
 def test_a_changed_gap_whose_label_was_cleared_only_adds_it_back() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
     again = _second_run(
-        {"basecradle/.github": [], "basecradle/basecradle-python": []},
+        ["basecradle/.github", "basecradle/basecradle-python"],
         _gap_issue(first, labels=()),
     )
     audit(again)
@@ -493,9 +533,9 @@ def test_a_changed_gap_whose_label_was_cleared_only_adds_it_back() -> None:
 
 
 def test_the_run_that_finds_no_gap_closes_the_issue() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
-    again = _second_run({}, _gap_issue(first))
+    again = _second_run([], _gap_issue(first))
     result = audit(again)
     assert result.heartbeat == "ping"
     home = [w for w in again.writes if w[0] in {"comment", "edit"} and w[2] == "500"]
@@ -509,12 +549,11 @@ def test_the_run_that_finds_no_gap_closes_the_issue() -> None:
 
 
 def test_a_second_copy_of_the_gap_issue_is_closed_as_one() -> None:
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
     gap = _gap_issue(first)
     copy = {**gap, "number": 501}
-    home = [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), gap, copy]
-    again = FakeGitHub(issues={"basecradle/.github": [], HOME: home})
+    again = lapsed("basecradle/.github", issues={HOME: [gap, copy]})
     audit(again)
     on_copy = [w for w in again.writes if len(w) > 2 and w[2] == "501"]
     assert [w[0] for w in on_copy] == ["comment", "unlabel", "edit"]
@@ -523,45 +562,27 @@ def test_a_second_copy_of_the_gap_issue_is_closed_as_one() -> None:
     assert not [w for w in again.writes if len(w) > 2 and w[2] == "500"]
 
 
-@pytest.mark.parametrize("author", [OWN_BOT, CAPITAL], ids=["own-bot", "capital-bot"])
-def test_a_reminder_either_writer_bot_filed_is_the_record(author: str) -> None:
-    # The workflow moved from the capital's bot to this repository's own (basecradle#870).
-    # Every standing reminder is the capital's bot's, and a reminder is moved in place, never
-    # re-filed: it is the record whoever wrote it, never doubled by a fresh one beside it.
-    issue = reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}", author)
-    assert [r.number for r in lockdown.reminders_in([issue])] == [10]
-    github = FakeGitHub(issues={repo: [issue] for repo in FLEET})
-    assert audit(github).heartbeat == "ping"
-    assert "create" not in github.kinds()
-
-
 @pytest.mark.parametrize("author", [CAPITAL, "basecradle-ruby-ai[bot]"], ids=["capital", "sibling"])
 def test_a_gap_issue_another_fleet_bot_filed_is_not_the_record(author: str) -> None:
     # The gap issue is this repository's own bot's alone: none was open under the capital's
     # when the identity moved (basecradle#870), and a sibling captain's is never the record.
-    first = FakeGitHub(issues={"basecradle/.github": []})
+    first = lapsed("basecradle/.github")
     audit(first)
-    github = _second_run({"basecradle/.github": []}, _gap_issue(first, author=author))
+    github = _second_run(["basecradle/.github"], _gap_issue(first, author=author))
     audit(github)
     assert not [w for w in github.writes if len(w) > 2 and w[2] == "500"]
     assert created(github)[1] == HOME
-
-
-def test_a_sibling_bots_reminder_is_not_the_record() -> None:
-    assert (
-        lockdown.reminders_in([reminder_issue(10, "2027-05-14", "basecradle-ruby-ai[bot]")]) == []
-    )
 
 
 def test_a_strangers_issue_with_the_gap_title_is_never_touched() -> None:
     stranger = {
         "number": 600,
         "title": lockdown.GAP_TITLE,
-        "body": lockdown._marker({"basecradle/.github": ["reminder-missing"]}),
+        "body": lockdown._marker({"basecradle/.github": ["limit-missing"]}),
         "user": {"login": "john"},
         "labels": [],
     }
-    github = _second_run({"basecradle/.github": []}, stranger)
+    github = _second_run(["basecradle/.github"], stranger)
     audit(github)
     assert not [w for w in github.writes if len(w) > 2 and w[2] == "600"]
     assert created(github)[1] == HOME
@@ -649,6 +670,18 @@ def test_a_failed_call_raises_with_ghs_last_line_and_an_empty_token_never_calls(
     with pytest.raises(lockdown.GitHubError, match="no token"):
         lockdown.GitHub("github_pat_ADMIN", "", run=run).open_issues(HOME)
     assert len(run.calls) == 1
+
+
+def test_a_call_that_hangs_is_a_github_error_never_a_crash() -> None:
+    # A timeout raised past the boundary would end the run before its result, paging for a
+    # lockdown that is fine; as a GitHubError it is the gap or the annotation it should be.
+    def hangs(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    with pytest.raises(lockdown.GitHubError, match="did not answer within 60 seconds") as raised:
+        lockdown.GitHub("github_pat_ADMIN", "ghs_ISSUES", run=hangs).comment(HOME, 7, "c")
+    assert raised.value.status is None
+    assert "ADMIN" not in str(raised.value) and "ISSUES" not in str(raised.value)
 
 
 def test_an_answer_that_is_not_json_is_never_a_limit() -> None:
@@ -937,7 +970,7 @@ def test_a_failure_that_is_not_a_refusal_names_no_credential() -> None:
 
 
 def test_a_gap_with_no_refusal_names_no_credential() -> None:
-    github = FakeGitHub(issues={"basecradle/.github": []})
+    github = lapsed("basecradle/.github")
     audit(github)
     assert "## The Credential It Needs" not in created(github)[3]
 
@@ -959,7 +992,7 @@ def _open_gap(body: str) -> list[dict[str, Any]]:
         "user": {"login": OWN_BOT},
         "labels": [{"name": "needs-capital"}],
     }
-    return [reminder_issue(10, f"{NOW + timedelta(days=170):%Y-%m-%d}"), gap]
+    return [gap]
 
 
 def test_the_open_452_is_told_the_credential_in_a_comment() -> None:

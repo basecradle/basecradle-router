@@ -8,9 +8,9 @@ Run from ``.github/workflows/interaction-limit-renewal.yml``, in two steps::
 GitHub interaction limits last six months at most, and a public repository whose limit
 lapses reopens to drive-by issues and comments: the surface the #60 injection came through.
 This renews ``collaborators_only`` on **every** public repository in the organization, reads
-each one back, keeps each repository's one renewal reminder dated to what GitHub reports,
-and answers one question for the ``Public Repository Lockdown`` heartbeat: does every public
-repository have an active members-only limit, with margin, and exactly one open reminder?
+each one back, and answers one question for the ``Public Repository Lockdown`` heartbeat:
+does every public repository have an active members-only limit, with margin? The job is the
+reminder: nothing else records when a limit is due (#524).
 
 Its predecessor renewed one repository of five and reported only by a red cross nobody
 opened: it found ``basecradle/.github`` unlimited four months running and told nobody
@@ -25,9 +25,8 @@ Two credentials, each for its own half, so neither is used for what the other is
   ``Administration`` is not a permission ``GITHUB_TOKEN`` can be granted, so it is a
   standing secret. It never writes an issue: whatever it posts would carry its owner's name.
 - **The issues token** (this repository's own ``basecradle-router-ai`` App, minted per run,
-  ``issues: write``, scoped to the public repositories) reads and edits the reminders and
-  files the gap issue. It was the capital's ``basecradle-ai`` App before basecradle#870, so
-  the reminders that bot filed are still the record (``REMINDER_AUTHORS``).
+  ``issues: write``, scoped to the public repositories) files the gap issue, and closes the
+  renewal reminders the job used to keep (:func:`close_reminders`, run once, then removed).
 
 Every GitHub call goes through ``gh api`` in :class:`GitHub`, the one boundary, so the tests
 replace it and nothing here has to reach GitHub to be exercised. Standard library only, so
@@ -63,30 +62,13 @@ MARGIN = timedelta(days=30)
 # The bot this workflow writes as: this repository's own, since basecradle#870.
 WRITER_BOT = "basecradle-router-ai[bot]"
 
-# A reminder is an open issue with this title written by one of these. The repositories are
-# public, so anyone can open an issue with any title; one nobody on the allow-list wrote is
-# never the record. The whole title is matched exactly, not searched: GitHub's search read
-# #449's own title ("... Interaction-Limit ... Renew ...") as a second reminder here.
-#
-# The capital's bot is on it for good, not for a transition: it wrote as this workflow
-# before basecradle#870 and filed every public repository's reminder then, and a reminder is
-# moved in place (its title and body edited), never re-filed, so it keeps its author. Drop
-# the entry and every one of those reads as missing.
-REMINDER_AUTHORS = frozenset({WRITER_BOT, "basecradle-ai[bot]", "drawkkwast"})
-REMINDER_FORMAT = "⏰ Renew interaction limit before {date} (public-repo write-lockdown)"
-REMINDER_TITLE = re.compile(
-    "^" + re.escape(REMINDER_FORMAT).replace(re.escape("{date}"), r"(\d{4}-\d{2}-\d{2})") + "$"
-)
-REMINDER_BODY_DATE = re.compile(r"expires `(\d{4}-\d{2}-\d{2})`")
-
 GAP_TITLE = "Public Repository Lockdown Found a Gap"
 GAP_AUTHOR = WRITER_BOT
 GAP_LABEL = "needs-capital"
 MARKER = re.compile(r"<!-- public-repository-lockdown (\{.*\}) -->")
 
 LOCKDOWN = (
-    f"the lockdown: an active `{LIMIT}` interaction limit with more than {MARGIN.days} days "
-    "left, and exactly one open renewal reminder"
+    f"the lockdown: an active `{LIMIT}` interaction limit with more than {MARGIN.days} days left"
 )
 # What the admin token needs, per GitHub's documented permissions for these endpoints:
 # repository Administration, write to renew and read to read back, and owner or admin access.
@@ -118,16 +100,13 @@ CREDENTIAL_HOW = {
 }
 CREDENTIAL_LIMITS = (
     "Nothing broader is needed: never organization administration, and no issue permission, "
-    "because this repository's own App writes the reminders and this issue. A newly minted token "
+    "because this repository's own App writes every issue this job writes. A newly minted token "
     "is stored as the `FLEET_ADMIN_TOKEN` secret on `basecradle/basecradle-router`. The token "
     "is `@origin`'s to change, and the first clean run after that closes this issue."
 )
 GAP_NEXT = (
     "Every run renews every public repository's limit, so a limit that was only missing is "
-    "usually back by the next run. A reminder that is missing or doubled is the capital's to "
-    "fix by hand: one open reminder per public repository, titled exactly `⏰ Renew interaction "
-    "limit before <YYYY-MM-DD> (public-repo write-lockdown)` and written by "
-    "`@basecradle-router-ai`, `@basecradle-ai` or `@origin`. "
+    "usually back by the next run. "
     "This issue is updated in place while a gap stands, and the run that finds none closes it."
 )
 
@@ -167,14 +146,6 @@ HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 # --- what one repository looks like ------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Reminder:
-    number: int
-    title: str
-    body: str
-    date: str
-
-
 @dataclass
 class Observation:
     """What one run saw of one repository. ``None`` in an answer means it was not asked
@@ -187,41 +158,12 @@ class Observation:
     limit: dict[str, Any] | None = None
     limit_error: str | None = None
     limit_status: int | None = None
-    reminders: list[Reminder] | None = None
-    reminders_error: str | None = None
-    reminder_moved: tuple[int, str, str] | None = None  # (number, from, to)
-    reminder_error: str | None = None
 
 
 @dataclass(frozen=True)
 class Finding:
     code: str
     detail: str
-
-
-def reminders_in(issues: list[dict[str, Any]]) -> list[Reminder]:
-    """The renewal reminders among a repository's open issues, from the REST issues list."""
-    reminders = []
-    for issue in issues:
-        if "pull_request" in issue:
-            continue
-        user = issue.get("user")
-        login = user.get("login") if isinstance(user, dict) else None
-        title = issue.get("title")
-        if login not in REMINDER_AUTHORS or not isinstance(title, str):
-            continue
-        match = REMINDER_TITLE.match(title)
-        if match:
-            body = issue.get("body")
-            reminders.append(
-                Reminder(
-                    number=int(issue["number"]),
-                    title=title,
-                    body=body if isinstance(body, str) else "",
-                    date=match.group(1),
-                )
-            )
-    return sorted(reminders, key=lambda reminder: reminder.number)
 
 
 def expiry_of(limit: dict[str, Any] | None) -> datetime | None:
@@ -273,32 +215,6 @@ def findings_for(observation: Observation, now: datetime) -> list[Finding]:
                     f"(the margin is {MARGIN.days})",
                 )
             )
-
-    reminders = observation.reminders
-    if observation.reminders_error is not None or reminders is None:
-        reason = _foreign(observation.reminders_error or "no answer")
-        found.append(
-            Finding("reminders-unreadable", f"its open issues could not be read: {reason}")
-        )
-    elif not reminders:
-        found.append(Finding("reminder-missing", "it has no open renewal reminder"))
-    elif len(reminders) > 1:
-        numbers = ", ".join(f"#{reminder.number}" for reminder in reminders)
-        found.append(
-            Finding(
-                "reminders-duplicate",
-                f"it has {len(reminders)} open renewal reminders ({numbers}); exactly one is "
-                "the record",
-            )
-        )
-    if observation.reminder_error is not None:
-        found.append(
-            Finding(
-                "reminder-not-moved",
-                "its reminder could not be moved to the limit's date: "
-                f"{_foreign(observation.reminder_error)}",
-            )
-        )
     return found
 
 
@@ -320,24 +236,6 @@ def _admin_refusal(call: str, status: int | None, error: str) -> Finding:
             f"or lacks Administration: {need} on it",
         )
     return Finding("renewal-refused", f"the renewal was refused: {_foreign(error)}")
-
-
-def reminder_move(observation: Observation) -> tuple[Reminder, str, str, str] | None:
-    """The one reminder's new title and body, when its date is not the limit's.
-
-    The reminder is a record of what GitHub reports, never the mechanism, so it follows the
-    limit whenever both read: after a renewal, and after a renewal made by hand."""
-    expires = expiry_of(observation.limit)
-    reminders = observation.reminders
-    if expires is None or reminders is None or len(reminders) != 1:
-        return None
-    reminder = reminders[0]
-    date = f"{expires:%Y-%m-%d}"
-    if reminder.date == date:
-        return None
-    title = REMINDER_FORMAT.format(date=date)
-    body = REMINDER_BODY_DATE.sub(f"expires `{date}`", reminder.body)
-    return reminder, date, title, body
 
 
 # --- the verdict -------------------------------------------------------------------------
@@ -392,8 +290,6 @@ class Audit:
             "renewed": o.renewal == "renewed",
             "limit": o.limit.get("limit") if o.limit is not None else None,
             "expires_at": o.limit.get("expires_at") if o.limit is not None else None,
-            "reminders": [r.number for r in o.reminders] if o.reminders is not None else None,
-            "reminder_moved": list(o.reminder_moved) if o.reminder_moved else None,
             "findings": [f.code for f in self.found[o.repository]],
         }
 
@@ -633,15 +529,19 @@ class GitHub:
         command.append(path)
         env = {**os.environ, "GH_TOKEN": token}
         env.pop("GITHUB_TOKEN", None)
-        process = self._run(
-            command,
-            input=json.dumps(payload) if payload is not None else None,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60,
-            check=False,
-        )
+        try:
+            process = self._run(
+                command,
+                input=json.dumps(payload) if payload is not None else None,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # A hang is a call that did not answer, said as one, never a crash past it.
+            raise GitHubError(f"{method} {path} did not answer within 60 seconds") from None
         if process.returncode != 0:
             # gh can print a hint after the line that carries the status; keep that line.
             lines = (process.stderr or "").strip().splitlines()
@@ -785,31 +685,6 @@ def renew_and_read(github: GitHub, repository: str, dry_run: bool) -> Observatio
     return observation
 
 
-def read_and_move_reminder(
-    github: GitHub, observation: Observation, dry_run: bool
-) -> list[dict[str, Any]] | None:
-    """The record's half, under the issues token. Returns the open issues it read."""
-    repository = observation.repository
-    try:
-        issues = github.open_issues(repository)
-    except GitHubError as error:
-        observation.reminders_error = str(error)
-        return None
-    observation.reminders = reminders_in(issues)
-    move = reminder_move(observation)
-    if move is not None:
-        reminder, date, title, body = move
-        if dry_run:
-            print(f"  DRY-RUN: would move {repository}#{reminder.number} {reminder.date} → {date}")
-        else:
-            try:
-                github.edit_issue(repository, reminder.number, {"title": title, "body": body})
-                observation.reminder_moved = (reminder.number, reminder.date, date)
-            except GitHubError as error:
-                observation.reminder_error = str(error)
-    return issues
-
-
 def _close(github: GitHub, number: int, comment: str, unlabel: list[str], reason: str) -> None:
     # The comment first, so the label change and the close ride it.
     github.comment(HOME_REPOSITORY, number, comment)
@@ -862,11 +737,6 @@ def run_audit(
     # Every renewal first, so a failure on the issues side (an App token that could not be
     # minted, an issue listing that errors) never costs a repository its renewal.
     observations = [renew_and_read(github, repository, dry_run) for repository in repositories]
-    home_issues = None
-    for observation in observations:
-        issues = read_and_move_reminder(github, observation, dry_run)
-        if observation.repository == HOME_REPOSITORY:
-            home_issues = issues
     audit = Audit(
         observations=observations,
         now=now,
@@ -882,26 +752,95 @@ def run_audit(
 
     # Reading the home repository's issues fails the run rather than skip the filing: a gap
     # nobody is told about is the failure this audit exists to end. The renewals are done.
-    if home_issues is None:
-        home_issues = github.open_issues(HOME_REPOSITORY)
+    home_issues = github.open_issues(HOME_REPOSITORY)
     plan = audit.gap_plan(home_issues)
     if plan is not None:
         if dry_run:
             print(f"DRY-RUN: would apply {plan['action']} to the gap issue in {HOME_REPOSITORY}")
         else:
             apply_gap_plan(github, plan, sleep)
+    close_reminders(github, repositories, home_issues, dry_run=dry_run, run_url=run_url)
     return audit
 
 
 def _log_line(o: Observation, dry_run: bool) -> str:
     limit = o.limit.get("limit") if o.limit is not None else "UNREADABLE"
     expires = o.limit.get("expires_at") if o.limit is not None else None
-    reminders = [r.number for r in o.reminders] if o.reminders is not None else "UNREADABLE"
     renewed = "dry-run" if dry_run else o.renewal == "renewed"
-    return (
-        f"  {o.repository:<34} renewed={renewed} limit={limit} expires={expires} "
-        f"reminders={reminders} moved={list(o.reminder_moved) if o.reminder_moved else None}"
+    return f"  {o.repository:<34} renewed={renewed} limit={limit} expires={expires}"
+
+
+# --- the one-time cleanup (#524): removed once its first real run has closed them ----------
+#
+# The job used to keep one renewal reminder per public repository and withhold its heartbeat
+# unless each existed: a job keeping notes about itself. The job and its heartbeat are the
+# reminder now, so whatever kept them closes them. Nothing here touches the verdict or the
+# heartbeat, and nothing here can stop the run: the lock alone decides both.
+
+# A reminder is an open issue with exactly this title, written by one of the authors that
+# filed them: these repositories are public, so a stranger's issue with the same title is
+# never closed. The title is matched whole: GitHub's search read #449's as a reminder.
+REMINDER_AUTHORS = frozenset({WRITER_BOT, "basecradle-ai[bot]", "drawkkwast"})
+REMINDER_TITLE = re.compile(
+    r"^⏰ Renew interaction limit before \d{4}-\d{2}-\d{2} \(public-repo write-lockdown\)$"
+)
+
+
+def reminders_in(issues: list[dict[str, Any]]) -> list[int]:
+    """The renewal reminders among a repository's open issues, from the REST issues list."""
+    return sorted(
+        issue["number"]
+        for issue in issues
+        if isinstance(issue.get("number"), int)
+        and "pull_request" not in issue
+        and _login(issue) in REMINDER_AUTHORS
+        and isinstance(issue.get("title"), str)
+        and REMINDER_TITLE.match(issue["title"])
     )
+
+
+def reminder_closing(run_url: str) -> str:
+    return (
+        "Closed by the Public Repository Lockdown job, which replaces this reminder: it renews "
+        "this repository's members-only interaction limit every Monday, reads it back, and pings "
+        f"its heartbeat only when every public repository is locked down. Run: {run_url}"
+    )
+
+
+def close_reminders(
+    github: GitHub,
+    repositories: list[str],
+    home_issues: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    run_url: str,
+) -> None:
+    """Close every public repository's renewal reminders. A call that fails is said as an
+    annotation and never raised; the next run tries again."""
+    for repository in repositories:
+        try:
+            issues = (
+                home_issues if repository == HOME_REPOSITORY else github.open_issues(repository)
+            )
+        except GitHubError as error:
+            print(f"::error::{repository}: its reminders could not be read: {error}")
+            continue
+        numbers = reminders_in(issues)
+        if not numbers:
+            print(f"  {repository:<34} reminders=none")
+        for number in numbers:
+            if dry_run:
+                print(f"  DRY-RUN: would close the reminder {repository}#{number}")
+                continue
+            try:
+                github.comment(repository, number, reminder_closing(run_url))
+                github.edit_issue(
+                    repository, number, {"state": "closed", "state_reason": "completed"}
+                )
+            except GitHubError as error:
+                print(f"::error::{repository}#{number}: the reminder could not be closed: {error}")
+                continue
+            print(f"  {repository:<34} reminder #{number} closed")
 
 
 def read_repositories(path: Path) -> list[str]:
@@ -948,11 +887,11 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
         print(f"{len(names)} public repositories: {', '.join(names)}")
         return 0
 
-    # Empty when the App token could not be minted. The renewals still run; every reminder
-    # then reads as unreadable and the run dies at the gap issue, so nothing is pinged.
+    # Empty when the App token could not be minted. The renewals still run, then the run dies
+    # at the gap issue, so nothing is pinged.
     issues = os.environ.get("ISSUES_TOKEN", "")
     if not issues:
-        print("::error::ISSUES_TOKEN is empty: renewing, but no reminder or issue can be read")
+        print("::error::ISSUES_TOKEN is empty: renewing, but the gap issue cannot be read")
     repositories = read_repositories(options.repositories)
     if not repositories:
         print("public-repository-lockdown: the repository list is empty.", file=sys.stderr)
