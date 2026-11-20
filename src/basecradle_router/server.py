@@ -348,6 +348,10 @@ class WebhookServer:
         agent, event = pending
         self._scheduler.submit(agent, event, result)
 
+    def _submit_retry(self, agent: Agent, event: Event) -> None:
+        """A retry whose time came, onto its agent's queue as a delivery of its own."""
+        self._scheduler.submit(agent, event, PipelineResult())
+
     async def drain(self) -> None:
         """Await all queued and in-flight wakes — called on shutdown, and by tests.
 
@@ -478,8 +482,15 @@ class WebhookServer:
                 # startup completes, uvicorn accepts no connection, so no delivery can
                 # arrive ahead of what the routes warm.
                 await asyncio.to_thread(self.warm_routes)
+                # Then fire the retries a previous daemon left waiting (#527), once the
+                # routes a retry's recheck reads are warm. A retry is a delivery again, so it
+                # goes to the scheduler like one.
+                self.pipeline.retries.start(self._submit_retry)
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                # No retry fires into a pool that is going away; what waits stays on disk,
+                # and the next daemon fires it.
+                self.pipeline.retries.stop()
                 # Let in-flight wakes finish before we go down, so a deploy/restart
                 # never severs an agent mid-task. (Wakes are unbounded, #389, so the
                 # service's stop timeout is what bounds how long this can take.) uvicorn has

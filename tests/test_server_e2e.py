@@ -31,7 +31,7 @@ from basecradle_router.routes import BasecradleRoute, RecipientKeyring, RouteReg
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
 from basecradle_router.server import WebhookServer, configure_logging, deployed_sha
-from basecradle_router.wake import WakeResult
+from basecradle_router.wake import WakeAttempt, WakeResult
 from basecradle_router.wakelock import WakeLockGuard
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -50,7 +50,7 @@ class _RecordingWaker:
     def __init__(self) -> None:
         self.calls: list[tuple[Agent, Event]] = []
 
-    def wake(self, agent: Agent, event: Event) -> WakeResult:
+    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
         self.calls.append((agent, event))
         return WakeResult(exit_code=0, stdout="opened PR")
 
@@ -315,7 +315,9 @@ def test_webhook_is_fast_acked_without_waiting_for_the_wake() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[Agent, Event]] = []
 
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
+        def wake(
+            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        ) -> WakeResult:
             self.calls.append((agent, event))
             release.wait(timeout=5)  # safety net so a broken test can never hang CI
             wake_done.set()
@@ -371,7 +373,9 @@ def test_a_labeled_create_wakes_once_through_the_real_scheduler() -> None:
         def __init__(self) -> None:
             self.calls: list[Event] = []
 
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
+        def wake(
+            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        ) -> WakeResult:
             self.calls.append(event)
             release.wait(timeout=5)  # safety net so a broken test can never hang CI
             return WakeResult(exit_code=0)
@@ -432,7 +436,9 @@ def test_lock_prevents_a_concurrent_double_wake_end_to_end() -> None:
     release = threading.Event()
 
     class _BlockingWaker:
-        def wake(self, agent: Agent, event: Event) -> WakeResult:
+        def wake(
+            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        ) -> WakeResult:
             in_wake.set()
             release.wait(timeout=5)
             return WakeResult(exit_code=0)

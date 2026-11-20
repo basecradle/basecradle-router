@@ -121,6 +121,7 @@ from basecradle_router.evidence import EvidenceStore
 from basecradle_router.logfmt import active_synthetic_origin, log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
+from basecradle_router.retry import RetrySchedule, Scheduled
 from basecradle_router.routes import (
     UNROUTED,
     DeliveryDecision,
@@ -137,7 +138,14 @@ from basecradle_router.routes import (
 )
 from basecradle_router.secret import Secret
 from basecradle_router.synthetic import SyntheticMarks
-from basecradle_router.wake import WakeError, Waker, WakeResult, WakeStopped
+from basecradle_router.wake import (
+    WakeAttempt,
+    WakeError,
+    Waker,
+    WakeResult,
+    WakeStopped,
+    WakeTempFailed,
+)
 from basecradle_router.wakelock import WakeLockGuard
 
 logger = logging.getLogger("basecradle_router.pipeline")
@@ -225,6 +233,11 @@ class Outcome(Enum):
     REJECTED = "rejected"  # bad signature or malformed payload
     FAILED = "failed"  # the stage errored
     STOPPED = "stopped"  # the wake was stopped by a signal — an operator's act, not a fault
+    DEFERRED = "deferred"  # the wake failed for a temporary reason; a retry is scheduled (#527)
+
+
+#: The outcomes a stage line and a wake's bookend are written at WARNING for.
+_WARNING_OUTCOMES = frozenset({Outcome.REJECTED, Outcome.FAILED, Outcome.DEFERRED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +375,9 @@ class Pipeline:
     # in-memory store so a bare Pipeline stays constructible offline and no test
     # ever writes to the box's state dir; the app factory injects the real path.
     evidence: EvidenceStore = field(default_factory=lambda: EvidenceStore(None))
+    # The deliveries waiting to be tried again after a temporary failure (#527). In memory
+    # by default, like the evidence store; the app factory injects the persisted one.
+    retries: RetrySchedule = field(default_factory=RetrySchedule)
     wake_attempts: int = 3
     sleep: Callable[[float], None] = time.sleep
     # Monotonic by design: the wake's duration must not jump if the wall clock is
@@ -609,6 +625,16 @@ class Pipeline:
         wake is recorded ``BREAKER``/``IGNORED`` and no wake runs; an admitted one
         falls through to the wake unrecorded, so the happy path is unchanged.
 
+        **A retry is dispatched through every one of these gates** (#527): a delivery whose
+        wake failed for a temporary reason comes back here at about 1, 5 and 30 minutes, as
+        its own delivery again, and a gate that ends it ends its schedule — a success, a
+        collapse into a wake that already covered it, a recheck drop, a breaker refusal, a
+        crash, a stop. A newer delivery's success has usually cancelled it already
+        (:meth:`_cancel_covered`); the collapse here is the net for one that was queued when
+        that success landed. A duplicate of a delivery whose retry waits collapses into the
+        schedule. One gate makes a retry wait instead: under the NOC's wake lock it is never
+        run, and waits its own step's wait again. See :mod:`basecradle_router.retry`.
+
         Runs the minutes-long ``claude`` wake off the request path (in the
         background) after acking. The pipeline ends here: the woken agent opens its
         own PR and enables GitHub native auto-merge, so the router never merges (see
@@ -617,8 +643,14 @@ class Pipeline:
         # On every line the slow half logs — so two concurrent wakes are trivially
         # separable in Live Tail, which they were not before (#170).
         who = _who(agent, event)
+        attempt: WakeAttempt | None = None
         try:
             with self.locks.guard(agent.harness_key):
+                # Which attempt at its delivery this dispatch is: a due retry's number, else 1.
+                # A probe is never retried, so it has none.
+                attempt = (
+                    None if event.synthetic else self.retries.attempt(agent.harness_key, event)
+                )
                 self._record(result, Stage.LOCK, Outcome.OK, **who)
                 # Every non-wake outcome below is tagged with the event's own source
                 # and provenance, so a probe stopped by a gate is never mistaken for a
@@ -650,6 +682,19 @@ class Pipeline:
                     self.evidence.record_wake_deduped(agent.harness_key, **provenance)
                     self._record(
                         result, Stage.DEDUP, Outcome.IGNORED, **who, reason=DUPLICATE_DELIVERY
+                    )
+                    return
+                if (
+                    attempt is not None
+                    and attempt.number == 1
+                    and self.retries.pending(agent.harness_key, event)
+                ):
+                    # A duplicate of a delivery whose retry is waiting (two Apps, one
+                    # GUID): its schedule already owns the work, so it collapses into it
+                    # rather than waking into the same outage (#527). No evidence: the
+                    # edge was not tried, and nothing gated it.
+                    self._record(
+                        result, Stage.DEDUP, Outcome.IGNORED, **who, reason="retry_pending"
                     )
                     return
                 covering = self.coverage.covering(agent.harness_key, event)
@@ -690,6 +735,11 @@ class Pipeline:
                     self._record(
                         result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
                     )
+                    if attempt is not None and attempt.number > 1:
+                        # A retry never runs under the lock, and is never dropped by it: it
+                        # waits, and is tried again (#527).
+                        waiting = self.retries.wait(agent, event, attempt)
+                        self._log_retry(who, attempt, waiting, reason="wake_lock")
                     return
                 outcome = self.breaker.admit(
                     agent.harness_key, event.stream_key, source=event.source
@@ -704,7 +754,7 @@ class Pipeline:
                         result, Stage.BREAKER, Outcome.IGNORED, **who, reason=outcome.detail
                     )
                     return
-                if self._wake(agent, event, result):
+                if self._wake(agent, event, result, attempt):
                     # Remember the delivery *only* once it is done — woken, or stopped by
                     # an operator — so the duplicate serialised behind us collapses; a
                     # failed wake leaves the duplicate free to retry the work (see dedup
@@ -712,6 +762,47 @@ class Pipeline:
                     self.deduper.mark(event.dedup_key)
         except Exception as exc:  # last-resort: a stage bug must never crash the daemon
             self._record(result, Stage.WAKE, Outcome.FAILED, **who, error=f"unexpected: {exc}")
+        finally:
+            if attempt is not None and attempt.number > 1:
+                # However the retry's dispatch ended, its schedule is over, unless it was
+                # armed again on the way out (a temporary failure with attempts left, or a
+                # wait on the lock). Never raises: it is a dictionary pop and a file write.
+                self.retries.settle(agent.harness_key, event)
+
+    def _cancel_covered(self, agent: Agent, event: Event, started_at: datetime) -> None:
+        """End the waiting retries a session that started at ``started_at`` read (#527).
+
+        Each cancelled delivery gets the line its collapse at dispatch would have given it,
+        ``decision=coalesced into=<this delivery>``, so ``delivery=<id>`` still reads its
+        whole fate.
+        """
+        for cancelled in self.retries.cancel_covered(agent.harness_key, event, started_at):
+            self._decide(cancelled, DeliveryDecision.COALESCED, into=event.delivery_id)
+
+    def _log_retry(
+        self,
+        who: dict[str, object],
+        attempt: WakeAttempt,
+        scheduled: Scheduled,
+        **detail: object,
+    ) -> None:
+        """The one line a scheduled retry gets: which attempt it follows, and when it runs.
+
+        The same ``event=wake_retry`` the quick retry writes, because it says the same
+        thing: an attempt ended in a temporary failure and a retry follows. ``retry_at``
+        and ``delay`` are what tell the two apart, and say when to look for it.
+        """
+        logger.warning(
+            "%s %s",
+            paint("event=wake_retry"),
+            log_fields(
+                attempt=str(attempt),
+                **who,
+                **detail,
+                delay=_seconds(scheduled.delay),
+                retry_at=_instant(scheduled.retry_at),
+            ),
+        )
 
     def _accept(
         self, source: str, route: Route, request: InboundRequest, result: PipelineResult
@@ -821,7 +912,9 @@ class Pipeline:
 
         return agent, event
 
-    def _wake(self, agent: Agent, event: Event, result: PipelineResult) -> bool:
+    def _wake(
+        self, agent: Agent, event: Event, result: PipelineResult, wake_attempt: WakeAttempt | None
+    ) -> bool:
         """Dispatch the wake (with retry); return ``True`` iff its delivery is done.
 
         Done means woken or stopped. The boolean drives delivery dedup: the caller marks
@@ -886,6 +979,18 @@ class Pipeline:
         :func:`_who` mapping — the verdict is appended to it, never spelled into a
         second, drifting order.
 
+        **A temporary failure is retried later, never at once** (#527). A wake that exits
+        :data:`~basecradle_router.wake.TEMPFAIL_EXIT` gave up on an outage its own retries
+        could not outlast, and three more tries in ten seconds meet the same refusal, so it
+        leaves the quick retry at once: its delivery is scheduled again at about 1, 5 and 30
+        minutes (:mod:`basecradle_router.retry`), recorded ``stage=wake outcome=deferred``
+        beside one ``event=wake_retry`` line naming when, and is not marked done. Like a
+        stop it records no wake evidence, because it is not the end of anything; the last
+        attempt's temporary failure is the delivery's failure, recorded and written as one,
+        ``attempts=`` then counting every attempt the delivery got. ``wake_attempt`` is
+        which attempt this is, handed to the wake; a probe has none, and its exit 75 (an
+        agent with no probe secret) is the failure it always was.
+
         **Real wakes only.** A probe never launches the agent, so bracketing one would
         put a start and an end around nothing and blur the very signal the pair exists
         to show. The gate is :attr:`~basecradle_router.models.Event.synthetic` — the
@@ -916,25 +1021,34 @@ class Pipeline:
             )
             started = self.clock()
             try:
-                return self.waker.wake(agent, event)
+                return self.waker.wake(agent, event, wake_attempt)
+            except WakeTempFailed as exc:
+                if wake_attempt is None:
+                    raise TransientError(str(exc)) from exc
+                raise
             except WakeError as exc:
                 raise TransientError(str(exc)) from exc
             finally:
                 last_duration = self.clock() - started
 
         def on_retry(failed: int, of: int, exc: Exception) -> None:
+            # `try=`, never `attempt=`: an attempt is the delivery's (#527), and these quick
+            # tries all happen inside one of them, under the bracket that names it.
             logger.warning(
                 "%s %s",
                 paint("event=wake_retry"),
                 log_fields(
-                    attempt=f"{failed}/{of}",
+                    **{"try": f"{failed}/{of}"},
                     **who,
                     duration=_seconds(last_duration),
                     error=str(exc),
                 ),
             )
 
-        self._bookend(event, who, "wake_start")
+        # The bracket's prefix: the slow half's own, then which attempt this is, so the close
+        # mirrors the open on a retry exactly as it does on a first wake (#527).
+        head = who if wake_attempt is None else {**who, "attempt": str(wake_attempt)}
+        self._bookend(event, head, "wake_start")
         verdict: dict[str, object] | None = None
         try:
             try:
@@ -948,9 +1062,39 @@ class Pipeline:
                 logger.warning("%s %s", paint("event=wake_stopped"), log_fields(**who, **stop))
                 if last_started_at is not None:
                     self.coverage.record(agent.harness_key, event, last_started_at)
+                    self._cancel_covered(agent, event, last_started_at)
                 self._record(result, Stage.WAKE, Outcome.STOPPED, **who, **stop)
                 verdict = {"outcome": Outcome.STOPPED.value, **stop}
                 return True
+            except WakeTempFailed as exc:
+                if wake_attempt is None:  # unreachable: a probe's exit 75 is a TransientError
+                    raise
+                scheduled = self.retries.schedule(agent, event, wake_attempt)
+                if scheduled is None:
+                    # The delivery's last attempt: its failure, written as one.
+                    error = str(exc)
+                    self.evidence.record_wake_failed(
+                        agent.harness_key, error, route=event.source, synthetic=event.synthetic
+                    )
+                    how = {
+                        "attempts": wake_attempt.of,
+                        "duration": _seconds(last_duration),
+                        "error": error,
+                    }
+                    self._record(result, Stage.WAKE, Outcome.FAILED, **who, **how)
+                    verdict = {"outcome": Outcome.FAILED.value, **how}
+                    return False
+                self._log_retry(who, wake_attempt, scheduled, duration=_seconds(last_duration))
+                how = {
+                    "attempt": str(wake_attempt),
+                    "retry_at": _instant(scheduled.retry_at),
+                    "duration": _seconds(last_duration),
+                    "error": str(exc),
+                }
+                self._record(result, Stage.WAKE, Outcome.DEFERRED, **who, **how)
+                del how["attempt"]  # the bracket's prefix already names it
+                verdict = {"outcome": Outcome.DEFERRED.value, **how}
+                return False
             except RetryExhausted as exc:
                 error = str(exc.__cause__ or exc)
                 self.evidence.record_wake_failed(
@@ -983,6 +1127,7 @@ class Pipeline:
             # start is always set here — a success means an attempt ran.)
             if last_started_at is not None:
                 self.coverage.record(agent.harness_key, event, last_started_at)
+                self._cancel_covered(agent, event, last_started_at)
             how = {"exit": woke.exit_code, "duration": _seconds(last_duration)}
             self._record(result, Stage.WAKE, Outcome.OK, **who, **how)
             verdict = {"outcome": Outcome.OK.value, **how}
@@ -1005,7 +1150,7 @@ class Pipeline:
                 # unexpected error are what it exists for.
                 self.evidence.record_wake_ended(agent.harness_key)
             finally:
-                self._bookend(event, who, "wake_end", **verdict)
+                self._bookend(event, head, "wake_end", **verdict)
 
     def _bookend(self, event: Event, who: dict[str, object], phase: str, **verdict: object) -> None:
         """Emit one half of the wake lifecycle bracket — ``wake_start`` or ``wake_end``.
@@ -1031,7 +1176,8 @@ class Pipeline:
         if event.synthetic:
             return
         outcome = verdict.pop("outcome", None)
-        level = logging.WARNING if outcome == Outcome.FAILED.value else logging.INFO
+        warns = {o.value for o in _WARNING_OUTCOMES}
+        level = logging.WARNING if outcome in warns else logging.INFO
         parts = [paint(f"event={phase}"), log_fields(**who)]
         if outcome:
             parts.append(paint(f"outcome={outcome}"))
@@ -1119,7 +1265,7 @@ class Pipeline:
         rendered = log_fields(**detail)
         record = StageRecord(stage=stage, outcome=outcome, detail=rendered)
         result.records.append(record)
-        level = logging.WARNING if outcome in (Outcome.REJECTED, Outcome.FAILED) else logging.INFO
+        level = logging.WARNING if outcome in _WARNING_OUTCOMES else logging.INFO
         logger.log(
             level,
             "%s %s%s",

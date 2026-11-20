@@ -110,15 +110,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 import threading
 from collections.abc import Callable
-from contextlib import suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+from basecradle_router import statefile
 from basecradle_router.dedup import DUPLICATE_DELIVERY
 from basecradle_router.logfmt import log_fields
 
@@ -142,7 +140,7 @@ _MAX_REASON = 200
 #: spelling for the writer and for the startup sweep that removes what a killed writer
 #: left behind, so the two can never drift apart (basecradle-router#281).
 _TEMP_PREFIX = ".evidence-"
-_TEMP_SUFFIX = ".tmp"
+_TEMP_SUFFIX = statefile.TEMP_SUFFIX
 
 
 def _utc_now() -> datetime:
@@ -607,25 +605,8 @@ class EvidenceStore:
         process cannot write, which the first flush already reports exactly once
         (``event=evidence_write_failed``).
         """
-        directory = os.path.dirname(path) or "."
-        document = os.path.basename(path)
-        try:
-            with os.scandir(directory) as entries:
-                orphans = sorted(
-                    entry.name
-                    for entry in entries
-                    if entry.name.startswith(_TEMP_PREFIX)
-                    and entry.name.endswith(_TEMP_SUFFIX)
-                    and entry.name != document
-                    and entry.is_file(follow_symlinks=False)
-                )
-        except OSError:
-            return
-        removed = []
-        for name in orphans:
-            with suppress(OSError):
-                os.unlink(os.path.join(directory, name))
-                removed.append(name)
+        directory = statefile.directory_of(path)
+        removed = statefile.remove_orphaned_temps(path, prefix=_TEMP_PREFIX)
         if removed:
             logger.warning(
                 "event=evidence_orphaned_temps_removed %s "
@@ -946,28 +927,11 @@ def _atomic_write(path: str, text: str) -> None:
     operator's ``cat``) always sees either the whole previous document or the whole
     new one.
     """
-    directory = os.path.dirname(path) or "."
-    fd, temp = tempfile.mkstemp(dir=directory, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        # Deliberately **no fsync**. Atomicity is what a reader needs and ``os.replace``
-        # already gives it; durability across a power cut is not worth what an fsync
-        # costs here — this runs on the webhook ack path and under the store's one
-        # lock, so every recorder would serialise behind the disk. The fail-direction
-        # is already safe: an unreadable document reports never-proven, so the worst a
-        # lost write can do is understate what we have proven, never overstate it.
-        #
-        # 0644: no secrets live here, and the NOC's converge must read it without a
-        # privilege grant. mkstemp creates 0600, so widen it before the swap.
-        os.chmod(temp, 0o644)
-        os.replace(temp, path)
-    except BaseException:
-        # Never leave a stray .evidence-*.tmp behind on a failed write — the state dir
-        # would fill with them one per failed flush.
-        with suppress(OSError):
-            os.unlink(temp)
-        raise
+    # 0644: no secrets live here, and the NOC's converge must read it without a privilege
+    # grant. No fsync, deliberately: this runs on the webhook ack path and under the store's
+    # one lock, and an unreadable document reports never-proven, so the worst a lost write
+    # can do is understate what we have proven, never overstate it.
+    statefile.atomic_write(path, text, prefix=_TEMP_PREFIX, mode=0o644)
 
 
 def _load(path: str) -> EvidenceDocument:

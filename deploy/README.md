@@ -116,6 +116,12 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
   .evidence-*.tmp                  # transient: a flush writes one and renames it over evidence.json.
                                    #   One left by a daemon killed mid-flush is removed at the next
                                    #   daemon start (#281).
+  wake-retries.json                # the deliveries waiting to be tried again after a temporary
+                                   #   failure (#527), so a restart never loses one (0600: it names
+                                   #   timelines and triggers). The DAEMON is its only writer: an
+                                   #   entry is added when a wake exits 75 and removed when its
+                                   #   schedule ends, so an idle box holds `"retries": []`.
+  .wake-retries-*.tmp              # transient, as .evidence-*.tmp: removed at the next daemon start.
 ```
 
 #### Who owns the daemon tree (and why root does)
@@ -318,7 +324,7 @@ The vocabulary, in the order one delivery produces it:
 | `event=route_config …` | one INFO per route that has source-specific config, logged right after the banner: `source=`, then that route's own fields. The basecradle route states `recipient_keys=` and `shared_fallback=` (#236) — once every agent is keyed, an armed fallback and a retired one produce identical traffic, so nothing but this line distinguishes them. |
 | `event=verify_key …` | which signing key verified a basecradle delivery (#236): `source=`, `key_path=recipient\|fallback`, `recipient=`, `delivery=`. Emitted only *after* the signature checks out — before that the recipient is an unauthenticated claim. `key_path=` and not `key=`, which `event=breaker_tripped` already spends on its scope. |
 | `stage=<s> outcome=<o> …` | one per pipeline stage: `route`, `verify`, `normalize`, `resolve`, `lock`, `dedup`, `coalesce`, `recheck`, `wake_lock`, `breaker`, `wake`. **Every** stage carries **`source=<route>`** (below) — the fast half always did, and the slow half, the half that is *about a wake*, joined it in #222. A `stage=route` line for a path that names no route carries `source=unrouted requested=<segment>` instead (#462). |
-| `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. |
+| `event=wake_retry attempt=N/M …` | **WARNING** per transient wake failure that a retry follows. Before #170 the backoff was silent, so a flapping agent that eventually succeeded read as perfectly healthy. Carries `source=` too. A crash's retry follows at once, its tries counted `try=N/3` inside the one attempt the bracket names; a **temporary failure's** is scheduled (#527), and its line names the delivery's `attempt=N/4` and adds `delay=` and `retry_at=` — see *A temporary failure is retried later*, below. |
 | `event=wake_stopped …` | **WARNING**, once, when a wake was killed by SIGTERM or SIGKILL (#386): `signal=TERM\|KILL`, `exit=` (`-15`/`-9`: `sudo` died by the signal, which only a signal from outside the wake causes), `duration=`. A stop is never retried and never a failure: no `wake_retry`, no `outcome=failed`. See *Stopping a wake*, below. |
 | `event=wake_start …` / `event=wake_end …` | the **wake lifecycle bookends** (#228) — the human surface, below. |
 | `event=wake_refused reason=…` | a gate declined a wake: `reason=wake_lock_held` / `wake_lock_unparseable` (the NOC freeze interlock) or `reason=breaker_open` (the wake-rate breaker, cooling down). One spelling, whichever gate refused. Ends with the refused wake's **`source=`** (#459), so a refused probe says `source=probe`. |
@@ -353,11 +359,16 @@ wall-clock (the *last* attempt's, on every line that reports one — never the r
 was never woken at all. A wake is now bracketed:
 
 ```
-event=wake_start delivery=0192f3a4-… agent=basecradle-glm-ai source=github
-event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=ok exit=0 duration=93.4s
-event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=failed attempts=3 duration=4.1s error="…"
-event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github outcome=stopped signal=TERM exit=-15 duration=2524.3s
+event=wake_start delivery=0192f3a4-… agent=basecradle-glm-ai source=github attempt=1/4
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github attempt=1/4 outcome=ok exit=0 duration=93.4s
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github attempt=1/4 outcome=failed attempts=3 duration=4.1s error="…"
+event=wake_end   delivery=0192f3a4-… agent=basecradle-glm-ai source=github attempt=1/4 outcome=stopped signal=TERM exit=-15 duration=2524.3s
+event=wake_end   delivery=0192f3a4-… agent=nova source=basecradle attempt=1/4 outcome=deferred retry_at=2026-11-02T03:01:00Z duration=8.2s error="…"
 ```
+
+`attempt=` is which attempt at its delivery the wake is (#527): `1/4` on a first wake, `2/4` to `4/4` on
+the retries a temporary failure earns. It rides in the bracket's prefix, so the close mirrors the open on
+a retry as on a first wake. A probe carries none.
 
 - **The pair is the human surface; `stage=…` is the machinery.** Both stay — the same two-surface split
   Rails draws between its `Started …`/`Completed …` request lines and its instrumentation events. The
@@ -384,7 +395,7 @@ emitted the line):
 |---|---|
 | **green** `\x1b[32m` | `event=wake_start`, `outcome=ok`, `event=breaker_reset` |
 | **blue** `\x1b[34m` | `event=wake_end` (the bookend's identity — its trailing `outcome=` carries the verdict's colour) |
-| **yellow** `\x1b[33m` | `event=wake_retry`, `event=wake_refused`, `event=wake_lock_stale` — the warning tier, neither success nor failure |
+| **yellow** `\x1b[33m` | `event=wake_retry`, `event=wake_refused`, `event=wake_lock_stale`, `outcome=deferred` — the warning tier, neither success nor failure: a wake that did not run, or has not run yet (a deferred one has its retry scheduled, #527) |
 | **yellow** `\x1b[33m` | `event=wake_stopped`, `outcome=stopped` — the Operator's Choice tier: neither success nor failure, an outcome an operator chose (a stopped wake); never red, because nothing failed (basecradle-harness#799) |
 | **red** `\x1b[31m` | `outcome=failed`, `outcome=rejected`, `event=breaker_tripped`, `event=wake_lock_unreadable` |
 
@@ -480,9 +491,10 @@ half that is about a wake, from the moment the agent is known:
 | `stage=recheck outcome=ignored` | a queued delivery whose work ended while it waited — `reason=` (#272) |
 | `stage=wake_lock outcome=ignored` | the NOC freeze interlock refused it |
 | `stage=breaker outcome=ignored` | the wake-rate breaker refused it |
-| `event=wake_retry attempt=N/M` | a transient failure a retry followed |
+| `event=wake_retry try=N/M` / `attempt=N/M` | a crash a quick try followed / a temporary failure a scheduled retry follows (#527) |
 | `stage=wake outcome=ok` | **the per-wake duration metric line** |
 | `stage=wake outcome=failed` | the wake-failure line |
+| `stage=wake outcome=deferred` | a wake that failed for a temporary reason, its retry scheduled (#527) — not yet a failure |
 | `stage=wake outcome=stopped` | a wake an operator stopped by signal (#386) — neither a duration sample nor a failure |
 
 A refused probe and a failed probe pollute a wake-failure count exactly as a successful one pollutes a
@@ -596,6 +608,10 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins: drawkkwa
 # banner so a live daemon says which it booted with:
 # BASECRADLE_ROUTER_WAKE_LOCK_DIR=/run/basecradle-noc/wake-locks   # the NOC freeze surface
 # BASECRADLE_ROUTER_EVIDENCE_FILE=/var/lib/basecradle-router/evidence.json  # "none" = memory only
+#
+# The waiting retries (issue #527) — optional; "none" keeps them in memory, so a restart
+# drops them. Never "none" on the fleet box:
+# BASECRADLE_ROUTER_RETRY_FILE=/var/lib/basecradle-router/wake-retries.json
 ```
 
 `BASECRADLE_ROUTER_WAKE_LOCK_DIR` is the NOC wake-lock (freeze) directory the daemon reads. It
@@ -930,6 +946,48 @@ credentials, its token minter) is the NOC's onboarding job (noc#91), not the dae
 
 **No secret lives in this repo, ever** (constitution §Security and Responsibility). Secrets are placed
 on the box out-of-band, `chmod 600`, never in git.
+
+### A temporary failure is retried later (#527)
+
+A wake that gives up on an outage — a vendor's rate limit, a vendor that is down, a dropped connection —
+exits **75** (`EX_TEMPFAIL`). Three tries in ten seconds meet the same refusal, so the router does not
+retry it at once: it tries the delivery again at about **1, 5 and 30 minutes**, as a job queue retries a
+failed job (`@origin`, 2026-11-20). Any other non-zero exit is the crash it always was: three quick tries,
+then `outcome=failed`. Until the harness exits 75, nothing earns the schedule.
+
+- **Each delivery has its own schedule**, and nothing carries from one delivery to the next. It ends when
+  the delivery's work is done or its four attempts are spent; the fourth's temporary failure is the
+  delivery's failure, `stage=wake outcome=failed attempts=4`, and the *Wake Failed* alert pages on it as
+  on any other.
+- **A success cancels the retries left.** A retry that succeeds schedules nothing more. A waiting retry
+  whose work a newer delivery's successful wake read is cancelled the moment that wake succeeds, by the
+  coalesce rule (its event happened before the session started): `event=delivery_decision
+  decision=coalesced into=<delivery>`. The cancellation is written to the file, so it holds across a
+  restart. A duplicate of a waiting delivery (two Apps, one GUID) collapses into its schedule
+  (`stage=dedup outcome=ignored reason=retry_pending`) rather than waking into the same outage.
+- **A retry is a delivery again.** When its time comes it joins its agent's queue and passes every gate a
+  delivery passes. A github issue closed in the wait is dropped by the recheck; a breaker refusal ends it.
+  Under the NOC's wake lock (a converge, or an operator's wake hold) it never runs and is never dropped: it
+  waits its own step's wait again (1, 5 or 30 minutes), then tries (`event=wake_retry … reason=wake_lock`).
+- **A stop ends it.** A retry an operator stops with `stop-wake` is a stop, as any wake is, and nothing
+  follows it. Between attempts there is no process for `stop-wake` to signal; a wake hold keeps a waiting
+  retry from running.
+- **The wake is told which attempt it is**, so the last one can say so on its timeline:
+  `wake-runner --attempt <n>/<of>`, exported after the privilege drop as **`BASECRADLE_WAKE_ATTEMPT`** and
+  **`BASECRADLE_WAKE_ATTEMPTS`** (after `agent.env`, so the router's values win). A probe carries neither.
+- **It survives a restart.** The waiting deliveries are kept in `/var/lib/basecradle-router/wake-retries.json`;
+  a daemon that starts fires what the last one left once its routes are warm, one already due at once. An
+  entry whose route is no longer enabled, or whose agent the registry no longer resolves, is dropped with
+  `event=wake_retry_unrestored reason=unresolved`.
+
+One delivery's whole schedule, by `delivery=<id>`:
+
+```
+event=wake_retry attempt=1/4 delivery=0192f3a4-… agent=nova source=basecradle duration=8.2s delay=60.0s retry_at=2026-11-02T03:01:00Z
+stage=wake outcome=deferred delivery=0192f3a4-… agent=nova source=basecradle attempt=1/4 retry_at=2026-11-02T03:01:00Z duration=8.2s error="…"
+event=wake_start delivery=0192f3a4-… agent=nova source=basecradle attempt=2/4
+event=wake_end   delivery=0192f3a4-… agent=nova source=basecradle attempt=2/4 outcome=ok exit=0 duration=41.0s
+```
 
 ### Stopping a wake — `stop-wake` (#386)
 

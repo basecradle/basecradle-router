@@ -7,7 +7,7 @@
 # `router` daemon invokes it through one locked sudoers rule:
 #
 #   sudo /opt/basecradle-router/bin/wake-runner --user <os_user> --cwd <clone> \
-#        [--delivery <id>] -- claude -p "<trigger>"
+#        [--delivery <id>] [--attempt <n>/<of>] -- claude -p "<trigger>"
 #
 # It validates the request, drops to the agent's own OS user, and runs the wake
 # in the agent's clone with the agent's own credentials. The router never runs as
@@ -36,6 +36,12 @@
 # the router's stage lines carry — one `delivery=<id>` grep then spans both journal
 # identifiers, `basecradle-router` and `basecradle-wake-<slug>` (#170). It is inert
 # observability: it confers no authority, and it is never evaluated as shell.
+#
+# The optional --attempt <n>/<of> says which attempt at its delivery this wake is, and how
+# many the delivery gets (#527): the router retries a wake that exited 75 (EX_TEMPFAIL, it
+# gave up on an outage) at about 1, 5 and 30 minutes, and the last attempt is the one that
+# should say so on its timeline. It is exported to the agent as BASECRADLE_WAKE_ATTEMPT and
+# BASECRADLE_WAKE_ATTEMPTS, inert like the delivery id, and a probe never carries it.
 #
 # PROBE MODE (--probe <marker>, mutually exclusive with a command after `--`; #208).
 # The router cannot prove an agent's wake edge is alive without using it, and using it
@@ -256,6 +262,8 @@ confined_path() {
 user=""
 cwd=""
 delivery=""
+attempt=""
+attempts=""
 probe=""
 # Set only for a builder's real wake (#481): empty means the agent script `exec`s its command.
 stream_python=""
@@ -277,6 +285,17 @@ while [[ $# -gt 0 ]]; do
 	--delivery)
 		[[ $# -ge 2 ]] || die "--delivery needs a value"
 		delivery="$2"
+		shift 2
+		;;
+	--attempt)
+		[[ $# -ge 2 ]] || die "--attempt needs a value"
+		# Two small positive integers, the first no greater than the second: anything else
+		# did not come from the router's normal path, so it is refused rather than passed on.
+		[[ $2 =~ ^([1-9][0-9]{0,2})/([1-9][0-9]{0,2})$ ]] ||
+			die "refusing: --attempt must be <n>/<of>, each 1-999"
+		attempt=${BASH_REMATCH[1]}
+		attempts=${BASH_REMATCH[2]}
+		((attempt <= attempts)) || die "refusing: --attempt $2 is past its last attempt"
 		shift 2
 		;;
 	--probe)
@@ -302,6 +321,8 @@ done
 if [[ -n $probe ]]; then
 	[[ $# -eq 0 ]] ||
 		die "refusing: --probe takes no command after '--' (got: $1)"
+	# A probe is never retried and launches nothing that could read an attempt.
+	[[ -z $attempt ]] || die "refusing: --probe takes no --attempt"
 	# The marker crosses into an inline bash script's positional arguments, so it is
 	# pinned to the same fully-anchored, inert charset the router pinned it to before
 	# sending it (src/basecradle_router/marker.py). Validate, then refuse — and refuse
@@ -487,9 +508,10 @@ fi
 
 # Drop to the agent and run the wake: as the agent, load its own env (0600, the
 # router never reads it), cd into the clone, export the delivery id, exec the
-# registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2,
-# a builder's stream helpers as $3..$6 (python3, the translator, jq, cat: all empty unless this
-# is a builder's real wake), and the command (launch_bin + args) as $7..; root never
+# registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2, the
+# attempt and the number of attempts as $3 and $4 (both empty when the router sent none), a
+# builder's stream helpers as $5..$8 (python3, the translator, jq, cat: all empty unless this
+# is a builder's real wake), and the command (launch_bin + args) as $9..; root never
 # interpolates the trigger/timeline/delivery — each is passed as an inert positional argument.
 #
 # Held in a variable rather than written inline at the exec, so the two launch shapes
@@ -563,6 +585,12 @@ AGENT_SCRIPT='
 		export BASECRADLE_DELIVERY_ID="$1"
 	fi
 	shift
+	# Which attempt at its delivery this is (#527), on the same terms: exported after the env
+	# file, so the router wins, and left unset when the router sent none.
+	if [[ -n ${1:-} ]]; then
+		export BASECRADLE_WAKE_ATTEMPT="$1" BASECRADLE_WAKE_ATTEMPTS="$2"
+	fi
+	shift 2
 	stream_python=$1 stream_translate=$2 stream_jq=$3 stream_cat=$4
 	shift 4
 	# >>> run_stream >>>
@@ -630,7 +658,7 @@ AGENT_SCRIPT='
 
 # The privilege drop itself, identical in both modes.
 drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery"
-	"$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
+	"$attempt" "$attempts" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
 
 if [[ -n $probe ]]; then
 	# A probe returns its verdict to the caller — see the systemd-cat block above.

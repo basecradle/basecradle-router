@@ -216,6 +216,7 @@ def _build_holders(tmp_path) -> dict[str, object]:
         "BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET": PROBE_SECRET,
         f"{RECIPIENT_SECRET_PREFIX}NOVA": NOVA_KEY,
         "BASECRADLE_ROUTER_EVIDENCE_FILE": str(tmp_path / "evidence.json"),
+        "BASECRADLE_ROUTER_RETRY_FILE": str(tmp_path / "wake-retries.json"),
         "BASECRADLE_ROUTER_WAKE_LOCK_DIR": str(tmp_path / "wake-locks"),
     }
     server = create_app(env)

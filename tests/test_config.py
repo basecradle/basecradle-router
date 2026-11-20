@@ -17,6 +17,7 @@ from basecradle_router.config import (
     load_dedup_ttl,
     load_evidence_path,
     load_github_trusted_actors,
+    load_retry_path,
     load_wake_lanes,
     load_wake_lock_dir,
 )
@@ -381,3 +382,20 @@ def test_admin_cmd_defaults_to_the_deploy_wrapper() -> None:
 
 def test_admin_cmd_reads_from_env() -> None:
     assert load_admin_cmd({_ADMIN_CMD_VAR: "/srv/router/admin"}) == "/srv/router/admin"
+
+
+def test_retry_path_defaults_to_the_state_dir() -> None:
+    from basecradle_router.retry import DEFAULT_RETRY_FILE
+
+    assert (
+        load_retry_path({}) == DEFAULT_RETRY_FILE == "/var/lib/basecradle-router/wake-retries.json"
+    )
+
+
+def test_retry_path_reads_from_env() -> None:
+    assert load_retry_path({"BASECRADLE_ROUTER_RETRY_FILE": "/tmp/r.json"}) == "/tmp/r.json"
+
+
+@pytest.mark.parametrize("value", ["none", "NONE", "", "  "])
+def test_retry_persistence_can_be_disabled_explicitly(value) -> None:
+    assert load_retry_path({"BASECRADLE_ROUTER_RETRY_FILE": value}) is None
