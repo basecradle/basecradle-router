@@ -26,25 +26,23 @@ is automated, read back, and watched (#449):
 
 - **`.github/workflows/interaction-limit-renewal.yml`** (*Public Repository
   Lockdown*) runs weekly. It renews `collaborators_only` on **every** public
-  repository in the organization, reads each limit back, and moves each
-  repository's one renewal reminder to the date GitHub reports, so the reminder
-  is a record and never the mechanism.
+  repository in the organization and reads each limit back. The job is the
+  reminder: no issue records when a limit is due, and none is needed (#524).
 - **`.github/scripts/public_repository_lockdown.py`** holds the decisions, with
   tests (`tests/test_public_repository_lockdown.py`).
 - **The `Public Repository Lockdown` heartbeat** (Better Stack, group
   `github.com`) is pinged only when every public repository reads an active
-  `collaborators_only` limit with more than 30 days left and exactly one open
-  reminder. A gap, an unreadable answer, or a run that dies withholds the ping,
-  and the miss pages. A gap also files or updates one `needs-capital` issue here,
-  *Public Repository Lockdown Found a Gap*, which the run that finds none closes.
+  `collaborators_only` limit with more than 30 days left, in a run that renewed.
+  That is the whole condition. A gap, an unreadable answer, or a run that dies
+  withholds the ping, and the miss pages. A gap also files or updates one
+  `needs-capital` issue here, *Public Repository Lockdown Found a Gap*, which the
+  run that finds none closes.
 
-A reminder counts only when its title is exactly
-`⏰ Renew interaction limit before <YYYY-MM-DD> (public-repo write-lockdown)` and
-it was written by `@basecradle-router-ai`, `@basecradle-ai` or `@origin`: these
-repositories are public, so anyone can open an issue with any title. The
-capital's bot is on that list for good: it wrote as this workflow before
-basecradle#870 and filed every standing reminder, and a reminder is moved in
-place, never re-filed, so it keeps that author. Never close one to re-file it.
+The job used to keep one renewal-reminder issue per public repository
+(`⏰ Renew interaction limit before <YYYY-MM-DD> (public-repo write-lockdown)`) and
+withheld its heartbeat unless each existed. Each run after #524 closes any that
+are still open, and once they are all closed the code that closes them is removed
+(#524 stays open until it is).
 
 ### Credentials
 
@@ -63,8 +61,8 @@ Two, each for its own half:
   last 60 days.
 - **This repository's own `basecradle-router-ai` App token** (basecradle#870),
   minted per run from `FLEET_BOT_CLIENT_ID` and `FLEET_BOT_APP_PRIVATE_KEY` with
-  `issues: write` and scoped to exactly the public repositories, reads and moves
-  the reminders and files the gap issue.
+  `issues: write` and scoped to exactly the public repositories, files the gap
+  issue and closes the old reminders (once, #524).
 - **`PUBLIC_REPO_LOCKDOWN_HEARTBEAT_URL`** is the heartbeat's write-only ping URL.
   Unset, the run fails after its renewals, so a missing monitor never stops the
   guard itself.
@@ -75,8 +73,7 @@ When a new public fleet repo is stood up (the capital's new-repository recipe):
 
 1. Apply the limit once:
    `gh api -X PUT /repos/basecradle/<repo>/interaction-limits -f limit=collaborators_only -f expiry=six_months`
-2. Open its one renewal-reminder issue, titled as above.
-3. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-router-ai` App reach it. The audit
+2. Make sure `FLEET_ADMIN_TOKEN` and the `basecradle-router-ai` App reach it. The audit
    finds every public repository on its own: one it cannot renew or read is a gap
    within the week, and one the App cannot reach fails the run (every other
    repository is still renewed), so the heartbeat pages either way.
