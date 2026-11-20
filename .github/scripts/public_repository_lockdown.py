@@ -25,8 +25,7 @@ Two credentials, each for its own half, so neither is used for what the other is
   ``Administration`` is not a permission ``GITHUB_TOKEN`` can be granted, so it is a
   standing secret. It never writes an issue: whatever it posts would carry its owner's name.
 - **The issues token** (this repository's own ``basecradle-router-ai`` App, minted per run,
-  ``issues: write``, scoped to the public repositories) files the gap issue, and closes the
-  renewal reminders the job used to keep (:func:`close_reminders`, run once, then removed).
+  ``issues: write``, scoped to this repository alone) reads and files the gap issue.
 
 Every GitHub call goes through ``gh api`` in :class:`GitHub`, the one boundary, so the tests
 replace it and nothing here has to reach GitHub to be exercised. Standard library only, so
@@ -759,7 +758,6 @@ def run_audit(
             print(f"DRY-RUN: would apply {plan['action']} to the gap issue in {HOME_REPOSITORY}")
         else:
             apply_gap_plan(github, plan, sleep)
-    close_reminders(github, repositories, home_issues, dry_run=dry_run, run_url=run_url)
     return audit
 
 
@@ -768,79 +766,6 @@ def _log_line(o: Observation, dry_run: bool) -> str:
     expires = o.limit.get("expires_at") if o.limit is not None else None
     renewed = "dry-run" if dry_run else o.renewal == "renewed"
     return f"  {o.repository:<34} renewed={renewed} limit={limit} expires={expires}"
-
-
-# --- the one-time cleanup (#524): removed once its first real run has closed them ----------
-#
-# The job used to keep one renewal reminder per public repository and withhold its heartbeat
-# unless each existed: a job keeping notes about itself. The job and its heartbeat are the
-# reminder now, so whatever kept them closes them. Nothing here touches the verdict or the
-# heartbeat, and nothing here can stop the run: the lock alone decides both.
-
-# A reminder is an open issue with exactly this title, written by one of the authors that
-# filed them: these repositories are public, so a stranger's issue with the same title is
-# never closed. The title is matched whole: GitHub's search read #449's as a reminder.
-REMINDER_AUTHORS = frozenset({WRITER_BOT, "basecradle-ai[bot]", "drawkkwast"})
-REMINDER_TITLE = re.compile(
-    r"^⏰ Renew interaction limit before \d{4}-\d{2}-\d{2} \(public-repo write-lockdown\)$"
-)
-
-
-def reminders_in(issues: list[dict[str, Any]]) -> list[int]:
-    """The renewal reminders among a repository's open issues, from the REST issues list."""
-    return sorted(
-        issue["number"]
-        for issue in issues
-        if isinstance(issue.get("number"), int)
-        and "pull_request" not in issue
-        and _login(issue) in REMINDER_AUTHORS
-        and isinstance(issue.get("title"), str)
-        and REMINDER_TITLE.match(issue["title"])
-    )
-
-
-def reminder_closing(run_url: str) -> str:
-    return (
-        "Closed by the Public Repository Lockdown job, which replaces this reminder: it renews "
-        "this repository's members-only interaction limit every Monday, reads it back, and pings "
-        f"its heartbeat only when every public repository is locked down. Run: {run_url}"
-    )
-
-
-def close_reminders(
-    github: GitHub,
-    repositories: list[str],
-    home_issues: list[dict[str, Any]],
-    *,
-    dry_run: bool,
-    run_url: str,
-) -> None:
-    """Close every public repository's renewal reminders. A call that fails is said as an
-    annotation and never raised; the next run tries again."""
-    for repository in repositories:
-        try:
-            issues = (
-                home_issues if repository == HOME_REPOSITORY else github.open_issues(repository)
-            )
-        except GitHubError as error:
-            print(f"::error::{repository}: its reminders could not be read: {error}")
-            continue
-        numbers = reminders_in(issues)
-        if not numbers:
-            print(f"  {repository:<34} reminders=none")
-        for number in numbers:
-            if dry_run:
-                print(f"  DRY-RUN: would close the reminder {repository}#{number}")
-                continue
-            try:
-                github.comment(repository, number, reminder_closing(run_url))
-                github.edit_issue(
-                    repository, number, {"state": "closed", "state_reason": "completed"}
-                )
-            except GitHubError as error:
-                print(f"::error::{repository}#{number}: the reminder could not be closed: {error}")
-                continue
-            print(f"  {repository:<34} reminder #{number} closed")
 
 
 def read_repositories(path: Path) -> list[str]:
