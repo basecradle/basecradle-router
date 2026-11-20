@@ -25,7 +25,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from basecradle_router.logfmt import log_fields
-from basecradle_router.marker import is_marker
+from basecradle_router.marker import is_marker, redact
 from basecradle_router.models import Agent, Event, WakeKind
 
 logger = logging.getLogger("basecradle_router.wake")
@@ -411,7 +411,7 @@ def _mode_args(agent: Agent, event: Event) -> tuple[str, ...]:
     if not is_marker(event.wake_arg):
         raise WakeError(
             f"refusing to wake {agent.key}: probe delivery {event.delivery_id} carries a "
-            f"malformed BCNOC1 marker ({event.wake_arg!r})"
+            f"malformed BCNOC1 marker ({redact(event.wake_arg)!r})"
         )
     return (PROBE_FLAG, event.wake_arg)
 

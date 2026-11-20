@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from basecradle_router.marker import nonce_of, redact
+
 
 class EventKind(Enum):
     """What a normalized event asks the core to do.
@@ -283,5 +285,17 @@ class Event:
         keys on its ``wake_arg`` (the timeline uuid). Both are stable across a loop's
         repeated wakes and compact enough to log — and both are core vocabulary, so
         this stays source-agnostic.
+
+        **A probe's stream is its nonce, never its marker** (basecradle-router#529). The
+        key is logged on every breaker line and carried into the refusal reason the
+        evidence store keeps, and a probe's ``wake_arg`` is a whole signed ``BCNOC1``
+        marker. Only a replay ever trips a probe's stream (each nonce is a stream of
+        one), so keyed on the marker, the one line that could ship a complete signed
+        marker was written exactly when someone was replaying one. The nonce keys the
+        same window, since a replay repeats it, and is the correlation id the NOC
+        already logs. A malformed marker, which only a caller that bypassed the probe
+        route can carry, keys on its redaction (:func:`~basecradle_router.marker.redact`).
         """
+        if self.kind is EventKind.SYNTHETIC_PROBE:
+            return nonce_of(self.wake_arg) or redact(self.wake_arg)
         return self.origin.url if self.origin is not None else self.wake_arg

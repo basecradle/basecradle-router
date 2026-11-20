@@ -7,12 +7,14 @@ env var; the webhook secrets are read straight from the environment.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from basecradle_router.breaker import BreakerConfig
 from basecradle_router.evidence import DEFAULT_EVIDENCE_FILE
@@ -477,11 +479,51 @@ def load_self_url(env: Mapping[str, str] | None = None) -> str:
     normalize — rather than a library call that would prove none of it. The override
     exists for a box whose daemon binds a different port; it must stay a loopback
     address, because a probe routed through the public front end would prove Caddy's
-    liveness and quietly stop proving the daemon's.
+    liveness and quietly stop proving the daemon's, and would send the probe's signed
+    delivery off loopback, where any front end it crosses can log it.
+
+    **The rule is enforced, not only documented** (basecradle-router#529): a value whose
+    host is not a loopback IP literal raises :class:`ConfigError` naming the variable,
+    so the probe refuses to start rather than send anything. A literal and not a name,
+    ``localhost`` included: a name is whatever the resolver answers, and the rule is
+    about where the request goes.
     """
     env = os.environ if env is None else env
     raw = (env.get(_SELF_URL_VAR) or "").strip()
-    return (raw or DEFAULT_SELF_URL).rstrip("/")
+    url = (raw or DEFAULT_SELF_URL).rstrip("/")
+    if not _is_loopback_url(url):
+        raise ConfigError(
+            f"{_SELF_URL_VAR}={raw!r} is not an http(s) URL on a loopback address; it must "
+            f"name the daemon's own loopback listener by IP (e.g. {DEFAULT_SELF_URL})"
+        )
+    return url
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Whether ``url`` is exactly ``http(s)://<loopback IP literal>[:port]`` and nothing more.
+
+    Nothing more because the injector appends the route's path to the base, so a path,
+    query or fragment of its own sends the probe somewhere other than the route, and
+    userinfo is a credential nothing here uses. An IPv4-mapped IPv6 address is judged by
+    the IPv4 address it carries: whether ``is_loopback`` sees through the mapping changed
+    in Python 3.13, and the verdict must not depend on the interpreter.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        _ = parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not host:
+        return False
+    if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return (mapped or address).is_loopback
 
 
 def load_evidence_path(env: Mapping[str, str] | None = None) -> str | None:

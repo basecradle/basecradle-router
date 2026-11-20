@@ -88,4 +88,44 @@ def nonce_of(value: str) -> str | None:
     return match.group("nonce") if match else None
 
 
-__all__ = ["MARKER_RE", "PROBE_SECRET_ENV", "SCHEME", "is_marker", "nonce_of"]
+#: What :func:`redact` puts where a signature-shaped run of hex stood.
+REDACTED = "<hmac>"
+
+#: Any run of hex at least as long as a signature. Wider than a signature on purpose,
+#: uppercase and over-long runs included: a redaction that misses is a leak, and one
+#: that overreaches costs a debugging reader only the hex, never the shape.
+_SIGNATURE_RUN_RE = re.compile(r"[0-9A-Fa-f]{64,}")
+
+
+#: The longest :func:`redact` returns, so a hostile value cannot become a huge log line.
+REDACTED_MAX = 200
+
+
+def redact(value: str) -> str:
+    """``value`` with every signature-shaped run of hex replaced by :data:`REDACTED`.
+
+    For logging a value that **failed** the shape check (basecradle-router#529). Failing
+    the router's anchored check does not make a string harmless: the NOC's and the
+    harness's verifiers ``search`` a body for a marker between word boundaries, so a
+    string this module refuses can still *contain* one they accept. A trailing newline
+    is enough. What an operator needs from a refused value is its shape (a stray
+    character, a wrong scheme, a short signature), and the redaction keeps all of it.
+    Bounded at :data:`REDACTED_MAX` characters, an ellipsis marking a cut: the shape of
+    a marker fits in a fraction of that.
+    """
+    redacted = _SIGNATURE_RUN_RE.sub(REDACTED, value)
+    if len(redacted) <= REDACTED_MAX:
+        return redacted
+    return redacted[: REDACTED_MAX - 1] + "…"
+
+
+__all__ = [
+    "MARKER_RE",
+    "PROBE_SECRET_ENV",
+    "REDACTED",
+    "REDACTED_MAX",
+    "SCHEME",
+    "is_marker",
+    "nonce_of",
+    "redact",
+]
