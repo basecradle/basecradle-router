@@ -53,9 +53,10 @@ route out of an agent's *production* wake edges entirely, so a probe can never i
 ``edge_count`` and green the parked builder it exists to expose.
 
 **The breaker still binds, at the agent scope.** A probe's
-:attr:`~basecradle_router.models.Event.stream_key` is its marker, whose nonce is fresh
-every cycle, so each probe is its own sub-stream and the per-stream cap never fires on
-one. That is the correct reading — a probe has no loop to catch — and the per-*agent*
+:attr:`~basecradle_router.models.Event.stream_key` is its marker's nonce, never the
+marker (#529), and the nonce is fresh every cycle, so each probe is its own sub-stream
+and the per-stream cap fires only on a replay, which repeats the nonce. That is the
+correct reading — a probe has no loop to catch — and the per-*agent*
 cap is untouched, so a runaway prober is still stopped by the same backstop as anything
 else.
 """
@@ -64,7 +65,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from basecradle_router.marker import is_marker, nonce_of
+from basecradle_router.marker import is_marker, nonce_of, redact
 from basecradle_router.models import Event, EventKind, Recipient
 from basecradle_router.routes.base import (
     DeliveryDecision,
@@ -141,11 +142,12 @@ class ProbeRoute:
         harness_key = _text(data, "harness_key")
         marker = _text(data, "marker")
         if not is_marker(marker):
-            # The value, not just its shape, is safe to name: a marker is a one-time
-            # nonce plus an HMAC over it, so it reveals nothing about the secret — and
-            # an operator debugging a rejected probe needs to see what was actually sent.
+            # Named redacted, never whole: a value refused here can still contain a
+            # marker the NOC's and the harness's searching verifiers accept (a trailing
+            # newline is enough), and an operator debugging a rejected probe needs its
+            # shape, which the redaction keeps (#529).
             raise PayloadError(
-                f"marker is not a well-formed BCNOC1 probe marker: {marker!r} "
+                f"marker is not a well-formed BCNOC1 probe marker: {redact(marker)!r} "
                 "(expected 'BCNOC1 <nonce> <64-hex-hmac>')"
             )
 

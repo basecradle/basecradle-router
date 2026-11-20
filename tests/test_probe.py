@@ -43,7 +43,7 @@ from basecradle_router.app import build_registry
 from basecradle_router.claims import build_manifests
 from basecradle_router.config import Config, ConfigError, load_config, load_self_url
 from basecradle_router.evidence import EvidenceStore, read_evidence
-from basecradle_router.marker import SCHEME, is_marker, nonce_of
+from basecradle_router.marker import REDACTED, REDACTED_MAX, SCHEME, is_marker, nonce_of, redact
 from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.probe import (
@@ -234,6 +234,29 @@ def test_a_malformed_marker_is_refused_at_the_router_not_carried() -> None:
             ProbeRoute().normalize(probe_request("nova", bad))
 
 
+def test_a_refused_marker_is_named_redacted_never_whole() -> None:
+    # #529: refused by the router's anchored check is not the same as harmless. The NOC's
+    # and the harness's verifiers search a body between word boundaries, so a value
+    # refused here can still carry a marker they accept, a trailing newline most simply.
+    signed = a_marker()
+    signature = signed.rsplit(" ", 1)[1]
+    searching = re.compile(rf"\b{SCHEME} (?P<nonce>[A-Za-z0-9_-]{{1,128}}) [0-9a-f]{{64}}\b")
+    assert searching.search(signed + "\n")  # the premise: it is a verifiable marker inside
+    for bad in (signed + "\n", "prefix " + signed, signed.upper()):
+        with pytest.raises(PayloadError) as refused:
+            ProbeRoute().normalize(probe_request("nova", bad))
+        assert signature not in str(refused.value).lower()
+        assert REDACTED in str(refused.value)  # the shape survives for the operator
+
+
+def test_redact_masks_every_signature_shaped_run_and_keeps_the_rest() -> None:
+    assert redact("BCNOC1 n " + "ab" * 32 + "\n") == f"BCNOC1 n {REDACTED}\n"
+    assert redact("x " + "F" * 70 + " y " + "0" * 64) == f"x {REDACTED} y {REDACTED}"
+    assert redact("BCNOC1 n " + "0" * 63) == "BCNOC1 n " + "0" * 63  # short: no signature
+    bounded = redact("Z" * 5_000_000)  # a hostile value never becomes a huge log line
+    assert len(bounded) == REDACTED_MAX and bounded.endswith("…")
+
+
 def test_a_probe_is_never_a_silent_ignore() -> None:
     # Every other route has an ignore path because its source's catalogue is wider than
     # the router's interest. This route's traffic is manufactured by the fleet for one
@@ -339,6 +362,21 @@ def test_the_waker_refuses_a_probe_whose_marker_is_malformed() -> None:
     )
     with pytest.raises(WakeError, match="malformed BCNOC1 marker"):
         HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event)
+
+    # And names it redacted (#529): a refused value can still carry a verifiable marker.
+    signed = a_marker()
+    carrying = Event(
+        source="probe",
+        kind=EventKind.SYNTHETIC_PROBE,
+        recipient=Recipient(by="harness_key", value="nova"),
+        wake_arg=signed + "\n",
+        delivery_id="d9",
+    )
+    with pytest.raises(WakeError, match="malformed BCNOC1 marker") as refused:
+        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, carrying)
+    assert signed.rsplit(" ", 1)[1] not in str(refused.value)
+    # Its stream key never carries the signature either: it is the breaker's log key.
+    assert signed.rsplit(" ", 1)[1] not in carrying.stream_key
 
 
 # --- 4. the verifier: the ack happens as the agent, or not at all ------------
@@ -1116,6 +1154,35 @@ def test_the_injector_targets_the_daemons_own_loopback_listener_by_default() -> 
     assert load_self_url({"BASECRADLE_ROUTER_SELF_URL": "http://127.0.0.1:9000/"}) == (
         "http://127.0.0.1:9000"
     )
+    assert load_self_url({"BASECRADLE_ROUTER_SELF_URL": "http://[::1]:8000"}) == (
+        "http://[::1]:8000"
+    )
+    # Judged by the IPv4 address it carries, on every interpreter (3.13 changed this).
+    mapped = "http://[::ffff:127.0.0.1]:8000"
+    assert load_self_url({"BASECRADLE_ROUTER_SELF_URL": mapped}) == mapped
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://ai.example.com",  # the public front end: proves Caddy, not the daemon
+        "http://10.0.0.5:8000",  # a private address is still off the loopback interface
+        "http://localhost:8000",  # a name is whatever the resolver answers
+        "127.0.0.1:8000",  # no scheme
+        "ftp://127.0.0.1:8000",
+        "http://127.0.0.1:port",  # a malformed port
+        "http://127.0.0.1:8000/webhooks",  # a path of its own: the route path is appended
+        "http://127.0.0.1:8000?x=1",  # a query sends the probe to the wrong path
+        "http://127.0.0.1:8000#x",
+        "http://user:pw@127.0.0.1:8000",  # userinfo: a credential nothing uses
+        "http://[::ffff:10.0.0.5]:8000",  # a mapped address is judged by the IPv4 inside
+    ],
+)
+def test_a_non_loopback_self_url_is_refused_naming_the_variable(value: str) -> None:
+    # #529: the loopback rule is enforced, not only documented. The probe refuses to
+    # start rather than send its signed delivery anywhere else.
+    with pytest.raises(ConfigError, match="BASECRADLE_ROUTER_SELF_URL"):
+        load_self_url({"BASECRADLE_ROUTER_SELF_URL": value})
 
 
 def test_the_marker_helpers_agree_with_the_wire_format() -> None:

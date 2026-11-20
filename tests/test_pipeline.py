@@ -526,6 +526,54 @@ def test_a_comment_storm_on_one_issue_trips_the_per_issue_breaker() -> None:
     assert len(waker.calls) == 2
 
 
+def test_a_tripped_probe_stream_logs_and_records_the_nonce_never_the_marker(caplog) -> None:
+    # #529: a probe's stream trips only on a replay of one marker, so keyed on the
+    # marker, the trip line shipped a whole signed marker exactly when someone was
+    # replaying it. The nonce keys the same window and is all any surface carries:
+    # the breaker's own lines, the stage reason, and the evidence's refusal reason.
+    nonce = "0192f3a45b6c7d8e9f0100000000c0de"
+    signature = "ab12" * 16
+
+    def probe(delivery: str) -> Event:
+        # A replay is the same marker under a fresh delivery id, as the injector mints.
+        return Event(
+            source="probe",
+            kind=EventKind.SYNTHETIC_PROBE,
+            recipient=Recipient(by="harness_key", value=NOVA.harness_key),
+            wake_arg=f"BCNOC1 {nonce} {signature}",
+            delivery_id=delivery,
+        )
+
+    assert probe(PROBE_DELIVERY).stream_key == nonce
+    breaker = WakeRateBreaker(
+        BreakerConfig(max_wakes=20, window=60.0, cooldown=60.0, stream_max_wakes=1)
+    )
+    evidence = EvidenceStore(None)
+    pipeline, waker = _pipeline(breaker=breaker, evidence=evidence)
+
+    with caplog.at_level("INFO"):
+        pipeline.execute(NOVA, probe(DELIVERY_A), PipelineResult())  # fills the window
+        tripped = PipelineResult()
+        pipeline.execute(NOVA, probe(DELIVERY_B), tripped)  # the replay trips it
+        refused = PipelineResult()
+        pipeline.execute(NOVA, probe(DELIVERY_DUP), refused)  # refused mid-cooldown
+
+    assert tripped.stages[-1] == (Stage.BREAKER, Outcome.IGNORED)
+    assert refused.stages[-1] == (Stage.BREAKER, Outcome.IGNORED)
+    assert len(waker.calls) == 1
+    breaker_lines = [r.getMessage() for r in caplog.records if r.name.endswith(".breaker")]
+    assert any("event=breaker_tripped" in line for line in breaker_lines)
+    assert any("event=wake_refused" in line for line in breaker_lines)
+    for line in breaker_lines:
+        if "scope=stream" in line:
+            assert f"key={nonce}" in line
+    for record in caplog.records:
+        assert signature not in record.getMessage(), record.getMessage()
+    wake = evidence.snapshot().agent_wakes[NOVA.harness_key]
+    assert nonce in wake.last_refused_reason
+    assert signature not in wake.last_refused_reason
+
+
 # --- delivery dedup collapses a duplicate webhook delivery (#133) -----------
 
 

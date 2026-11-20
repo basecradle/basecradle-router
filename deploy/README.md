@@ -586,7 +586,7 @@ BASECRADLE_ROUTER_GITHUB_TRUSTED_ACTORS=<comma-separated GitHub logins: drawkkwa
 # point is loopback-only (the Caddyfile masks /webhooks/probe from the internet):
 # BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe
 # BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds the other copy>
-# BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000   # optional; must be the address uvicorn binds
+# BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000   # optional; the address uvicorn binds, a loopback IP or the probe refuses to start
 #
 # Wake-rate circuit breaker (the runaway-loop backstop, issue #110) — all optional,
 # generous defaults; only a genuine runaway should ever trip it:
@@ -1459,7 +1459,7 @@ read time, where a route since disabled would silently answer "real".
 ```bash
 BASECRADLE_ROUTER_ENABLED_ROUTES=github,basecradle,probe
 BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds the other copy>
-# optional; must stay a loopback address the daemon actually binds:
+# optional; must stay a loopback IP the daemon actually binds (anything else is refused, #529):
 # BASECRADLE_ROUTER_SELF_URL=http://127.0.0.1:8000
 ```
 
