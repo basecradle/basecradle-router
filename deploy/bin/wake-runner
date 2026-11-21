@@ -619,14 +619,20 @@ target_uid="$(id -u "$user")"
 # The (user, clone) pair must be registered — the wrapper trusts only the registry.
 # Pull, in one shot, the matched entry's key, kind (default "github"), and wake_bin
 # so the launched binary is decided by the registry, never the caller's argv.
+#
+# Joined by the unit separator, never a tab (#541): a tab is IFS whitespace, so `read` would
+# merge the two around an empty field and shift the fields after it into the wrong names. A
+# field holding a control character, the separator or a newline among them, is refused here
+# rather than let into `read`, so every field arrives as its own and an empty one names itself.
 command -v jq >/dev/null 2>&1 || die "jq is required to validate against the registry"
 [[ -r $REGISTRY ]] || die "registry not readable: $REGISTRY"
 entry="$(jq -r --arg u "$user" --arg c "$cwd" \
 	'to_entries[] | select(.value.os_user == $u and .value.clone_path == $c)
-	 | [.key, (.value.kind // "github"), (.value.wake_bin // "")] | @tsv' \
+	 | [.key, (.value.kind // "github"), (.value.wake_bin // "")] | map(tostring)
+	 | if any(test("[[:cntrl:]]")) then error("a field holds a control character") else join("\u001f") end' \
 	"$REGISTRY")" || die "could not read registry $REGISTRY"
 [[ -n $entry ]] || die "refusing: ($user, $cwd) is not a registered agent clone"
-IFS=$'\t' read -r match kind wake_bin <<<"$entry"
+IFS=$'\x1f' read -r match kind wake_bin <<<"$entry"
 
 # Defence in depth against a poisoned registry AND against the account that owns
 # /home/$user: every component of the clone path, from the agent's own home down, must

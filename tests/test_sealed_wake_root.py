@@ -419,6 +419,12 @@ def test_a_router_owned_interpreter_behind_the_link_is_refused(tmp_path: Path) -
     _refused_both_ways(tmp_path, "is owned by nova or router", mutations=(repoint,))
 
 
+def test_an_empty_kind_is_refused_by_its_own_name(tmp_path: Path) -> None:
+    # #541: the tab-joined read handed kind the wake_bin path and named the wrong field.
+    out = box(tmp_path, [PROBE], mutations=(_registry_edit('.nova.kind = ""'),))
+    refused(out["runs"][0], "agent nova has unknown kind ''")
+
+
 def test_a_daemon_still_holding_the_old_value_is_refused(tmp_path: Path) -> None:
     # Registry flipped, daemon not restarted: it still passes the home path as argv[1].
     out = box(tmp_path, [real_wake(HOME_BIN)])

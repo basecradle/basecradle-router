@@ -392,9 +392,12 @@ trap 'rm -f -- "$STAGING"' EXIT
 rm -f -- "$STAGING"
 
 # Joined by the unit separator, not a tab: a tab is IFS whitespace, so `read` would merge the two
-# around an empty field and shift every field after it into the wrong name.
+# around an empty field and shift every field after it into the wrong name. A field holding a
+# control character is refused, as wake-runner refuses one (#541).
 entry="$(jq -r --arg k "$key" \
-	'if has($k) then [(.[$k].kind // "github"), (.[$k].os_user // ""), (.[$k].wake_bin // "")] | map(tostring) | join("\u001f") else empty end' \
+	'if has($k) then [(.[$k].kind // "github"), (.[$k].os_user // ""), (.[$k].wake_bin // "")] | map(tostring)
+	 | if any(test("[[:cntrl:]]")) then error("a field holds a control character") else join("\u001f") end
+	 else empty end' \
 	"$REGISTRY")" || die "could not read registry $REGISTRY"
 [[ -n $entry ]] || die "refusing: no agent $key in the registry"
 IFS=$'\x1f' read -r kind user current <<<"$entry"
