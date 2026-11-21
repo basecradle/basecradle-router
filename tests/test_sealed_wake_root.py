@@ -337,6 +337,60 @@ def test_a_sealed_agents_env_file_cannot_load_its_own_code(tmp_path: Path) -> No
     assert out["exists"] == {f"{CLONE}/INJECTED": False}, "agent code ran in a sealed wake"
 
 
+def test_no_agents_probe_runs_its_injected_code(tmp_path: Path) -> None:
+    # Sealed or not, a probe runs only our verifier (#538): an agent that could load code into it
+    # could ack a marker its secret does not verify.
+    out = box(
+        tmp_path, [PROBE], nova_sealed=False, nova_tree=False,
+        mutations=(INJECT,), check_paths=(f"{CLONE}/INJECTED",),
+    )  # fmt: skip
+    assert out["runs"][0]["rc"] == 0, out["runs"][0]
+    assert out["exists"] == {f"{CLONE}/INJECTED": False}, "agent code ran in the probe verifier"
+
+
+#: A usercustomize.py in nova's own user site, which a Python not run with -I imports at start.
+USER_SITE = (
+    "site=$(runuser -u nova -- /usr/bin/python3 -c "
+    "'import site; print(site.getusersitepackages())')"
+    " && runuser -u nova -- mkdir -p \"$site\" && printf '%s\\n' "
+    '\'open("/home/nova/harness/INJECTED", "w").close()\' '
+    '| runuser -u nova -- tee "$site/usercustomize.py" >/dev/null'
+)
+
+#: An LD_LIBRARY_PATH in nova's agent.env to a directory of empty files named for every library
+#: python3 links: should the loader see it, python3 does not start.
+LOADER = (
+    "install -d -o nova -g nova /home/nova/lib && for lib in "
+    "$(ldd /usr/bin/python3 | awk '/=>/ {print $1}'); do "
+    "runuser -u nova -- touch /home/nova/lib/$lib; done "
+    "&& printf 'LD_LIBRARY_PATH=/home/nova/lib\\n' >>/home/nova/.config/basecradle/agent.env"
+)
+
+
+def test_no_agents_probe_imports_its_user_site(tmp_path: Path) -> None:
+    # What `-I` alone keeps out of the verifier: the agent's own user site directory (#538).
+    out = box(
+        tmp_path, [PROBE], nova_sealed=False, nova_tree=False,
+        mutations=(USER_SITE,), check_paths=(f"{CLONE}/INJECTED",),
+    )  # fmt: skip
+    assert out["runs"][0]["rc"] == 0, out["runs"][0]
+    assert out["exists"] == {f"{CLONE}/INJECTED": False}, "the verifier imported the agent's site"
+
+
+def test_no_agents_loader_variable_reaches_the_probe(tmp_path: Path) -> None:
+    # What the scrub alone keeps out: the loader's variables, which `-I` does not touch (#538).
+    # The control is in the same box: the same env, run as nova without the scrub, fails to start.
+    control = {
+        "argv": ["env", "LD_LIBRARY_PATH=/home/nova/lib", "/usr/bin/python3", "-c", "pass"],
+        "as": "nova",
+    }
+    out = box(
+        tmp_path, [control, PROBE], nova_sealed=False, nova_tree=False, mutations=(LOADER,),
+    )  # fmt: skip
+    assert out["runs"][0]["rc"] != 0, "the planted libraries do not break python3 here"
+    assert out["runs"][1]["rc"] == 0, out["runs"][1]
+
+
 def test_a_sealed_real_wake_runs_none_of_the_agents_injected_code(tmp_path: Path) -> None:
     out = box(tmp_path, [real_wake()], mutations=(INJECT,), check_paths=(f"{CLONE}/INJECTED",))
     if not out["journal"]:

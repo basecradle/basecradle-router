@@ -482,7 +482,7 @@ def test_probe_mode_still_resolves_the_binary_a_real_wake_would_have_run() -> No
     # Only the exec is skipped.
     source = wake_runner_source()
     assert 'would_exec="$launch_bin"' in source
-    assert 'set -- "$PROBE_ACK" "$probe" "$would_exec"' in source
+    assert 'set -- -I "$PROBE_ACK" "$probe" "$would_exec"' in source
 
 
 def test_the_verifiers_interpreter_is_resolved_as_root_off_the_trusted_path() -> None:

@@ -603,11 +603,23 @@ def test_an_unsealed_wake_keeps_its_env_file_as_it_was(tmp_path: Path) -> None:
     assert env["LD_PRELOAD"] == "/home/nova/evil.so"
 
 
-def test_root_marks_a_wake_sealed_only_from_the_gates_own_answer() -> None:
+def test_root_scrubs_only_a_sealed_wake_and_a_probe() -> None:
     text = WAKE_RUNNER.read_text()
-    assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed' in text
-    # Set in exactly two places: cleared with the other flags, and set from the gate's output.
-    assert len(re.findall(r"\bsealed=", text)) == 2
+    assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || scrub=scrub' in text
+    # Set in exactly three places: cleared with the other flags, set from the gate's sealed
+    # answer, and set for a probe, which runs only our verifier (#538).
+    assert re.findall(r"\bscrub=\S*", text) == ['scrub=""', "scrub=scrub", "scrub=scrub"]
+    assert '\tset -- -I "$PROBE_ACK" "$probe" "$would_exec"\n\tscrub=scrub\n' in text
+
+
+def test_the_stream_translator_runs_with_no_loader_variable_of_the_agents() -> None:
+    # In the translator's own subshell, so claude keeps its environment as it was (#538).
+    text = WAKE_RUNNER.read_text()
+    assert re.search(
+        r'> >\(\n(?:\t\t\t#[^\n]*\n)*\t\t\tfor _name in "\$\{!LD_@\}"; do\n'
+        r'\t\t\t\tunset "\$_name"\n\t\t\tdone\n\t\t\t"\$python" -I "\$translate" "\$\$" \|\| \{',
+        text,
+    )
 
 
 @pytest.mark.skipif(

@@ -95,7 +95,7 @@ def test_a_missing_translator_refuses_the_wake_rather_than_run_it_unlogged() -> 
 def test_the_stream_helpers_ride_into_the_drop_as_inert_positionals() -> None:
     assert re.search(
         r'drop=\(runuser -u "\$user" -- /bin/bash -c "\$AGENT_SCRIPT" wake-runner "\$real_cwd"'
-        r' "\$delivery"\n\t"\$attempt" "\$attempts" "\$try_number" "\$tries" "\$sealed"'
+        r' "\$delivery"\n\t"\$attempt" "\$attempts" "\$try_number" "\$tries" "\$scrub"'
         r' "\$stream_python"'
         r' "\$stream_translate" "\$stream_jq" "\$stream_cat" "\$launch_bin" "\$@"\)',
         _script(),
@@ -106,7 +106,8 @@ def test_a_builders_claude_is_execed_with_its_stdout_into_the_translator() -> No
     # runuser's child must be claude itself, as for every wake: a shell in between would die of
     # runuser's relayed TERM at once, and the router would read the wake as over while claude ran.
     assert re.search(
-        r'\texec "\$@" > >\(\n\t\t"\$python" -I "\$translate" "\$\$" \|\| \{\n',
+        r'\texec "\$@" > >\(\n(?:\t\t#[^\n]*\n)*\t\tfor _name in "\$\{!LD_@\}"; do\n'
+        r'\t\t\tunset "\$_name"\n\t\tdone\n\t\t"\$python" -I "\$translate" "\$\$" \|\| \{\n',
         _run_stream(),
     )
 

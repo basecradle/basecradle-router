@@ -89,7 +89,7 @@ def test_the_delivery_id_is_passed_as_an_inert_positional_never_interpolated() -
     assert (
         'drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" '
         'wake-runner "$real_cwd" "$delivery"\n'
-        '\t"$attempt" "$attempts" "$try_number" "$tries" "$sealed" "$stream_python"'
+        '\t"$attempt" "$attempts" "$try_number" "$tries" "$scrub" "$stream_python"'
         ' "$stream_translate"'
         ' "$stream_jq" "$stream_cat" "$launch_bin" "$@")'
     ) in WAKE_RUNNER.read_text()

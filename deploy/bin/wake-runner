@@ -511,9 +511,11 @@ attempts=""
 try_number=""
 tries=""
 probe=""
-# `sealed` once the registry's wake_bin passed the gate's sealed branch (#535): the agent
-# script then drops every loader and interpreter variable agent.env set.
-sealed=""
+# `scrub` when nothing the wake runs may load code the agent chose: a sealed harness wake,
+# once the registry's wake_bin passed the gate's sealed branch (#535), and every probe, which
+# runs only our root-owned verifier (#538). The agent script then drops every loader and
+# interpreter variable agent.env set.
+scrub=""
 # Set only for a builder's real wake (#481): empty means the agent script `exec`s its command.
 stream_python=""
 stream_translate=""
@@ -708,7 +710,7 @@ harness)
 	# judge the file it names. Either way the `exec` happens after the drop, as the agent.
 	launch_bin="$(harness_wake_bin "wake_bin" "/home/$user" "$SEALED_BASE" "$user" "$wake_bin")" || exit 1
 	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
-	[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed
+	[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || scrub=scrub
 	;;
 *)
 	die "refusing: agent $match has unknown kind '$kind'"
@@ -736,7 +738,12 @@ if [[ -n $probe ]]; then
 		refuse "$EXIT_UNPROVABLE" "could not prove: python3 not found on the trusted PATH"
 	would_exec="$launch_bin"
 	launch_bin="$probe_python"
-	set -- "$PROBE_ACK" "$probe" "$would_exec"
+	# `-I`, as the stream translator is run: the verifier is exec-ed after agent.env has loaded,
+	# and isolated mode keeps the agent's own PYTHON* settings and site directories out of it, so
+	# the account under test cannot load code into the program that grades it (#538). The scrub
+	# below drops the loader's LD_* for it too.
+	set -- -I "$PROBE_ACK" "$probe" "$would_exec"
+	scrub=scrub
 else
 	shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
 	# A builder's stream flags, appended by root after the caller's `-p <trigger>` (#481).
@@ -781,8 +788,8 @@ fi
 # router never reads it), cd into the clone, export the delivery id, exec the
 # registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2, the
 # attempt and the number of attempts as $3 and $4 (both empty when the router sent none), the
-# quick try and the number of tries as $5 and $6 (the same), whether the agent is sealed as $7
-# (`sealed`, or empty), a builder's stream helpers as $8..$11 (python3, the translator, jq,
+# quick try and the number of tries as $5 and $6 (the same), whether to drop the loader and
+# interpreter variables agent.env set as $7 (`scrub`, or empty), a builder's stream helpers as $8..$11 (python3, the translator, jq,
 # cat: all empty unless this is a builder's real wake), and the command (launch_bin + args) as
 # $12..; root never
 # interpolates the trigger/timeline/delivery — each is passed as an inert positional argument.
@@ -871,7 +878,8 @@ AGENT_SCRIPT='
 	shift 2
 	# A sealed agent (#535): its tree is the one thing it cannot write, so its own env file must
 	# not point the two programs that load that tree, the dynamic loader and the interpreter, at
-	# code of its own. Every LD_* (a preload, a library path) and every PYTHON* (a path, a home, a
+	# code of its own. A probe (#538) for the same reason: it runs only our verifier, which the
+	# agent must not be able to load code into. Every LD_* (a preload, a library path) and every PYTHON* (a path, a home, a
 	# startup file) is dropped once agent.env has loaded, whoever set it, and stays dropped for
 	# every child; the four PYTHON* names that load no code (output buffering and encoding, and
 	# bytecode writing) are kept, so the wake ledger is written as it was. This is NOT a seal of
@@ -940,6 +948,12 @@ AGENT_SCRIPT='
 		local python=$1 translate=$2 jq=$3 cat=$4
 		shift 4
 		exec "$@" > >(
+			# The translator is root-owned and run as the agent for the same reason as the probe
+			# verifier, so the loader variables agent.env set are dropped in this subshell alone
+			# (#538): `-I` keeps the PYTHON* ones out, and claude keeps its environment as it was.
+			for _name in "${!LD_@}"; do
+				unset "$_name"
+			done
 			"$python" -I "$translate" "$$" || {
 				printf "wake-runner: the stream translator exited %s; keeping the reply from the rest of the stream\n" "$?" >&2
 				"$jq" -R -r --unbuffered "fromjson? | select(type == \"object\" and .type == \"result\") | .result | strings | \"(?<![A-Z0-9_])[A-Z0-9_]*?(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(?:_BASE)?=\" as \$n | \"\\u0027<a redacted value>\\u0027\" as \$r | def redact(\$body): (\"(?<x>\" + \$n + \$body + \"){0}\") as \$x | def search(\$k): [\"(?<u>\\\\g<x>)\", (range(1; \$k) | \"(?:(?<g>(?:(?!\\\\g<x>)(?s:.)){0,4096}+)(?<u>\\\\g<x>)\"), (range(1; \$k) | \")?\"), \$x] | add; [label \$done | foreach range(0; infinite) as \$_ ({t: ., k: 1}; .t as \$t | .k as \$k | (try ([\$t | match(search(\$k))] | first) catch (if \$k > 1 and test(\"retry-limit\") then \"retry\" else error end)) as \$m | if \$m == \"retry\" then {t: \$t, k: ([\$k / 4 | floor, 1] | max), out: []} elif \$m == null then {t: null, out: [\$t]} else [\$m.captures[] | select(.offset >= 0 and .name != \"x\")] as \$c | {t: \$t[\$m.offset + \$m.length:], k: (if \$m.length * 4 < 65536 and ([\$c[] | select(.name == \"u\")] | length) == \$k then [\$k * 4, 256] | min else \$k end), out: [\$t[:\$m.offset], (\$c[] | if .name == \"g\" then .string else (.string | .[:index(\"=\") + 1]), \$r end)]} end; .out[], if .t == null then break \$done else empty end)] | add; redact(\"(?:\\u0027<a redacted value>\\u0027(?=[\\t \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\z)|(?:\\t++(?=[^ ,}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]))?(?:(?:[^ \\t\\n\\\"\\u0027\`\\\\\\\\(=]|(?==)(?:(?<![DENTY])|(?<!EN|ET|EY|RD|SE)|(?<!KEY)(?<!TOKEN)(?<!SECRET)(?<!PASSWORD)(?<!PASSPHRASE)(?<!KEY_BASE)(?<!TOKEN_BASE)(?<!SECRET_BASE)(?<!PASSWORD_BASE)(?<!PASSPHRASE_BASE))=|\\\"(?:[^\\\"\\\\\\\\\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\\\\\.)*\\\"|\\u0027[^\\u0027\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\u0027|\\\\\$?\\\\([^)\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\\\)|\`[^\`\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\`|\\\\\\\\(?:[^\\t]|(?=\\t)))*+(?:(?==)(?:(?<=KEY)|(?<=TOKEN)|(?<=SECRET)|(?<=PASSWORD)|(?<=PASSPHRASE)|(?<=KEY_BASE)|(?<=TOKEN_BASE)|(?<=SECRET_BASE)|(?<=PASSWORD_BASE)|(?<=PASSPHRASE_BASE))=(?:\\t++(?=[^ ,}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]))?|(?<=(?i:bearer))[ \\t]+(?=[^ ,}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]))|(?:(?:[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\t\\u0027\`\\\\\\\\(=]|(?==)(?:(?<![DENTY])|(?<!EN|ET|EY|RD|SE)|(?<!KEY)(?<!TOKEN)(?<!SECRET)(?<!PASSWORD)(?<!PASSPHRASE)(?<!KEY_BASE)(?<!TOKEN_BASE)(?<!SECRET_BASE)(?<!PASSWORD_BASE)(?<!PASSPHRASE_BASE))=|\\\\\\\\[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\t]|\\u0027[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\u0027]*\\u0027|\`(?:[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\`\\\\\\\\]|\\\\\\\\[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029])*\`|\\\\([^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029()\\u0027\`\\\\\\\\]*\\\\))++(?:\\\\\\\\)?|\\\\\\\\)\\t+(?=[^ ,}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]))*(?:(?:[^ \\t\\n\\\"\\u0027\`\\\\\\\\(=]|(?==)(?:(?<![DENTY])|(?<!EN|ET|EY|RD|SE)|(?<!KEY)(?<!TOKEN)(?<!SECRET)(?<!PASSWORD)(?<!PASSPHRASE)(?<!KEY_BASE)(?<!TOKEN_BASE)(?<!SECRET_BASE)(?<!PASSWORD_BASE)(?<!PASSPHRASE_BASE))=|\\\"(?:[^\\\"\\\\\\\\\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\\\\\.)*\\\"|\\u0027[^\\u0027\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\u0027|\\\\\$?\\\\([^)\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\\\)|\`[^\`\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\`|\\\\\\\\(?:[^\\t]|(?=\\t)))*+(?==)(?:(?<=KEY)|(?<=TOKEN)|(?<=SECRET)|(?<=PASSWORD)|(?<=PASSPHRASE)|(?<=KEY_BASE)|(?<=TOKEN_BASE)|(?<=SECRET_BASE)|(?<=PASSWORD_BASE)|(?<=PASSPHRASE_BASE))=(?:\\t+(?![^ ,}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029])|(?=[ \\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\z))|(?:(?:[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\t\\u0027\`\\\\\\\\(=]|(?==)(?:(?<![DENTY])|(?<!EN|ET|EY|RD|SE)|(?<!KEY)(?<!TOKEN)(?<!SECRET)(?<!PASSWORD)(?<!PASSPHRASE)(?<!KEY_BASE)(?<!TOKEN_BASE)(?<!SECRET_BASE)(?<!PASSWORD_BASE)(?<!PASSPHRASE_BASE))=|\\\\\\\\[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\t]|\\u0027[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\\u0027]*\\u0027|\`(?:[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029\`\\\\\\\\]|\\\\\\\\[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029])*\`|\\\\([^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029()\\u0027\`\\\\\\\\]*\\\\))++(?:\\\\\\\\)?|\\\\\\\\)\\t+|(?:[^ \\t\\n\\\"\\u0027\`\\\\\\\\(]|\\\"(?:[^\\\"\\\\\\\\\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]|\\\\\\\\.)*\\\"?|\\u0027[^\\u0027\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\u0027?|\\\\\$?\\\\([^)\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\\\\)?|\`[^\`\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]*\`?|\\\\\\\\(?:[^\\t]|(?=\\t)))+)|\\t+)\") | redact(\"[^ \\\",}\\n\\r\\u0000\\u000b\\u000c\\u001c\\u001d\\u001e\\u0085\\u2028\\u2029]{8,}\") | reduce (\"\\r\\n\", \"\\n\", \"\\r\", \"\\u0000\", \"\\u000b\", \"\\u000c\", \"\\u001c\", \"\\u001d\", \"\\u001e\", \"\\u0085\", \"\\u2028\", \"\\u2029\") as \$c ([.]; [.[] | if . == \"\" then . else split(\$c)[] end]) | if length > 1 and .[-1] == \"\" then .[:-1] end | .[] | if . == \"\" then \">\" else explode as \$c | range(0; \$c | length; 8000) as \$i | \"> \" + (\$c[\$i:\$i+8000] | implode) end" ||
@@ -956,7 +970,7 @@ AGENT_SCRIPT='
 
 # The privilege drop itself, identical in both modes.
 drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery"
-	"$attempt" "$attempts" "$try_number" "$tries" "$sealed" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
+	"$attempt" "$attempts" "$try_number" "$tries" "$scrub" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
 
 if [[ -n $probe ]]; then
 	# A probe returns its verdict to the caller — see the systemd-cat block above.
