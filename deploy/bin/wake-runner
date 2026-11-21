@@ -91,7 +91,9 @@
 #   - a builder ("github", the default): only the trusted, system-installed
 #     `claude` may be launched, resolved off a root-owned PATH;
 #   - a harness agent ("harness", e.g. @nova): only the exact `wake_bin` the
-#     registry pins for that agent may be launched (its own wake CLI in its venv).
+#     registry pins for that agent may be launched (its own wake CLI in its venv:
+#     the sealed one under /opt/basecradle-harness/venv/<user>/ once the NOC has sealed it,
+#     else the one in its home; see `harness_wake_bin`).
 # Either way the binary is decided by the ROOT-OWNED registry, never by the
 # caller's argv, so a compromised router cannot substitute a different command.
 #
@@ -101,7 +103,9 @@
 #     registered in the agent registry with exactly the requested clone path;
 #   - only the registry-sanctioned binary for that agent may be launched —
 #     `claude` for a builder, the pinned `wake_bin` for a harness agent — and a
-#     harness `wake_bin` must lie inside the agent's own home;
+#     harness `wake_bin` must lie inside that agent's own sealed tree,
+#     /opt/basecradle-harness/venv/<user>/, or, only while no such tree exists, inside the
+#     agent's own home (`harness_wake_bin`, #535);
 #   - every path that lives inside an account's own directory goes through ONE gate,
 #     `confined_path` below: walked component-wise from a trusted root, refusing `..`
 #     itself and refusing any symlink component rather than resolving it. Root never
@@ -149,6 +153,11 @@ STREAM_TRANSLATE=/opt/basecradle-router/bin/claude-stream-translate
 # The flags that make `claude -p` write the stream the translator reads. All three are needed:
 # without --include-partial-messages the stream never states a call's final output tokens.
 STREAM_FLAGS=(--output-format stream-json --verbose --include-partial-messages)
+# Where a sealed harness agent's environment lives (#535): /opt/basecradle-harness/venv/<os_user>/,
+# under two directories root owns, so the agent can neither write its tree nor rename it
+# and put one of its own in its place. A CONSTANT, for PROBE_ACK's reason: whoever could
+# choose it would choose what the agent's wake runs.
+SEALED_BASE=/opt/basecradle-harness
 
 die() {
 	printf 'wake-runner: %s\n' "$*" >&2
@@ -263,6 +272,192 @@ confined_path() {
 	printf '%s' "$path"
 }
 # <<< confined_path <<<
+
+# >>> harness_wake_bin >>>
+# May root hand this harness WAKE_BIN to the drop? The ONE gate a harness agent's
+# registry `wake_bin` goes through (#535). It has two places it may be, and only two:
+#
+#   - SEALED: under BASE/venv/USER/, the tree the NOC builds and an account other than the
+#     agent owns. Before anything is exec'd, BASE and BASE/venv must be real directories
+#     (no symlink), owned by root, with no group or other write, so nobody but root can
+#     rename the agent's tree or put another in its place. The path is then walked by
+#     `confined_path` rooted at BASE/venv/USER (no symlink, no `..`, nothing missing), so it
+#     can name only THIS user's tree. And no entry on it, from that root down to the binary,
+#     may be owned by the agent or writable by its group or by others: a tree the agent can
+#     write is not sealed, whatever its path says, and running it would report a seal that
+#     is absent. Last, neither the binary nor the interpreter its `#!` line names may be
+#     setuid or setgid: the tree's owner runs package install code, and a set-id program
+#     the agent's group can execute would let the agent become that owner by running it.
+#     A directory's setgid bit on the path is how the tree hands the agent's group down,
+#     and passes. The interpreter must be an absolute path that exists, named directly:
+#     the kernel resolves a relative one against the agent's own clone, and `env` resolves
+#     it off the agent's own PATH, so either would let the agent choose what runs.
+#
+#     The walk covers the binary's own path, never the interpreter's. A real venv's
+#     `bin/python` is a link to the box's interpreter, and the one place this gate FOLLOWS a
+#     link is there, to judge the file the kernel will finally run: it must exist, must not
+#     be owned by the agent or writable by its group or by others, and must not be set-id.
+#     That holds for the `#!` interpreter and for the tree's own `bin/python`, which is what
+#     a uv console script runs either way. The directories above that file, and the rest of
+#     the venv (`site-packages`), are the NOC's build to keep sealed; this gate does not
+#     read them.
+#   - HOME: under HOME (/home/USER), as before the seal, and ONLY while BASE/venv/USER does
+#     not exist. Its existence, as anything at all, a dangling link included, means the NOC
+#     has sealed this agent (only root can create an entry there), so a registry that still
+#     names the home is refused rather than followed. Nothing trusted follows a path under
+#     the agent's home once the agent is sealed, even when the registry flip was forgotten.
+#
+# Anywhere else is refused. Which of the two applies is the ROOT-OWNED registry's call,
+# never inferred from the tree: inferring "sealed" from the tree's presence would read a
+# sealed agent whose tree went missing as an unsealed one and fall back to its home, the
+# one outcome this gate exists to make impossible. A sealed agent whose tree is missing or
+# fails a check is a refused wake that names the check.
+#
+# Like `confined_path` it resolves nothing, writes nothing, and names the entry at fault,
+# never a link's target. The ownership test is `-O` (owned by the effective uid), which is
+# root's, because this script refuses to run as anyone else.
+#
+#   harness_wake_bin <label> <home> <base> <user> <wake_bin>
+#     -> stdout: WAKE_BIN verbatim
+#     -> stderr + return 1: one line naming what is wrong and where
+not_set_id() {
+	local label=$1 what=$2 entry=$3
+	# `-u` and `-g` stat the file a link names, which is the point: the set-id bit that
+	# takes effect at exec is the one on the file the kernel finally runs.
+	if [[ -u $entry || -g $entry ]]; then
+		printf 'wake-runner: refusing: %s: %s %s is setuid or setgid; it would run as its owner, not as the agent\n' \
+			"$label" "$what" "$entry" >&2
+		return 1
+	fi
+}
+
+not_writable_by_others() {
+	local label=$1 entry=$2 found
+	found="$(find "$entry" -prune \( -perm -g+w -o -perm -o+w \) -print)" || {
+		printf 'wake-runner: refusing: %s: could not read the mode of %s\n' "$label" "$entry" >&2
+		return 1
+	}
+	if [[ -n $found ]]; then
+		printf 'wake-runner: refusing: %s: %s is writable by its group or by others\n' \
+			"$label" "$entry" >&2
+		return 1
+	fi
+}
+
+not_the_agents() {
+	local label=$1 user=$2 entry=$3 found
+	found="$(find "$entry" -prune -user "$user" -print)" || {
+		printf 'wake-runner: refusing: %s: could not read the owner of %s\n' "$label" "$entry" >&2
+		return 1
+	}
+	if [[ -n $found ]]; then
+		printf 'wake-runner: refusing: %s: %s is owned by %s; a sealed tree is never the agent'"'"'s own\n' \
+			"$label" "$entry" "$user" >&2
+		return 1
+	fi
+	not_writable_by_others "$label" "$entry"
+}
+
+# An interpreter the wake will run: followed, deliberately and only here. A venv's
+# `bin/python` is a link to the box's interpreter, and what runs is the file it finally
+# names. So that file, wherever it is, must exist, may not be the agent's own or writable by
+# its group or by others, and may not be set-id.
+runs_as_installed() {
+	local label=$1 user=$2 what=$3 interpreter=$4 found
+	if [[ ! -e $interpreter ]]; then
+		printf 'wake-runner: refusing: %s: the %s %s does not exist\n' "$label" "$what" "$interpreter" >&2
+		return 1
+	fi
+	found="$(find -L "$interpreter" -prune \( -user "$user" -o -perm -g+w -o -perm -o+w \) -print)" || {
+		printf 'wake-runner: refusing: %s: could not read the owner and mode of the %s %s\n' \
+			"$label" "$what" "$interpreter" >&2
+		return 1
+	}
+	if [[ -n $found ]]; then
+		printf 'wake-runner: refusing: %s: the %s %s is owned by %s or writable by its group or by others\n' \
+			"$label" "$what" "$interpreter" "$user" >&2
+		return 1
+	fi
+	not_set_id "$label" "$what" "$interpreter"
+}
+
+harness_wake_bin() {
+	local label=$1 home=$2 base=$3 user=$4 path=$5
+	local venvs="$base/venv" tree="$base/venv/$user"
+	local parent rest component walked line interpreter
+
+	case "$path" in
+	"$venvs"/*)
+		for parent in "$base" "$venvs"; do
+			if [[ -L $parent || ! -d $parent ]]; then
+				printf 'wake-runner: refusing: %s: sealed parent %s is not a real directory\n' \
+					"$label" "$parent" >&2
+				return 1
+			fi
+			if [[ ! -O $parent ]]; then
+				printf 'wake-runner: refusing: %s: sealed parent %s is not owned by root\n' \
+					"$label" "$parent" >&2
+				return 1
+			fi
+			not_writable_by_others "$label" "$parent" || return 1
+		done
+		confined_path "$label" "$tree" "$path" >/dev/null || return 1
+		not_the_agents "$label" "$user" "$tree" || return 1
+		rest=${path#"$tree"/}
+		walked=$tree
+		while [[ -n $rest ]]; do
+			component=${rest%%/*}
+			if [[ $component == "$rest" ]]; then
+				rest=""
+			else
+				rest=${rest#*/}
+			fi
+			walked="$walked/$component"
+			not_the_agents "$label" "$user" "$walked" || return 1
+		done
+		not_set_id "$label" "binary" "$path" || return 1
+		# The kernel reads at most 256 bytes of a `#!` line; so do we.
+		line=""
+		IFS= read -r -n 256 line <"$path" || true
+		if [[ $line == '#!'* ]]; then
+			interpreter=${line#'#!'}
+			interpreter=${interpreter#"${interpreter%%[![:space:]]*}"}
+			interpreter=${interpreter%%[[:space:]]*}
+			if [[ $interpreter != /* ]]; then
+				printf 'wake-runner: refusing: %s: the #! interpreter %s of %s is not an absolute path\n' \
+					"$label" "$interpreter" "$path" >&2
+				return 1
+			fi
+			if [[ ${interpreter##*/} == env ]]; then
+				printf 'wake-runner: refusing: %s: %s names its interpreter through %s, which resolves it off the agent'"'"'s own PATH\n' \
+					"$label" "$path" "$interpreter" >&2
+				return 1
+			fi
+			runs_as_installed "$label" "$user" "#! interpreter" "$interpreter" || return 1
+		fi
+		# And the tree's own interpreter, whatever the `#!` line says. uv names it there
+		# directly for any path the kernel can read in a `#!` line, but writes a `#!/bin/sh`
+		# trampoline that execs it instead for a longer one (127 bytes), which a `#!` check
+		# alone would pass on /bin/sh's word. A venv's `bin/python` is what its scripts run.
+		runs_as_installed "$label" "$user" "tree interpreter" "$tree/bin/python" || return 1
+		;;
+	"$home"/*)
+		if [[ -e $tree || -L $tree ]]; then
+			printf 'wake-runner: refusing: %s: %s is sealed (%s exists) but its wake_bin is still under %s; point the registry at the sealed tree\n' \
+				"$label" "$user" "$tree" "$home" >&2
+			return 1
+		fi
+		confined_path "$label" "$home" "$path" >/dev/null || return 1
+		;;
+	*)
+		printf 'wake-runner: refusing: %s %s is under neither %s nor %s\n' \
+			"$label" "$path" "$tree" "$home" >&2
+		return 1
+		;;
+	esac
+	printf '%s' "$path"
+}
+# <<< harness_wake_bin <<<
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (via the sudoers rule)"
 
@@ -443,23 +638,28 @@ github)
 	fi
 	;;
 harness)
-	# A harness agent's wake CLI lives in its OWN venv (agent-writable), so it
-	# cannot be resolved off a root PATH. The control instead is the registry: the
-	# launched path must equal the `wake_bin` the registry pins for this agent, and
-	# must resolve to a real executable inside the agent's own home. The router
-	# supplies argv[1] but cannot deviate from the pinned value; running it as the
-	# agent (below) confers no privilege the agent lacks over its own venv.
+	# A harness agent's wake CLI lives in its OWN venv, so it cannot be resolved off a
+	# root PATH. The control instead is the registry: the launched path must equal the
+	# `wake_bin` the registry pins for this agent, and must be a real executable in one
+	# of the two places `harness_wake_bin` allows. The router supplies argv[1] but cannot
+	# deviate from the pinned value, so moving an agent's wake_bin is a registry edit and a
+	# daemon restart; a daemon still holding the old value is refused here by name.
+	#
+	# Where the venv is depends on whether the NOC has sealed the agent (#535). Unsealed, it
+	# is in the agent's home, which the agent writes, so it is no more trusted than the agent
+	# and running it as the agent confers no privilege the agent lacks over its own venv.
+	# Sealed, it is under /opt/basecradle-harness/venv/<user>/, which the agent can read and run but
+	# never write, rename or replace, and `harness_wake_bin` refuses the wake unless that
+	# still holds on the path it would run.
 	[[ -n $wake_bin ]] || die "refusing: harness agent $match has no wake_bin in the registry"
 	[[ -n $probe ]] ||
 		[[ "$1" == "$wake_bin" ]] ||
 		die "refusing: command must be the registered wake_bin '$wake_bin', got '$1'"
-	# Same gate as the clone path, and it matters more here: this path is an EXECUTABLE
-	# inside a directory the agent writes, so `realpath` would have handed root a target
-	# the agent chose. `confined_path` refuses a link instead, and the `-x` below then
-	# stats the component-verified path itself. Root still only stats it — the `exec`
-	# happens after the drop, as the agent, which is why a swap racing this check can
-	# reach nothing the agent could not already reach.
-	launch_bin="$(confined_path "wake_bin" "/home/$user" "$wake_bin")" || exit 1
+	# The same component-wise walk as the clone path, and it matters more here: this path is
+	# an EXECUTABLE, so `realpath` would have handed root a target someone else chose. The
+	# gate refuses a link instead, and the `-x` below then stats the component-verified path
+	# itself. Root still only stats it: the `exec` happens after the drop, as the agent.
+	launch_bin="$(harness_wake_bin "wake_bin" "/home/$user" "$SEALED_BASE" "$user" "$wake_bin")" || exit 1
 	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
 	;;
 *)

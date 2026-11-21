@@ -160,3 +160,15 @@ jobs:
         run: >-
           sudo env PATH="$PATH" STOP_WAKE_TREE_REQUIRED=1 PYTHONDONTWRITEBYTECODE=1
           .venv/bin/python -m pytest -p no:cacheprovider tests/test_stop_wake_tree.py
+
+      # THE SEALED WAKE, AS ROOT (#535). tests/test_sealed_wake_root.py runs the whole real
+      # wake-runner and set-wake-bin against root-owned trees built from real uv environments,
+      # through the real privilege drop, which takes root; the Test step above skips it. Each
+      # box is built in a private mount namespace on tmpfs-backed overlays, so nothing reaches
+      # the runner's own /etc, /opt or /home. SEALED_WAKE_ROOT_REQUIRED turns a skip, a real
+      # wake included (it needs the runner's journal), into a failure. A STEP, so the required
+      # status context stays the single `CI`.
+      - name: Sealed Harness Wake (Root)
+        run: >-
+          sudo env PATH="$PATH" SEALED_WAKE_ROOT_REQUIRED=1 PYTHONDONTWRITEBYTECODE=1
+          .venv/bin/python -m pytest -p no:cacheprovider tests/test_sealed_wake_root.py
