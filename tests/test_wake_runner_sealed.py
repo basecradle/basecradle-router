@@ -553,8 +553,11 @@ def _agent_script() -> str:
 INJECTING = (
     "PYTHONPATH=/home/nova/inject\nPYTHONHOME=/home/nova/py\nPYTHONSTARTUP=/home/nova/s.py\n"
     "LD_PRELOAD=/home/nova/evil.so\nLD_LIBRARY_PATH=/home/nova/lib\nLD_AUDIT=/home/nova/a.so\n"
-    "GH_APP_SLUG=nova-ai\n"
+    "PYTHONUNBUFFERED=1\nPYTHONIOENCODING=utf-8\nGH_APP_SLUG=nova-ai\n"
 )
+
+#: The PYTHON* names that load no code, kept so a sealed wake's ledger is written as before.
+KEPT = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
 
 def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
@@ -585,7 +588,8 @@ def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
 
 def test_a_sealed_wake_drops_every_loader_and_interpreter_variable(tmp_path: Path) -> None:
     env = _woken_env(tmp_path, "sealed")
-    assert not [name for name in env if name.startswith(("LD_", "PYTHON"))], env
+    loaders = {name: value for name, value in env.items() if name.startswith(("LD_", "PYTHON"))}
+    assert loaders == KEPT, env
     # Everything else the agent's env file sets still arrives, and so does the router's mark.
     assert env["GH_APP_SLUG"] == "nova-ai"
     assert env["BASECRADLE_DELIVERY_ID"] == "0192f3a4-5b6c-7d8e-9f01-0000000000ab"
@@ -604,3 +608,21 @@ def test_root_marks_a_wake_sealed_only_from_the_gates_own_answer() -> None:
     assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed' in text
     # Set in exactly two places: cleared with the other flags, and set from the gate's output.
     assert len(re.findall(r"\bsealed=", text)) == 2
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="BSD `ls -L` reports a link's own list, not its target's; the box runs GNU ls",
+)
+def test_an_interpreter_carrying_an_access_control_list_is_refused(
+    box: Box, tmp_path: Path
+) -> None:
+    _build_tree(box)
+    real = tmp_path / "python-with-a-list"
+    _script(real)
+    _grant_by_acl(real)
+    (box.tree() / "bin" / "python").unlink()
+    (box.tree() / "bin" / "python").symlink_to(real)
+    done = box.gate(box.sealed_bin())
+    assert done.returncode == 1
+    assert f"tree interpreter {box.tree()}/bin/python carries an access control list" in done.stderr

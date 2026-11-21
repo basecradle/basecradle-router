@@ -976,20 +976,24 @@ fall back to its home. Every harness `wake_bin` goes through one gate, `harness_
 - **Anywhere else** → refused.
 
 A refusal names the check and launches nothing; a probe resolves through the same gate, so `router-admin
-probe wake` proves a sealed agent's edge with no model call. **A sealed agent's own `agent.env` cannot
-choose code for its tree to run:** after it loads, every `LD_*` and `PYTHON*` variable is dropped,
-whoever set it, so a `PYTHONPATH` to a `sitecustomize.py` in the home, or an `LD_PRELOAD`, never
-reaches the sealed interpreter or its children.
+probe wake` proves a sealed agent's edge with no model call. **A sealed agent's own `agent.env` cannot point
+the loader or the interpreter at its code:** after it loads, every `LD_*` and `PYTHON*` variable is
+dropped, whoever set it (but `PYTHONUNBUFFERED`, `PYTHONUTF8`, `PYTHONIOENCODING` and
+`PYTHONDONTWRITEBYTECODE`, which load no code), so a `PYTHONPATH` to a `sitecustomize.py` in the home, or
+an `LD_PRELOAD`, never reaches the sealed interpreter or its children. **That is not a seal of the
+environment.** `agent.env` is still the agent's own file, and a name a library reads (`OPENSSL_CONF`,
+`GCONV_PATH`) still reaches the sealed process; closing that is a decision about where a sealed agent's
+env file lives, and it is #536.
 
 **Moving one agent: `set-wake-bin`.** Root runs
-`/opt/basecradle-router/bin/set-wake-bin <agent-key> <wake_bin>`, which changes `.[<agent-key>].wake_bin`
-of one harness entry and no other value (jq writes the file back in its own layout). It judges the value with `wake-runner`'s own gate, carried byte for
-byte (`tests/test_set_wake_bin.py` pins the copy), so it never writes a value the next wake would refuse.
-It holds an exclusive lock on `/etc/basecradle-router` from the read to the rename (a lock not had in
-30 seconds is a refusal, never a wait inside the wake-lock), writes the one
-fixed-name staging slot `/etc/basecradle-router/.agents.json.set-wake-bin.tmp`, gives it the registry's
-own owner, group and mode, and renames it over `agents.json`. The slot is removed by every run, a failed
-one included. It restarts nothing. The NOC's conversion, per agent:
+`/opt/basecradle-router/bin/set-wake-bin <agent-key> <wake_bin>`, which changes
+`.[<agent-key>].wake_bin` of one harness entry and no other value (jq writes the file back in its own
+layout). It judges the value with `wake-runner`'s own gate, carried byte for byte
+(`tests/test_set_wake_bin.py` pins the copy), so it never writes a value the next wake would refuse. It
+holds an exclusive lock on `/etc/basecradle-router` from the read to the rename (a lock not had in 30
+seconds is a refusal, never a wait inside the wake-lock), writes the one fixed-name staging slot
+`/etc/basecradle-router/.agents.json.set-wake-bin.tmp`, gives it the registry's own owner, group and
+mode, and renames it over `agents.json`. The slot is removed by every run, a failed one included. It restarts nothing. The NOC's conversion, per agent:
 
 1. Hold the agent's wake-lock.
 2. Build the tree at its final name, `/opt/basecradle-harness/venv/<os_user>`.

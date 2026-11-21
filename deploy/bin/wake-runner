@@ -283,9 +283,10 @@ confined_path() {
 #     rename the agent's tree or put another in its place. The path is then walked by
 #     `confined_path` rooted at BASE/venv/USER (no symlink, no `..`, nothing missing), so it
 #     can name only THIS user's tree. And no entry on it, from that root down to the binary,
-#     may be owned by the agent or writable by its group or by others: a tree the agent can
-#     write is not sealed, whatever its path says, and running it would report a seal that
-#     is absent. Last, neither the binary nor the interpreter its `#!` line names may be
+#     may be owned by the agent or by router, be writable by its group or by others, or carry
+#     an access control list: a tree the agent (or the router this script fences) can write
+#     is not sealed, whatever its path says, and running it would report a seal that is
+#     absent. The binary must be a regular file: a FIFO would block root's read of it. Last, neither the binary nor the interpreter its `#!` line names may be
 #     setuid or setgid: the tree's owner runs package install code, and a set-id program
 #     the agent's group can execute would let the agent become that owner by running it.
 #     A directory's setgid bit on the path is how the tree hands the agent's group down,
@@ -392,14 +393,25 @@ runs_as_installed() {
 		printf 'wake-runner: refusing: %s: the %s %s does not exist\n' "$label" "$what" "$interpreter" >&2
 		return 1
 	fi
-	found="$(find -L "$interpreter" -prune \( -user "$user" -o -perm -g+w -o -perm -o+w \) -print)" || {
+	local owners=(-user "$user")
+	! id -u router >/dev/null 2>&1 || owners+=(-o -user router)
+	found="$(find -L "$interpreter" -prune \( "${owners[@]}" -o -perm -g+w -o -perm -o+w \) -print)" || {
 		printf 'wake-runner: refusing: %s: could not read the owner and mode of the %s %s\n' \
 			"$label" "$what" "$interpreter" >&2
 		return 1
 	}
 	if [[ -n $found ]]; then
-		printf 'wake-runner: refusing: %s: the %s %s is owned by %s or writable by its group or by others\n' \
+		printf 'wake-runner: refusing: %s: the %s %s is owned by %s or router, or writable by its group or by others\n' \
 			"$label" "$what" "$interpreter" "$user" >&2
+		return 1
+	fi
+	found="$(ls -ldL -- "$interpreter")" || {
+		printf 'wake-runner: refusing: %s: could not read the mode of the %s %s\n' "$label" "$what" "$interpreter" >&2
+		return 1
+	}
+	found=${found%% *}
+	if [[ $found == *+ ]]; then
+		printf 'wake-runner: refusing: %s: the %s %s carries an access control list\n' "$label" "$what" "$interpreter" >&2
 		return 1
 	fi
 	not_set_id "$label" "$what" "$interpreter"
@@ -858,13 +870,21 @@ AGENT_SCRIPT='
 	fi
 	shift 2
 	# A sealed agent (#535): its tree is the one thing it cannot write, so its own env file must
-	# not be able to choose code for that tree to run instead. Every LD_* (the loader: a preload,
-	# a library path) and every PYTHON* (the interpreter: a path, a home, a startup file) is
-	# dropped once agent.env has loaded, whoever set it, and stays dropped for every child.
+	# not point the two programs that load that tree, the dynamic loader and the interpreter, at
+	# code of its own. Every LD_* (a preload, a library path) and every PYTHON* (a path, a home, a
+	# startup file) is dropped once agent.env has loaded, whoever set it, and stays dropped for
+	# every child; the four PYTHON* names that load no code (output buffering and encoding, and
+	# bytecode writing) are kept, so the wake ledger is written as it was. This is NOT a seal of
+	# the environment: agent.env is the agent`s own file, and other names a library reads
+	# (OPENSSL_CONF, GCONV_PATH) still reach the sealed process. Closing that is a decision about
+	# where a sealed agent`s env file lives (basecradle-router#536).
+	# Prefix expansion, never `compgen`: it is core bash, so the scrub cannot fail open on a
+	# bash built without programmable completion.
 	if [[ -n ${1:-} ]]; then
-		for _name in $(compgen -e); do
+		for _name in "${!LD_@}" "${!PYTHON@}"; do
 			case $_name in
-			LD_* | PYTHON*) unset "$_name" ;;
+			PYTHONUNBUFFERED | PYTHONUTF8 | PYTHONIOENCODING | PYTHONDONTWRITEBYTECODE) ;;
+			*) unset "$_name" ;;
 			esac
 		done
 	fi

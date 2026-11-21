@@ -272,7 +272,7 @@ def test_an_interpreter_the_agent_owns_behind_the_link_is_refused(tmp_path: Path
         "install -o nova -g nova -m 0755 /usr/bin/python3 /opt/python-novas "
         f"&& ln -sfn /opt/python-novas {TREE}/bin/python"
     )
-    _refused_both_ways(tmp_path, "is owned by nova or writable", mutations=(repoint,))
+    _refused_both_ways(tmp_path, "is owned by nova or router", mutations=(repoint,))
 
 
 def test_a_router_owned_tree_is_refused(tmp_path: Path) -> None:
@@ -310,6 +310,25 @@ INJECT = (
 )
 
 
+def test_the_injection_is_live_on_this_box(tmp_path: Path) -> None:
+    # The positive control for the two tests below: the mutation lands its line in agent.env,
+    # and the planted sitecustomize.py does run under that PYTHONPATH as nova, so its absence
+    # there is the scrub's doing and not a sitecustomize that never loads.
+    env_line = [
+        "grep",
+        "-qx",
+        "PYTHONPATH=/home/nova/inject",
+        "/home/nova/.config/basecradle/agent.env",
+    ]
+    loads = {
+        "argv": ["env", "PYTHONPATH=/home/nova/inject", "/usr/bin/python3", "-c", "pass"],
+        "as": "nova",
+    }
+    out = box(tmp_path, [env_line, loads], mutations=(INJECT,), check_paths=(f"{CLONE}/INJECTED",))
+    assert [run["rc"] for run in out["runs"]] == [0, 0], out["runs"]
+    assert out["exists"] == {f"{CLONE}/INJECTED": True}
+
+
 def test_a_sealed_agents_env_file_cannot_load_its_own_code(tmp_path: Path) -> None:
     # The seal's point: a PYTHONPATH in the agent's own env file to a sitecustomize.py in its
     # home would run the agent's code inside the sealed interpreter, before the harness.
@@ -327,6 +346,14 @@ def test_a_sealed_real_wake_runs_none_of_the_agents_injected_code(tmp_path: Path
     assert out["runs"][0]["rc"] == 0, out["runs"][0]
     assert out["woke"] == f"nova\n{SEALED_BIN}\n--timeline\n{TIMELINE}\n"
     assert out["exists"] == {f"{CLONE}/INJECTED": False}, "agent code ran in a sealed wake"
+
+
+def test_a_router_owned_interpreter_behind_the_link_is_refused(tmp_path: Path) -> None:
+    repoint = (
+        "install -o router -g router -m 0755 /usr/bin/python3 /opt/python-routers "
+        f"&& ln -sfn /opt/python-routers {TREE}/bin/python"
+    )
+    _refused_both_ways(tmp_path, "is owned by nova or router", mutations=(repoint,))
 
 
 def test_a_daemon_still_holding_the_old_value_is_refused(tmp_path: Path) -> None:
