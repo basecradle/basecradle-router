@@ -511,10 +511,10 @@ attempts=""
 try_number=""
 tries=""
 probe=""
-# `scrub` when nothing the wake runs may load code the agent chose: a sealed harness wake,
-# once the registry's wake_bin passed the gate's sealed branch (#535), and every probe, which
-# runs only our root-owned verifier (#538). The agent script then drops every loader and
-# interpreter variable agent.env set.
+# What of agent.env the agent script drops: `scrub` for a sealed harness wake, once the
+# registry's wake_bin passed the gate's sealed branch (#535), so the loader and the interpreter
+# take no code of the agent's; `verifier` for every probe, which runs only our root-owned
+# verifier and gets only the three names it reads (#538).
 scrub=""
 # Set only for a builder's real wake (#481): empty means the agent script `exec`s its command.
 stream_python=""
@@ -739,11 +739,11 @@ if [[ -n $probe ]]; then
 	would_exec="$launch_bin"
 	launch_bin="$probe_python"
 	# `-I`, as the stream translator is run: the verifier is exec-ed after agent.env has loaded,
-	# and isolated mode keeps the agent's own PYTHON* settings and site directories out of it, so
-	# the account under test cannot load code into the program that grades it (#538). The scrub
-	# below drops the loader's LD_* for it too.
+	# and isolated mode keeps the agent's own site directories out of it, so the account under
+	# test cannot load code into the program that grades it (#538). And `verifier` hands it only
+	# the three names it reads, so nothing else the agent's env file set reaches it.
 	set -- -I "$PROBE_ACK" "$probe" "$would_exec"
-	scrub=scrub
+	scrub=verifier
 else
 	shift # drop argv[1]; the remainder (e.g. -p <trigger> or --timeline <uuid>) are its args
 	# A builder's stream flags, appended by root after the caller's `-p <trigger>` (#481).
@@ -788,11 +788,11 @@ fi
 # router never reads it), cd into the clone, export the delivery id, exec the
 # registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2, the
 # attempt and the number of attempts as $3 and $4 (both empty when the router sent none), the
-# quick try and the number of tries as $5 and $6 (the same), whether to drop the loader and
-# interpreter variables agent.env set as $7 (`scrub`, or empty), a builder's stream helpers as $8..$11 (python3, the translator, jq,
-# cat: all empty unless this is a builder's real wake), and the command (launch_bin + args) as
-# $12..; root never
-# interpolates the trigger/timeline/delivery — each is passed as an inert positional argument.
+# quick try and the number of tries as $5 and $6 (the same), what of agent.env to drop as $7
+# (`scrub` for a sealed wake, `verifier` for a probe, or empty), a builder's stream helpers as
+# $8..$11 (python3, the translator, jq, cat: all empty unless this is a builder's real wake), and
+# the command (launch_bin + args) as $12..; root never interpolates the
+# trigger/timeline/delivery — each is passed as an inert positional argument.
 #
 # Held in a variable rather than written inline at the exec, so the two launch shapes
 # below (journald-wrapped for a real wake, direct for a probe) share ONE copy of the
@@ -876,26 +876,42 @@ AGENT_SCRIPT='
 		export BASECRADLE_WAKE_TRY="$1" BASECRADLE_WAKE_TRIES="$2"
 	fi
 	shift 2
-	# A sealed agent (#535): its tree is the one thing it cannot write, so its own env file must
-	# not point the two programs that load that tree, the dynamic loader and the interpreter, at
-	# code of its own. A probe (#538) for the same reason: it runs only our verifier, which the
-	# agent must not be able to load code into. Every LD_* (a preload, a library path) and every PYTHON* (a path, a home, a
-	# startup file) is dropped once agent.env has loaded, whoever set it, and stays dropped for
-	# every child; the four PYTHON* names that load no code (output buffering and encoding, and
-	# bytecode writing) are kept, so the wake ledger is written as it was. This is NOT a seal of
-	# the environment: agent.env is the agent`s own file, and other names a library reads
-	# (OPENSSL_CONF, GCONV_PATH) still reach the sealed process. Closing that is a decision about
-	# where a sealed agent`s env file lives (basecradle-router#536).
-	# Prefix expansion, never `compgen`: it is core bash, so the scrub cannot fail open on a
-	# bash built without programmable completion.
-	if [[ -n ${1:-} ]]; then
+	# What of agent.env may reach the program the wake runs, once it has loaded.
+	#
+	# `scrub`, a sealed agent (#535): its tree is the one thing it cannot write, so its own env
+	# file must not point the two programs that load that tree, the dynamic loader and the
+	# interpreter, at code of its own. Every LD_* (a preload, a library path) and every PYTHON* (a
+	# path, a home, a startup file) is dropped, whoever set it, and stays dropped for every child;
+	# the four PYTHON* names that load no code (output buffering and encoding, and bytecode
+	# writing) are kept, so the wake ledger is written as it was. Prefix expansion, never
+	# `compgen`: it is core bash, so this cannot fail open on a bash built without completion.
+	# It is NOT a seal of the environment: agent.env is the agent`s own file, and a name some
+	# library reads (OPENSSL_CONF, GCONV_PATH) still reaches the sealed process. Closing that is
+	# a decision about where a sealed agent`s env file lives (basecradle-router#536).
+	#
+	# `verifier`, a probe (#538): it runs only our root-owned verifier, whose whole contract with
+	# the environment is three names, so every other one is dropped, an OPENSSL_CONF that would
+	# have libcrypto load a provider of the agent`s included. Here `compgen` is the right tool
+	# and fails closed: should it be missing, the assignment fails and `set -e` ends the probe.
+	case ${1:-} in
+	scrub)
 		for _name in "${!LD_@}" "${!PYTHON@}"; do
 			case $_name in
 			PYTHONUNBUFFERED | PYTHONUTF8 | PYTHONIOENCODING | PYTHONDONTWRITEBYTECODE) ;;
 			*) unset "$_name" ;;
 			esac
 		done
-	fi
+		;;
+	verifier)
+		_names=$(compgen -e)
+		for _name in $_names; do
+			case $_name in
+			NOC_PROBE_SECRET | USER | LOGNAME) ;;
+			*) unset "$_name" ;;
+			esac
+		done
+		;;
+	esac
 	shift
 	stream_python=$1 stream_translate=$2 stream_jq=$3 stream_cat=$4
 	shift 4

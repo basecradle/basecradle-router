@@ -10,6 +10,7 @@ translator launcher, a crashing one, real ``jq`` and real ``cat``.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import shutil
@@ -167,9 +168,11 @@ def stream(
     jq: str | None = None,
     fixture: str = "tools",
     raw: bool = False,
+    claude_body: str = CLAUDE,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     claude = tmp_path / "claude"
-    claude.write_text(CLAUDE)
+    claude.write_text(claude_body)
     claude.chmod(0o755)
     program = f'set -euo pipefail\n{_run_stream()}\nrun_stream "$@"\n'
     return subprocess.run(
@@ -190,6 +193,7 @@ def stream(
         capture_output=True,
         text=not raw,  # raw: bytes as journald reads them, a `\r` never a line break
         timeout=60,
+        env=env,
     )
 
 
@@ -621,3 +625,37 @@ def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
     assert f"(?<={SCHEME_WORD})[ \\t]+" in program
     assert fallback_rule.run_char("\t" + LEAD_OPENERS + "=") in fallback_rule.LEAD
     assert all(f"(?<={s})" in program and f"(?<!{s})" in program for s in fallback_rule.SPELLINGS)
+
+
+# --- what the translator inherits (#538) ---------------------------------------------------------
+
+#: A translator that records the loader names it was started with, then reads the stream through.
+ENV_DUMP = """import os, sys
+with open(__file__ + ".env", "w") as out:  # argv[1] is claude's pid
+    out.write(" ".join(sorted(name for name in os.environ if name.startswith("LD_"))))
+for line in sys.stdin:
+    pass
+"""
+
+#: The fake claude, which first records the loader names it was started with.
+CLAUDE_ENV = CLAUDE.replace(
+    "import sys\n",
+    "import os, sys\n"
+    'open(os.path.join(os.path.dirname(sys.argv[0]), "claude.env"), "w").write(\n'
+    '    " ".join(sorted(n for n in os.environ if n.startswith("LD_"))))\n',
+    1,
+)
+
+
+def test_the_translator_runs_without_the_agents_loader_names_and_claude_keeps_them(
+    tmp_path: Path,
+) -> None:
+    # The loader names the agent's env file set are dropped in the translator's subshell alone:
+    # the root-owned program run as the agent loads none of the agent's code, and claude's own
+    # environment is what it always was. Inert names, so nothing is preloaded on any platform.
+    translator = _helper(tmp_path, "dump.py", ENV_DUMP)
+    marked = {**os.environ, "LD_PROOF_MARK": "1", "LD_PROOF_SECOND": "1"}
+    done = stream(tmp_path, translator, claude_body=CLAUDE_ENV, env=marked)
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "claude.env").read_text() == "LD_PROOF_MARK LD_PROOF_SECOND"
+    assert (tmp_path / "dump.py.env").read_text() == ""

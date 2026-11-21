@@ -367,6 +367,15 @@ LOADER = (
 )
 
 
+def test_the_user_site_injection_is_live_on_this_box(tmp_path: Path) -> None:
+    # The positive control for the test below: nova's own python3, run without -I, does import
+    # the planted usercustomize.py, so its absence from a probe is -I's doing.
+    loads = {"argv": ["/usr/bin/python3", "-c", "pass"], "as": "nova"}
+    out = box(tmp_path, [loads], mutations=(USER_SITE,), check_paths=(f"{CLONE}/INJECTED",))
+    assert out["runs"][0]["rc"] == 0, out["runs"][0]
+    assert out["exists"] == {f"{CLONE}/INJECTED": True}
+
+
 def test_no_agents_probe_imports_its_user_site(tmp_path: Path) -> None:
     # What `-I` alone keeps out of the verifier: the agent's own user site directory (#538).
     out = box(

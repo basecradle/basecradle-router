@@ -1542,10 +1542,13 @@ BASECRADLE_ROUTER_PROBE_WEBHOOK_SECRET=<generated for this box; the NOC holds th
 
 `deploy/bin/probe-ack` sits root-owned beside the wrapper — it runs *as* the agent but must not be
 *writable* by it, or the account under test could rewrite its own verifier to always ack. Nor may the
-agent load code into it (#538): `wake-runner` starts it with `python3 -I`, which keeps the agent's
-`PYTHON*` settings and user site directory out, and drops every `LD_*` and `PYTHON*` variable the agent's
-`agent.env` set before it runs. The stream translator is started with `-I` the same way, and runs with
-the `LD_*` variables dropped in its own subshell, so the builder's `claude` keeps its environment. Every deploy
+agent load code into it (#538). `wake-runner` starts it with `python3 -I`, which keeps the agent's
+`PYTHON*` settings and user site directory out, and hands it only the three environment names it reads
+(`NOC_PROBE_SECRET`, `USER`, `LOGNAME`): everything else the agent's `agent.env` set is dropped, an
+`OPENSSL_CONF` that would have libcrypto load a provider of the agent's included. The stream translator is
+started with `-I` the same way and runs with every `LD_*` variable dropped in its own subshell, so the
+builder's `claude` keeps its environment; it is not allow-listed, because the names it reads are the
+telemetry contract's, not ours to fix here. Every deploy
 reinstalls it (the op's `deploy/bin/*` glob, Part 3); the by-hand equivalent, the command `wake-runner`
 names when the verifier is missing, is:
 
