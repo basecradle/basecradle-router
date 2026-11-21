@@ -50,7 +50,7 @@ from basecradle_router.routes.github import GithubRoute
 from basecradle_router.routes.probe import DELIVERY_HEADER, SIGNATURE_HEADER, ProbeRoute
 from basecradle_router.secret import Secret
 from basecradle_router.server import WebhookServer, configure_logging
-from basecradle_router.wake import WakeAttempt, WakeError, WakeResult
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeTry
 from basecradle_router.wakelock import WakeLockGuard
 
 PROBE_SECRET = "fake-probe-route-secret-" + "1" * 32
@@ -82,7 +82,9 @@ class _Waker:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         if self.fail:
             raise WakeError("probe verifier refused the marker", exit_code=3)
         return WakeResult(exit_code=0, stdout="acked")

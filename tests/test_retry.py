@@ -48,8 +48,12 @@ from basecradle_router.wake import (
     WakeResult,
     WakeStopped,
     WakeTempFailed,
+    WakeTry,
 )
 from basecradle_router.wakelock import WakeLockDecision, WakeLockState
+
+#: The first of three quick tries (#533).
+FIRST_TRY = WakeTry(1, 3)
 
 NOVA = Agent(
     key="nova",
@@ -122,7 +126,9 @@ class _Waker:
         self.script = list(script)
         self.calls: list[tuple[str, WakeAttempt | None]] = []
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         self.calls.append((event.delivery_id, attempt))
         answer = self.script.pop(0) if self.script else WakeResult(0)
         if isinstance(answer, BaseException):
@@ -575,7 +581,7 @@ def test_a_stopped_schedule_fires_nothing() -> None:
 def test_the_attempt_rides_to_the_wake_runner_as_one_flag() -> None:
     seen: list[WakeInvocation] = []
     waker = HomeServerWaker(runner=lambda i: seen.append(i) or WakeResult(0))
-    waker.wake(NOVA, _event(), WakeAttempt(2, 4))
+    waker.wake(NOVA, _event(), WakeAttempt(2, 4), quick_try=FIRST_TRY)
     argv = seen[0].argv
     assert argv[argv.index("--attempt") + 1] == "2/4"
     assert argv.index("--attempt") < argv.index("--")
@@ -584,24 +590,28 @@ def test_the_attempt_rides_to_the_wake_runner_as_one_flag() -> None:
 def test_the_attempt_reaches_a_subprocess_wakes_environment() -> None:
     seen: list[WakeInvocation] = []
     waker = SubprocessWaker(runner=lambda i: seen.append(i) or WakeResult(0))
-    waker.wake(NOVA, _event(), WakeAttempt(3, 4))
+    waker.wake(NOVA, _event(), WakeAttempt(3, 4), quick_try=FIRST_TRY)
     assert seen[0].env[ATTEMPT_ENV] == "3" and seen[0].env[ATTEMPTS_ENV] == "4"
 
 
 def test_without_an_attempt_the_wake_carries_neither() -> None:
     seen: list[WakeInvocation] = []
-    HomeServerWaker(runner=lambda i: seen.append(i) or WakeResult(0)).wake(NOVA, _event())
+    HomeServerWaker(runner=lambda i: seen.append(i) or WakeResult(0)).wake(
+        NOVA, _event(), quick_try=FIRST_TRY
+    )
     assert "--attempt" not in seen[0].argv
 
 
 def test_exit_75_is_a_temporary_failure_and_still_a_wake_error() -> None:
     waker = SubprocessWaker(runner=lambda _i: WakeResult(75, stderr="rate limited"))
     with pytest.raises(WakeTempFailed) as raised:
-        waker.wake(NOVA, _event())
+        waker.wake(NOVA, _event(), quick_try=FIRST_TRY)
     assert isinstance(raised.value, WakeError)
     assert str(raised.value) == "wake of nova exited 75: rate limited"
     with pytest.raises(WakeError) as other:
-        SubprocessWaker(runner=lambda _i: WakeResult(1, stderr="boom")).wake(NOVA, _event())
+        SubprocessWaker(runner=lambda _i: WakeResult(1, stderr="boom")).wake(
+            NOVA, _event(), quick_try=FIRST_TRY
+        )
     assert not isinstance(other.value, WakeTempFailed)
 
 

@@ -122,7 +122,7 @@ class AgentLocks:
 
 
 def with_retry(
-    operation: Callable[[], T],
+    operation: Callable[[int], T],
     *,
     attempts: int = 3,
     base_delay: float = 0.5,
@@ -130,6 +130,11 @@ def with_retry(
     on_retry: Callable[[int, int, TransientError], None] | None = None,
 ) -> T:
     """Run ``operation``, retrying on :class:`TransientError` up to ``attempts``.
+
+    ``operation`` is called with its own 1-based try number, once per try, so an operation
+    that tells something downstream which try it is reads the number from the one place that
+    counts it, never a second counter beside it (basecradle-router#533). The bound it honors
+    is ``attempts``, exactly.
 
     Returns the operation's result on the first success. Sleeps with exponential
     backoff (``base_delay * 2 ** (attempt - 1)``) between tries — ``sleep`` is
@@ -150,7 +155,7 @@ def with_retry(
 
     for attempt in range(1, attempts + 1):
         try:
-            return operation()
+            return operation(attempt)
         except TransientError as exc:
             if attempt >= attempts:
                 raise RetryExhausted(attempts) from exc

@@ -18,7 +18,7 @@ from basecradle_router.config import ConfigError, load_config
 from basecradle_router.models import Agent, Event, WakeKind
 from basecradle_router.routes.basecradle import RECIPIENT_SECRET_PREFIX
 from basecradle_router.secret import Secret
-from basecradle_router.wake import HomeServerWaker, WakeAttempt, WakeResult
+from basecradle_router.wake import HomeServerWaker, WakeAttempt, WakeResult, WakeTry
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
 NOVA = Agent(
@@ -33,7 +33,9 @@ class _RecordingWaker:
     def __init__(self) -> None:
         self.calls: list[tuple[Agent, Event]] = []
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         self.calls.append((agent, event))
         return WakeResult(exit_code=0, stdout="opened PR")
 
