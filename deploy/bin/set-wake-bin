@@ -380,6 +380,9 @@ harness_wake_bin() {
 key="$1"
 wake_bin="$2"
 [[ -n $key ]] || die "refusing: an empty agent key"
+# What this writes, wake-runner must be able to read back (#541): it refuses a field holding a
+# control character, so one is never written.
+[[ $wake_bin != *[[:cntrl:]]* ]] || die "refusing: the wake_bin holds a control character"
 
 command -v jq >/dev/null 2>&1 || die "jq is required to read and write the registry"
 [[ -r $REGISTRY ]] || die "registry not readable: $REGISTRY"
@@ -392,10 +395,19 @@ trap 'rm -f -- "$STAGING"' EXIT
 rm -f -- "$STAGING"
 
 # Joined by the unit separator, not a tab: a tab is IFS whitespace, so `read` would merge the two
-# around an empty field and shift every field after it into the wrong name.
+# around an empty field and shift every field after it into the wrong name. A field holding a
+# control character is refused, and `kind` defaults only when absent, as wake-runner reads them
+# (#541).
 entry="$(jq -r --arg k "$key" \
-	'if has($k) then [(.[$k].kind // "github"), (.[$k].os_user // ""), (.[$k].wake_bin // "")] | map(tostring) | join("\u001f") else empty end' \
-	"$REGISTRY")" || die "could not read registry $REGISTRY"
+	'if has($k) then
+	   [(if .[$k] | has("kind") then .[$k].kind else "github" end), (.[$k].os_user // ""), (.[$k].wake_bin // "")]
+	   | map(tostring)
+	   | if any(test("[[:cntrl:]]")) then "" | halt_error(7) else join("\u001f") end
+	 else empty end' \
+	"$REGISTRY")" || {
+	[[ $? -ne 7 ]] || die "refusing: agent $key has a registry field holding a control character"
+	die "could not read registry $REGISTRY"
+}
 [[ -n $entry ]] || die "refusing: no agent $key in the registry"
 IFS=$'\x1f' read -r kind user current <<<"$entry"
 [[ $kind == harness ]] || die "refusing: agent $key is kind '$kind'; only a harness agent has a wake_bin"

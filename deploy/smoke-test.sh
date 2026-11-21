@@ -847,7 +847,9 @@ registry_harness_agents() {
 		| sort_by(.key)
 		| .[]
 		| select(.value.kind == "harness" and (.value.recipient_uuid | type) == "string")
-		| "\(.key)\t\(.value.recipient_uuid)"
+		| [.key, .value.recipient_uuid]
+		| select(all(test("[[:cntrl:]]") | not))
+		| join("\u001f")
 	' "$1"
 }
 
@@ -876,7 +878,10 @@ discover_recipient() {
 	bc_key=""
 	bc_registered=false
 	agents="$(registry_harness_agents "$1")"
-	while IFS=$'\t' read -r slug uuid; do
+	# Joined by the unit separator, never a tab, as wake-runner reads its entry (#541): a tab is
+	# IFS whitespace, so `read` would merge two around an empty field. An entry holding a control
+	# character is left out by the reader above, as no recipient this test could sign for.
+	while IFS=$'\x1f' read -r slug uuid; do
 		[[ -n "$slug" && -n "$uuid" ]] || continue
 		bc_registered=true
 		var="${BC_RECIPIENT_SECRET_PREFIX}$(slug_suffix "$slug")"
