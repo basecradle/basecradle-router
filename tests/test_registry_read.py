@@ -24,6 +24,14 @@ pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None or shutil.which("jq") is None, reason="bash and jq read it"
 )
 
+#: The PATH the cut lines run under: the directories this suite found bash and jq in, so the
+#: run finds the very programs the skip check did.
+_PATH = ":".join(
+    dict.fromkeys(
+        str(Path(found).parent) for found in (shutil.which("bash"), shutil.which("jq")) if found
+    )
+)
+
 
 def _lookup() -> str:
     match = re.search(
@@ -48,7 +56,7 @@ def _read(tmp_path: Path, entry: dict) -> subprocess.CompletedProcess[str]:
         ["bash", "-c", script, "bash", str(registry)],
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"},
+        env={"PATH": _PATH},
         check=False,
     )
 
@@ -75,5 +83,33 @@ def test_an_absent_kind_still_defaults_to_a_builder(tmp_path: Path) -> None:
 def test_a_field_holding_a_control_character_is_refused(tmp_path: Path, value: str) -> None:
     done = _read(tmp_path, {"kind": "harness", "wake_bin": value})
     assert done.returncode == 1
-    assert "could not read registry" in done.stderr
+    assert done.stderr == "refusing: the registry entry for (nova, /c) holds a control character\n"
     assert done.stdout == ""
+
+
+@pytest.mark.parametrize("kind", [False, None], ids=["false", "null"])
+def test_a_kind_that_is_present_but_not_a_string_is_never_a_builder(
+    tmp_path: Path, kind: bool | None
+) -> None:
+    # Defaulted only when absent, as the daemon's config reads it: `false` and `null` reach the
+    # unknown-kind refusal instead of becoming `github`.
+    done = _read(tmp_path, {"kind": kind, "wake_bin": "/w"})
+    assert done.stdout == f"match=nova kind={json.dumps(kind)} wake_bin=/w\n", done.stderr
+
+
+def test_an_unreadable_registry_is_named_as_such(tmp_path: Path) -> None:
+    registry = tmp_path / "agents.json"
+    registry.write_text("{not json")
+    script = (
+        'set -euo pipefail\ndie() { printf "%s\\n" "$*" >&2; exit 1; }\n'
+        f'REGISTRY="$1" user=nova cwd=/c\n{_lookup()}\n'
+    )
+    done = subprocess.run(
+        ["bash", "-c", script, "bash", str(registry)],
+        capture_output=True,
+        text=True,
+        env={"PATH": _PATH},
+        check=False,
+    )
+    assert done.returncode == 1
+    assert done.stderr.endswith(f"could not read registry {registry}\n")

@@ -528,7 +528,8 @@ def test_the_smoke_test_reads_the_daemons_enabled_routes_variable_and_default() 
 def test_registry_harness_agents_lists_only_harness_entries_in_key_order(tmp_path: Path) -> None:
     """The github builder is not a basecradle recipient and must never be signed for."""
     out = _run_registry(ENV_FILE, 'registry_harness_agents "$2"', tmp_path)
-    assert out.splitlines() == [f"aurora-5.2\t{AURORA_UUID}", f"nova\t{NOVA_UUID}"]
+    # Joined by the unit separator, which `read` never merges, as wake-runner's entry is (#541).
+    assert out.splitlines() == [f"aurora-5.2\x1f{AURORA_UUID}", f"nova\x1f{NOVA_UUID}"]
 
 
 @requires_jq

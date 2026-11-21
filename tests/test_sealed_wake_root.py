@@ -523,6 +523,29 @@ def test_set_wake_bin_names_an_empty_os_user_rather_than_shifting_fields(tmp_pat
     )  # fmt: skip
 
 
+def test_set_wake_bin_refuses_a_stored_field_holding_a_control_character(tmp_path: Path) -> None:
+    _setter_refused(
+        tmp_path,
+        ["nova", SEALED_BIN],
+        "agent nova has a registry field holding a control character",
+        mutations=(_registry_edit('.nova.os_user = "nova\\tx"'),),
+    )
+
+
+def test_set_wake_bin_never_writes_a_control_character(tmp_path: Path) -> None:
+    # wake-runner refuses to read one back (#541), so the setter refuses to write one.
+    _setter_refused(
+        tmp_path, ["nova", f"{SEALED_BIN}\nx"], "the wake_bin holds a control character"
+    )
+
+
+def test_set_wake_bin_refuses_an_empty_kind_by_its_own_name(tmp_path: Path) -> None:
+    _setter_refused(
+        tmp_path, ["nova", SEALED_BIN], "agent nova is kind ''",
+        mutations=(_registry_edit('.nova.kind = ""'),),
+    )  # fmt: skip
+
+
 def test_set_wake_bin_writes_nothing_for_the_value_already_there(tmp_path: Path) -> None:
     out = box(tmp_path, [[SET_WAKE_BIN, "nova", SEALED_BIN]])
     assert out["runs"][0]["rc"] == 0
