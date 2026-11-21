@@ -8,12 +8,13 @@ ends, from this table, and tags the figure ``cost_basis=computed`` (basecradle-r
 ``result`` it checks its own sum per model against the figure Claude Code states, so a stale row is
 loud rather than silently wrong.
 
-The rows are the basecradle-harness ``_anthropic_rates`` table's, transcribed from the same page on
-the same date (:data:`SOURCE`); on the captures behind #481 they reproduce Claude Code's own
-``costUSD`` to the last digit, 5-minute and 1-hour cache writes, Haiku and the per-search fee
-included (``tests/test_anthropic_rates.py``). Where the fleet's vendor price tables live is being
-decided by @origin (basecradle/basecradle#864, #865): this file is deliberately one small table with
-one reader, so it can move without touching anything else.
+The rows are transcribed from Anthropic's pricing page (:data:`SOURCE`), the page and never the
+basecradle-harness ``_anthropic_rates`` table, which keeps a narrower set of models. On the
+captures behind #481 they reproduce Claude Code's own ``costUSD`` to the last digit, 5-minute and
+1-hour cache writes, Haiku and the per-search fee included, and each rate is pinned on its own
+against the page, typed by hand (``tests/test_anthropic_rates.py``). Where the fleet's vendor
+price tables live is being decided by @origin (basecradle/basecradle#864, #865): this file is
+deliberately one small table with one reader, so it can move without touching anything else.
 
 Three rules keep it honest, the harness table's own:
 
@@ -38,11 +39,17 @@ from typing import Any
 from urllib.parse import urlsplit
 
 #: Where every number in this module was read, and when.
-SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-31)"
+SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing (read 2026-11-21)"
 
 #: On Claude Haiku 5.5, a request whose prompt is over this many tokens pays the higher row for all
-#: of them. Every other current model is priced flat across its whole context window.
+#: of them. Claude 4.6 and later are otherwise priced flat across their whole 1M window.
 HAIKU_LONG_PROMPT_THRESHOLD = 100_000
+
+#: The context window of the models before Claude 4.6, "200K tokens" on Anthropic's models overview
+#: (https://platform.claude.com/docs/en/about-claude/models/overview, read 2026-11-21). The pricing
+#: page states a flat price across the whole 1M window only for Claude 4.6 and later and prices no
+#: longer prompt on an earlier model, so a prompt over this on one is not priced.
+PRE_4_6_CONTEXT_WINDOW = 200_000
 
 #: "$10 USD per 1,000 searches" (Web search tool).
 WEB_SEARCH_PER_SEARCH = 10.00 / 1_000
@@ -74,16 +81,30 @@ class Tier:
 
 @dataclass(frozen=True, slots=True)
 class Rates:
-    """A model's rates: one row for every prompt, or (Claude Haiku 5.5) two prompt-length rows."""
+    """A model's rates: one row for every prompt, or (Claude Haiku 5.5) two prompt-length rows.
+
+    ``priced_up_to`` is the longest prompt the page prices on the model, where it prices fewer
+    than the model may be sent; a longer one names :data:`UNPRICED_TIER`.
+    """
 
     short: Tier
     long: Tier | None = None
+    priced_up_to: int | None = None
 
 
-#: Model id → its rates, transcribed from :data:`SOURCE`, "Model pricing". A dated snapshot of an id
-#: (``claude-haiku-4-5-20251001``) is priced as that id.
+#: Model id → its rates, transcribed from :data:`SOURCE`, "Model pricing". Every model the page
+#: lists that a fleet agent can run on Anthropic's API has a row. Left out: Claude Mythos, limited
+#: to organizations verified through Anthropic's own programs, and the models the page marks retired
+#: (Opus 4.1, Opus 4, Sonnet 4). A dated snapshot of an id (``claude-haiku-4-5-20251001``) is
+#: priced as that id.
+#:
+#: The models before Claude 4.6 reject ``inference_geo`` (the page: "a request that includes the
+#: parameter returns a 400 error"), and are priced only up to :data:`PRE_4_6_CONTEXT_WINDOW`.
+_PRE_4_6 = PRE_4_6_CONTEXT_WINDOW
+
 RATES: Mapping[str, Rates] = MappingProxyType(
     {
+        "claude-fable-5-2": Rates(Tier(8.0, 10.0, 16.0, 0.20, 40.0)),
         "claude-fable-5-1": Rates(Tier(10.0, 12.50, 20.0, 0.25, 50.0)),
         "claude-fable-5": Rates(Tier(10.0, 12.50, 20.0, 1.0, 50.0)),
         "claude-opus-5-5": Rates(Tier(4.0, 5.0, 8.0, 0.20, 20.0)),
@@ -91,14 +112,16 @@ RATES: Mapping[str, Rates] = MappingProxyType(
         "claude-opus-4-8": Rates(Tier(5.0, 6.25, 10.0, 0.50, 25.0)),
         "claude-opus-4-7": Rates(Tier(5.0, 6.25, 10.0, 0.50, 25.0)),
         "claude-opus-4-6": Rates(Tier(5.0, 6.25, 10.0, 0.50, 25.0)),
+        "claude-opus-4-5": Rates(Tier(5.0, 6.25, 10.0, 0.50, 25.0), priced_up_to=_PRE_4_6),
         "claude-sonnet-5-5": Rates(Tier(2.0, 2.50, 4.0, 0.10, 10.0)),
         "claude-sonnet-5": Rates(Tier(2.0, 2.50, 4.0, 0.20, 10.0)),
         "claude-sonnet-4-6": Rates(Tier(3.0, 3.75, 6.0, 0.30, 15.0)),
+        "claude-sonnet-4-5": Rates(Tier(3.0, 3.75, 6.0, 0.30, 15.0), priced_up_to=_PRE_4_6),
         "claude-haiku-5-5": Rates(
             short=Tier(0.10, 0.125, 0.20, 0.01, 0.50),
             long=Tier(0.50, 0.625, 1.0, 0.05, 2.50),
         ),
-        "claude-haiku-4-5": Rates(Tier(1.0, 1.25, 2.0, 0.10, 5.0)),
+        "claude-haiku-4-5": Rates(Tier(1.0, 1.25, 2.0, 0.10, 5.0), priced_up_to=_PRE_4_6),
     }
 )
 
@@ -185,8 +208,7 @@ def canonical(model: str) -> str:
     Claude Code names a model by its configured alias, which may carry a context-window marker
     (``claude-opus-5-5[1m]``, the box's builders' since 2026-11), while the API's own message
     carries the plain id; and a dated snapshot (``claude-haiku-4-5-20251001``) is the id it pins.
-    Every current model is priced flat across its whole context window, so the marker changes no
-    rate.
+    A rate turns on the prompt's length, never on the marker, so the marker changes no rate.
     """
     return re.sub(r"(?:\[[^\]]*\]|-\d{8})\Z", "", model.strip().lower())
 
@@ -237,6 +259,8 @@ def call_price(
         return Price(None, UNPRICED_TIER)
     if not usage.split_known:
         return Price(None, NOT_REPORTED)
+    if rates.priced_up_to is not None and usage.prompt > rates.priced_up_to:
+        return Price(None, UNPRICED_TIER)
     row = (
         rates.long
         if rates.long is not None and usage.prompt > HAIKU_LONG_PROMPT_THRESHOLD

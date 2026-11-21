@@ -56,6 +56,71 @@ def test_the_table_reproduces_claude_codes_own_figure(case: str, model: str, fig
     assert price.cost + searches == pytest.approx(figures["costUSD"], abs=1e-9)
 
 
+#: Anthropic's pricing page, "Model pricing", typed by hand from the page (read 2026-11-21), never
+#: copied from the table: (input, 5-minute write, 1-hour write, cache hit, output) in USD per
+#: million tokens. Claude Haiku 5.5's second row is the page's "for prompts over 100,000 tokens".
+LONG = " over 100k"
+PAGE = {
+    "claude-fable-5-2": (8.0, 10.0, 16.0, 0.20, 40.0),
+    "claude-fable-5-1": (10.0, 12.50, 20.0, 0.25, 50.0),
+    "claude-fable-5": (10.0, 12.50, 20.0, 1.0, 50.0),
+    "claude-opus-5-5": (4.0, 5.0, 8.0, 0.20, 20.0),
+    "claude-opus-5": (5.0, 6.25, 10.0, 0.50, 25.0),
+    "claude-opus-4-8": (5.0, 6.25, 10.0, 0.50, 25.0),
+    "claude-opus-4-7": (5.0, 6.25, 10.0, 0.50, 25.0),
+    "claude-opus-4-6": (5.0, 6.25, 10.0, 0.50, 25.0),
+    "claude-opus-4-5": (5.0, 6.25, 10.0, 0.50, 25.0),
+    "claude-sonnet-5-5": (2.0, 2.50, 4.0, 0.10, 10.0),
+    "claude-sonnet-5": (2.0, 2.50, 4.0, 0.20, 10.0),
+    "claude-sonnet-4-6": (3.0, 3.75, 6.0, 0.30, 15.0),
+    "claude-sonnet-4-5": (3.0, 3.75, 6.0, 0.30, 15.0),
+    "claude-haiku-5-5": (0.10, 0.125, 0.20, 0.01, 0.50),
+    "claude-haiku-5-5" + LONG: (0.50, 0.625, 1.0, 0.05, 2.50),
+    "claude-haiku-4-5": (1.0, 1.25, 2.0, 0.10, 5.0),
+}
+
+CATEGORIES = ("input", "write_5m", "write_1h", "read", "output")
+RATE_CASES = [
+    (row, category, page)
+    for row, figures in PAGE.items()
+    for category, page in zip(CATEGORIES, figures, strict=True)
+]
+
+
+def _usage(uncached: int = 0, **counts: int) -> rates.Usage:
+    full = dict.fromkeys(("write_5m", "write_1h", "read", "output"), 0) | counts
+    return rates.Usage(uncached=uncached, **full)
+
+
+def test_every_row_of_the_table_is_pinned_against_the_page() -> None:
+    assert set(rates.RATES) == {row.removesuffix(LONG) for row in PAGE}
+    assert {row for row in PAGE if row.endswith(LONG)} == {
+        f"{model}{LONG}" for model, r in rates.RATES.items() if r.long is not None
+    }
+
+
+@pytest.mark.parametrize(
+    ("row", "category", "page"), RATE_CASES, ids=[f"{r}-{c}" for r, c, _ in RATE_CASES]
+)
+def test_each_rate_is_the_pages_own_number(row: str, category: str, page: float) -> None:
+    """One category at a time, so a wrong rate fails by name rather than hiding in a sum.
+
+    The rate is read as the price of adding a threshold's worth of that one category to a base
+    call: an empty one for a short row, so the prompt never passes the threshold, and for the long
+    row an uncached prompt one token over it, so the call is on that row whatever is added.
+    """
+    model = row.removesuffix(LONG)
+    tokens = rates.HAIKU_LONG_PROMPT_THRESHOLD
+    base = {"uncached": tokens + 1 if row.endswith(LONG) else 0}
+    added = dict(base)
+    field = "uncached" if category == "input" else category
+    added[field] = added.get(field, 0) + tokens
+    before = rates.call_price(model, _usage(**base))
+    after = rates.call_price(model, _usage(**added))
+    assert before.gap is None and after.gap is None
+    assert (after.cost - before.cost) * 1_000_000 / tokens == pytest.approx(page, rel=1e-9)
+
+
 USAGE = rates.Usage(uncached=10, write_5m=20, write_1h=30, read=40, output=50)
 
 
@@ -108,6 +173,22 @@ def test_haiku_5_5_prices_a_long_prompt_entirely_on_its_higher_row() -> None:
     )
     assert rates.call_price("claude-haiku-5-5", short).cost == pytest.approx(0.01)
     assert rates.call_price("claude-haiku-5-5", long).cost == pytest.approx(100_001 * 0.5 / 1e6)
+
+
+@pytest.mark.parametrize("model", ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"])
+def test_a_model_before_4_6_is_priced_only_within_its_200k_window(model: str) -> None:
+    # The page states the flat price across the whole 1M window only for Claude 4.6 and later, so
+    # a longer prompt on an earlier model (a 1M alias, say) is a named gap, never the short row.
+    window = rates.PRE_4_6_CONTEXT_WINDOW
+    assert rates.call_price(model, _usage(read=window)).gap is None
+    assert rates.call_price(f"{model}[1m]", _usage(read=window, uncached=1)) == rates.Price(
+        None, rates.UNPRICED_TIER
+    )
+
+
+def test_claude_4_6_and_later_are_priced_flat_past_200k() -> None:
+    big = _usage(uncached=rates.PRE_4_6_CONTEXT_WINDOW * 4)
+    assert rates.call_price("claude-opus-4-6", big).cost == pytest.approx(800_000 * 5.0 / 1e6)
 
 
 def test_a_dated_snapshot_is_priced_as_the_id_it_pins() -> None:
