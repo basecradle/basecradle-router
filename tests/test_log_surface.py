@@ -84,12 +84,13 @@ def test_the_delivery_id_is_passed_as_an_inert_positional_never_interpolated() -
     # a probe, journald-wrapped for a real wake — basecradle-router#208), so this pins
     # the one assembly rather than each launch.
     # A builder's stream helpers (#481) ride the same way, root-resolved paths, between the
-    # delivery id and the command, and so does the wake's attempt (#527), right after the id.
+    # delivery id and the command, and so do the wake's attempt (#527), right after the id,
+    # and its quick try (#533), right after the attempt.
     assert (
         'drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" '
         'wake-runner "$real_cwd" "$delivery"\n'
-        '\t"$attempt" "$attempts" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat"'
-        ' "$launch_bin" "$@")'
+        '\t"$attempt" "$attempts" "$try_number" "$tries" "$stream_python" "$stream_translate"'
+        ' "$stream_jq" "$stream_cat" "$launch_bin" "$@")'
     ) in WAKE_RUNNER.read_text()
 
 

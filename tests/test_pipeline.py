@@ -24,7 +24,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, ProbeRoute, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeStopped
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeStopped, WakeTry
 from basecradle_router.wakelock import WakeLockGuard, WakeLockState
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -74,9 +74,13 @@ class _StubWaker:
         self.result = result or WakeResult(exit_code=0, stdout="woke")
         self.fail_times = fail_times
         self.calls: list[tuple[Agent, Event]] = []
+        self.tries: list[WakeTry] = []
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         self.calls.append((agent, event))
+        self.tries.append(quick_try)
         if len(self.calls) <= self.fail_times:
             raise WakeError("transient blip", exit_code=2)
         return self.result
@@ -769,7 +773,12 @@ def test_same_agent_is_locked_during_a_wake() -> None:
 
     class _BlockingWaker:
         def wake(
-            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+            self,
+            agent: Agent,
+            event: Event,
+            attempt: WakeAttempt | None = None,
+            *,
+            quick_try: WakeTry,
         ) -> WakeResult:
             in_wake.set()
             release.wait(timeout=5)
@@ -1223,9 +1232,11 @@ class _WatchingWaker(_StubWaker):
         self._caplog = caplog
         self.journal_at_call: list[list[str]] = []
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         self.journal_at_call.append([r.getMessage() for r in self._caplog.records])
-        return super().wake(agent, event, attempt)
+        return super().wake(agent, event, attempt, quick_try=quick_try)
 
 
 def test_the_wake_start_line_is_emitted_before_the_first_attempt(caplog) -> None:
@@ -1285,7 +1296,12 @@ def test_the_bracket_closes_even_when_the_wake_path_raises_unexpectedly(caplog) 
     # whose whole job is saying whether an agent is awake.
     class _ExplodingWaker(_StubWaker):
         def wake(
-            self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+            self,
+            agent: Agent,
+            event: Event,
+            attempt: WakeAttempt | None = None,
+            *,
+            quick_try: WakeTry,
         ) -> WakeResult:
             raise RuntimeError("the wake path is broken")
 
@@ -1329,6 +1345,52 @@ def test_a_probe_is_never_bracketed(caplog) -> None:
     assert _bookends(caplog, "wake_end") == []
     # ...but the machinery line is unchanged: a probe still proves the edge.
     assert "outcome=ok" in _uncoloured(_stage_line(caplog, Stage.WAKE))
+
+
+# --- the wake is told which quick try it is (#533) ------------------------------------------
+
+
+def test_a_first_try_that_succeeds_is_told_it_is_one_of_three() -> None:
+    pipeline, waker = _pipeline()
+    pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert waker.tries == [WakeTry(1, 3)]
+
+
+def test_a_repeated_try_is_told_its_number_and_the_bound_the_router_honors() -> None:
+    # One failure that is not an exit 75, then a success: two tries, each told which it is.
+    # The bound is the one the quick retry runs to, so a try below it is one the router
+    # repeats on such a failure, and it did.
+    pipeline, waker = _pipeline(waker=_StubWaker(fail_times=1))
+    pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert waker.tries == [WakeTry(1, 3), WakeTry(2, 3)]
+
+
+def test_the_last_try_is_told_it_is_the_last_and_nothing_is_numbered_past_it() -> None:
+    pipeline, waker = _pipeline(waker=_StubWaker(fail_times=99))
+    result = pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert waker.tries == [WakeTry(1, 3), WakeTry(2, 3), WakeTry(3, 3)]
+    assert waker.tries[-1].last and not any(t.last for t in waker.tries[:-1])
+    assert result.records[-1].outcome is Outcome.FAILED
+
+
+def test_the_bound_is_the_configured_quick_try_count() -> None:
+    waker = _StubWaker(fail_times=99)
+    pipeline = Pipeline(
+        registry=_registry(),
+        config=_config(),
+        waker=waker,
+        sleep=lambda _d: None,
+        wake_attempts=2,
+    )
+    pipeline.handle("github", _github_request(delivery=DELIVERY_A))
+    assert waker.tries == [WakeTry(1, 2), WakeTry(2, 2)]
+
+
+def test_a_probe_is_told_it_is_its_one_try() -> None:
+    # A probe gets exactly one try, so it is handed 1/1 and never reads as having another.
+    pipeline, waker = _pipeline(waker=_StubWaker(fail_times=99))
+    pipeline.execute(NOVA, _probe_event(), PipelineResult())
+    assert waker.tries == [WakeTry(1, 1)]
 
 
 def test_the_slow_half_leads_with_the_delivery_then_the_agent_then_the_source(caplog) -> None:
@@ -1459,7 +1521,9 @@ class _StoppedWaker(_StubWaker):
         self.signal = signal
         self.exit_code = exit_code
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         if len(self.calls) + 1 == self.stop_on:
             self.calls.append((agent, event))
             raise WakeStopped(
@@ -1467,7 +1531,7 @@ class _StoppedWaker(_StubWaker):
                 signal=self.signal,
                 exit_code=self.exit_code,
             )
-        return super().wake(agent, event, attempt)
+        return super().wake(agent, event, attempt, quick_try=quick_try)
 
 
 def test_a_stopped_wake_is_never_retried_and_never_failed(caplog) -> None:

@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 
 from basecradle_router.models import Agent, Event, EventKind, Recipient
-from basecradle_router.wake import DELIVERY_ID_ENV, WAKE_RUNNER, HomeServerWaker, WakeAttempt
+from basecradle_router.wake import (
+    DELIVERY_ID_ENV,
+    WAKE_RUNNER,
+    HomeServerWaker,
+    WakeAttempt,
+    WakeTry,
+)
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "stop-wake"
 
@@ -122,11 +128,12 @@ def test_the_parser_reads_exactly_the_argv_the_router_assembles() -> None:
         wake_arg="Cross-repo handoff: work https://example.com/1",
         delivery_id=DELIVERY,
     )
-    # Both shapes the waker builds: the pipeline hands every real wake its attempt (#527),
-    # and a wake without one still parses.
+    # Every shape the waker builds: the pipeline hands every real wake its attempt (#527) and
+    # its quick try (#533), and a wake without an attempt still parses.
     for attempt in (WakeAttempt(1, 4), WakeAttempt(4, 4), None):
-        argv = HomeServerWaker().invocation_for(agent, event, attempt).argv
-        assert sw.parse_wake(argv) == ("nova", DELIVERY), argv
+        for quick_try in (WakeTry(1, 3), WakeTry(3, 3), WakeTry(1, 1)):
+            argv = HomeServerWaker().invocation_for(agent, event, attempt, quick_try=quick_try)
+            assert sw.parse_wake(argv.argv) == ("nova", DELIVERY), argv.argv
     assert sw.WAKE_RUNNER == WAKE_RUNNER
 
 

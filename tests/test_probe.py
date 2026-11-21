@@ -63,9 +63,11 @@ from basecradle_router.routes.probe import DELIVERY_HEADER, SIGNATURE_HEADER, Pr
 from basecradle_router.secret import Secret
 from basecradle_router.selftest import EXIT_UNPROVABLE
 from basecradle_router.server import WebhookServer
-from basecradle_router.wake import HomeServerWaker, SubprocessWaker, WakeError, WakeResult
+from basecradle_router.wake import HomeServerWaker, SubprocessWaker, WakeError, WakeResult, WakeTry
 from basecradle_router.wakelock import WakeLockGuard
 
+#: A probe's one try (#533): it is never tried again.
+PROBE_TRY = WakeTry(1, 1)
 PROBE_ACK = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "probe-ack"
 WAKE_RUNNER = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "wake-runner"
 
@@ -311,14 +313,14 @@ def test_the_bare_subprocess_waker_cannot_carry_a_probe_at_all() -> None:
     # The v0/offline waker would have run `claude -p <marker>` directly, so it refuses.
     event = ProbeRoute().normalize(probe_request("nova", a_marker()))
     with pytest.raises(WakeError):
-        SubprocessWaker(runner=lambda _i: WakeResult(0)).wake(NOVA, event)
+        SubprocessWaker(runner=lambda _i: WakeResult(0)).wake(NOVA, event, quick_try=PROBE_TRY)
 
 
 def test_the_home_server_waker_assembles_probe_mode_never_a_command() -> None:
     marker = a_marker()
     event = ProbeRoute().normalize(probe_request("nova", marker, delivery="d7"))
 
-    argv = HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event).argv
+    argv = HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event, quick_try=PROBE_TRY).argv
 
     assert argv == (
         "sudo",
@@ -329,12 +331,21 @@ def test_the_home_server_waker_assembles_probe_mode_never_a_command() -> None:
         "/home/nova/basecradle-python",
         "--delivery",
         "d7",
+        "--try",
+        "1/1",
         "--probe",
         marker,
     )
     # No `--`, and therefore no command: the two modes are disjoint in the argv itself.
     assert "--" not in argv
     assert "claude" not in argv
+
+
+def test_the_home_server_waker_refuses_a_probe_any_try_but_its_one() -> None:
+    # The wrapper refuses it too; the router refuses first, and never corrects the pair.
+    event = ProbeRoute().normalize(probe_request("nova", a_marker(), delivery="d7"))
+    with pytest.raises(WakeError, match="a probe has exactly one"):
+        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event, quick_try=WakeTry(2, 3))
 
 
 def test_a_real_wake_is_untouched_by_probe_mode_existing() -> None:
@@ -345,7 +356,7 @@ def test_a_real_wake_is_untouched_by_probe_mode_existing() -> None:
         wake_arg="Cross-repo handoff: work https://example.invalid/1",
         delivery_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd",
     )
-    argv = HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event).argv
+    argv = HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event, quick_try=PROBE_TRY).argv
     assert argv[-4:] == ("--", "claude", "-p", event.wake_arg)
     assert "--probe" not in argv
 
@@ -361,7 +372,7 @@ def test_the_waker_refuses_a_probe_whose_marker_is_malformed() -> None:
         delivery_id="d9",
     )
     with pytest.raises(WakeError, match="malformed BCNOC1 marker"):
-        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event)
+        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, event, quick_try=PROBE_TRY)
 
     # And names it redacted (#529): a refused value can still carry a verifiable marker.
     signed = a_marker()
@@ -373,7 +384,7 @@ def test_the_waker_refuses_a_probe_whose_marker_is_malformed() -> None:
         delivery_id="d9",
     )
     with pytest.raises(WakeError, match="malformed BCNOC1 marker") as refused:
-        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, carrying)
+        HomeServerWaker(wrapper="/opt/wr").invocation_for(NOVA, carrying, quick_try=PROBE_TRY)
     assert signed.rsplit(" ", 1)[1] not in str(refused.value)
     # Its stream key never carries the signature either: it is the breaker's log key.
     assert signed.rsplit(" ", 1)[1] not in carrying.stream_key

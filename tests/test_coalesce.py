@@ -39,7 +39,7 @@ from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
 from basecradle_router.routes import BasecradleRoute, InboundRequest, RouteRegistry
 from basecradle_router.routes.github import GithubRoute
 from basecradle_router.secret import Secret
-from basecradle_router.wake import WakeAttempt, WakeError, WakeResult
+from basecradle_router.wake import WakeAttempt, WakeError, WakeResult, WakeTry
 
 SECRET = "fake-github-webhook-secret-" + "0" * 32
 BASECRADLE_SECRET = "bc_isk_" + "1" * 32
@@ -103,7 +103,9 @@ class _Waker:
         self.fail = fail
         self.calls: list[Event] = []
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         self.calls.append(event)
         if len(self.calls) <= self.fail:
             raise WakeError("wake path down", exit_code=1)

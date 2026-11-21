@@ -975,6 +975,14 @@ then `outcome=failed`. Until the harness exits 75, nothing earns the schedule.
 - **The wake is told which attempt it is**, so the last one can say so on its timeline:
   `wake-runner --attempt <n>/<of>`, exported after the privilege drop as **`BASECRADLE_WAKE_ATTEMPT`** and
   **`BASECRADLE_WAKE_ATTEMPTS`** (after `agent.env`, so the router's values win). A probe carries neither.
+- **The wake is told which quick try it is, too** (#533). Inside one attempt the router runs a wake that
+  failed other than by exit 75 again at once, up to `wake_attempts` tries (`event=wake_retry try=N/3`), so
+  a wake can tell a try the router will repeat from its last and write no final failure for the first:
+  `wake-runner --try <n>/<of>`, exported the same way as **`BASECRADLE_WAKE_TRY`** and
+  **`BASECRADLE_WAKE_TRIES`**. Every wake carries it, a probe at `1/1` (the wrapper refuses a probe any
+  other). When a wake fails with an exit other than 75, another try follows exactly when `TRY < TRIES`;
+  an exit 75 is never tried again at once, so for it the attempt pair says what follows. A wake that reads neither (an
+  older router sent none) should read it as no try following.
 - **It survives a restart.** The waiting deliveries are kept in `/var/lib/basecradle-router/wake-retries.json`;
   a daemon that starts fires what the last one left once its routes are warm, one already due at once. An
   entry whose route is no longer enabled, or whose agent the registry no longer resolves, is dropped with

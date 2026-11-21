@@ -22,7 +22,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 from basecradle_router.logfmt import log_fields
 from basecradle_router.marker import is_marker, redact
@@ -46,6 +46,18 @@ DELIVERY_ID_ENV = "BASECRADLE_DELIVERY_ID"
 #: and on no probe. Like :data:`DELIVERY_ID_ENV`, a wake that reads neither is unaffected.
 ATTEMPT_ENV = "BASECRADLE_WAKE_ATTEMPT"
 ATTEMPTS_ENV = "BASECRADLE_WAKE_ATTEMPTS"
+
+#: Which quick try of its attempt a wake is, and how many quick tries the attempt gets (#533).
+#: Inside one attempt the router runs a wake that failed with an exit other than
+#: :data:`TEMPFAIL_EXIT` again at once, up to the bound (the pipeline's ``wake_attempts``, logged
+#: ``try=``), so a wake can tell a try the router will repeat from the last one and write no
+#: final failure for the first: when a wake fails with such an exit, another try follows
+#: exactly when the try is below the bound. Set on every wake, a probe included at
+#: ``1``/``1``, on either runtime. The pair is exact by construction: the try is the number the
+#: quick retry itself hands its operation, and the bound is the one it honors. An exit 75 is
+#: never tried again at once, so for it the attempt pair, not this one, says what follows.
+TRY_ENV = "BASECRADLE_WAKE_TRY"
+TRIES_ENV = "BASECRADLE_WAKE_TRIES"
 
 #: The exit status a wake gives when it gave up for a temporary reason: a vendor's rate
 #: limit, a vendor that is down, a dropped connection. ``EX_TEMPFAIL`` from
@@ -172,7 +184,32 @@ class WakeTempFailed(WakeError):
 
 
 @dataclass(frozen=True, slots=True)
-class WakeAttempt:
+class _NumberOf:
+    """``number`` of ``of``, 1-based and never past its bound: the one shape both
+    :class:`WakeAttempt` and :class:`WakeTry` are. Two types, never one, so a try can never be
+    handed where an attempt is meant (they never compare equal either). The two subclass it
+    plainly, adding no field: re-running ``dataclass(slots=True)`` on them would, on Python
+    3.10, lay the base's two slots down a second time."""
+
+    _noun: ClassVar[str] = "a count"
+
+    number: int
+    of: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.number <= self.of:
+            raise ValueError(f"{self._noun} is 1..{self.of}, got {self.number}")
+
+    @property
+    def last(self) -> bool:
+        """Whether nothing follows this one, whatever it ends in."""
+        return self.number == self.of
+
+    def __str__(self) -> str:
+        return f"{self.number}/{self.of}"
+
+
+class WakeAttempt(_NumberOf):
     """Which attempt at its delivery a wake is: ``number`` of ``of`` (#527).
 
     The first wake of a delivery is attempt 1; each retry the router schedules after a
@@ -180,20 +217,21 @@ class WakeAttempt:
     can tell when it is the last one.
     """
 
-    number: int
-    of: int
+    __slots__ = ()
+    _noun: ClassVar[str] = "a wake attempt"
 
-    def __post_init__(self) -> None:
-        if not 1 <= self.number <= self.of:
-            raise ValueError(f"a wake attempt is 1..{self.of}, got {self.number}")
 
-    @property
-    def last(self) -> bool:
-        """Whether no retry follows this attempt, whatever it ends in."""
-        return self.number == self.of
+class WakeTry(_NumberOf):
+    """Which quick try of its attempt a wake is: ``number`` of ``of`` (#533).
 
-    def __str__(self) -> str:
-        return f"{self.number}/{self.of}"
+    The quick retry (:func:`~basecradle_router.concurrency.with_retry`) runs a wake that
+    failed other than by :data:`TEMPFAIL_EXIT` again at once, inside the same attempt;
+    ``of`` is its bound, ``1`` for a probe, so a try below it is one the router repeats on
+    such a failure.
+    """
+
+    __slots__ = ()
+    _noun: ClassVar[str] = "a quick try"
 
 
 # The exit statuses that mean "this wake was stopped by a signal", and the signal each
@@ -269,11 +307,16 @@ EnvProvider = Callable[[Agent], Mapping[str, str]]
 class Waker(Protocol):
     """Wake an agent for an event. The pipeline depends only on this protocol."""
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
         """Run ``agent``'s headless ``claude`` for ``event``.
 
         ``attempt`` is which attempt at the delivery this is, handed to the wake as
         :data:`ATTEMPT_ENV` and :data:`ATTEMPTS_ENV`; ``None`` hands it neither.
+        ``quick_try`` is which quick try of that attempt this is, handed to the wake as
+        :data:`TRY_ENV` and :data:`TRIES_ENV` (#533). It has no default: no wake is launched
+        without saying it.
 
         Returns a :class:`WakeResult` on a clean (exit 0) run; raises
         :class:`WakeStopped` when the wake was killed by a stop signal,
@@ -353,16 +396,18 @@ class SubprocessWaker:
     read as a crash and retry the work. See :class:`WakeInvocation` for the deployed
     path's reason.
 
-    The child's environment is the provider's, plus :data:`DELIVERY_ID_ENV` — the
-    one variable the *router* contributes. It carries no authority and no secret;
-    the provider still owns everything that does.
+    The child's environment is the provider's, plus the variables the *router*
+    contributes, all of them position and none of them authority: :data:`DELIVERY_ID_ENV`,
+    :data:`ATTEMPT_ENV` and :data:`ATTEMPTS_ENV` when the wake has an attempt (#527), and
+    :data:`TRY_ENV` and :data:`TRIES_ENV` on every wake (#533). None carries a secret; the
+    provider still owns everything that does.
     """
 
     runner: Runner = _run_subprocess
     env_provider: EnvProvider = _empty_env
 
     def invocation_for(
-        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
     ) -> WakeInvocation:
         """Assemble the command to wake ``agent`` for ``event`` — pure, no I/O."""
         env = dict(self.env_provider(agent))
@@ -372,6 +417,8 @@ class SubprocessWaker:
         if attempt is not None:
             env[ATTEMPT_ENV] = str(attempt.number)
             env[ATTEMPTS_ENV] = str(attempt.of)
+        env[TRY_ENV] = str(quick_try.number)
+        env[TRIES_ENV] = str(quick_try.of)
         return WakeInvocation(
             argv=wake_command(agent, event),
             cwd=agent.clone_path,
@@ -379,9 +426,15 @@ class SubprocessWaker:
             run_as_user=agent.os_user,
         )
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
-        return _result_or_raise(self.runner(self.invocation_for(agent, event, attempt)), agent)
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
+        invocation = self.invocation_for(agent, event, attempt, quick_try=quick_try)
+        return _result_or_raise(self.runner(invocation), agent)
 
+
+# A probe's one quick try: it is never tried again (#533).
+_PROBE_TRY = WakeTry(1, 1)
 
 # The root-owned wrapper the home-server waker escalates through (see deploy/).
 WAKE_RUNNER = "/opt/basecradle-router/bin/wake-runner"
@@ -420,11 +473,11 @@ def _mode_args(agent: Agent, event: Event) -> tuple[str, ...]:
 class HomeServerWaker:
     """The deployable :class:`Waker` — runs the wake through the wake-runner wrapper.
 
-    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> --delivery <id> --
-    <wake command>`` and runs it, where the wake command is the agent-kind-specific
-    :func:`wake_command` (``claude -p "<trigger>"`` for a builder, ``<wake_bin>
-    --timeline "<uuid>"`` for a harness agent). The root-owned wrapper validates
-    the request, drops to the agent's own OS user, and (as the agent) sources that
+    Assembles ``sudo <wrapper> --user <os_user> --cwd <clone> [--delivery <id>]
+    [--attempt <n>/<of>] --try <n>/<of> -- <wake command>`` and runs it, where the wake
+    command is the agent-kind-specific :func:`wake_command` (``claude -p "<trigger>"`` for a
+    builder, ``<wake_bin> --timeline "<uuid>"`` for a harness agent). The root-owned wrapper
+    validates the request, drops to the agent's own OS user, and (as the agent) sources that
     agent's ``agent.env`` — so the router itself passes **no** environment and never
     holds a secret. The event value rides as a single ``argv`` element, never a
     shell string, so it is never re-interpreted. ``runner`` is the same injectable
@@ -442,7 +495,10 @@ class HomeServerWaker:
     the inert wake command the wrapper pins against its registry. ``--attempt N/M``
     rides the same way for the same reason, exported as :data:`ATTEMPT_ENV` and
     :data:`ATTEMPTS_ENV` (#527); a probe never carries it, because a probe is never
-    retried and never launches anything that could read it.
+    retried and never launches anything that could read it. ``--try N/M`` rides beside it,
+    exported as :data:`TRY_ENV` and :data:`TRIES_ENV` (#533), and every wake carries it, a
+    probe at ``1/1``: the wrapper refuses a probe any other, since a probe is never tried
+    again.
 
     **A synthetic probe takes the wrapper's ``--probe`` mode instead of a command.**
     The wrapper then performs every step a real wake performs — validate the request
@@ -460,11 +516,18 @@ class HomeServerWaker:
     wrapper: str = WAKE_RUNNER
 
     def invocation_for(
-        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
     ) -> WakeInvocation:
         """Assemble the sudo+wrapper command — pure, no I/O."""
         delivery = _correlation_id(event)
         attempt_args = () if attempt is None or event.synthetic else ("--attempt", str(attempt))
+        if event.synthetic and quick_try != _PROBE_TRY:
+            # A probe is never tried again, so any other pair would be a lie the wrapper
+            # refuses too. Refused here first, never corrected: a corrected pair is not exact.
+            raise WakeError(
+                f"refusing to wake {agent.key}: probe delivery {event.delivery_id} carries "
+                f"quick try {quick_try}, and a probe has exactly one"
+            )
         return WakeInvocation(
             argv=(
                 "sudo",
@@ -475,6 +538,8 @@ class HomeServerWaker:
                 agent.clone_path,
                 *(() if delivery is None else ("--delivery", delivery)),
                 *attempt_args,
+                "--try",
+                str(quick_try),
                 *_mode_args(agent, event),
             ),
             # The wrapper cd's into the clone as the agent; the router's own cwd is
@@ -485,5 +550,8 @@ class HomeServerWaker:
             run_as_user=agent.os_user,
         )
 
-    def wake(self, agent: Agent, event: Event, attempt: WakeAttempt | None = None) -> WakeResult:
-        return _result_or_raise(self.runner(self.invocation_for(agent, event, attempt)), agent)
+    def wake(
+        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None, *, quick_try: WakeTry
+    ) -> WakeResult:
+        invocation = self.invocation_for(agent, event, attempt, quick_try=quick_try)
+        return _result_or_raise(self.runner(invocation), agent)

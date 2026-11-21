@@ -145,6 +145,7 @@ from basecradle_router.wake import (
     WakeResult,
     WakeStopped,
     WakeTempFailed,
+    WakeTry,
 )
 from basecradle_router.wakelock import WakeLockGuard
 
@@ -1005,8 +1006,10 @@ class Pipeline:
         last_started_at: datetime | None = None
 
         # A wake failure is retryable transient by policy here (the boundary
-        # reports it as a plain WakeError); the bound stops a permanent fault.
-        def attempt() -> WakeResult:
+        # reports it as a plain WakeError); the bound stops a permanent fault. Each try is
+        # told which one it is, by the quick retry's own count, and the bound that count
+        # runs to (#533), so a wake can tell a try the router repeats from its last.
+        def attempt(tried: int) -> WakeResult:
             nonlocal last_duration, last_started_at
             last_started_at = self.now()
             # What is running, durably, for a reader that cannot see this journal (#456):
@@ -1021,7 +1024,9 @@ class Pipeline:
             )
             started = self.clock()
             try:
-                return self.waker.wake(agent, event, wake_attempt)
+                return self.waker.wake(
+                    agent, event, wake_attempt, quick_try=WakeTry(tried, attempts)
+                )
             except WakeTempFailed as exc:
                 if wake_attempt is None:
                     raise TransientError(str(exc)) from exc

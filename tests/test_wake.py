@@ -14,6 +14,8 @@ from basecradle_router import wake as wake_module
 from basecradle_router.models import Agent, Event, EventKind, IssueRef, Recipient, WakeKind
 from basecradle_router.wake import (
     DELIVERY_ID_ENV,
+    TRIES_ENV,
+    TRY_ENV,
     WAKE_RUNNER,
     HomeServerWaker,
     SubprocessWaker,
@@ -22,7 +24,11 @@ from basecradle_router.wake import (
     Waker,
     WakeResult,
     WakeStopped,
+    WakeTry,
 )
+
+#: The first of three quick tries (#533): what most cases here wake as.
+FIRST_TRY = WakeTry(1, 3)
 
 NOVA = Agent(
     key="basecradle/basecradle-python",
@@ -80,13 +86,19 @@ def test_wake_assembles_command_cwd_env_and_run_as_user() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="done"))
     waker = SubprocessWaker(runner=runner, env_provider=lambda agent: env)
 
-    result = waker.wake(NOVA, EVENT)
+    result = waker.wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
     assert runner.invocation is not None
     assert runner.invocation.argv == ("claude", "-p", EVENT.wake_arg)
     assert runner.invocation.cwd == "/home/nova/basecradle-python"
-    # The provider's env, plus the one variable the router itself contributes.
-    assert runner.invocation.env == {**env, DELIVERY_ID_ENV: EVENT.delivery_id}
+    # The provider's env, plus the variables the router itself contributes: the delivery id
+    # and the wake's quick try (#533).
+    assert runner.invocation.env == {
+        **env,
+        DELIVERY_ID_ENV: EVENT.delivery_id,
+        TRY_ENV: "1",
+        TRIES_ENV: "3",
+    }
     assert runner.invocation.run_as_user == "nova"
     assert result.ok
     assert result.stdout == "done"
@@ -96,7 +108,7 @@ def test_wake_assembles_the_harness_command_for_a_harness_agent() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
     waker = SubprocessWaker(runner=runner)
 
-    waker.wake(ORION, ORION_EVENT)
+    waker.wake(ORION, ORION_EVENT, quick_try=FIRST_TRY)
 
     assert runner.invocation is not None
     assert runner.invocation.argv == (
@@ -116,30 +128,37 @@ def test_env_provider_receives_the_agent() -> None:
         return {"BOT_SLUG": agent.bot_slug}
 
     runner = _FakeRunner(WakeResult(exit_code=0))
-    SubprocessWaker(runner=runner, env_provider=provider).wake(NOVA, EVENT)
+    SubprocessWaker(runner=runner, env_provider=provider).wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
     assert seen == [NOVA]
     assert runner.invocation is not None
     assert runner.invocation.env == {
         "BOT_SLUG": "basecradle-python-ai",
         DELIVERY_ID_ENV: EVENT.delivery_id,
+        TRY_ENV: "1",
+        TRIES_ENV: "3",
     }
 
 
-def test_default_env_carries_only_the_delivery_id() -> None:
-    # The router contributes exactly one variable to the child — the delivery id, for
-    # log correlation (#170). It carries no authority and no secret: everything the
-    # agent needs to *act* still comes from the agent's own env, never from the router.
+def test_default_env_carries_only_the_delivery_id_and_the_try() -> None:
+    # The router contributes only position to the child: the delivery id, for log
+    # correlation (#170), and which quick try this is (#533). None of it carries authority
+    # or a secret: everything the agent needs to *act* still comes from the agent's own env,
+    # never from the router.
     runner = _FakeRunner(WakeResult(exit_code=0))
-    SubprocessWaker(runner=runner).wake(NOVA, EVENT)
+    SubprocessWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert runner.invocation is not None
-    assert runner.invocation.env == {DELIVERY_ID_ENV: EVENT.delivery_id}
+    assert runner.invocation.env == {
+        DELIVERY_ID_ENV: EVENT.delivery_id,
+        TRY_ENV: "1",
+        TRIES_ENV: "3",
+    }
 
 
 def test_invocation_for_is_pure_and_does_not_run() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0))
     waker = SubprocessWaker(runner=runner)
-    invocation = waker.invocation_for(NOVA, EVENT)
+    invocation = waker.invocation_for(NOVA, EVENT, quick_try=FIRST_TRY)
     assert invocation.run_as_user == "nova"
     assert runner.invocation is None  # assembling the command runs nothing
 
@@ -148,7 +167,7 @@ def test_non_zero_exit_raises_wake_error_with_code_and_stderr() -> None:
     runner = _FakeRunner(WakeResult(exit_code=2, stderr="model overloaded"))
     waker = SubprocessWaker(runner=runner)
     with pytest.raises(WakeError, match="model overloaded") as excinfo:
-        waker.wake(NOVA, EVENT)
+        waker.wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert excinfo.value.exit_code == 2
     assert NOVA.key in str(excinfo.value)
 
@@ -157,11 +176,11 @@ def test_non_zero_exit_falls_back_to_stdout_then_placeholder() -> None:
     # stderr empty but stdout has the detail → stdout is surfaced.
     runner = _FakeRunner(WakeResult(exit_code=1, stdout="no git credentials", stderr=""))
     with pytest.raises(WakeError, match="no git credentials"):
-        SubprocessWaker(runner=runner).wake(NOVA, EVENT)
+        SubprocessWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
     # Nothing on either stream → a clear placeholder, never an empty message.
     silent = _FakeRunner(WakeResult(exit_code=1, stdout="", stderr=""))
     with pytest.raises(WakeError, match=r"\(no output\)"):
-        SubprocessWaker(runner=silent).wake(NOVA, EVENT)
+        SubprocessWaker(runner=silent).wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
 
 @pytest.mark.parametrize("cls", [WakeInvocation, SubprocessWaker, HomeServerWaker])
@@ -198,11 +217,16 @@ def test_default_runner_invokes_subprocess_with_assembled_command(monkeypatch) -
 
     env = {"GH_TOKEN": "ghs_" + "0" * 36}
     waker = SubprocessWaker(env_provider=lambda agent: env)  # default real runner
-    result = waker.wake(NOVA, EVENT)
+    result = waker.wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
     assert captured["argv"] == ["claude", "-p", EVENT.wake_arg]
     assert captured["kwargs"]["cwd"] == "/home/nova/basecradle-python"
-    assert captured["kwargs"]["env"] == {**env, DELIVERY_ID_ENV: EVENT.delivery_id}
+    assert captured["kwargs"]["env"] == {
+        **env,
+        DELIVERY_ID_ENV: EVENT.delivery_id,
+        TRY_ENV: "1",
+        TRIES_ENV: "3",
+    }
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["check"] is False
@@ -226,7 +250,7 @@ def test_default_runner_never_puts_a_deadline_on_the_wake(monkeypatch, waker) ->
         return _Completed()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    waker.wake(NOVA, EVENT)
+    waker.wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert "timeout" not in captured
 
 
@@ -236,7 +260,7 @@ def test_default_runner_wraps_launch_failure_in_wake_error(monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(WakeError, match="could not launch"):
-        SubprocessWaker().wake(NOVA, EVENT)
+        SubprocessWaker().wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
 
 def test_default_runner_is_the_module_default() -> None:
@@ -254,11 +278,11 @@ def test_home_server_waker_satisfies_the_protocol() -> None:
 
 def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="opened PR"))
-    result = HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+    result = HomeServerWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
 
     assert runner.invocation is not None
     # The exact contract:
-    #   sudo <wrapper> --user U --cwd DIR --delivery ID -- claude -p TRIGGER.
+    #   sudo <wrapper> --user U --cwd DIR --delivery ID --try N/M -- claude -p TRIGGER.
     assert runner.invocation.argv == (
         "sudo",
         WAKE_RUNNER,
@@ -268,6 +292,8 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
         "/home/nova/basecradle-python",
         "--delivery",
         EVENT.delivery_id,
+        "--try",
+        "1/3",
         "--",
         "claude",
         "-p",
@@ -279,9 +305,10 @@ def test_home_server_waker_assembles_the_sudo_wrapper_command() -> None:
 
 def test_home_server_waker_assembles_the_harness_wake_command() -> None:
     # A harness agent is woken via its registry-pinned wake CLI, not claude:
-    # sudo <wrapper> --user orion --cwd <home> --delivery ID -- <wake_bin> --timeline <uuid>.
+    # sudo <wrapper> --user orion --cwd <home> --delivery ID --try N/M --
+    #     <wake_bin> --timeline <uuid>.
     runner = _FakeRunner(WakeResult(exit_code=0, stdout="replied"))
-    result = HomeServerWaker(runner=runner).wake(ORION, ORION_EVENT)
+    result = HomeServerWaker(runner=runner).wake(ORION, ORION_EVENT, quick_try=FIRST_TRY)
 
     assert runner.invocation is not None
     assert runner.invocation.argv == (
@@ -293,6 +320,8 @@ def test_home_server_waker_assembles_the_harness_wake_command() -> None:
         "/home/orion/harness",
         "--delivery",
         ORION_EVENT.delivery_id,
+        "--try",
+        "1/3",
         "--",
         "/home/orion/venv/bin/basecradle-harness-wake",
         "--timeline",
@@ -306,7 +335,7 @@ def test_home_server_waker_passes_no_env_and_an_irrelevant_cwd() -> None:
     # The wrapper loads the agent's own env after the privilege drop, so the
     # router must hand over nothing — no secret ever flows through it.
     runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+    HomeServerWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert runner.invocation is not None
     assert runner.invocation.env == {}
     assert runner.invocation.cwd == "/"
@@ -325,7 +354,7 @@ def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> No
         origin=EVENT.origin,
     )
     runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner).wake(NOVA, event)
+    HomeServerWaker(runner=runner).wake(NOVA, event, quick_try=FIRST_TRY)
     assert runner.invocation is not None
     assert runner.invocation.argv[-1] == nasty  # exactly one element, verbatim
     assert runner.invocation.argv.count(nasty) == 1
@@ -333,7 +362,9 @@ def test_home_server_waker_carries_the_trigger_as_one_inert_argv_element() -> No
 
 def test_home_server_waker_honours_a_custom_wrapper_path() -> None:
     runner = _FakeRunner(WakeResult(exit_code=0))
-    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner").wake(NOVA, EVENT)
+    HomeServerWaker(runner=runner, wrapper="/opt/x/wake-runner").wake(
+        NOVA, EVENT, quick_try=FIRST_TRY
+    )
     assert runner.invocation is not None
     assert runner.invocation.argv[1] == "/opt/x/wake-runner"
 
@@ -341,7 +372,7 @@ def test_home_server_waker_honours_a_custom_wrapper_path() -> None:
 def test_home_server_waker_raises_wake_error_on_non_zero_exit() -> None:
     runner = _FakeRunner(WakeResult(exit_code=3, stderr="refusing: not a registered agent clone"))
     with pytest.raises(WakeError, match="not a registered agent clone") as excinfo:
-        HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+        HomeServerWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert excinfo.value.exit_code == 3
     assert NOVA.key in str(excinfo.value)
 
@@ -366,7 +397,7 @@ def test_a_stop_signal_exit_raises_wake_stopped_not_wake_error(
 ) -> None:
     waker = waker_kind(runner=_FakeRunner(WakeResult(exit_code=exit_code)))
     with pytest.raises(WakeStopped) as excinfo:
-        waker.wake(NOVA, EVENT)
+        waker.wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert excinfo.value.signal == signal
     assert excinfo.value.exit_code == exit_code
     assert f"SIG{signal}" in str(excinfo.value)
@@ -386,5 +417,37 @@ def test_a_stop_is_not_a_wake_error_so_no_failure_handler_can_swallow_it() -> No
 def test_every_other_non_zero_exit_is_still_a_crash_with_its_retry(exit_code: int) -> None:
     runner = _FakeRunner(WakeResult(exit_code=exit_code))
     with pytest.raises(WakeError) as excinfo:
-        HomeServerWaker(runner=runner).wake(NOVA, EVENT)
+        HomeServerWaker(runner=runner).wake(NOVA, EVENT, quick_try=FIRST_TRY)
     assert excinfo.value.exit_code == exit_code
+
+
+# --- the wake is told which quick try it is (#533) ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "quick_try", [WakeTry(1, 3), WakeTry(2, 3), WakeTry(3, 3), WakeTry(1, 1)], ids=str
+)
+def test_a_subprocess_wake_carries_its_exact_try(quick_try: WakeTry) -> None:
+    runner = _FakeRunner(WakeResult(exit_code=0))
+    SubprocessWaker(runner=runner).wake(NOVA, EVENT, quick_try=quick_try)
+    assert runner.invocation is not None
+    assert runner.invocation.env[TRY_ENV] == str(quick_try.number)
+    assert runner.invocation.env[TRIES_ENV] == str(quick_try.of)
+
+
+@pytest.mark.parametrize(
+    "quick_try", [WakeTry(1, 3), WakeTry(2, 3), WakeTry(3, 3), WakeTry(1, 1)], ids=str
+)
+def test_a_home_server_wake_carries_its_exact_try_before_the_command(quick_try: WakeTry) -> None:
+    argv = HomeServerWaker().invocation_for(NOVA, EVENT, quick_try=quick_try).argv
+    assert argv[argv.index("--try") + 1] == f"{quick_try.number}/{quick_try.of}"
+    assert argv.index("--try") < argv.index("--")
+    assert argv.count("--try") == 1
+
+
+def test_a_try_is_never_past_its_bound_and_is_never_an_attempt() -> None:
+    with pytest.raises(ValueError, match="a quick try is 1..3, got 4"):
+        WakeTry(4, 3)
+    with pytest.raises(ValueError, match="a quick try is 1..3, got 0"):
+        WakeTry(0, 3)
+    assert WakeTry(1, 3) != wake_module.WakeAttempt(1, 3)

@@ -113,7 +113,7 @@ def test_retry_returns_immediately_on_success() -> None:
     sleep = _Recorder()
     calls = []
 
-    def op() -> str:
+    def op(_try: int) -> str:
         calls.append(1)
         return "woke"
 
@@ -126,14 +126,15 @@ def test_retry_succeeds_after_transient_failures() -> None:
     sleep = _Recorder()
     attempts_seen = []
 
-    def op() -> str:
-        attempts_seen.append(1)
+    def op(tried: int) -> str:
+        attempts_seen.append(tried)
         if len(attempts_seen) < 3:
             raise TransientError("transient blip")
         return "woke"
 
     assert with_retry(op, attempts=3, base_delay=0.5, sleep=sleep) == "woke"
-    assert len(attempts_seen) == 3
+    # Each try is handed its own number, from the loop that counts them (#533).
+    assert attempts_seen == [1, 2, 3]
     # Slept between the two failed attempts, with exponential backoff.
     assert sleep.delays == [0.5, 1.0]
 
@@ -142,8 +143,8 @@ def test_retry_gives_up_after_the_bound() -> None:
     sleep = _Recorder()
     calls = []
 
-    def op() -> str:
-        calls.append(1)
+    def op(tried: int) -> str:
+        calls.append(tried)
         raise TransientError("always failing")
 
     with pytest.raises(RetryExhausted) as excinfo:
@@ -151,7 +152,7 @@ def test_retry_gives_up_after_the_bound() -> None:
 
     assert excinfo.value.attempts == 3
     assert isinstance(excinfo.value.__cause__, TransientError)
-    assert len(calls) == 3  # tried exactly the bound
+    assert calls == [1, 2, 3]  # tried exactly the bound, and never numbered past it
     assert sleep.delays == [0.5, 1.0]  # slept between tries, not after the last
 
 
@@ -159,7 +160,7 @@ def test_retry_does_not_catch_non_transient_errors() -> None:
     sleep = _Recorder()
     calls = []
 
-    def op() -> str:
+    def op(_try: int) -> str:
         calls.append(1)
         raise ValueError("permanent")
 
@@ -172,4 +173,4 @@ def test_retry_does_not_catch_non_transient_errors() -> None:
 
 def test_retry_rejects_non_positive_attempts() -> None:
     with pytest.raises(ValueError, match="attempts must be >= 1"):
-        with_retry(lambda: None, attempts=0)
+        with_retry(lambda _try: None, attempts=0)

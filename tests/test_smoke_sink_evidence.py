@@ -49,7 +49,7 @@ from basecradle_router.routes.probe import ProbeRoute
 from basecradle_router.secret import Secret
 from basecradle_router.server import WebhookServer
 from basecradle_router.synthetic import MARK_HEADER, WINDOW, mint
-from basecradle_router.wake import WakeAttempt, WakeResult
+from basecradle_router.wake import WakeAttempt, WakeResult, WakeTry
 from basecradle_router.wakelock import WakeLockGuard
 
 GITHUB_SECRET = "fake-github-webhook-secret-" + "0" * 32
@@ -75,7 +75,12 @@ REAL_SINKS = ("github", "basecradle")
 
 class _Waker:
     def wake(
-        self, agent: Agent, event: Event, attempt: WakeAttempt | None = None
+        self,
+        agent: Agent,
+        event: Event,
+        attempt: WakeAttempt | None = None,
+        *,
+        quick_try: WakeTry,
     ) -> WakeResult:  # pragma: no cover - no case wakes
         raise AssertionError(f"no smoke case may wake an agent: {event.delivery_id}")
 
