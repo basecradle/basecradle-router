@@ -52,7 +52,7 @@ def _wake_env(
     clone.mkdir()
     proc = subprocess.run(
         ["bash", "-c", _agent_script(), "wake-runner", str(clone), DELIVERY, attempt, attempts]
-        + [try_number, tries, "", "", "", "", shutil.which("env") or "/usr/bin/env", "-0"],
+        + [try_number, tries, "", "", "", "", "", shutil.which("env") or "/usr/bin/env", "-0"],
         capture_output=True,
         text=True,
         env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
@@ -131,4 +131,4 @@ def test_the_try_flag_is_parsed_strictly_and_a_probe_takes_only_one_of_one() -> 
     assert "[[ -z $try_number || $try_number/$tries == 1/1 ]] ||" in text
     assert 'die "refusing: --probe takes only --try 1/1"' in text
     # Handed to the agent script in its own two positions, after the attempt's.
-    assert '"$attempt" "$attempts" "$try_number" "$tries" "$stream_python"' in text
+    assert '"$attempt" "$attempts" "$try_number" "$tries" "$sealed" "$stream_python"' in text

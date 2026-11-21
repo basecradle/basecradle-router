@@ -480,6 +480,10 @@ NO_SECRET: dict[str, str] = {
         "reads the registry (no secrets) and the account database, and runs systemctl with a"
         " constant argv; reads no credential"
     ),
+    "deploy/bin/set-wake-bin": (
+        "reads and writes the registry (no secrets) and stats a harness tree with find, jq,"
+        " chown, chmod and mv; reads no credential"
+    ),
     "deploy/verify-recovery.sh": "systemctl and the loopback /up; reads no credential",
     "src/basecradle_router/wake.py": (
         "builds `sudo wake-runner …` from the registry and the event, with an empty"

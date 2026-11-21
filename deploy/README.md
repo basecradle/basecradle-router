@@ -97,6 +97,10 @@ the daemon's *wake targets*, resolved from the registry below. Provisioning them
                                    #   inside its environment, so it must not be agent- or
                                    #   router-writable; it loads only three source files from
                                    #   app/src, each verified root-owned from `/` down first.
+  bin/set-wake-bin                 # root-owned (root:root, 0755) one-field registry setter (#535):
+                                   #   moves one harness agent's wake_bin between its home and its
+                                   #   sealed tree, judged by wake-runner's own gate. Run by root
+                                   #   (the NOC), never through the router's sudoers rule.
   bin/fleet-writers                # root-owned (root:root, 0755) writer-map builder (#484), run as
                                    #   root by basecradle-router-writers.service before every daemon
                                    #   start; writes /etc/vector/fleet-writers.csv (Part 5).
@@ -907,6 +911,8 @@ An entry's `kind` selects how it is read (absent ⇒ `github`); existing github 
   },
   // A harness agent: woken via its OWN wake CLI in its venv, resolved by its
   // BaseCradle user uuid. No bot_slug; carries kind/recipient_uuid/wake_bin.
+  // Unsealed, shown here: the venv is in its home. Sealed, the wake_bin is
+  // /opt/basecradle-harness/venv/nova/bin/basecradle-harness-wake (#535, below).
   "nova": {
     "kind": "harness",
     "os_user": "nova",
@@ -918,12 +924,13 @@ An entry's `kind` selects how it is read (absent ⇒ `github`); existing github 
 ```
 
 The `wake-runner` reads the same registry: for a harness entry it launches **only** the pinned
-`wake_bin` (which must lie inside that agent's `/home/<user>`), never a caller-supplied path — the
-same registry-is-the-only-authority rule that confines builders to the system `claude`.
+`wake_bin` (which must lie inside that agent's sealed tree, or, while it has none, its `/home/<user>`:
+*A sealed harness agent*, below), never a caller-supplied path — the same
+registry-is-the-only-authority rule that confines builders to the system `claude`.
 
 #### The clone and the `wake_bin` must be plain paths — no symlink component (basecradle/basecradle#576)
 
-Both live inside a directory **the agent writes**, and both are checked by root *before* the privilege
+The clone, and an unsealed agent's `wake_bin`, live inside a directory **the agent writes**, and both are checked by root *before* the privilege
 drop. So `wake-runner` puts them through one gate, `confined_path`, which walks the path a component at
 a time from `/home/<user>` and **refuses the first component that is a symlink** — and refuses `..`, `.`,
 a relative path, and a non-canonical one (`//`, a trailing `/`) itself rather than handing them to a
@@ -935,6 +942,68 @@ stops waking.** Point the registry at the real path instead; a venv's wake scrip
 ordinary files and directories, so this is a constraint on how an entry is written, not on what can be
 registered. Nothing about the privilege boundary changed — the `cd` and the `exec` still happen after the
 drop, as the agent, which is what makes root's part of this a check and not an action.
+
+#### A sealed harness agent: its `wake_bin` outside the home (#535)
+
+An unsealed agent's venv is in its home, which it writes, so it can rename the folder and put its own in
+its place. A **sealed** agent's environment is at **`/opt/basecradle-harness/venv/<os_user>/`**, built by
+the NOC: `/opt/basecradle-harness` and its `venv` are `root:root 0755`, and the tree is owned by a
+per-agent updater account the agent shares no group with, so the agent reads and runs it through its own
+group and can never write, `chmod`, rename or replace it. The path is one constant, `SEALED_BASE`, in
+`wake-runner` and `set-wake-bin`, and a test holds the two equal.
+
+**The registry decides which place an agent wakes from; `wake-runner` never infers it.** Inferring
+"sealed" from the tree's presence would read a sealed agent whose tree went missing as an unsealed one and
+fall back to its home. Every harness `wake_bin` goes through one gate, `harness_wake_bin`:
+
+- **Under `/opt/basecradle-harness/venv/`** → the two parents must be real directories (no symlink),
+  owned by root, with no group or other write and no access control list; the path is walked by
+  `confined_path` rooted at `venv/<os_user>`, so it names **that** agent's tree and no other; no entry on
+  it may be owned by the agent or by `router`, be writable by its group or by others, or carry an access
+  control list (a directory's setgid bit, how the group is handed down, passes); the binary must be a
+  regular file and may not be setuid or setgid; and the interpreter it runs may not be either. The interpreter
+  is judged twice: the one its `#!` line names, which must be an absolute path that exists and never
+  `env` (the kernel resolves a relative one against the agent's clone, and `env` resolves it off the
+  agent's `PATH`), and the tree's own `bin/python`, which is what a uv console script runs whatever its
+  first line says (uv writes a `#!/bin/sh` trampoline for a path over 127 bytes). A venv's `bin/python`
+  is a link to the box's interpreter, so this is the **one place the gate follows a link**: the file it
+  finally names must exist, may not be the agent's or writable by group or others, and may not be
+  set-id. The rest of the venv (`site-packages`, the directories above the interpreter) is the NOC's
+  build to keep sealed.
+- **Under `/home/<os_user>/`** → today's rule, **only while `venv/<os_user>` does not exist**. Its
+  existence, as anything at all, a dangling link included, means the NOC has sealed the agent (only root can
+  create an entry there), so a registry still naming the home is refused, not followed.
+- **Anywhere else** → refused.
+
+A refusal names the check and launches nothing; a probe resolves through the same gate, so `router-admin
+probe wake` proves a sealed agent's edge with no model call. **A sealed agent's own `agent.env` cannot point
+the loader or the interpreter at its code:** after it loads, every `LD_*` and `PYTHON*` variable is
+dropped, whoever set it (but `PYTHONUNBUFFERED`, `PYTHONUTF8`, `PYTHONIOENCODING` and
+`PYTHONDONTWRITEBYTECODE`, which load no code), so a `PYTHONPATH` to a `sitecustomize.py` in the home, or
+an `LD_PRELOAD`, never reaches the sealed interpreter or its children. **That is not a seal of the
+environment.** `agent.env` is still the agent's own file, and a name a library reads (`OPENSSL_CONF`,
+`GCONV_PATH`) still reaches the sealed process; closing that is a decision about where a sealed agent's
+env file lives, and it is #536.
+
+**Moving one agent: `set-wake-bin`.** Root runs
+`/opt/basecradle-router/bin/set-wake-bin <agent-key> <wake_bin>`, which changes
+`.[<agent-key>].wake_bin` of one harness entry and no other value (jq writes the file back in its own
+layout). It judges the value with `wake-runner`'s own gate, carried byte for byte
+(`tests/test_set_wake_bin.py` pins the copy), so it never writes a value the next wake would refuse. It
+holds an exclusive lock on `/etc/basecradle-router` from the read to the rename (a lock not had in 30
+seconds is a refusal, never a wait inside the wake-lock), writes the one fixed-name staging slot
+`/etc/basecradle-router/.agents.json.set-wake-bin.tmp`, gives it the registry's own owner, group and
+mode, and renames it over `agents.json`. The slot is removed by every run, a failed one included. It restarts nothing. The NOC's conversion, per agent:
+
+1. Hold the agent's wake-lock.
+2. Build the tree at its final name, `/opt/basecradle-harness/venv/<os_user>`.
+3. `set-wake-bin <slug> /opt/basecradle-harness/venv/<os_user>/bin/basecradle-harness-wake`.
+4. Restart the daemon once, idle-gated: it reads the registry at start, and until then it passes the old
+   value, which `wake-runner` refuses by name.
+5. Release the lock.
+
+Unsealing reverses it: the tree goes first, then `set-wake-bin` back to the home path. In every wrong order
+the wake is refused by name, never run from the other place.
 
 Each agent's own secrets live in a per-agent `agent.env` that the **wrapper** loads *as that user* after
 the privilege drop — the live implementation of `wake.py`'s `env_provider` seam, so the unprivileged

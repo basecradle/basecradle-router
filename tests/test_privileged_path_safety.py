@@ -18,16 +18,17 @@ root-run or daemon-run path of ours touches a directory another account writes i
 *read* whose act happens after the privilege drop: ``deploy/bin/wake-runner`` resolves the
 clone and the harness ``wake_bin`` as root, then ``cd``s and ``exec``s as the **agent**.
 No root write, chown, chmod or delete under an agent-writable path exists. So this module
-guards the shape rather than a live bug — the two pre-drop resolutions now go through one
-component-wise gate, and the scanner below fails the build when new privileged code
-reaches an agent-writable path any other way.
+guards the shape rather than a live bug — the two pre-drop resolutions go through one
+component-wise gate (the ``wake_bin`` by way of its own gate, which picks the agent's sealed
+tree or its home first, #535), and the scanner below fails the build when new privileged
+code reaches an agent-writable path any other way.
 
 Five guards, each with a positive control so none can pass vacuously:
 
 1. **the helper itself** — the shipped ``confined_path`` body, run in bash against a real
    sandbox, must refuse every link, ``..``, and non-canonical shape, and change nothing;
 2. **the call sites** — the caller's ``--cwd`` and the registry's ``wake_bin`` (and
-   anything they flow into) may reach a filesystem operation *only* through the helper,
+   anything they flow into) may reach a filesystem operation *only* through a gate,
    in **every** shipped shell script, not just the one that has the problem today;
 3. **the literals** — ``/home/`` may appear in a shipped file only as an operand of the
    helper, or under ``/home/router`` (the daemon's own home, which is not an agent's);
@@ -61,9 +62,23 @@ from basecradle_router.__main__ import ManifestWriteError, _write_manifests
 REPO = Path(__file__).resolve().parents[1]
 WAKE_RUNNER = REPO / "deploy" / "bin" / "wake-runner"
 
-#: The one sanctioned gate. Named once, here, so a rename in the script fails loudly
+#: The component-wise gate. Named once, here, so a rename in the script fails loudly
 #: in the call-site guard rather than silently disarming it.
 HELPER = "confined_path"
+
+#: The harness ``wake_bin``'s gate (#535): it chooses between the agent's sealed tree and
+#: its home, and walks whichever it chose with ``HELPER``. Proven behaviourally in
+#: ``tests/test_wake_runner_sealed.py``, so it is a sanctioner here, exactly as HELPER is.
+HARNESS_GATE = "harness_wake_bin"
+
+#: Every sanctioned gate. A path the caller or the registry chose reaches the filesystem
+#: only through one of these, and each is proven against a real sandbox, never scanned.
+GATES = (HELPER, HARNESS_GATE)
+
+
+def _names_a_gate(line: str) -> bool:
+    return any(gate in line for gate in GATES)
+
 
 #: The daemon's own home. Not an agent's, so naming it is not a finding — it is where
 #: `basecradle-router.service` finds `uv`.
@@ -351,11 +366,11 @@ def _outside_helper(text: str) -> list[tuple[int, str]]:
     Part 1 proves the helper behaviourally, against a real sandbox. Scanning it here
     would only ask whether the gate goes through itself.
     """
-    span = _helper_span(text)
+    spans = [span for gate in GATES if (span := _helper_span(text, gate))]
     return [
         (lineno, line)
         for lineno, line in logical_lines(text)
-        if not (span and span[0] <= lineno <= span[1])
+        if not any(start <= lineno <= end for start, end in spans)
     ]
 
 
@@ -388,7 +403,7 @@ def untrusted_path_names(text: str) -> set[str]:
     while changed:
         changed = False
         for _, line in lines:
-            if HELPER in line:
+            if _names_a_gate(line):
                 continue
             if not _names_in(line) & names:
                 continue
@@ -404,7 +419,7 @@ def scan_call_sites(text: str) -> list[Violation]:
     names = untrusted_path_names(text)
     violations: list[Violation] = []
     for lineno, line in _outside_helper(text):
-        if HELPER in line:
+        if _names_a_gate(line):
             continue
         for segment in _segments(line):
             tainted = {
@@ -413,20 +428,22 @@ def scan_call_sites(text: str) -> list[Violation]:
             if not tainted:
                 continue
             violations.append(
-                Violation(lineno, line, f"acts on a path from {sorted(tainted)} without {HELPER}")
+                Violation(
+                    lineno, line, f"acts on a path from {sorted(tainted)} without one of {GATES}"
+                )
             )
             break
     return violations
 
 
-def _helper_span(text: str) -> tuple[int, int] | None:
-    """The 1-based line range of the ``confined_path`` marker block, if present."""
+def _helper_span(text: str, gate: str = HELPER) -> tuple[int, int] | None:
+    """The 1-based line range of one gate's marker block, if present."""
     lines = text.splitlines()
     opening = closing = None
     for index, line in enumerate(lines, start=1):
-        if f"# >>> {HELPER} >>>" in line:
+        if f"# >>> {gate} >>>" in line:
             opening = index
-        elif f"# <<< {HELPER} <<<" in line:
+        elif f"# <<< {gate} <<<" in line:
             closing = index
     if opening is None or closing is None:
         return None
@@ -764,11 +781,23 @@ def test_single_quoted_and_post_drop_code_is_not_scanned() -> None:
     assert not scan_call_sites(sample)
 
 
-def test_both_wake_paths_are_confined_to_the_agents_own_home() -> None:
-    """The clone and the harness ``wake_bin`` each go through the gate, rooted at /home/<user>."""
-    view = "\n".join(line for _, line in logical_lines(WAKE_RUNNER.read_text()))
-    calls = re.findall(rf'{HELPER} "[^"]+" "(/home/\$\w+)" "\$(\w+)"', view)
-    assert sorted(calls) == [("/home/$user", "cwd"), ("/home/$user", "wake_bin")], calls
+def test_both_wake_paths_are_confined_to_the_agents_own_places() -> None:
+    """The clone goes through the gate at /home/<user>; the ``wake_bin`` through its own gate.
+
+    The harness gate is handed the agent's home and the sealed base (#535), and nothing
+    else: the base is a root-owned constant, never a value the caller or the registry chose.
+    """
+    text = WAKE_RUNNER.read_text()
+    view = "\n".join(line for _, line in logical_lines(text))
+    clone = re.findall(rf'{HELPER} "[^"]+" "(/home/\$\w+)" "\$(\w+)"', view)
+    assert clone == [("/home/$user", "cwd")], clone
+    harness = re.findall(
+        rf'{HARNESS_GATE} "[^"]+" "(/home/\$\w+)" "\$(\w+)" "\$(\w+)" "\$(\w+)"', view
+    )
+    assert harness == [("/home/$user", "SEALED_BASE", "user", "wake_bin")], harness
+    assert re.findall(r"^SEALED_BASE=.*$", text, re.MULTILINE) == [
+        "SEALED_BASE=/opt/basecradle-harness"
+    ]
 
 
 def test_the_root_owned_wrappers_resolve_no_path_themselves() -> None:
@@ -828,8 +857,8 @@ def agent_home_literals(path: Path) -> list[Violation]:
     )
     violations = []
     for lineno, line in lines:
-        if HELPER in line:
-            continue  # the gate's own trusted root is the one sanctioned spelling
+        if _names_a_gate(line):
+            continue  # a gate's own trusted root is the one sanctioned spelling
         if re.search(_FOREIGN_HOME, line):
             violations.append(Violation(lineno, line, "names an agent home outside the gate"))
     return violations
