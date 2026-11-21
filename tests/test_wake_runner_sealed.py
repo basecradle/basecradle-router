@@ -87,6 +87,9 @@ class Box:
             text=True,
             env={"PATH": "/usr/bin:/bin"},
             check=False,
+            # The gate reads a file as root; one that blocks it (a FIFO) must fail the test,
+            # never hang the suite.
+            timeout=30,
         )
 
 
@@ -484,3 +487,120 @@ def test_a_sh_trampoline_does_not_vouch_for_the_python_it_runs(box: Box, tmp_pat
     assert done.returncode == 1
     assert "tree interpreter" in done.stderr
     assert "or writable by its group or by others" in done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# What the gate also refuses: not a regular file, an access control list.       #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_directory_named_as_the_wake_bin_is_refused(box: Box) -> None:
+    # `-x` is true of a directory, so without this it would pass and fail only at exec.
+    _build_tree(box)
+    done = box.gate(box.tree() / "bin")
+    assert done.returncode == 1
+    assert "is not a regular file" in done.stderr
+
+
+def test_a_fifo_named_as_the_wake_bin_is_refused_without_blocking(box: Box) -> None:
+    _build_tree(box)
+    box.sealed_bin().unlink()
+    os.mkfifo(box.sealed_bin(), 0o755)
+    done = box.gate(box.sealed_bin())  # a read of the FIFO would hang here, as root
+    assert done.returncode == 1
+    assert "is not a regular file" in done.stderr
+
+
+def _grant_by_acl(path: Path) -> None:
+    """Put an access control list on ``path`` that its mode bits do not show.
+
+    On Linux a named entry's write is masked by the group bits, so a list that grants an
+    effective write already reads as group-writable; the mask here is cut to ``r-x`` so only
+    the list itself is left to see, which is the check under test.
+    """
+    if sys.platform == "darwin":
+        command = ["chmod", "+a", "everyone allow write", str(path)]
+    elif shutil.which("setfacl"):
+        command = ["setfacl", "-m", "u:nobody:rwx,m::rx", str(path)]
+    else:
+        pytest.skip("no way to set an access control list here")
+    if subprocess.run(command, capture_output=True, check=False).returncode != 0:
+        pytest.skip("this filesystem refuses an access control list")
+    listing = subprocess.run(["ls", "-ld", str(path)], capture_output=True, text=True).stdout
+    if not listing.split()[0].endswith("+"):
+        pytest.skip(f"`ls` does not mark this list ({listing.split()[0]}): extended attributes win")
+
+
+def test_a_tree_entry_carrying_an_access_control_list_is_refused(box: Box) -> None:
+    _build_tree(box)
+    _grant_by_acl(box.tree() / "bin")
+    done = box.gate(box.sealed_bin())
+    assert done.returncode == 1
+    assert f"{box.tree()}/bin carries an access control list" in done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# A sealed agent's own agent.env cannot choose code for the tree to run.         #
+# --------------------------------------------------------------------------- #
+
+
+def _agent_script() -> str:
+    match = re.search(r"^AGENT_SCRIPT='\n(.*?)\n'$", WAKE_RUNNER.read_text(), re.S | re.M)
+    assert match, "AGENT_SCRIPT not found"
+    return match.group(1)
+
+
+INJECTING = (
+    "PYTHONPATH=/home/nova/inject\nPYTHONHOME=/home/nova/py\nPYTHONSTARTUP=/home/nova/s.py\n"
+    "LD_PRELOAD=/home/nova/evil.so\nLD_LIBRARY_PATH=/home/nova/lib\nLD_AUDIT=/home/nova/a.so\n"
+    "GH_APP_SLUG=nova-ai\n"
+)
+
+
+def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
+    """Run the shipped agent script, as the drop does, and return the env it execs with."""
+    home = tmp_path / "home"
+    (home / ".config" / "basecradle").mkdir(parents=True)
+    (home / ".config" / "basecradle" / "agent.env").write_text(INJECTING)
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _agent_script(),
+            "wake-runner",
+            str(clone),
+            "0192f3a4-5b6c-7d8e-9f01-0000000000ab",
+        ]
+        + ["", "", "", "", sealed, "", "", "", "", shutil.which("env") or "/usr/bin/env", "-0"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return dict(pair.split("=", 1) for pair in proc.stdout.split("\0") if "=" in pair)
+
+
+def test_a_sealed_wake_drops_every_loader_and_interpreter_variable(tmp_path: Path) -> None:
+    env = _woken_env(tmp_path, "sealed")
+    assert not [name for name in env if name.startswith(("LD_", "PYTHON"))], env
+    # Everything else the agent's env file sets still arrives, and so does the router's mark.
+    assert env["GH_APP_SLUG"] == "nova-ai"
+    assert env["BASECRADLE_DELIVERY_ID"] == "0192f3a4-5b6c-7d8e-9f01-0000000000ab"
+
+
+def test_an_unsealed_wake_keeps_its_env_file_as_it_was(tmp_path: Path) -> None:
+    # The positive control: the scrub is the sealed branch's alone, so the test above is not
+    # passing on a loader that never exported the variables at all.
+    env = _woken_env(tmp_path, "")
+    assert env["PYTHONPATH"] == "/home/nova/inject"
+    assert env["LD_PRELOAD"] == "/home/nova/evil.so"
+
+
+def test_root_marks_a_wake_sealed_only_from_the_gates_own_answer() -> None:
+    text = WAKE_RUNNER.read_text()
+    assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed' in text
+    # Set in exactly two places: cleared with the other flags, and set from the gate's output.
+    assert len(re.findall(r"\bsealed=", text)) == 2

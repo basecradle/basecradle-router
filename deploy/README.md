@@ -957,10 +957,11 @@ group and can never write, `chmod`, rename or replace it. The path is one consta
 fall back to its home. Every harness `wake_bin` goes through one gate, `harness_wake_bin`:
 
 - **Under `/opt/basecradle-harness/venv/`** → the two parents must be real directories (no symlink),
-  owned by root, with no group or other write; the path is walked by `confined_path` rooted at
-  `venv/<os_user>`, so it names **that** agent's tree and no other; no entry on it may be owned by the agent
-  or writable by its group or by others (a directory's setgid bit, how the group is handed down, passes);
-  the binary may not be setuid or setgid; and the interpreter it runs may not be either. The interpreter
+  owned by root, with no group or other write and no access control list; the path is walked by
+  `confined_path` rooted at `venv/<os_user>`, so it names **that** agent's tree and no other; no entry on
+  it may be owned by the agent or by `router`, be writable by its group or by others, or carry an access
+  control list (a directory's setgid bit, how the group is handed down, passes); the binary must be a
+  regular file and may not be setuid or setgid; and the interpreter it runs may not be either. The interpreter
   is judged twice: the one its `#!` line names, which must be an absolute path that exists and never
   `env` (the kernel resolves a relative one against the agent's clone, and `env` resolves it off the
   agent's `PATH`), and the tree's own `bin/python`, which is what a uv console script runs whatever its
@@ -975,13 +976,17 @@ fall back to its home. Every harness `wake_bin` goes through one gate, `harness_
 - **Anywhere else** → refused.
 
 A refusal names the check and launches nothing; a probe resolves through the same gate, so `router-admin
-probe wake` proves a sealed agent's edge with no model call.
+probe wake` proves a sealed agent's edge with no model call. **A sealed agent's own `agent.env` cannot
+choose code for its tree to run:** after it loads, every `LD_*` and `PYTHON*` variable is dropped,
+whoever set it, so a `PYTHONPATH` to a `sitecustomize.py` in the home, or an `LD_PRELOAD`, never
+reaches the sealed interpreter or its children.
 
 **Moving one agent: `set-wake-bin`.** Root runs
 `/opt/basecradle-router/bin/set-wake-bin <agent-key> <wake_bin>`, which changes `.[<agent-key>].wake_bin`
-of one harness entry and nothing else. It judges the value with `wake-runner`'s own gate, carried byte for
+of one harness entry and no other value (jq writes the file back in its own layout). It judges the value with `wake-runner`'s own gate, carried byte for
 byte (`tests/test_set_wake_bin.py` pins the copy), so it never writes a value the next wake would refuse.
-It holds an exclusive lock on `/etc/basecradle-router` from the read to the rename, writes the one
+It holds an exclusive lock on `/etc/basecradle-router` from the read to the rename (a lock not had in
+30 seconds is a refusal, never a wait inside the wake-lock), writes the one
 fixed-name staging slot `/etc/basecradle-router/.agents.json.set-wake-bin.tmp`, gives it the registry's
 own owner, group and mode, and renames it over `agents.json`. The slot is removed by every run, a failed
 one included. It restarts nothing. The NOC's conversion, per agent:

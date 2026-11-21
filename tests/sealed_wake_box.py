@@ -5,7 +5,8 @@ Run as root by ``tests/test_sealed_wake_root.py``, always under
 
     unshare --mount --propagation private -- python3 -I sealed_wake_box.py '<spec json>'
 
-It lays an overlay over ``/etc``, ``/opt`` and ``/home``, whose upper layers sit on a tmpfs
+It lays an overlay over ``/etc``, ``/opt``, ``/home`` and ``/var`` (where an account's
+creation would otherwise leave its log records), whose upper layers sit on a tmpfs
 mounted at the spec's scratch directory, so every account, registry, tree and file it makes
 exists only in this namespace and is gone when the process exits. The real filesystem is read,
 never written: ``wake-runner`` keeps its constant paths (``/etc/basecradle-router/agents.json``,
@@ -105,8 +106,15 @@ def install(source: Path, dest: Path, mode: int, owner: str = "root", group: str
 
 
 def build_agent(user: str, sealed: bool, spec: dict, scratch: Path) -> None:
-    sh("useradd", "--create-home", "--user-group", "--shell", "/bin/bash", user)
-    sh("useradd", "--system", "--no-create-home", "--user-group", f"harness-up-{user}")
+    sh("useradd", "--create-home", "--no-log-init", "--user-group", "--shell", "/bin/bash", user)
+    sh(
+        "useradd",
+        "--system",
+        "--no-create-home",
+        "--no-log-init",
+        "--user-group",
+        f"harness-up-{user}",
+    )
     home = Path(f"/home/{user}")
     clone = home / "harness"
     config = home / ".config" / "basecradle"
@@ -163,10 +171,11 @@ def main(spec: dict) -> dict:
     repo = Path(spec["repo"])
     scratch = Path(spec["scratch"])
     sh("mount", "-t", "tmpfs", "-o", "mode=0700", "tmpfs", str(scratch))
-    for target in ("/etc", "/opt", "/home"):
+    for target in ("/etc", "/opt", "/home", "/var"):
         overlay(scratch, target)
 
-    sh("groupadd", "--system", "router")
+    # The daemon's account, as on the box: the gate refuses a tree it owns.
+    sh("useradd", "--system", "--no-create-home", "--no-log-init", "--user-group", "router")
     for directory in (BASE, BASE / "venv", ROUTER_BIN, REGISTRY.parent):
         directory.mkdir(parents=True, exist_ok=True)
         sh("chown", "root:root", str(directory))
@@ -217,6 +226,7 @@ def main(spec: dict) -> dict:
         ),
         "staging_left": STAGING.exists() or STAGING.is_symlink(),
         "woke": woke.read_text() if woke.exists() else None,
+        "exists": {path: Path(path).exists() for path in spec.get("check_paths", [])},
     }
 
 

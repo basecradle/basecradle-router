@@ -7,10 +7,11 @@
 #
 #   set-wake-bin <agent-key> <wake_bin>
 #
-# It exists so the NOC can seal or unseal one agent inside one short hold of that agent's
-# wake-lock with no person in the loop: build the tree out of sight, then, holding the lock,
-# give the tree its final name, run this, restart the daemon, release the lock. It changes
-# exactly one field of exactly one entry, and nothing else in the file.
+# It exists so the NOC can seal or unseal one agent inside one hold of that agent's wake-lock
+# with no person in the loop: hold the lock, build the tree at its final name (a venv's scripts
+# name its own path, so it cannot be renamed after it is built), run this, restart the daemon
+# once, release the lock. It changes one field of one entry and no other value in the
+# document; jq writes the file back in its own layout.
 #
 # THE VALUE IS JUDGED BY WAKE-RUNNER'S OWN GATE, BEFORE IT IS WRITTEN. `harness_wake_bin`
 # below is wake-runner's, byte for byte (tests/test_set_wake_bin.py pins it), so a value this
@@ -24,7 +25,8 @@
 # restart is a loud refusal, never a wake from the old tree. This program restarts nothing:
 # the restart is the NOC's step, in the same hold.
 #
-# THE WRITE. Under an exclusive lock on the registry's directory, so two runs cannot interleave.
+# THE WRITE. Under an exclusive lock on the registry's directory, so two runs cannot interleave;
+# a lock not had within LOCK_WAIT seconds is a refusal, never a wait that holds the wake-lock.
 # The new file is written to one fixed-name staging slot beside the registry, given the
 # registry's own owner, group and mode, and renamed over it, so a reader sees the old file or
 # the new one and never part of either. The slot is removed by every run, a failed one
@@ -34,6 +36,7 @@ set -euo pipefail
 REGISTRY=/etc/basecradle-router/agents.json
 STAGING=/etc/basecradle-router/.agents.json.set-wake-bin.tmp
 MIN_UID=1000
+LOCK_WAIT=30
 # wake-runner's constant, and for its reason: whoever could choose it would choose what the
 # agent's wake runs. tests/test_set_wake_bin.py holds the two equal.
 SEALED_BASE=/opt/basecradle-harness
@@ -203,7 +206,7 @@ not_set_id() {
 }
 
 not_writable_by_others() {
-	local label=$1 entry=$2 found
+	local label=$1 entry=$2 found mode
 	found="$(find "$entry" -prune \( -perm -g+w -o -perm -o+w \) -print)" || {
 		printf 'wake-runner: refusing: %s: could not read the mode of %s\n' "$label" "$entry" >&2
 		return 1
@@ -211,6 +214,17 @@ not_writable_by_others() {
 	if [[ -n $found ]]; then
 		printf 'wake-runner: refusing: %s: %s is writable by its group or by others\n' \
 			"$label" "$entry" >&2
+		return 1
+	fi
+	# The mode bits are not the whole answer: an access control list can grant a write they
+	# do not show, and `ls` marks an entry that carries one with a trailing `+`.
+	mode="$(ls -ld -- "$entry")" || {
+		printf 'wake-runner: refusing: %s: could not read the mode of %s\n' "$label" "$entry" >&2
+		return 1
+	}
+	mode=${mode%% *}
+	if [[ $mode == *+ ]]; then
+		printf 'wake-runner: refusing: %s: %s carries an access control list\n' "$label" "$entry" >&2
 		return 1
 	fi
 }
@@ -225,6 +239,19 @@ not_the_agents() {
 		printf 'wake-runner: refusing: %s: %s is owned by %s; a sealed tree is never the agent'"'"'s own\n' \
 			"$label" "$entry" "$user" >&2
 		return 1
+	fi
+	# Nor the router's: it is the account this wrapper fences, and a tree it owned is one it
+	# could rewrite between wakes. Asked only where the account exists.
+	if id -u router >/dev/null 2>&1; then
+		found="$(find "$entry" -prune -user router -print)" || {
+			printf 'wake-runner: refusing: %s: could not read the owner of %s\n' "$label" "$entry" >&2
+			return 1
+		}
+		if [[ -n $found ]]; then
+			printf 'wake-runner: refusing: %s: %s is owned by router; a sealed tree is never the router'"'"'s\n' \
+				"$label" "$entry" >&2
+			return 1
+		fi
 	fi
 	not_writable_by_others "$label" "$entry"
 }
@@ -286,6 +313,12 @@ harness_wake_bin() {
 			walked="$walked/$component"
 			not_the_agents "$label" "$user" "$walked" || return 1
 		done
+		# A regular file, before root reads a byte of it: a FIFO would block the read, and a
+		# directory passes `-x` and fails only at exec, after the drop, with no named reason.
+		if [[ ! -f $path ]]; then
+			printf 'wake-runner: refusing: %s: %s is not a regular file\n' "$label" "$path" >&2
+			return 1
+		fi
 		not_set_id "$label" "binary" "$path" || return 1
 		# The kernel reads at most 256 bytes of a `#!` line; so do we.
 		line=""
@@ -341,16 +374,18 @@ command -v jq >/dev/null 2>&1 || die "jq is required to read and write the regis
 
 # Held from the first read to the rename, so the entry judged is the entry written.
 exec 9<"${REGISTRY%/*}"
-flock -x 9 || die "could not lock ${REGISTRY%/*}"
+flock -x -w "$LOCK_WAIT" 9 || die "could not lock ${REGISTRY%/*} within ${LOCK_WAIT}s; $REGISTRY is unchanged"
 
 trap 'rm -f -- "$STAGING"' EXIT
 rm -f -- "$STAGING"
 
+# Joined by the unit separator, not a tab: a tab is IFS whitespace, so `read` would merge the two
+# around an empty field and shift every field after it into the wrong name.
 entry="$(jq -r --arg k "$key" \
-	'if has($k) then [(.[$k].kind // "github"), (.[$k].os_user // ""), (.[$k].wake_bin // "")] | @tsv else empty end' \
+	'if has($k) then [(.[$k].kind // "github"), (.[$k].os_user // ""), (.[$k].wake_bin // "")] | map(tostring) | join("\u001f") else empty end' \
 	"$REGISTRY")" || die "could not read registry $REGISTRY"
 [[ -n $entry ]] || die "refusing: no agent $key in the registry"
-IFS=$'\t' read -r kind user current <<<"$entry"
+IFS=$'\x1f' read -r kind user current <<<"$entry"
 [[ $kind == harness ]] || die "refusing: agent $key is kind '$kind'; only a harness agent has a wake_bin"
 [[ -n $user ]] || die "refusing: agent $key has no os_user"
 

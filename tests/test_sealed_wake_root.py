@@ -83,6 +83,7 @@ def box(
     nova_sealed: bool = True,
     nova_tree: bool = True,
     mutations: tuple[str, ...] = (),
+    check_paths: tuple[str, ...] = (),
 ) -> dict:
     scratch = tmp_path / "scratch"
     scratch.mkdir()
@@ -94,6 +95,7 @@ def box(
         "nova_sealed": nova_sealed,
         "nova_tree": nova_tree,
         "mutations": list(mutations),
+        "check_paths": list(check_paths),
         "runs": [run if isinstance(run, dict) else {"argv": run} for run in runs],
     }
     done = subprocess.run(
@@ -102,6 +104,7 @@ def box(
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )  # fmt: skip
     assert done.returncode == 0, f"the box did not build:\n{done.stderr}"
     return json.loads(done.stdout)
@@ -272,6 +275,60 @@ def test_an_interpreter_the_agent_owns_behind_the_link_is_refused(tmp_path: Path
     _refused_both_ways(tmp_path, "is owned by nova or writable", mutations=(repoint,))
 
 
+def test_a_router_owned_tree_is_refused(tmp_path: Path) -> None:
+    # The daemon is the account this wrapper fences: a tree it owned, it could rewrite.
+    _refused_both_ways(
+        tmp_path,
+        "is owned by router; a sealed tree is never the router's",
+        mutations=(f"chown -R --no-dereference router {TREE}",),
+    )
+
+
+def test_a_tree_entry_with_an_access_control_list_is_refused(tmp_path: Path) -> None:
+    if shutil.which("setfacl") is None:
+        if REQUIRED:
+            pytest.fail("setfacl is not installed, so the ACL case cannot run")
+        pytest.skip("setfacl is not installed")
+    # The mask cut to r-x, so the mode bits show no write and only the list itself is left.
+    grant = f'setfacl -m u:nova:rwx,m::rx {TREE}/bin 2>/dev/null || touch "$SCRATCH/no-acl"'
+    supported = ["sh", "-c", 'test ! -e "$SCRATCH/no-acl"']
+    out = box(tmp_path, [supported, PROBE, real_wake()], mutations=(grant,))
+    if out["runs"][0]["rc"] != 0:
+        reason = "this box's tmpfs refuses an access control list (a container's kernel)"
+        if REQUIRED:
+            pytest.fail(f"the ACL case cannot run: {reason}")
+        pytest.skip(reason)
+    for result in out["runs"][1:]:
+        refused(result, f"{TREE}/bin carries an access control list")
+    assert out["woke"] is None, "a refused wake ran something"
+
+
+INJECT = (
+    "install -d -o nova -g nova /home/nova/inject && printf '%s\\n' "
+    '\'open("/home/nova/harness/INJECTED", "w").close()\' >/home/nova/inject/sitecustomize.py '
+    "&& printf 'PYTHONPATH=/home/nova/inject\\n' >>/home/nova/.config/basecradle/agent.env"
+)
+
+
+def test_a_sealed_agents_env_file_cannot_load_its_own_code(tmp_path: Path) -> None:
+    # The seal's point: a PYTHONPATH in the agent's own env file to a sitecustomize.py in its
+    # home would run the agent's code inside the sealed interpreter, before the harness.
+    out = box(tmp_path, [PROBE], mutations=(INJECT,), check_paths=(f"{CLONE}/INJECTED",))
+    assert out["runs"][0]["rc"] == 0, out["runs"][0]
+    assert out["exists"] == {f"{CLONE}/INJECTED": False}, "agent code ran in a sealed wake"
+
+
+def test_a_sealed_real_wake_runs_none_of_the_agents_injected_code(tmp_path: Path) -> None:
+    out = box(tmp_path, [real_wake()], mutations=(INJECT,), check_paths=(f"{CLONE}/INJECTED",))
+    if not out["journal"]:
+        if REQUIRED:
+            pytest.fail("the journal is not reachable, so a real wake cannot run here")
+        pytest.skip("the journal is not reachable (a container): the probe proves the scrub")
+    assert out["runs"][0]["rc"] == 0, out["runs"][0]
+    assert out["woke"] == f"nova\n{SEALED_BIN}\n--timeline\n{TIMELINE}\n"
+    assert out["exists"] == {f"{CLONE}/INJECTED": False}, "agent code ran in a sealed wake"
+
+
 def test_a_daemon_still_holding_the_old_value_is_refused(tmp_path: Path) -> None:
     # Registry flipped, daemon not restarted: it still passes the home path as argv[1].
     out = box(tmp_path, [real_wake(HOME_BIN)])
@@ -356,6 +413,17 @@ def test_set_wake_bin_refuses_a_setuid_binary(tmp_path: Path) -> None:
     _setter_refused(
         tmp_path, ["nova", SEALED_BIN], "is setuid or setgid",
         nova_sealed=False, mutations=(f"chmod u+s {SEALED_BIN}",),
+    )  # fmt: skip
+
+
+def test_set_wake_bin_refuses_a_directory(tmp_path: Path) -> None:
+    _setter_refused(tmp_path, ["nova", f"{TREE}/bin"], "is not a regular file", nova_sealed=False)
+
+
+def test_set_wake_bin_names_an_empty_os_user_rather_than_shifting_fields(tmp_path: Path) -> None:
+    _setter_refused(
+        tmp_path, ["nova", SEALED_BIN], "agent nova has no os_user",
+        mutations=(_registry_edit('.nova.os_user = ""'),),
     )  # fmt: skip
 
 

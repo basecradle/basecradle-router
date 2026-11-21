@@ -85,11 +85,12 @@ def test_the_delivery_id_is_passed_as_an_inert_positional_never_interpolated() -
     # the one assembly rather than each launch.
     # A builder's stream helpers (#481) ride the same way, root-resolved paths, between the
     # delivery id and the command, and so do the wake's attempt (#527), right after the id,
-    # and its quick try (#533), right after the attempt.
+    # and its quick try (#533), right after the attempt, and whether it is sealed (#535).
     assert (
         'drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" '
         'wake-runner "$real_cwd" "$delivery"\n'
-        '\t"$attempt" "$attempts" "$try_number" "$tries" "$stream_python" "$stream_translate"'
+        '\t"$attempt" "$attempts" "$try_number" "$tries" "$sealed" "$stream_python"'
+        ' "$stream_translate"'
         ' "$stream_jq" "$stream_cat" "$launch_bin" "$@")'
     ) in WAKE_RUNNER.read_text()
 

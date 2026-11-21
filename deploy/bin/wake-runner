@@ -332,7 +332,7 @@ not_set_id() {
 }
 
 not_writable_by_others() {
-	local label=$1 entry=$2 found
+	local label=$1 entry=$2 found mode
 	found="$(find "$entry" -prune \( -perm -g+w -o -perm -o+w \) -print)" || {
 		printf 'wake-runner: refusing: %s: could not read the mode of %s\n' "$label" "$entry" >&2
 		return 1
@@ -340,6 +340,17 @@ not_writable_by_others() {
 	if [[ -n $found ]]; then
 		printf 'wake-runner: refusing: %s: %s is writable by its group or by others\n' \
 			"$label" "$entry" >&2
+		return 1
+	fi
+	# The mode bits are not the whole answer: an access control list can grant a write they
+	# do not show, and `ls` marks an entry that carries one with a trailing `+`.
+	mode="$(ls -ld -- "$entry")" || {
+		printf 'wake-runner: refusing: %s: could not read the mode of %s\n' "$label" "$entry" >&2
+		return 1
+	}
+	mode=${mode%% *}
+	if [[ $mode == *+ ]]; then
+		printf 'wake-runner: refusing: %s: %s carries an access control list\n' "$label" "$entry" >&2
 		return 1
 	fi
 }
@@ -354,6 +365,19 @@ not_the_agents() {
 		printf 'wake-runner: refusing: %s: %s is owned by %s; a sealed tree is never the agent'"'"'s own\n' \
 			"$label" "$entry" "$user" >&2
 		return 1
+	fi
+	# Nor the router's: it is the account this wrapper fences, and a tree it owned is one it
+	# could rewrite between wakes. Asked only where the account exists.
+	if id -u router >/dev/null 2>&1; then
+		found="$(find "$entry" -prune -user router -print)" || {
+			printf 'wake-runner: refusing: %s: could not read the owner of %s\n' "$label" "$entry" >&2
+			return 1
+		}
+		if [[ -n $found ]]; then
+			printf 'wake-runner: refusing: %s: %s is owned by router; a sealed tree is never the router'"'"'s\n' \
+				"$label" "$entry" >&2
+			return 1
+		fi
 	fi
 	not_writable_by_others "$label" "$entry"
 }
@@ -415,6 +439,12 @@ harness_wake_bin() {
 			walked="$walked/$component"
 			not_the_agents "$label" "$user" "$walked" || return 1
 		done
+		# A regular file, before root reads a byte of it: a FIFO would block the read, and a
+		# directory passes `-x` and fails only at exec, after the drop, with no named reason.
+		if [[ ! -f $path ]]; then
+			printf 'wake-runner: refusing: %s: %s is not a regular file\n' "$label" "$path" >&2
+			return 1
+		fi
 		not_set_id "$label" "binary" "$path" || return 1
 		# The kernel reads at most 256 bytes of a `#!` line; so do we.
 		line=""
@@ -469,6 +499,9 @@ attempts=""
 try_number=""
 tries=""
 probe=""
+# `sealed` once the registry's wake_bin passed the gate's sealed branch (#535): the agent
+# script then drops every loader and interpreter variable agent.env set.
+sealed=""
 # Set only for a builder's real wake (#481): empty means the agent script `exec`s its command.
 stream_python=""
 stream_translate=""
@@ -658,9 +691,12 @@ harness)
 	# The same component-wise walk as the clone path, and it matters more here: this path is
 	# an EXECUTABLE, so `realpath` would have handed root a target someone else chose. The
 	# gate refuses a link instead, and the `-x` below then stats the component-verified path
-	# itself. Root still only stats it: the `exec` happens after the drop, as the agent.
+	# itself. On the home branch root only stats it. On the sealed branch, where no entry is
+	# the agent's, root also reads its `#!` line and follows the tree's interpreter link to
+	# judge the file it names. Either way the `exec` happens after the drop, as the agent.
 	launch_bin="$(harness_wake_bin "wake_bin" "/home/$user" "$SEALED_BASE" "$user" "$wake_bin")" || exit 1
 	[[ -x $launch_bin ]] || die "wake_bin is not executable: $launch_bin"
+	[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed
 	;;
 *)
 	die "refusing: agent $match has unknown kind '$kind'"
@@ -733,9 +769,10 @@ fi
 # router never reads it), cd into the clone, export the delivery id, exec the
 # registry-sanctioned binary. The inline script takes the cwd as $1, the delivery id as $2, the
 # attempt and the number of attempts as $3 and $4 (both empty when the router sent none), the
-# quick try and the number of tries as $5 and $6 (the same), a builder's stream helpers as
-# $7..$10 (python3, the translator, jq, cat: all empty unless this is a builder's real wake),
-# and the command (launch_bin + args) as $11..; root never
+# quick try and the number of tries as $5 and $6 (the same), whether the agent is sealed as $7
+# (`sealed`, or empty), a builder's stream helpers as $8..$11 (python3, the translator, jq,
+# cat: all empty unless this is a builder's real wake), and the command (launch_bin + args) as
+# $12..; root never
 # interpolates the trigger/timeline/delivery — each is passed as an inert positional argument.
 #
 # Held in a variable rather than written inline at the exec, so the two launch shapes
@@ -820,6 +857,18 @@ AGENT_SCRIPT='
 		export BASECRADLE_WAKE_TRY="$1" BASECRADLE_WAKE_TRIES="$2"
 	fi
 	shift 2
+	# A sealed agent (#535): its tree is the one thing it cannot write, so its own env file must
+	# not be able to choose code for that tree to run instead. Every LD_* (the loader: a preload,
+	# a library path) and every PYTHON* (the interpreter: a path, a home, a startup file) is
+	# dropped once agent.env has loaded, whoever set it, and stays dropped for every child.
+	if [[ -n ${1:-} ]]; then
+		for _name in $(compgen -e); do
+			case $_name in
+			LD_* | PYTHON*) unset "$_name" ;;
+			esac
+		done
+	fi
+	shift
 	stream_python=$1 stream_translate=$2 stream_jq=$3 stream_cat=$4
 	shift 4
 	# >>> run_stream >>>
@@ -887,7 +936,7 @@ AGENT_SCRIPT='
 
 # The privilege drop itself, identical in both modes.
 drop=(runuser -u "$user" -- /bin/bash -c "$AGENT_SCRIPT" wake-runner "$real_cwd" "$delivery"
-	"$attempt" "$attempts" "$try_number" "$tries" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
+	"$attempt" "$attempts" "$try_number" "$tries" "$sealed" "$stream_python" "$stream_translate" "$stream_jq" "$stream_cat" "$launch_bin" "$@")
 
 if [[ -n $probe ]]; then
 	# A probe returns its verdict to the caller — see the systemd-cat block above.
