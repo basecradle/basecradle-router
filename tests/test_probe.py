@@ -42,7 +42,12 @@ import pytest
 from basecradle_router.app import build_registry
 from basecradle_router.claims import build_manifests
 from basecradle_router.config import Config, ConfigError, load_config, load_self_url
-from basecradle_router.evidence import EvidenceStore, read_evidence
+from basecradle_router.evidence import (
+    EVIDENCE_VERSION,
+    EvidenceStore,
+    RefusalGate,
+    read_evidence,
+)
 from basecradle_router.marker import REDACTED, REDACTED_MAX, SCHEME, is_marker, nonce_of, redact
 from basecradle_router.models import Agent, Event, EventKind, Recipient, WakeKind
 from basecradle_router.pipeline import Outcome, Pipeline, PipelineResult, Stage
@@ -847,12 +852,79 @@ def test_a_frozen_agent_refuses_the_probe_which_reads_unprovable_not_broken(box,
 
     assert result.status == UNPROVABLE
     assert result.exit_code == EXIT_UNPROVABLE
+    # The reading names the gate by its counter, in both snapshots (#543).
+    reading = result.to_json()
+    assert (reading["before"]["route_refused"], reading["before"]["route_wake_locked"]) == (0, 0)
+    assert (reading["after"]["route_refused"], reading["after"]["route_wake_locked"]) == (1, 1)
     wake = box.evidence().agent_wakes["nova"]
     assert wake.refused == 1
     assert wake.last_refused_route == "probe"
     assert wake.last_refused_synthetic is True
     assert wake.last_ok_at is None
     assert box.attempts == []  # nothing was launched
+
+
+def test_a_breaker_refused_probe_leaves_route_wake_locked_still(tmp_path) -> None:
+    """The other gate: ``route_refused`` moves and ``route_wake_locked`` does not (#543).
+
+    Driven at the recording seam, as the dedup case below is, because what is pinned is
+    the reading the prober tells the two gates apart by, not the breaker's arithmetic.
+    """
+    box = FakeBox(tmp_path, {"nova": NOVA_AGENT_SECRET})
+
+    def tripped(*_args) -> Injection:
+        box.pipeline.evidence.record_wake_refused(
+            "nova", "breaker_open", gate=RefusalGate.BREAKER, route="probe", synthetic=True
+        )
+        return Injection(status=202, stages=(("resolve", "ok"),))
+
+    result = WakeProbe(
+        secret=Secret(PROBE_SECRET),
+        evidence_path=box.evidence_path,
+        self_url="http://127.0.0.1:8000",
+        post=tripped,
+        read=lambda: read_evidence(box.evidence_path),
+        sleep=lambda _d: None,
+    ).run("nova", a_marker(NOVA_AGENT_SECRET))
+
+    assert result.status == UNPROVABLE
+    reading = result.to_json()
+    assert (reading["before"]["route_refused"], reading["before"]["route_wake_locked"]) == (0, 0)
+    assert (reading["after"]["route_refused"], reading["after"]["route_wake_locked"]) == (1, 0)
+
+
+def test_a_probe_on_a_row_that_predates_wake_locked_reads_it_as_absent(tmp_path) -> None:
+    # The `before` snapshot of a pre-#543 row carries `null`, never `0`, and the row's
+    # first wake-lock refusal reads `1` after: `null` to a number is the gate moving.
+    (tmp_path / "evidence.json").write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {"nova": {"refused": 2, "by_route": {"probe": {"refused": 2}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    box = FakeBox(tmp_path, {"nova": NOVA_AGENT_SECRET})  # the daemon boots on that document
+
+    def locked(*_args) -> Injection:
+        box.pipeline.evidence.record_wake_refused(
+            "nova", "wake_lock_held", gate=RefusalGate.WAKE_LOCK, route="probe", synthetic=True
+        )
+        return Injection(status=202, stages=(("resolve", "ok"),))
+
+    result = WakeProbe(
+        secret=Secret(PROBE_SECRET),
+        evidence_path=box.evidence_path,
+        self_url="http://127.0.0.1:8000",
+        post=locked,
+        read=lambda: read_evidence(box.evidence_path),
+        sleep=lambda _d: None,
+    ).run("nova", a_marker(NOVA_AGENT_SECRET))
+
+    reading = result.to_json()
+    assert (reading["before"]["route_refused"], reading["before"]["route_wake_locked"]) == (2, None)
+    assert (reading["after"]["route_refused"], reading["after"]["route_wake_locked"]) == (3, 1)
 
 
 def test_a_collapsed_injection_reads_unprovable_naming_the_dedup(tmp_path) -> None:

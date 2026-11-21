@@ -34,7 +34,7 @@ from basecradle_router.claims import (
     manifest_filename,
 )
 from basecradle_router.config import Config
-from basecradle_router.evidence import EvidenceStore
+from basecradle_router.evidence import EvidenceStore, RefusalGate
 from basecradle_router.models import Agent, WakeKind
 from basecradle_router.routes import RouteRegistry
 from basecradle_router.routes.basecradle import BasecradleRoute
@@ -187,6 +187,8 @@ def test_enabling_the_route_arms_the_edge_that_was_missing(tmp_path) -> None:
             "failed": 0,
             "refused": 0,
             "deduped": 0,
+            "wake_locked": 0,
+            "refused_unclassified": 0,
             "last_ok_at": None,
             "last_ok_delivery": None,
             "last_failed_at": None,
@@ -280,6 +282,21 @@ def test_a_collapsed_duplicate_is_published_apart_from_a_refusal(tmp_path) -> No
     # And the row the ledger actually arms still resolves to the success, which is the
     # whole outcome being bought: nothing about a dedup disturbs the proof.
     assert _resolve(_claim(subject, "wake-edge:webhook-route:github")) is not None
+
+
+def test_a_wake_lock_refusal_is_published_apart_from_a_breaker_refusal(tmp_path) -> None:
+    # The per-route row the claim projects carries the gate split (#543), so the NOC
+    # tells an update in progress from a runaway caught without parsing a reason.
+    evidence = EvidenceStore(None)
+    for gate in (RefusalGate.WAKE_LOCK, RefusalGate.BREAKER, RefusalGate.BREAKER):
+        evidence.record_wake_refused("nova", gate.value, gate=gate, route="github", synthetic=False)
+
+    subject = _subject(_build(tmp_path, evidence=evidence), "agent:nova")
+    route_row = _claim(subject, "wake-edge:webhook-route:github")["detail"]
+    agent_row = _claim(subject, "wake-edge:webhook-route")["detail"]["by_route"]["github"]
+
+    for row in (route_row, agent_row):
+        assert (row["refused"], row["wake_locked"], row["refused_unclassified"]) == (3, 1, 0)
 
 
 def test_regression_instance_5_per_recipient_an_armed_edge_can_be_unproven(tmp_path) -> None:

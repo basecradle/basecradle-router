@@ -14,6 +14,8 @@ import shlex
 from datetime import datetime, timezone
 from types import MappingProxyType
 
+import pytest
+
 from basecradle_router.breaker import BreakerConfig, WakeRateBreaker
 from basecradle_router.config import Config
 from basecradle_router.dedup import DeliveryDeduper
@@ -718,6 +720,32 @@ def test_unparseable_wake_lock_also_refuses() -> None:
     result = pipeline.handle("github", _github_request())
     assert result.stages[-1] == (Stage.WAKE_LOCK, Outcome.IGNORED)
     assert waker.calls == []
+
+
+@pytest.mark.parametrize("state", [WakeLockState.HELD, WakeLockState.UNPARSEABLE])
+def test_a_wake_lock_refusal_moves_wake_locked(state) -> None:
+    # Both refusing states are the wake-lock gate, so both move its counter (#543).
+    evidence = EvidenceStore(None)
+    pipeline, _ = _pipeline(wake_lock=_StubWakeLock({"nova": state}), evidence=evidence)
+    pipeline.handle("github", _github_request())
+
+    per_route = evidence.snapshot().agent_wakes["nova"].by_route["github"]
+    assert (per_route.refused, per_route.wake_locked) == (1, 1)
+
+
+def test_a_breaker_refusal_never_moves_wake_locked() -> None:
+    # The other gate: it counts in `refused`, and `wake_locked` stays where it was (#543).
+    breaker = WakeRateBreaker(BreakerConfig(max_wakes=1, window=60.0, cooldown=60.0))
+    evidence = EvidenceStore(None)
+    pipeline, _ = _pipeline(breaker=breaker, evidence=evidence)
+    pipeline.handle("github", _github_request())
+    assert pipeline.handle("github", _github_request()).stages[-1] == (
+        Stage.BREAKER,
+        Outcome.IGNORED,
+    )
+
+    per_route = evidence.snapshot().agent_wakes["nova"].by_route["github"]
+    assert (per_route.ok, per_route.refused, per_route.wake_locked) == (1, 1, 0)
 
 
 def test_stale_wake_lock_wakes_normally() -> None:

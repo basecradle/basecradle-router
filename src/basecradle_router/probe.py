@@ -181,6 +181,13 @@ class WakeProof:
     move, and the one the NOC's census carries — while the per-route fields are what the
     synthetic claim points at and what tells this probe's outcome apart from a real
     wake's that happened to land in the same window.
+
+    ``route_wake_locked`` is the wake-lock gate's share of ``route_refused``
+    (basecradle-router#543): when ``route_refused`` moves, ``route_wake_locked`` moving with
+    it says an update held the agent's wake lock, and staying still says the breaker
+    refused. It is ``None`` where the evidence row predates the counter and has refusals
+    on it, and moves from ``None`` to ``1`` on that row's first wake-lock refusal, which
+    a breaker refusal never does.
     """
 
     agent_last_ok_at: str | None = None
@@ -195,6 +202,7 @@ class WakeProof:
     route_refused: int = 0
     route_last_refused_at: str | None = None
     route_last_refused_reason: str | None = None
+    route_wake_locked: int | None = 0
     route_deduped: int = 0
     queued: int = 0
 
@@ -215,6 +223,7 @@ class WakeProof:
             route_refused=per_route.refused,
             route_last_refused_at=per_route.last_refused_at,
             route_last_refused_reason=per_route.last_refused_reason,
+            route_wake_locked=per_route.wake_locked,
             route_deduped=per_route.deduped,
             queued=wake.queued,
         )
@@ -233,6 +242,7 @@ class WakeProof:
             "route_refused": self.route_refused,
             "route_last_refused_at": self.route_last_refused_at,
             "route_last_refused_reason": self.route_last_refused_reason,
+            "route_wake_locked": self.route_wake_locked,
             "route_deduped": self.route_deduped,
             "queued": self.queued,
         }
