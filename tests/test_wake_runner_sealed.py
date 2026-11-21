@@ -554,13 +554,15 @@ INJECTING = (
     "PYTHONPATH=/home/nova/inject\nPYTHONHOME=/home/nova/py\nPYTHONSTARTUP=/home/nova/s.py\n"
     "LD_PRELOAD=/home/nova/evil.so\nLD_LIBRARY_PATH=/home/nova/lib\nLD_AUDIT=/home/nova/a.so\n"
     "PYTHONUNBUFFERED=1\nPYTHONIOENCODING=utf-8\nGH_APP_SLUG=nova-ai\n"
+    "OPENSSL_CONF=/home/nova/o.cnf\nGCONV_PATH=/home/nova/gconv\n"
+    "NOC_PROBE_SECRET=bcnoc1-fake-probe-secret-00000000000000000000000000000000000000\n"
 )
 
 #: The PYTHON* names that load no code, kept so a sealed wake's ledger is written as before.
 KEPT = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
 
-def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
+def _woken_env(tmp_path: Path, scrub: str) -> dict[str, str]:
     """Run the shipped agent script, as the drop does, and return the env it execs with."""
     home = tmp_path / "home"
     (home / ".config" / "basecradle").mkdir(parents=True)
@@ -576,10 +578,10 @@ def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
             str(clone),
             "0192f3a4-5b6c-7d8e-9f01-0000000000ab",
         ]
-        + ["", "", "", "", sealed, "", "", "", "", shutil.which("env") or "/usr/bin/env", "-0"],
+        + ["", "", "", "", scrub, "", "", "", "", shutil.which("env") or "/usr/bin/env", "-0"],
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home), "USER": "nova", "LOGNAME": "nova"},
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
@@ -587,7 +589,7 @@ def _woken_env(tmp_path: Path, sealed: str) -> dict[str, str]:
 
 
 def test_a_sealed_wake_drops_every_loader_and_interpreter_variable(tmp_path: Path) -> None:
-    env = _woken_env(tmp_path, "sealed")
+    env = _woken_env(tmp_path, "scrub")
     loaders = {name: value for name, value in env.items() if name.startswith(("LD_", "PYTHON"))}
     assert loaders == KEPT, env
     # Everything else the agent's env file sets still arrives, and so does the router's mark.
@@ -596,18 +598,40 @@ def test_a_sealed_wake_drops_every_loader_and_interpreter_variable(tmp_path: Pat
 
 
 def test_an_unsealed_wake_keeps_its_env_file_as_it_was(tmp_path: Path) -> None:
-    # The positive control: the scrub is the sealed branch's alone, so the test above is not
-    # passing on a loader that never exported the variables at all.
+    # The positive control: an unsealed real wake drops nothing (only a sealed wake and a probe
+    # do), so the tests around this one are not passing on a loader that never exported them.
     env = _woken_env(tmp_path, "")
     assert env["PYTHONPATH"] == "/home/nova/inject"
     assert env["LD_PRELOAD"] == "/home/nova/evil.so"
 
 
-def test_root_marks_a_wake_sealed_only_from_the_gates_own_answer() -> None:
+def test_root_drops_agent_env_only_for_a_sealed_wake_and_a_probe() -> None:
     text = WAKE_RUNNER.read_text()
-    assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || sealed=sealed' in text
-    # Set in exactly two places: cleared with the other flags, and set from the gate's output.
-    assert len(re.findall(r"\bsealed=", text)) == 2
+    assert '[[ $launch_bin != "$SEALED_BASE"/venv/* ]] || scrub=scrub' in text
+    # Set in exactly three places: cleared with the other flags, set from the gate's sealed
+    # answer, and set for a probe, which runs only our verifier (#538).
+    assert re.findall(r"\bscrub=\S*", text) == ['scrub=""', "scrub=scrub", "scrub=verifier"]
+    assert '\tset -- -I "$PROBE_ACK" "$probe" "$would_exec"\n\tscrub=verifier\n' in text
+
+
+def test_a_probe_hands_the_verifier_only_the_names_it_reads(tmp_path: Path) -> None:
+    # The verifier's whole contract with the environment is three names (#538): an OPENSSL_CONF
+    # that would have libcrypto load a provider of the agent's, a GCONV_PATH, the loader's and
+    # the interpreter's, every one is gone. `_` and `SHLVL` are bash's own, which it sets on the
+    # program it execs, never anything agent.env chose.
+    env = _woken_env(tmp_path, "verifier")
+    assert set(env) - {"_", "SHLVL"} == {"NOC_PROBE_SECRET", "USER", "LOGNAME"}, env
+    assert env["NOC_PROBE_SECRET"].startswith("bcnoc1-fake-probe-secret-")
+
+
+def test_the_stream_translator_runs_with_no_loader_variable_of_the_agents() -> None:
+    # In the translator's own subshell, so claude keeps its environment as it was (#538).
+    text = WAKE_RUNNER.read_text()
+    assert re.search(
+        r'> >\(\n(?:\t\t\t#[^\n]*\n)*\t\t\tfor _name in "\$\{!LD_@\}"; do\n'
+        r'\t\t\t\tunset "\$_name"\n\t\t\tdone\n\t\t\t"\$python" -I "\$translate" "\$\$" \|\| \{',
+        text,
+    )
 
 
 @pytest.mark.skipif(

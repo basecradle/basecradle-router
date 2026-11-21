@@ -677,13 +677,17 @@ PLANTED: dict[tuple[str, str], tuple[str, str]] = {
         'run --env "SECRET=$BASECRADLE_ROUTER_GITHUB_WEBHOOK_SECRET" --project "$APP_DIR"'
         ' python -m basecradle_router "$@"\n',
     ),
-    **{
-        ("deploy/bin/wake-runner", mode): (
-            '\texec "$@"\n',
-            '\texec env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@"\n',
-        )
-        for mode in ("harness", "probe")
-    },
+    ("deploy/bin/wake-runner", "harness"): (
+        '\texec "$@"\n',
+        '\texec env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" "$@"\n',
+    ),
+    # A probe hands its verifier only the names it reads (#538), PATH not among them, so the plant
+    # is the one secret still in its environment, the probe's own, as an argument to the program
+    # root resolved by absolute path, the recorder's python3: a PATH lookup would miss the shims.
+    ("deploy/bin/wake-runner", "probe"): (
+        '\texec "$@"\n',
+        '\texec "$@" "$NOC_PROBE_SECRET"\n',
+    ),
     # A builder's wake takes the stream's `exec` (#481): the plant goes on that command.
     ("deploy/bin/wake-runner", "builder"): (
         '\t\texec "$@" > >(\n',
