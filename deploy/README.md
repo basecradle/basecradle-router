@@ -1394,6 +1394,20 @@ router dispatches ends in exactly one of these, published on both the agent-wide
 | `refused` | a **gate** declined a wake that would otherwise have run: a live NOC converge freeze, or a tripped wake-rate breaker | the router working correctly and *suppressing* a wake — an agent whose history is all refusals is **gated, not unreachable** |
 | `deduped` | a delivery was collapsed into the wake that already ran for it — a duplicate delivery (#133), or one coalesced into a wake that read it (#272) | the router working correctly *because a wake already succeeded* — never a finding |
 
+**A refusal names its gate by a counter** (`#543`). Each `(agent, route)` row carries
+`wake_locked`, the share of `refused` the **wake-lock gate** refused (a held or unparseable NOC
+wake-lock), beside `refused_unclassified`, the share a row written before the split already held. The
+breaker never moves `wake_locked`, so the breaker's share is `refused - refused_unclassified -
+wake_locked`. One is an update in progress, the other a runaway the backstop caught, and a consumer
+tells them apart by the counters, never by `last_refused_reason`. `refused` keeps counting both. A
+row the daemon creates starts at `0` and `0`. A row written before `#543` with refusals on it reads
+both as `null`, never `0` (its `refused` was never classified); its first wake-lock refusal files every
+refusal before it as unclassified and starts the count at `1`, so `null` moves only to a number and
+only on a wake-lock refusal, and the breaker's share never takes in a refusal nobody classified. A
+pre-`#543` row with no refusals reads `0`, which is simply true. The per-route claim rows carry both
+fields, and `probe wake --json` carries `wake_locked` in both snapshots as `before.route_wake_locked`
+and `after.route_wake_locked`, beside `route_refused`.
+
 A **genuine rejection of a delivery** — a bad signature, a malformed payload, an untrusted sender —
 never reaches any of these. It is counted at the sink, as `delivery_sinks.<route>.rejected`, because
 it is refused at `verify`/`normalize` before an agent is ever resolved. Nor does a delivery **dropped at

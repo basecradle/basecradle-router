@@ -59,6 +59,15 @@ which ``route`` delivered it, and whether that delivery was ``synthetic``. A pro
 therefore lands in its own delivery sink and its own ``by_route`` row, and the
 agent-wide scalars say plainly which kind of traffic last proved the edge.
 
+**And a refusal says which gate refused it** (basecradle-router#543). ``refused`` counts
+both gates, the NOC wake-lock and the wake-rate breaker, and they mean different things
+to the reader: a held wake-lock is an update in progress, a breaker refusal is a runaway
+the backstop caught. The per-route row therefore carries ``wake_locked``, the wake-lock
+gate's share of ``refused``, beside ``refused_unclassified``, the share a row written
+before the split already held, so a consumer tells the gates apart by the counters it
+reads — the same split, for the same reason, as ``deduped`` above. ``refused`` keeps its
+meaning, so nothing that reads it moves.
+
 **And instance 5 is asked per *recipient*, not per route.** A route-wide accept
 counter says the sink works for *somebody*; the ledger's rows ask whether it works
 for *this agent*. Neither the per-route counters nor the per-agent scalars can
@@ -115,6 +124,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 
 from basecradle_router import statefile
 from basecradle_router.dedup import DUPLICATE_DELIVERY
@@ -153,6 +163,19 @@ def _iso(moment: datetime) -> str:
 
 def _reason(text: object) -> str:
     return str(text)[:_MAX_REASON]
+
+
+class RefusalGate(Enum):
+    """Which gate refused a wake — the classification :attr:`RouteWakeEvidence.wake_locked`
+    is counted from (basecradle-router#543).
+
+    A required argument of :meth:`EvidenceStore.record_wake_refused`, never a default and
+    never read back out of the reason string: the gate is a fact the caller holds, and a
+    default would record a caller's silence as an assertion about which gate it was.
+    """
+
+    WAKE_LOCK = "wake_lock"
+    BREAKER = "breaker"
 
 
 @dataclass
@@ -216,6 +239,23 @@ class RouteWakeEvidence:
     (basecradle-router#218). This is also the granularity the misreading was measured at
     — the per-route row is what the NOC's per-recipient claim points into, so a dedup
     counted as a refusal here is a healthy route reading as a rejected one.
+
+    ``wake_locked`` is the share of ``refused`` the **wake-lock gate** refused — a held or
+    unparseable NOC wake-lock — and never the breaker's (basecradle-router#543).
+    ``refused_unclassified`` is the share recorded before the row told the two gates
+    apart, so wherever ``wake_locked`` is set the three always balance, and the breaker's
+    share is ``refused - refused_unclassified - wake_locked``. A row the daemon creates
+    has told them apart from its first outcome, so it starts at ``0`` and ``0``.
+
+    A row written before the field existed, with refusals on it, reads both as ``None``,
+    never ``0``: its ``refused`` may hold wake-lock refusals nobody classified, and a zero
+    would claim it holds none. Its first wake-lock refusal starts the count and files
+    every refusal before it as unclassified, which keeps the row self-describing: had it
+    simply become ``1``, the refusals before it would read as the breaker's, a runaway
+    invented after the fact. A breaker refusal before that point stays unclassified too,
+    which understates the breaker and never invents it — this store's standing
+    fail-direction. So ``None`` moves only to a number, and only on a wake-lock refusal.
+    A pre-field row with no refusals at all has nothing to classify, and reads ``0``.
     """
 
     ok: int = 0
@@ -229,6 +269,8 @@ class RouteWakeEvidence:
     last_refused_at: str | None = None
     last_refused_reason: str | None = None
     last_deduped_at: str | None = None
+    wake_locked: int | None = 0
+    refused_unclassified: int | None = 0
 
 
 @dataclass
@@ -448,6 +490,34 @@ def _wake_json(wake: AgentWakeEvidence) -> dict:
     return fields
 
 
+def _rebuild_route_wake(fields: dict) -> RouteWakeEvidence:
+    """Rebuild one ``(agent, route)`` row, reading a gate split it lacks as ``None``.
+
+    :func:`_rebuild` alone would fill a missing ``wake_locked`` with the dataclass default
+    of ``0``, and a row written before #543 never told its gates apart: its ``refused``
+    is unclassified, so the honest reading is *absent*, never *none* — unless it has no
+    refusals, when ``0`` is simply true. A pair that is not two counts (a hand-edited or
+    partly written file) reads absent too, so the next wake-lock refusal starts the count
+    afresh rather than adding to a value it cannot trust or raising on the wake path.
+    """
+    per_route = _rebuild(RouteWakeEvidence, fields)
+    split = (
+        _count_or_none(fields.get("wake_locked")),
+        _count_or_none(fields.get("refused_unclassified")),
+    )
+    if None in split:
+        split = (0, 0) if per_route.refused == 0 else (None, None)
+    per_route.wake_locked, per_route.refused_unclassified = split
+    return per_route
+
+
+def _count_or_none(value: object) -> int | None:
+    """``value`` if it is a count, else ``None`` (``bool`` is an ``int``, and not a count)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 def _rebuild_agent_wake(fields: dict) -> AgentWakeEvidence:
     """Rebuild one agent's wake evidence, including its nested per-route map.
 
@@ -459,7 +529,7 @@ def _rebuild_agent_wake(fields: dict) -> AgentWakeEvidence:
     """
     wake = _rebuild(AgentWakeEvidence, fields)
     wake.by_route = {
-        route: _rebuild(RouteWakeEvidence, entry) for route, entry in _items(fields.get("by_route"))
+        route: _rebuild_route_wake(entry) for route, entry in _items(fields.get("by_route"))
     }
     _reclassify_legacy_dedup(wake, provenance=_LEGACY_DEDUP_PROVENANCE)
     for per_route in wake.by_route.values():
@@ -820,13 +890,21 @@ class EvidenceStore:
             per_route.last_failed_reason = _reason(reason)
             self._flush_locked()
 
-    def record_wake_refused(self, agent: str, reason: str, *, route: str, synthetic: bool) -> None:
+    def record_wake_refused(
+        self, agent: str, reason: str, *, gate: RefusalGate, route: str, synthetic: bool
+    ) -> None:
         """A wake a gate deliberately declined — gated, not broken (see the class).
 
         A held NOC wake-lock or a tripped breaker, and nothing else: a collapsed duplicate
         delivery goes to :meth:`record_wake_deduped` instead. Both are the router working
         correctly, but only this one means a wake that *should* have run did not, and only
         this one should move the newest-attempt reading of a route's health.
+
+        ``gate`` is required and keyword-only for the reason ``synthetic`` is: which gate
+        refused is a fact the caller holds, and the per-route ``wake_locked`` counter is
+        counted from it, never from ``reason`` (basecradle-router#543). A row that
+        predates the counter starts it on its first wake-lock refusal, filing every refusal
+        before it as unclassified (see :class:`RouteWakeEvidence`).
         """
         with self._lock:
             wake = self._doc.agent_wakes.setdefault(agent, AgentWakeEvidence())
@@ -837,6 +915,13 @@ class EvidenceStore:
             wake.last_refused_route = route
             wake.last_refused_synthetic = synthetic
             per_route = wake.by_route.setdefault(route, RouteWakeEvidence())
+            if gate is RefusalGate.WAKE_LOCK:
+                if per_route.wake_locked is None or per_route.refused_unclassified is None:
+                    # Read before this refusal is counted: every refusal already on the row
+                    # is one nobody classified.
+                    per_route.refused_unclassified = per_route.refused
+                    per_route.wake_locked = 0
+                per_route.wake_locked += 1
             per_route.refused += 1
             per_route.last_refused_at = at
             per_route.last_refused_reason = _reason(reason)

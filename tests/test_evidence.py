@@ -25,6 +25,7 @@ from basecradle_router.evidence import (
     EVIDENCE_VERSION,
     EvidenceDocument,
     EvidenceStore,
+    RefusalGate,
     read_evidence,
 )
 
@@ -184,7 +185,11 @@ def test_a_refused_wake_is_never_confused_with_a_failed_one(tmp_path) -> None:
     # converge.
     store = _store(tmp_path)
     store.record_wake_refused(
-        NOVA, "wake_lock_held until 2026-07-27T12:05:00+00:00", route="github", synthetic=False
+        NOVA,
+        "wake_lock_held until 2026-07-27T12:05:00+00:00",
+        gate=RefusalGate.WAKE_LOCK,
+        route="github",
+        synthetic=False,
     )
     store.record_wake_failed(NOVA, "claude exited 1", route="github", synthetic=False)
 
@@ -192,6 +197,141 @@ def test_a_refused_wake_is_never_confused_with_a_failed_one(tmp_path) -> None:
     assert (wake.ok, wake.refused, wake.failed) == (0, 1, 1)
     assert wake.last_refused_reason.startswith("wake_lock_held")
     assert wake.last_failed_reason == "claude exited 1"
+
+
+def test_a_wake_lock_refusal_is_counted_apart_from_a_breaker_refusal(tmp_path) -> None:
+    """``wake_locked`` is the wake-lock gate's share of ``refused`` (#543).
+
+    One is an update in progress, the other a runaway the backstop caught, and the
+    counter is the classification: a consumer never parses ``last_refused_reason`` to
+    tell them apart. ``refused`` keeps counting both, so nothing that reads it moves.
+    """
+    store = _store(tmp_path)
+    store.record_wake_refused(
+        NOVA, "wake_lock_held", gate=RefusalGate.WAKE_LOCK, route="github", synthetic=False
+    )
+    store.record_wake_refused(
+        NOVA, "breaker_open", gate=RefusalGate.BREAKER, route="github", synthetic=False
+    )
+    store.record_wake_refused(
+        NOVA, "breaker_open", gate=RefusalGate.BREAKER, route="probe", synthetic=True
+    )
+
+    wake = read_evidence(str(tmp_path / "evidence.json")).agent_wakes[NOVA]
+    assert wake.refused == 3
+    github, probe = wake.by_route["github"], wake.by_route["probe"]
+    assert (github.refused, github.wake_locked, github.refused_unclassified) == (2, 1, 0)
+    # The breaker never moves it, and a row the daemon created counts from zero.
+    assert (probe.refused, probe.wake_locked, probe.refused_unclassified) == (1, 0, 0)
+
+
+def test_a_row_the_daemon_creates_reads_wake_locked_as_zero(tmp_path) -> None:
+    # Counted from its first outcome, so an untouched counter is a true zero.
+    store = _store(tmp_path)
+    store.record_wake_ok(NOVA, "delivery-1", route="github", synthetic=False)
+
+    per_route = read_evidence(str(tmp_path / "evidence.json")).agent_wakes[NOVA].by_route["github"]
+    assert (per_route.wake_locked, per_route.refused_unclassified) == (0, 0)
+
+
+def test_a_row_written_before_wake_locked_reads_it_as_absent(tmp_path) -> None:
+    """A pre-#543 row's ``refused`` is unclassified, so its split reads ``None``, never 0.
+
+    A zero would claim none of those refusals were the wake-lock's. A breaker refusal
+    leaves it absent, and the absence survives the daemon rewriting the document. The
+    next wake-lock refusal starts the count and files every refusal before it as
+    unclassified, so the breaker's share never includes a refusal nobody classified.
+    """
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {
+                    NOVA: {
+                        "ok": 1,
+                        "refused": 3,
+                        "by_route": {"probe": {"ok": 1, "refused": 3}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert read_evidence(str(path)).agent_wakes[NOVA].by_route["probe"].wake_locked is None
+
+    store = _store(tmp_path)
+    store.record_wake_refused(
+        NOVA, "breaker_open", gate=RefusalGate.BREAKER, route="probe", synthetic=True
+    )
+    per_route = read_evidence(str(path)).agent_wakes[NOVA].by_route["probe"]
+    assert (per_route.refused, per_route.wake_locked, per_route.refused_unclassified) == (
+        4,
+        None,
+        None,
+    )
+    written = json.loads(path.read_text())["agent_wakes"][NOVA]["by_route"]["probe"]
+    assert (written["wake_locked"], written["refused_unclassified"]) == (None, None)
+
+    store.record_wake_refused(
+        NOVA, "wake_lock_held", gate=RefusalGate.WAKE_LOCK, route="probe", synthetic=True
+    )
+    store.record_wake_refused(
+        NOVA, "breaker_open", gate=RefusalGate.BREAKER, route="probe", synthetic=True
+    )
+    per_route = read_evidence(str(path)).agent_wakes[NOVA].by_route["probe"]
+    assert (per_route.refused, per_route.wake_locked, per_route.refused_unclassified) == (6, 1, 4)
+    # The breaker's share is the one refusal it made since the split began, never the four
+    # nobody classified.
+    assert per_route.refused - per_route.refused_unclassified - per_route.wake_locked == 1
+
+
+def test_a_row_written_before_wake_locked_with_no_refusals_reads_zero(tmp_path) -> None:
+    # Nothing to classify, so zero is simply true, and the row counts like a new one.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "agent_wakes": {NOVA: {"ok": 5, "by_route": {"github": {"ok": 5}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    per_route = read_evidence(str(path)).agent_wakes[NOVA].by_route["github"]
+    assert (per_route.wake_locked, per_route.refused_unclassified) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "split",
+    [
+        {"wake_locked": "3", "refused_unclassified": 0},
+        {"wake_locked": -1, "refused_unclassified": 0},
+        {"wake_locked": True, "refused_unclassified": 0},
+        {"wake_locked": 1},
+    ],
+)
+def test_a_gate_split_that_is_not_two_counts_reads_absent(tmp_path, split) -> None:
+    # A hand-edited or partly written row must neither raise on the wake path nor be
+    # added to: it reads absent, and the next wake-lock refusal starts the count afresh.
+    path = tmp_path / "evidence.json"
+    row = {"refused": 2, **split}
+    path.write_text(
+        json.dumps(
+            {"version": EVIDENCE_VERSION, "agent_wakes": {NOVA: {"by_route": {"github": row}}}}
+        ),
+        encoding="utf-8",
+    )
+    per_route = read_evidence(str(path)).agent_wakes[NOVA].by_route["github"]
+    assert (per_route.wake_locked, per_route.refused_unclassified) == (None, None)
+
+    store = _store(tmp_path)
+    store.record_wake_refused(
+        NOVA, "wake_lock_held", gate=RefusalGate.WAKE_LOCK, route="github", synthetic=False
+    )
+    per_route = store.snapshot().agent_wakes[NOVA].by_route["github"]
+    assert (per_route.refused, per_route.wake_locked, per_route.refused_unclassified) == (3, 1, 2)
 
 
 def test_a_dedup_is_never_confused_with_a_refusal(tmp_path) -> None:

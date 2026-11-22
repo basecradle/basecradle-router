@@ -585,12 +585,20 @@ def _route_scalars(proof: RouteWakeEvidence | None) -> dict:
     filed under ``refused``, ``ok=4 failed=0 refused=2`` with the refusal 2.6 ms after the
     success was a route that had rejected nothing at all. ``deduped``/``last_deduped_at``
     carry it now, so ``last_refused_at`` moves only for a wake a gate actually stopped.
+
+    ``wake_locked`` and ``refused_unclassified`` split ``refused`` by gate the same way
+    (basecradle-router#543): a held wake-lock is an update in progress, a breaker refusal
+    a runaway caught, and the breaker's share is ``refused - refused_unclassified -
+    wake_locked``. Both are ``null`` on a row written before the split that has refusals
+    on it (see :class:`~basecradle_router.evidence.RouteWakeEvidence`).
     """
     return {
         "ok": proof.ok if proof else 0,
         "failed": proof.failed if proof else 0,
         "refused": proof.refused if proof else 0,
         "deduped": proof.deduped if proof else 0,
+        "wake_locked": proof.wake_locked if proof else 0,
+        "refused_unclassified": proof.refused_unclassified if proof else 0,
         "last_ok_at": proof.last_ok_at if proof else None,
         "last_ok_delivery": proof.last_ok_delivery if proof else None,
         "last_failed_at": proof.last_failed_at if proof else None,

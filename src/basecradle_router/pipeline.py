@@ -117,7 +117,7 @@ from basecradle_router.concurrency import (
 )
 from basecradle_router.config import Config, ConfigError
 from basecradle_router.dedup import DUPLICATE_DELIVERY, DeliveryDeduper
-from basecradle_router.evidence import EvidenceStore
+from basecradle_router.evidence import EvidenceStore, RefusalGate
 from basecradle_router.logfmt import active_synthetic_origin, log_fields, paint
 from basecradle_router.models import Agent, Event
 from basecradle_router.resolve import resolve_agent
@@ -731,7 +731,10 @@ class Pipeline:
                     # dead edge — which is exactly what a refusal (never a failure)
                     # tells the ledger.
                     self.evidence.record_wake_refused(
-                        agent.harness_key, decision.detail, **provenance
+                        agent.harness_key,
+                        decision.detail,
+                        gate=RefusalGate.WAKE_LOCK,
+                        **provenance,
                     )
                     self._record(
                         result, Stage.WAKE_LOCK, Outcome.IGNORED, **who, reason=decision.detail
@@ -749,7 +752,7 @@ class Pipeline:
                     # A trip/refusal is a deliberate, visible drop — recorded like the
                     # route's IGNORED decisions; the breaker already escalated loudly.
                     self.evidence.record_wake_refused(
-                        agent.harness_key, outcome.detail, **provenance
+                        agent.harness_key, outcome.detail, gate=RefusalGate.BREAKER, **provenance
                     )
                     self._record(
                         result, Stage.BREAKER, Outcome.IGNORED, **who, reason=outcome.detail
