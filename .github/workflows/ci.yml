@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege, like every other workflow here: CI only reads the repository, so its
+# GITHUB_TOKEN never takes the repository's default scope.
+permissions:
+  contents: read
+
 jobs:
   # Job id is the published check-run name, and the "Protect main" ruleset
   # requires the status context "CI" — so this job must be named CI (not the
