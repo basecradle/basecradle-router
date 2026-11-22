@@ -286,6 +286,48 @@ def test_a_row_written_before_wake_locked_reads_it_as_absent(tmp_path) -> None:
     assert per_route.refused - per_route.refused_unclassified - per_route.wake_locked == 1
 
 
+@pytest.mark.parametrize("bad", ["3", -1, True, 2.5, None, [1]])
+def test_a_counter_that_is_not_a_count_falls_back_to_its_default(tmp_path, bad) -> None:
+    # `from_json` promises an unusable field falls back to its default. A counter copied
+    # through as read would raise on the next `+= 1`, on the wake path.
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": EVIDENCE_VERSION,
+                "delivery_sinks": {"github": {"accepted": bad, "rejected": 4}},
+                "agent_wakes": {
+                    NOVA: {
+                        "ok": 7,
+                        "refused": bad,
+                        "queued": bad,
+                        "by_route": {"github": {"ok": 7, "refused": bad}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    document = read_evidence(str(path))
+    assert (
+        document.delivery_sinks["github"].accepted,
+        document.delivery_sinks["github"].rejected,
+    ) == (
+        0,
+        4,
+    )
+    wake = document.agent_wakes[NOVA]
+    assert (wake.ok, wake.refused, wake.queued, wake.by_route["github"].refused) == (7, 0, 0, 0)
+
+    store = _store(tmp_path)
+    store.record_wake_refused(
+        NOVA, "wake_lock_held", gate=RefusalGate.WAKE_LOCK, route="github", synthetic=False
+    )
+    store.record_delivery_accepted("github")
+    wake = store.snapshot().agent_wakes[NOVA]
+    assert (wake.refused, wake.by_route["github"].refused) == (1, 1)
+
+
 def test_a_row_written_before_wake_locked_with_no_refusals_reads_zero(tmp_path) -> None:
     # Nothing to classify, so zero is simply true, and the row counts like a new one.
     path = tmp_path / "evidence.json"

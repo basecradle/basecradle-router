@@ -607,11 +607,29 @@ def _items(raw: object):
 
 
 def _rebuild(kind, fields: object):
-    """Build a dataclass from ``fields``, keeping only keys it declares."""
+    """Build a dataclass from ``fields``, keeping only keys it declares.
+
+    A counter (a field whose default is an ``int``) keeps only a count: anything else
+    falls back to the default, as :meth:`EvidenceDocument.from_json` promises an
+    unusable field does. Copied through as read, a hand-edited ``"refused": "3"`` would
+    raise ``TypeError`` at the next ``+= 1``, on the wake path, which is the instrument
+    breaking the thing it instruments.
+    """
     if not isinstance(fields, dict):
         return kind()
-    known = {f for f in kind.__dataclass_fields__}
-    return kind(**{k: v for k, v in fields.items() if k in known})
+    declared = kind.__dataclass_fields__
+    return kind(
+        **{
+            k: v
+            for k, v in fields.items()
+            if k in declared and (not _is_counter(declared[k]) or _count_or_none(v) is not None)
+        }
+    )
+
+
+def _is_counter(declared) -> bool:
+    default = declared.default
+    return isinstance(default, int) and not isinstance(default, bool)
 
 
 def _str_or_none(value: object) -> str | None:
