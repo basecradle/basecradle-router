@@ -1,4 +1,22 @@
 version: 2
+# The fleet's Dependabot policy, approved by @origin for every repository on 2026-11-22
+# (basecradle#874, basecradle-router#548). Dependabot proposes a version update only once
+# the release is seven days old, so a release pulled or found compromised in its first week
+# never arrives here as a Dependabot version-update pull request. A cooldown never delays a
+# security update: Dependabot's security updates are exempt, and the daily osv-scanner scan
+# of uv.lock (#410) reads no cooldown. The routing half lives in the shared auto-merge
+# workflow (.github/workflows/dependabot-auto-merge.yml in basecradle/.github, called by
+# this repository's file of the same name): an action update, or an update in a group
+# named exactly `publish-path`, goes to the capital to read and is never auto-merged.
+#
+# No `publish-path` group: this repository publishes no package, and no tool Dependabot
+# moves runs in a job holding a credential. Of the jobs that hold one, the auto-merge and
+# needs-human alert jobs only call reusable workflows in basecradle/.github, and the
+# dependency scan and the interaction-limit renewal run only actions, the runner's own
+# python3 on standard-library scripts, gh, jq and curl, and an osv-scanner pinned by
+# version and checksum in the workflow itself. A change that runs a uv-managed tool in
+# such a job adds that tool and its closure here as a `publish-path` group in the same
+# diff.
 updates:
 # The `uv` ecosystem, not `pip`: this repo's manifests are `pyproject.toml` +
 # a committed `uv.lock`, and CI installs with `uv sync --locked` (the deploy's
@@ -10,9 +28,18 @@ updates:
   directory: "/"
   schedule:
     interval: weekly
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
 - package-ecosystem: github-actions
   directory: "/"
   schedule:
     interval: weekly
+  cooldown:
+    default-days: 7
+  # A week's action bumps arrive as one pull request for the capital to read.
+  groups:
+    github-actions:
+      patterns:
+      - "*"
   open-pull-requests-limit: 10
