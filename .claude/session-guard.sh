@@ -14,13 +14,20 @@
 # thing that creates it. A session that has self-exited cannot clean up, so the
 # cleanup has to happen BEFORE the exit — and be checked there, not remembered.
 #
-# THE TWO HALVES
-# --------------
-#   GROUND TRUTH  for Docker, for Docker Desktop and for this account's listening
-#                 TCP ports (a dev server). The daemon, the process list and the
-#                 kernel's socket table are authoritative, so `check` compares what is there now
-#                 against a baseline taken at session start and needs nobody to
-#                 have written anything down.
+# THE THREE HALVES
+# ----------------
+#   GROUND TRUTH  for Docker Desktop and for this account's listening TCP ports (a
+#                 dev server). The process list and the kernel's socket table are
+#                 authoritative, so `check` compares what is there now against a
+#                 baseline taken at session start.
+#   A LEDGER      for Docker artefacts (basecradle-noc#1715). @origin's rule: a
+#                 session cleans up exactly what it created, and it knows what it
+#                 created because it recorded it at the moment it created it. It
+#                 never guesses. So every container, image, volume and builder a
+#                 session makes goes through this script (`run`, `create`, `pull`,
+#                 `build`, `volume-create`), which writes it on the session's own
+#                 ledger as it is made; `check` reads only that ledger, and `sweep`
+#                 removes only what is on it.
 #   A RECORD      for browser tabs. A tab carries no attribution we can read,
 #                 and censusing @origin's own tabs is not ours to do, so the tab
 #                 half rests on `tab-open`/`tab-close` plus the mandatory
@@ -32,11 +39,16 @@
 # a session whose SessionStart hook never fired cannot exit quietly — it is told
 # so. That is also why `begin` is a hook rather than a step to remember.
 #
-# PROVE-IT-IS-OURS, OR REPORT: the sweep removes only what carries this
-# session's own label; anything else that appeared during the session is
-# REPORTED with the exact command and never touched. An image @origin pulled
-# mid-session is his. "Clean the hotel's towels; never the guest's suitcase."
-# There is deliberately no `docker system prune` anywhere in this file.
+# WHAT A SESSION DID NOT RECORD IS NOT ITS FINDING. The guard this replaced read
+# every Docker artefact that "appeared during the session" as the session's, so a
+# sibling's pulled base image (which can carry no label) and a sibling's growth of
+# the shared build cache each held an innocent session open with no lever but
+# removing someone else's property. Nothing outside the ledger blocks now: an
+# artefact made around the guard (a bare `docker pull`) is caught after every
+# builder exits by the capital's own leftovers check, which names anything on the
+# laptop no session claimed. "Clean the hotel's towels; never the guest's
+# suitcase." There is deliberately no `docker system prune` anywhere in this file,
+# and no removal here is forced past a container still using an image.
 #
 # ONE DOCKER DESKTOP, EVERY BUILDER (basecradle-noc#1255). Every laptop builder runs
 # under one macOS account and there is one Docker Desktop, so "it was running when I
@@ -119,15 +131,27 @@ usage: session-guard.sh <command> [args]
                             THIS session started it. The only sanctioned way to
                             start it — `open -a Docker` leaves no record, so the
                             quit can never be proved to be ours.
+  run [docker run args]     Run a container, recorded on this session's ledger
+                            (docker writes its id there as it creates it). It is
+                            never pulled implicitly: pull its image first.
+  create [docker create args]   The same, for `docker create`.
+  pull [options] <ref>      Pull an image and record it, unless it was already
+                            on the engine (then it is not this session's).
+  build [buildx build args] <context>
+                            Build on this session's own buildx builder (made and
+                            recorded on first use) and load the result, recorded.
+  volume-create <name> [options]
+                            Create a named volume, recorded. Refuses a name that
+                            already exists.
   tab-open <id> [note]      Record a browser tab this session opened.
   tab-close <id>            Record that it was closed.
   baseline-listeners        A late listening-port baseline, for a session that began
                             before the guard censused ports (attested by hand)
   tabs-checked              Attest that the browser was looked at (one
                             tabs_context_mcp call) and holds no session tab.
-  sweep                     Remove this session's labelled containers, images and
-                            throwaway builders; quit Docker Desktop if this
-                            session started it, reading the stop back.
+  sweep                     Remove what this session's ledger records (containers,
+                            builders, images, volumes, in that order); quit Docker
+                            Desktop if this session started it, reading the stop back.
   check                     Exit 0 only when this session left nothing behind.
   done                      check, then clear this session's state.
 USAGE
@@ -276,87 +300,332 @@ docker_desktop_running() {
   grep -qE '^Status[[:space:]]+running$' <<<"$status"
 }
 
-# Every list below is empty (and harmless) when the engine is unreachable; the
-# caller decides whether "we could not look" is clean, and it never is.
-list_containers()      { docker ps -a --no-trunc --format '{{.ID}}' 2>/dev/null | sort -u; }
-list_images()          { docker image ls -a --no-trunc --format '{{.ID}}' 2>/dev/null | sort -u; }
-list_volumes()         { docker volume ls --format '{{.Name}}' 2>/dev/null | sort -u; }
+# The engine's buildx builders, by name. Empty (and failing, under pipefail) when the engine is
+# unreachable; the caller decides whether "we could not look" is clean, and it never is.
 list_builders()        { docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^[:space:]]/ {sub(/\*$/, "", $1); print $1}' | sort -u; }
-labelled_containers()  { docker ps -aq --no-trunc --filter "label=$LABEL" 2>/dev/null | sort -u; }
-labelled_images()      { docker image ls -aq --no-trunc --filter "label=$LABEL" 2>/dev/null | sort -u; }
-session_builders()     { list_builders | grep "^$BUILDER_PREFIX" || true; }
-build_cache_size()     { docker system df --format json 2>/dev/null \
-                           | grep '"Type":"Build Cache"' \
-                           | sed -n 's/.*"Size":"\([^"]*\)".*/\1/p' | sed -n 1p; }
 
-# Docker prints sizes the way go-units' HumanSize does: decimal units, four significant digits
-# ("0B", "512.5kB", "1.234GB"); its binary form (BytesSize: "KiB", "MiB") is read too. Prints bytes,
-# or fails on a shape it does not know, which the caller reads as "we could not look".
-size_bytes() {
-  awk -v s="$1" 'BEGIN {
-    if (!match(s, /^[0-9]+(\.[0-9]+)?/)) exit 1
-    n = substr(s, 1, RLENGTH); u = substr(s, RLENGTH + 1)
-    m["B"] = 1; m["kB"] = 1e3; m["KB"] = 1e3; m["MB"] = 1e6; m["GB"] = 1e9; m["TB"] = 1e12; m["PB"] = 1e15
-    m["KiB"] = 1024; m["MiB"] = 1024 ^ 2; m["GiB"] = 1024 ^ 3; m["TiB"] = 1024 ^ 4
-    if (!(u in m)) exit 1
-    printf "%.0f\n", n * m[u] }'
+# ------------------------------------------------------------------ the ledger
+#
+# YOU CLEAN UP WHAT YOU CREATED, AND YOU KNOW BECAUSE YOU WROTE IT DOWN (@origin, basecradle-noc#1715).
+# Every Docker artefact a session makes is written on its own ledger at the moment it is made, by the
+# one command here that makes it, and nothing else decides whose an artefact is: not a label (a pulled
+# image cannot carry one), not "it appeared while this session ran", not "a sibling's container uses
+# it". The ledger lives in the session's state directory:
+#
+#   records/     one file per image, volume or builder, holding `<kind>\t<id>\t<note>`, written as it
+#                is made. A volume and a builder are written BEFORE docker makes them, under a name the
+#                guard has already checked is free, so not even a session killed mid-call makes one
+#                off it.
+#   containers/  one file per container the session ran or created, written by docker itself
+#                (`--cidfile`) the moment the container exists: a session killed mid-run is still on it.
+#   pending/     an image operation (`pull`, `build`) asked for and not yet resolved to the image it
+#                made: its reference, the process running it, and every image on the engine before it
+#                ran, so the image it made is told apart from one that was already there, by whoever
+#                resolves it — the operation itself, or the next `check` after a crash.
+#
+# An entry is DISCHARGED (its file removed) once an answering engine shows its artefact gone, so a
+# sweep that quit Docker Desktop leaves a ledger that needs no engine to read as clear. One file per
+# entry is what makes that safe: a discharge removes only the files it read, so it never races an
+# entry another call of the same session is writing.
+#
+# The label still goes on every container, built image and volume, because it helps a reader; it is no
+# longer how ownership is decided.
+
+# The image a session's own builder runs, pulled through `pull` first so the ledger records it when it
+# is new. Pinned by tag, so the builder's own pull at bootstrap is the same image.
+BUILDKIT_IMAGE="moby/buildkit:buildx-stable-1"
+
+# A name this session alone holds, for its own builder and the tag each of its builds carries: the
+# session key, in the characters an image repository allows.
+session_slug() {
+  printf '%s' "$(session_key)" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//'
+}
+own_builder() { echo "${BUILDER_PREFIX}$(session_slug)"; }
+
+# The conversation a session belongs to, which a resume keeps while the process (the key) changes.
+conversation_id() { printf '%s' "${SESSION_ID_OVERRIDE:-${CLAUDE_CODE_SESSION_ID:-}}"; }
+
+note_conversation() {  # note_conversation <id>: every conversation id this session's process carried
+  local f; f="$(state_dir)/conversations"
+  [ -n "$1" ] || return 0
+  if [ ! -f "$f" ] || ! grep -qxF -- "$1" "$f"; then printf '%s\n' "$1" >> "$f"; fi
 }
 
-# The Docker half of the baseline, taken only from an engine that answers (basecradle#707 (b)). An
-# engine that is down at `begin` has nothing to list, and comparing against that empty list read
-# every container and image already on the laptop as this session's — the moment `docker-up`
-# brought the engine up — with `docker rmi <someone else's image>` as the repair. So `docker-up`,
-# the one sanctioned way to reach Docker, takes the census before the session can use the engine.
-docker_census() {  # docker_census begin|started|late
-  local d; d="$(state_dir)"
-  list_containers > "$d/containers.base"
-  list_images     > "$d/images.base"
-  list_volumes    > "$d/volumes.base"
-  list_builders   > "$d/builders.base"
-  # One re-read (basecradle#710 item 2): the `started` census runs the moment `docker version` first
-  # answers, while the engine may still be settling, and a single failed `docker system df` stored
-  # an unreadable baseline for the whole session. One that stays unreadable is `docker-up`'s to re-take.
-  local cache; cache="$(build_cache_size)"
-  size_bytes "$cache" >/dev/null || { sleep "$POLL_SECONDS"; cache="$(build_cache_size)"; }
-  s_put build_cache.base "$cache"
-  s_put docker_census_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  s_put docker_census "$1"
+# This process, by identity where its start time can be read (a recycled pid cannot pass for it),
+# else by pid alone; and whether a process so named is still the one running.
+my_ident() { proc_identity "$$" || echo "$$"; }
+op_alive() {  # op_alive <ident>
+  local pid="${1%%-*}"
+  [ -n "$pid" ] || return 1
+  if [ "$1" != "$pid" ]; then [ "$(proc_identity "$pid")" = "$1" ]; else kill -0 "$pid" 2>/dev/null; fi
 }
 
-# Narrow the Docker baseline to what is still on the engine now (basecradle-noc#1255). An artefact
-# the baseline holds that is gone now and present later was made again during this session, and
-# an ID cannot say so: on 2026-11-04 the router builder's baseline held the harness builder's
-# `ubuntu:24.04`, the harness builder removed it, the router builder pulled it again under the same
-# content ID, and its check read the copy it pulled as one that was already there. Every moment
-# `docker-up` reaches the engine is a moment the laptop is measured, so the baseline is what was
-# there at all of them. Narrowing only ever adds to what `check` reports. A list the engine did not
-# answer narrows nothing, because an empty list here is the #707 (b) defect: everything reads new.
-docker_census_narrow() {
-  local d kind now gone=0 before; d="$(state_dir)"
-  for kind in containers images volumes; do
-    now="$("list_$kind")" || { echo "session-guard: the engine did not list $kind; that baseline is kept as it was." >&2; continue; }
-    before="$(wc -l < "$d/$kind.base" | tr -d ' ')"
-    comm -12 "$d/$kind.base" <(printf '%s\n' "$now" | sed '/^$/d') > "$d/$kind.base.next" && mv -f "$d/$kind.base.next" "$d/$kind.base"
-    gone=$((gone + before - $(wc -l < "$d/$kind.base" | tr -d ' ')))
+# Write one entry. With `held`, the entry is written BEFORE docker makes the artefact, and names the
+# process making it on its second line, so no concurrent call of this session discharges it while it
+# is still being made; `ledger_release` drops that line once docker has made it. Prints the file.
+ledger_record() {  # ledger_record <kind> <id> [note] [held]
+  local d f; d="$(state_dir)/records"
+  mkdir -p "$d" || return 1
+  f="$d/$(date +%s).$$.$RANDOM"
+  { printf '%s\t%s\t%s\n' "$1" "$2" "${3:--}"; if [ "${4-}" = "held" ]; then my_ident; fi; } > "$f.next" || return 1
+  mv -f "$f.next" "$f" || return 1
+  touch "$(state_dir)"
+  echo "$f"
+}
+
+ledger_release() {  # ledger_release <file>
+  sed -n 1p "$1" > "$1.next" && mv -f "$1.next" "$1"
+}
+
+# The process still making an entry's artefact, if any: its second line, while that process lives.
+entry_held() {  # entry_held <file>
+  local holder; holder="$(sed -n 2p "$1" 2>/dev/null)"
+  [ -n "$holder" ] && op_alive "$holder"
+}
+
+# Every entry a ledger holds, containers included, one `<kind>\t<id>\t<note>\t<file>` line each. No
+# field is ever empty (an empty note is `-`): a tab is whitespace to `read`, which would fold an empty
+# field into the next one. The same artefact recorded twice is two lines, one per file.
+ledger_entries() {  # ledger_entries [state dir]
+  local d="${1:-$(state_dir)}" f kind id note
+  for f in "$d/records"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r kind id note < "$f" || true
+    if [ -n "${kind:-}" ] && [ -n "${id:-}" ]; then printf '%s\t%s\t%s\t%s\n' "$kind" "$id" "${note:--}" "$f"; fi
   done
-  # The build cache is narrowed to its smallest reading, by the same rule: only growth is a build.
-  local cache base cache_bytes base_bytes
-  cache="$(build_cache_size)"; base="$(s_get build_cache.base)"
-  if cache_bytes="$(size_bytes "$cache")"; then
-    if ! base_bytes="$(size_bytes "$base")"; then
-      # The one lever for an unreadable cache baseline (basecradle#709 item 6). Without it, the
-      # finding `check` raises could never clear, and self-exit has no override.
-      s_put build_cache.base "$cache"
-      s_put build_cache_late "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      echo "session-guard: the build cache's size could not be read when the Docker baseline was taken; it is read now ($cache, LATE) — a build before now is attested by hand, not measured."
-    elif [ "$cache_bytes" -lt "$base_bytes" ]; then
-      s_put build_cache.base "$cache"
-    fi
-  elif ! size_bytes "$base" >/dev/null; then
-    echo "session-guard: the build cache's size still cannot be read ('$cache'); no cache baseline recorded." >&2
-    return 1
+  for f in "$d/containers"/*; do
+    [ -s "$f" ] || continue
+    id="$(tr -d '[:space:]' < "$f")"
+    if [ -n "$id" ]; then printf 'container\t%s\t-\t%s\n' "$id" "$f"; fi
+  done
+  return 0
+}
+
+# One line per artefact, however many entries record it.
+distinct() { awk -F'\t' 'NF && !seen[$1 FS $2]++'; }
+
+# Remove the file of every entry read in <entries> whose artefact is not in <present>, both read off
+# an answering engine moments ago. Only files that read listed are touched.
+ledger_discharge() {  # ledger_discharge <entries> <present>
+  local entries="$1" keys kind id note file
+  keys="$(cut -f1,2 <<< "$2")"
+  while IFS=$'\t' read -r kind id note file; do
+    [ -n "${file:-}" ] || continue
+    grep -qxF -- "$kind"$'\t'"$id" <<< "$keys" && continue
+    entry_held "$file" || rm -f "$file"
+  done <<< "$entries"
+  return 0
+}
+
+has_pending() {  # has_pending [state dir]
+  local d="${1:-$(state_dir)}" f
+  for f in "$d/pending"/*; do [ -f "$f" ] && return 0; done
+  return 1
+}
+
+ledger_empty() {  # ledger_empty [state dir]
+  [ -z "$(ledger_entries "${1-}")" ] && ! has_pending "${1-}"
+}
+
+# Which of these ledger entries are still on the engine, in the form `ledger_entries` prints. Each kind
+# the entries hold is listed once; a list the engine did not answer fails the whole read, which the
+# caller reports and never reads as "gone". An entry of a kind this script does not know is reported
+# as present: a ledger it cannot read is never a clean one.
+ledger_present() {  # ledger_present <entries>
+  local entries="$1" kind id note file have c="" i="" v="" b=""
+  [ -n "$entries" ] || return 0
+  if grep -q '^container' <<< "$entries"; then c="$(docker ps -aq --no-trunc 2>/dev/null)" || return 1; fi
+  if grep -q '^image' <<< "$entries"; then i="$(docker image ls -aq --no-trunc 2>/dev/null)" || return 1; fi
+  if grep -q '^volume' <<< "$entries"; then v="$(docker volume ls -q 2>/dev/null)" || return 1; fi
+  if grep -q '^builder' <<< "$entries"; then b="$(list_builders)" || return 1; fi
+  while IFS=$'\t' read -r kind id note file; do
+    [ -n "${id:-}" ] || continue
+    case "$kind" in
+      container) have="$c" ;;
+      image)     have="$i" ;;
+      volume)    have="$v" ;;
+      builder)   have="$b" ;;
+      *)         printf '%s\t%s\t%s\t%s\n' "$kind" "$id" "$note" "$file"; continue ;;
+    esac
+    if grep -qxF -- "$id" <<< "$have"; then printf '%s\t%s\t%s\t%s\n' "$kind" "$id" "$note" "$file"; fi
+  done <<< "$entries"
+  return 0
+}
+
+describe_entry() {  # describe_entry <kind> <id> <note>
+  case "$1" in
+    container) echo "container $2 ($(describe_container "$2"))" ;;
+    image)     if [ "${3:--}" = "-" ]; then echo "image $2 (untagged)"; else echo "image $2 ($3)"; fi ;;
+    volume)    echo "volume $2" ;;
+    builder)   echo "buildx builder $2" ;;
+    *)         echo "a ledger entry of a kind this guard does not know ('$1': $2)" ;;
+  esac
+}
+
+# Remove one artefact this session recorded. Never forced past a container still using an image: a
+# forced removal would pull it out from under that container, which is not this session's to break.
+remove_entry() {  # remove_entry <kind> <id> <note>
+  local out="" tag rc=0
+  case "$1" in
+    container) out="$(docker rm -f -v "$2" 2>&1)" || rc=1 ;;
+    builder)   out="$(docker buildx rm "$2" 2>&1)" || rc=1 ;;
+    volume)    out="$(docker volume rm "$2" 2>&1)" || rc=1 ;;
+    image)
+      # The tags its own operation gave it first, each only while it still names this image (an image
+      # with several tags cannot be removed by its id unforced), then the image itself.
+      while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
+        [ "$(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null)" = "$2" ] || continue
+        out="$(docker rmi "$tag" 2>&1)" || { rc=1; break; }
+      done <<< "$(if [ "$3" != "-" ]; then tr ',' '\n' <<< "$3"; fi)"
+      if [ "$rc" = "0" ] && docker image inspect "$2" >/dev/null 2>&1; then
+        out="$(docker rmi "$2" 2>&1)" || rc=1
+      fi
+      ;;
+    *) out="this guard does not know how to remove a '$1'"; rc=1 ;;
+  esac
+  if [ "$rc" != "0" ]; then
+    echo "session-guard: could not remove $(describe_entry "$1" "$2" "$3"): $(tr '\n' ' ' <<< "$out")" >&2
   fi
-  [ "$gone" -eq 0 ] || echo "session-guard: narrowed the Docker baseline: $gone artefact(s) it held are gone now, so any that comes back counts as made during this session."
+  return "$rc"
+}
+
+# Start an image operation: write its pending record, holding the images on the engine before it runs.
+image_op_begin() {  # image_op_begin <ref> <pull|build>  ->  the pending record's path
+  local d p before ident
+  d="$(state_dir)/pending"
+  before="$(docker image ls -aq --no-trunc 2>/dev/null)" || {
+    echo "session-guard: the engine did not list its images, so nothing could tell what this $2 makes; not running it." >&2
+    return 1
+  }
+  ident="$(my_ident)"
+  mkdir -p "$d" || return 1
+  p="$d/$(date +%s).$$.$RANDOM"
+  { printf '%s\n%s\n%s\n' "$1" "$2" "$ident"; printf '%s\n' "$before"; } > "$p.next" || return 1
+  mv -f "$p.next" "$p" || return 1
+  touch "$(state_dir)"
+  echo "$p"
+}
+
+# Resolve a pending image operation to what it made, read off the engine: the image its reference
+# names now, recorded only if that image was not on the engine before the operation ran. Returns 0
+# when resolved (recorded, or nothing to record), 1 when the engine could not be read or the ledger
+# not written (the record is kept), and 2 while the operation's own process is still running, which
+# only the operation itself (`now`) may resolve.
+#
+# A PULL CUT OFF IS NEVER GUESSED AT. Once its process is gone, an image under its reference that was
+# not there before may be the one it landed or one a sibling pulled since, and nothing on the engine
+# tells the two apart; recording it would hand this session's sweep a sibling's image. So it is named
+# and left to the capital's leftovers check. A build cut off is resolved: its tag is this session's
+# alone, so the image under it can only be its own.
+resolve_pending() {  # resolve_pending <record> [now]
+  local f="$1" ref how ident before id tags
+  ref="$(sed -n 1p "$f")"; how="$(sed -n 2p "$f")"; ident="$(sed -n 3p "$f")"
+  if [ "${2-}" != "now" ]; then
+    op_alive "$ident" && return 2
+    if [ "$how" != "build" ]; then
+      echo "session-guard: a $how of $ref this session started was cut off before it said what it made; whatever it may have left is NOT recorded, because nothing can tell it from another session's (remove it by hand if it is this session's, and say so in the completion comment)."
+      rm -f "$f"
+      return 0
+    fi
+  fi
+  engine_up || return 1
+  if ! id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null)" || [ -z "$id" ]; then
+    echo "session-guard: the $how of $ref left no image on the engine; nothing to record."
+    rm -f "$f"
+    return 0
+  fi
+  before="$(sed 1,3d "$f")"
+  if grep -qxF -- "$id" <<< "$before"; then
+    echo "session-guard: not this session's: image $id ($ref) was on the engine before this $how, so it is not recorded and no sweep of this session's removes it."
+  else
+    tags="$(docker image inspect --format '{{join .RepoTags ","}}' "$id" 2>/dev/null)" || tags="$ref"
+    if ! ledger_record image "$id" "${tags:-$ref}" >/dev/null; then
+      echo "session-guard: could not write the ledger, so image $id ($ref) is NOT recorded; its pending record is kept." >&2
+      return 1
+    fi
+    echo "session-guard: recorded image $id (${tags:-$ref}) on this session's ledger."
+  fi
+  rm -f "$f"
+}
+
+# Resolve every pending record this session holds. 0 when none is left, else 1.
+resolve_all_pending() {
+  local f left=0
+  for f in "$(state_dir)/pending"/*; do
+    [ -f "$f" ] || continue
+    resolve_pending "$f" || left=1
+  done
+  return "$left"
+}
+
+# Every OTHER session's ledger under this repo's state root that still records something, as
+# `<key>\t<dir>`: one whose `claude` has provably exited, or one whose key no process check can read
+# that is older than the stale window. A live session's ledger is its own business.
+ended_ledgers() {
+  local root dir key alive
+  root="$(state_root)"
+  [ -d "$root" ] || return 0
+  for dir in "$root"/*; do
+    [ -d "$dir" ] || continue
+    key="${dir##*/}"
+    [ "$key" != "$(session_key)" ] || continue
+    ledger_empty "$dir" && continue
+    key_alive "$key"; alive=$?
+    if [ "$alive" = "1" ] || { [ "$alive" = "2" ] && [ -n "$(find "$dir" -maxdepth 0 -mtime "+$STALE_STATE_DAYS" 2>/dev/null)" ]; }; then
+      printf '%s\t%s\n' "$key" "$dir"
+    fi
+  done
+  return 0
+}
+
+# A RESUME IS THE SAME CONVERSATION IN A NEW PROCESS. The key is the `claude` process, so a resumed
+# session takes a new key, and the ledger its crashed predecessor wrote sits under the old one. What
+# that predecessor created, this conversation created, so the resume ADOPTS it, out loud — only from a
+# session whose `claude` has provably exited and whose state names this same conversation id. Every
+# other ended session's ledger is named (`name_ended_ledgers`) and never adopted.
+adopt_resumed_ledgers() {  # adopt_resumed_ledgers <conversation id>
+  local conv="$1" key dir d f alive
+  [ -n "$conv" ] || return 0
+  d="$(state_dir)"
+  while IFS=$'\t' read -r key dir; do
+    [ -n "${key:-}" ] || continue
+    key_alive "$key"; alive=$?
+    [ "$alive" = "1" ] || continue
+    [ -f "$dir/conversations" ] || continue
+    grep -qxF -- "$conv" "$dir/conversations" || continue
+    mkdir -p "$d/records" "$d/containers" "$d/pending" || return 1
+    for f in "$dir/records"/* "$dir/containers"/* "$dir/pending"/*; do
+      if [ -f "$f" ]; then mv -f "$f" "$d/${f#"$dir"/}" || return 1; fi
+    done
+    echo "  ADOPTED: session $key ended (its claude has exited) and was this same conversation ($conv): this is its resume, so what its Docker ledger records is this session's to remove."
+  done <<< "$(ended_ledgers)"
+  return 0
+}
+
+# Name every ended session's ledger, never blocking on it: it is not this session's. One whose every
+# artefact is gone from an answering engine has nothing left to say, and is cleared here; whatever is
+# still on the laptop, the capital's leftovers check names after every builder exits.
+name_ended_ledgers() {
+  local key dir entries present n f
+  while IFS=$'\t' read -r key dir; do
+    [ -n "${key:-}" ] || continue
+    # An operation its ended session never resolved is resolved by nobody: no other session can say
+    # what it made. It is named once and dropped, so the ledger can clear.
+    for f in "$dir/pending"/*; do
+      [ -f "$f" ] || continue
+      echo "session-guard: not this session's: ended session $key left a $(sed -n 2p "$f") of $(sed -n 1p "$f") unresolved; nothing can say what it made, so it is dropped (the capital's leftovers check names anything it left)."
+      rm -f "$f"
+    done
+    entries="$(ledger_entries "$dir")"
+    if ! has_pending "$dir" && engine_up && present="$(ledger_present "$entries")" && [ -z "$present" ]; then
+      rm -rf "$dir/records" "$dir/containers"
+      echo "session-guard: cleared ended session $key's Docker ledger: nothing it recorded is on the engine any more."
+      continue
+    fi
+    n="$(distinct <<< "$entries" | grep -c .)"
+    echo "session-guard: not this session's: session $key ended with a Docker ledger that still records $n artefact(s)$(has_pending "$dir" && echo ' and an unresolved image operation') ($dir). It is never adopted by another conversation; it clears itself here once they are gone."
+  done <<< "$(ended_ledgers)"
   return 0
 }
 
@@ -450,7 +719,6 @@ adopt_orphaned_desktop() {  # adopt_orphaned_desktop <records>
         publish_desktop procs || { echo "  WARNING: could not write this session's ledger record; session $key's Docker Desktop is not adopted." >&2; continue; }
         rm -f "$(desktop_ledger)/$key"
         s_put docker_started_by_session 1
-        s_put docker_released 0
         s_put adopted_from "$key"
         echo "  ADOPTED: session $key ($repo) ended without quitting the Docker Desktop it started, and that same Docker Desktop is still running — this session quits it at sweep."
         ;;
@@ -463,24 +731,6 @@ adopt_orphaned_desktop() {  # adopt_orphaned_desktop <records>
     esac
   done <<< "$1"
   return 0
-}
-
-# Whether the engine must still answer, because this session may have made something on it that
-# `check` cannot see with it down:
-#   - it started (or adopted) Docker Desktop and has not quit it;
-#   - not once its own sweep checked the engine and quit it: down because the session is done;
-#   - it used the engine through `docker-up`;
-#   - the engine was the laptop's own at `begin` (no builder's record accounted for it), which
-#     nothing in this session should have stopped.
-# An engine a SIBLING was running at `begin`, and this session never reached through `docker-up`,
-# going down is that sibling's sweep doing its job (basecradle-noc#1255), not something this
-# session must answer for. Reaching a sibling's engine outside `docker-up` is out of protocol and
-# unmeasured once the sibling quits it: the residual, named.
-engine_must_answer() {
-  [ "$(s_get docker_started_by_session 0)" = "1" ] && return 0
-  [ "$(s_get docker_released 0)" = "1" ] && return 1
-  [ "$(s_get docker_used 0)" = "1" ] && return 0
-  [ "$(s_get docker_census)" = "begin" ] && [ -z "$(s_get desktop_owner)" ]
 }
 
 # A DEV SERVER, OR ANYTHING ELSE LISTENING (the capital, on @origin's word, basecradle-noc#899): a
@@ -597,20 +847,6 @@ attribute_pid() {
 }
 
 describe_container() { docker ps -a --no-trunc --filter "id=$1" --format '{{.Image}} ({{.Status}})' 2>/dev/null | sed -n 1p; }
-describe_image()     { docker image ls -a --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | awk -v i="$1" '$1==i && !seen++ {print $2}'; }
-
-# Another laptop builder's label on an artefact, which is that sibling's attribution exactly as this
-# session's own label is its own (basecradle-noc#1230): every carrier labels `<repo>-builder=1`.
-# Prints the sibling's label key, or nothing and fails, which the caller reads as unattributed — an
-# inspect that could not answer included, so "we could not look" stays a finding.
-sibling_label() {  # sibling_label container|image|volume <id>
-  local labels
-  case "$1" in
-    volume) labels="$(docker volume inspect --format '{{json .Labels}}' "$2" 2>/dev/null)" ;;
-    *)      labels="$(docker inspect --type "$1" --format '{{json .Config.Labels}}' "$2" 2>/dev/null)" ;;
-  esac
-  grep -oE '"[a-z0-9][a-z0-9.-]*-builder":"1"' <<< "$labels" | cut -d'"' -f2 | grep -vxF "$LABEL_KEY" | sed -n 1p | grep .
-}
 
 # ------------------------------------------------------------------- commands
 
@@ -622,28 +858,33 @@ cmd_begin() {
   # compaction and fork, and every one of them must leave a baseline in place. A new `claude`
   # process (startup, resume, a fork) has a new key and takes its own; the same process (/clear,
   # compaction) keeps the one it has, because re-taking it would wipe what the session recorded
-  # (a Docker Desktop it started, its tab ledger) and fold its leftovers into the new baseline.
-  # A bare pid key can be recycled by an unrelated session, so that one is still replaced.
+  # (a Docker Desktop it started, its ledger, its tab record) and fold its leftovers into the new
+  # baseline. A bare pid key can be recycled by an unrelated session, so that one is still replaced.
   case "$(session_key)" in
     pid-*|no-session) ;;
     *)
       if [ -f "$d/began_at" ]; then
+        # A /clear moves the conversation id inside the same process; a resume of either is this one.
+        note_conversation "$(conversation_id)"
         echo "session-guard: baseline for $(session_key) already taken at $(s_get began_at); kept."
         return 0
       fi
       ;;
   esac
+  # A state directory already here (a `begin` cut off part-way, or a recyclable key) is replaced,
+  # except its Docker ledger: a record is never deleted unread, and what it holds is named below.
   if [ -d "$d" ]; then
-    echo "session-guard: replacing a state directory that already existed for this session key." >&2
+    echo "session-guard: replacing a state directory that already existed for this session key; its Docker ledger, if any, is kept." >&2
+    find "$d" -mindepth 1 -maxdepth 1 ! -name records ! -name containers ! -name pending -exec rm -rf {} + 2>/dev/null
   fi
-  rm -rf "$d"
   mkdir -p "$d" || { echo "session-guard: cannot create $d" >&2; return 1; }
 
   # `began_at` is what `check` reads as "a baseline exists", so it is written LAST:
   # a census cut off part-way (the hook's timeout, a wedged engine) leaves no
-  # baseline, never one that reads complete with its .base files missing.
+  # baseline, never one that reads complete with a half-taken census.
   local began_at; began_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   s_put began_epoch "$(date +%s)"
+  note_conversation "$(conversation_id)"
 
   if has_docker; then s_put docker_present 1; else s_put docker_present 0; fi
   if engine_up; then s_put engine_up 1; else s_put engine_up 0; fi
@@ -663,12 +904,19 @@ cmd_begin() {
     adopt_orphaned_desktop "$(desktop_records)"
   fi
 
-  # This guard's own leftovers have a stated end too.
+  # A resume takes over what its crashed predecessor in the same conversation recorded.
+  adopt_resumed_ledgers "$(conversation_id)"
+
+  # This guard's own leftovers have a stated end too — except a state directory whose Docker ledger
+  # still records something, which is never deleted unread: it is named below until it is discharged.
+  local dir
   if [ -d "$root" ]; then
-    find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$STALE_STATE_DAYS" -exec rm -rf {} + 2>/dev/null || true
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      if ledger_empty "$dir"; then rm -rf "$dir"; fi
+    done <<< "$(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$STALE_STATE_DAYS" 2>/dev/null)"
   fi
 
-  [ "$(s_get engine_up)" = "1" ] && docker_census begin
   if has_lsof; then
     s_put lsof_present 1
     # A census that failed leaves no listener baseline, which `check` reports with its repair.
@@ -690,18 +938,9 @@ cmd_begin() {
   elif [ "$(s_get desktop_running)" = "1" ]; then
     echo "  docker desktop: no builder session's record accounts for it — the laptop's own, never quit"
   fi
-  if [ -n "$(s_get docker_census)" ]; then
-    echo "  containers=$(wc -l < "$d/containers.base" | tr -d ' ') images=$(wc -l < "$d/images.base" | tr -d ' ') volumes=$(wc -l < "$d/volumes.base" | tr -d ' ') build_cache=$(s_get build_cache.base)"
-  else
-    echo "  docker census: deferred to docker-up (the engine is not answering)"
-  fi
+  echo "  docker ledger: $(ledger_entries | distinct | grep -c .) artefact(s) recorded (make each through this script: run, create, pull, build, volume-create)"
   [ -f "$d/listeners.base" ] && echo "  listeners=$(wc -l < "$d/listeners.base" | tr -d ' ') (this account's TCP ports in LISTEN)"
-
-  # A previous session's leftovers are a finding, not background noise.
-  local leftover; leftover="$(labelled_containers)$(labelled_images)"
-  if [ -n "$leftover" ]; then
-    echo "  WARNING: builder-labelled artefacts already present at session start — a previous session leaked. They are yours to sweep."
-  fi
+  name_ended_ledgers
 }
 
 cmd_docker_up() {
@@ -710,16 +949,8 @@ cmd_docker_up() {
 
   if engine_up; then
     echo "session-guard: Docker engine is already up; not recording a session start."
-    s_put docker_used 1
-    s_put docker_released 0
     local sib; sib="$(desktop_sibling "$(desktop_records)")"
     [ -z "$sib" ] || echo "session-guard: this Docker Desktop is sibling session $sib's: it quits it at its own sweep, and if that comes first, run docker-up again."
-    if [ -z "$(s_get docker_census)" ]; then
-      docker_census late
-      echo "session-guard: it came up after this session began, so the Docker baseline is taken now (LATE) — anything this session made on the engine before now is attested by hand, not measured."
-    else
-      docker_census_narrow || return 1
-    fi
     return 0
   fi
 
@@ -733,8 +964,6 @@ cmd_docker_up() {
 
   echo "session-guard: starting Docker Desktop (this session will quit it at sweep)."
   s_put docker_started_by_session 1
-  s_put docker_used 1
-  s_put docker_released 0
   publish_desktop || echo "session-guard: WARNING: could not write this session's ledger record, so a sibling session cannot tell this Docker Desktop is this session's." >&2
   docker desktop start >/dev/null 2>&1 || open -a Docker >/dev/null 2>&1 || true
 
@@ -743,17 +972,187 @@ cmd_docker_up() {
     if engine_up; then
       echo "session-guard: engine up after ${waited}s."
       publish_desktop procs || echo "session-guard: WARNING: could not record this Docker Desktop's processes in the ledger." >&2
-      if [ -z "$(s_get docker_census)" ]; then
-        docker_census started
-      else
-        docker_census_narrow || return 1
-      fi
       return 0
     fi
     sleep "$POLL_SECONDS"; waited=$((waited + POLL_SECONDS))
   done
   echo "session-guard: engine did not come up within ${START_WAIT_SECONDS}s." >&2
   return 1
+}
+
+# ----------------------------------------------------- making Docker artefacts, on the record
+
+require_docker() {
+  [ -f "$(state_dir)/began_at" ] || { echo "session-guard: no baseline — run 'begin' first." >&2; return 1; }
+  has_docker || { echo "session-guard: no docker CLI on this machine." >&2; return 1; }
+  engine_up || { echo "session-guard: the Docker engine is not answering — run .claude/session-guard.sh docker-up first." >&2; return 1; }
+}
+
+guard_owned_flag() {  # guard_owned_flag <command> <flag>
+  echo "session-guard: $1: $2 is the guard's own to set — it is how this session's ledger records what the command makes. Remove it and run again." >&2
+  return 1
+}
+
+# Every named volume a `run`/`create` mounts must already exist: docker would make a missing one off
+# the record, and `rm -v` removes only anonymous volumes. One this session made through
+# `volume-create` is on its ledger; one that was already there is used, and made by nobody here.
+# A bind mount (a path) and an anonymous volume (no source) make nothing that outlives the container.
+named_volumes_exist() {  # named_volumes_exist <verb> [docker args]
+  local verb="$1" a src next=0 have="" names="" missing=""; shift
+  for a in "$@"; do
+    src=""
+    if [ "$next" = "v" ]; then src="${a%%:*}"; [ "$src" != "$a" ] || src=""
+    elif [ "$next" = "m" ]; then src="$(mount_source "$a")"
+    else
+      case "$a" in
+        -v|--volume) next=v; continue ;;
+        --mount) next=m; continue ;;
+        --volume=*) src="${a#--volume=}"; [ "${src%%:*}" != "$src" ] && src="${src%%:*}" || src="" ;;
+        -v?*) src="${a#-v}"; [ "${src%%:*}" != "$src" ] && src="${src%%:*}" || src="" ;;
+        --mount=*) src="$(mount_source "${a#--mount=}")" ;;
+      esac
+    fi
+    next=0
+    case "$src" in ""|/*|.*|\~*) continue ;; esac
+    names="$names$src"$'\n'
+  done
+  [ -n "$names" ] || return 0
+  have="$(docker volume ls -q 2>/dev/null)" || { echo "session-guard: the engine did not list its volumes." >&2; return 1; }
+  while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    grep -qxF -- "$src" <<< "$have" || missing="$missing $src"
+  done <<< "$names"
+  [ -z "$missing" ] && return 0
+  echo "session-guard: docker $verb: named volume(s)$missing do not exist, and docker would make them off the record. Make each first with .claude/session-guard.sh volume-create <name>." >&2
+  return 1
+}
+
+# The source of a `--mount` value, when it is a volume's (the default type); nothing for a bind or tmpfs.
+mount_source() {  # mount_source <type=...,src=...>
+  local field type="volume" src=""
+  while IFS= read -r field; do
+    case "$field" in
+      type=*) type="${field#type=}" ;;
+      src=*|source=*) src="${field#*=}" ;;
+    esac
+  done <<< "$(tr ',' '\n' <<< "$1")"
+  if [ "$type" = "volume" ]; then printf '%s' "$src"; fi
+}
+
+# A container, run or created: docker itself writes its id into this session's ledger (`--cidfile`)
+# the moment it exists. `--pull never`, because an implicit pull would make an image off the record:
+# an image is pulled through `pull`, which records it.
+cmd_container() {  # cmd_container run|create [docker args]
+  local verb="$1" a dir rc; shift
+  require_docker || return 1
+  for a in "$@"; do
+    case "$a" in
+      --cidfile|--cidfile=*|--pull|--pull=*) guard_owned_flag "docker $verb" "${a%%=*}"; return 1 ;;
+    esac
+  done
+  named_volumes_exist "$verb" "$@" || return 1
+  dir="$(state_dir)/containers"
+  mkdir -p "$dir" || return 1
+  touch "$(state_dir)"
+  docker "$verb" --cidfile "$dir/$(date +%s).$$.$RANDOM" --pull never --label "$LABEL" "$@"; rc=$?
+  if [ "$rc" = "125" ]; then
+    echo "session-guard: (docker could not $verb it. An image is never pulled implicitly here: pull it first with .claude/session-guard.sh pull <image>.)" >&2
+  fi
+  return "$rc"
+}
+
+# An image, pulled: recorded when the image its reference names afterwards was not on the engine
+# before. One a sibling already holds is not this session's, and is neither recorded nor removed.
+cmd_pull() {  # cmd_pull [docker pull options] <ref>
+  [ $# -ge 1 ] || usage
+  require_docker || return 1
+  local a ref p rc
+  for a in "$@"; do
+    case "$a" in
+      -a|--all-tags|--all-tags=*)
+        echo "session-guard: pull: --all-tags makes images the ledger cannot name one by one; pull each tag." >&2
+        return 1 ;;
+    esac
+  done
+  # The reference is the one argument that is neither a flag nor `--platform`'s value.
+  local refs="" skip=0
+  for a in "$@"; do
+    if [ "$skip" = "1" ]; then skip=0; continue; fi
+    case "$a" in
+      --platform) skip=1 ;;
+      -*) ;;
+      *) refs="$refs$a"$'\n' ;;
+    esac
+  done
+  if [ "$(grep -c . <<< "$refs")" != "1" ]; then
+    echo "session-guard: pull: name exactly one image reference." >&2
+    return 1
+  fi
+  ref="${refs%$'\n'}"
+  p="$(image_op_begin "$ref" pull)" || return 1
+  docker pull "$@"; rc=$?
+  resolve_pending "$p" now || rc=1
+  return "$rc"
+}
+
+# This session's own buildx builder, made on first use and recorded before docker makes it. Its build
+# cache leaves with it at sweep, so a build here never grows the shared cache every builder reads. It
+# is never made `--use`: the current builder is laptop-wide, and every sibling's.
+ensure_own_builder() {
+  local name builders; name="$(own_builder)"
+  builders="$(list_builders)" || { echo "session-guard: the engine did not list its buildx builders." >&2; return 1; }
+  grep -qxF -- "$name" <<< "$builders" && return 0
+  cmd_pull -q "$BUILDKIT_IMAGE" >/dev/null || { echo "session-guard: could not pull $BUILDKIT_IMAGE for this session's builder." >&2; return 1; }
+  local rec; rec="$(ledger_record builder "$name" docker-container held)" || return 1
+  if ! docker buildx create --name "$name" --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap >/dev/null; then
+    echo "session-guard: could not create this session's builder $name." >&2
+    builders="$(list_builders)" && ! grep -qxF -- "$name" <<< "$builders" && rm -f "$rec"
+    return 1
+  fi
+  ledger_release "$rec"
+  echo "session-guard: made this session's own builder $name (recorded); its build cache goes with it at sweep."
+}
+
+# An image, built on this session's own builder and loaded: it carries a tag only this session holds,
+# by which the build is resolved to the image it made, whatever else it is tagged.
+cmd_build() {  # cmd_build [docker buildx build options] <context>
+  [ $# -ge 1 ] || usage
+  require_docker || return 1
+  local a tag p rc
+  for a in "$@"; do
+    case "$a" in
+      --builder|--builder=*|--push|--push=*|--output|--output=*|-o*) guard_owned_flag "docker buildx build" "${a%%=*}"; return 1 ;;
+    esac
+  done
+  ensure_own_builder || return 1
+  tag="$(own_builder):build-$(date +%s)-$$"
+  p="$(image_op_begin "$tag" build)" || return 1
+  docker buildx build --builder "$(own_builder)" --load --label "$LABEL" -t "$tag" "$@"; rc=$?
+  resolve_pending "$p" now || rc=1
+  return "$rc"
+}
+
+# A named volume, recorded before docker makes it, under a name checked to be free: `docker volume
+# create` of an existing name succeeds without making anything, so recording that would hand this
+# session's sweep a sibling's volume.
+cmd_volume_create() {  # cmd_volume_create <name> [docker volume create options]
+  [ $# -ge 1 ] || usage
+  require_docker || return 1
+  local name="$1" have; shift
+  case "$name" in
+    ""|-*) echo "session-guard: volume-create: the volume's name comes first." >&2; return 1 ;;
+  esac
+  have="$(docker volume ls -q 2>/dev/null)" || { echo "session-guard: the engine did not list its volumes." >&2; return 1; }
+  if grep -qxF -- "$name" <<< "$have"; then
+    echo "session-guard: volume $name already exists, so it is not this session's to make, record or remove." >&2
+    return 1
+  fi
+  local rec rc; rec="$(ledger_record volume "$name" - held)" || return 1
+  docker volume create --label "$LABEL" "$@" "$name"; rc=$?
+  # A create that failed made nothing, and its record must not outlive it: a sibling could take
+  # the name later, and this session's sweep would then remove that sibling's volume.
+  if [ "$rc" = "0" ]; then ledger_release "$rec"; else rm -f "$rec"; fi
+  return "$rc"
 }
 
 cmd_tab_open() {
@@ -791,42 +1190,40 @@ cmd_sweep() {
   local d failed=0; d="$(state_dir)"
   [ -d "$d" ] || { echo "session-guard: no baseline — run 'begin' first." >&2; return 1; }
 
-  if ! engine_up; then
-    if engine_must_answer; then
-      echo "session-guard: this session used the Docker engine and it is not reachable now — nothing can be swept or verified." >&2
+  # Exactly what this session's ledger records, and nothing else (basecradle-noc#1715): containers
+  # first (they hold images), then builders (whose node containers hold the builder image), images,
+  # volumes. Each removal is read back off the engine, never trusted from an exit code.
+  if ledger_empty; then
+    echo "session-guard: this session's Docker ledger is empty; nothing to sweep."
+  elif ! engine_up; then
+    echo "session-guard: this session's ledger records Docker artefacts and the engine is not reachable — nothing can be removed or shown gone. Bring it back with docker-up and sweep again." >&2
+    return 1
+  else
+    resolve_all_pending || { echo "session-guard: an image operation this session started has not finished; sweep again once it has." >&2; failed=1; }
+    local entries present kind k id note file
+    if ! present="$(ledger_present "$(ledger_entries)")"; then
+      echo "session-guard: the engine did not answer a list this session's ledger needs; nothing was removed." >&2
       return 1
     fi
-    echo "session-guard: no Docker engine; nothing to sweep."
-  else
-    local ids id
-    ids="$(labelled_containers)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        echo "session-guard: removing container $id ($(describe_container "$id"))"
-        docker rm -f "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove container $id" >&2; failed=1; }
-      done <<< "$ids"
-    fi
-
-    ids="$(labelled_images)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        echo "session-guard: removing image $id ($(describe_image "$id"))"
-        docker rmi -f "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove image $id" >&2; failed=1; }
-      done <<< "$ids"
-    fi
-
-    # A throwaway builder takes its whole build cache with it — which is why the
-    # charter says to build on one. A cache record carries no label we control,
-    # so pruning a SHARED builder could only ever be a guess at whose cache it is.
-    ids="$(session_builders)"
-    if [ -n "$ids" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        echo "session-guard: removing buildx builder $id"
-        docker buildx rm "$id" >/dev/null 2>&1 || { echo "session-guard: could not remove builder $id" >&2; failed=1; }
-      done <<< "$ids"
+    for kind in container builder image volume; do
+      while IFS=$'\t' read -r k id note file; do
+        if [ "$k" != "$kind" ] || [ -z "${id:-}" ]; then continue; fi
+        echo "session-guard: removing $(describe_entry "$k" "$id" "$note")"
+        remove_entry "$k" "$id" "$note" || failed=1
+      done <<< "$(distinct <<< "$present")"
+    done
+    entries="$(ledger_entries)"
+    if ! present="$(ledger_present "$entries")"; then
+      echo "session-guard: the engine did not answer a list this session's ledger needs, so the removals cannot be read back." >&2
+      failed=1
+    else
+      ledger_discharge "$entries" "$present"
+      if [ -n "$present" ]; then
+        while IFS=$'\t' read -r k id note file; do
+          echo "session-guard: still on the engine: $(describe_entry "$k" "$id" "$note")" >&2
+        done <<< "$(distinct <<< "$present")"
+        failed=1
+      fi
     fi
   fi
 
@@ -834,7 +1231,7 @@ cmd_sweep() {
   # engine out from under it — with the engine down, `check` could no longer see
   # what was left.
   if [ "$failed" = "1" ]; then
-    echo "session-guard: sweep INCOMPLETE — a removal above failed; not quitting Docker Desktop." >&2
+    echo "session-guard: sweep INCOMPLETE — what this session recorded is not all gone; not quitting Docker Desktop." >&2
     return 1
   fi
 
@@ -845,20 +1242,6 @@ cmd_sweep() {
   fi
 
   if [ "$(s_get docker_started_by_session 0)" = "1" ]; then
-    local left; left="$(labelled_containers)$(labelled_images)$(session_builders)"
-    if [ -n "$left" ]; then
-      echo "session-guard: labelled artefacts remain; not quitting Docker Desktop." >&2
-      return 1
-    fi
-    # Never quit the engine out from under what `check` must see: an image this session pulled
-    # carries no label, and with the engine down `check` could no longer list it.
-    if engine_up; then
-      check_engine_artefacts
-      if [ "$FINDINGS" -gt 0 ]; then
-        echo "session-guard: $FINDINGS finding(s) above — not quitting Docker Desktop, because with its engine down check could no longer see them." >&2
-        return 1
-      fi
-    fi
     stop_docker_desktop || return 1
   fi
 
@@ -877,7 +1260,6 @@ stop_docker_desktop() {
     if [ -z "$(docker_desktop_pids)" ]; then
       echo "session-guard: Docker Desktop stopped (no process under $DOCKER_APP_PREFIX) after ${waited}s."
       s_put docker_started_by_session 0
-      s_put docker_released 1
       retract_desktop
       return 0
     fi
@@ -887,118 +1269,52 @@ stop_docker_desktop() {
   return 1
 }
 
-# What is on the answering engine that this session cannot account for: its own labelled artefacts
-# still present, and every artefact that appeared since the Docker baseline that no builder's label
-# accounts for. `check` reports these, and `sweep` refuses to quit Docker Desktop while any stands,
-# because with the engine down `check` could no longer see them (basecradle-noc#1255).
-check_engine_artefacts() {
-  local d base_census; d="$(state_dir)"; base_census="$(s_get docker_census)"
-  local ids id extra sib
-  ids="$(labelled_containers)"
-  if [ -n "$ids" ]; then
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      finding "labelled container still present: $id ($(describe_container "$id"))" ".claude/session-guard.sh sweep"
-    done <<< "$ids"
+# The Docker half of `check`: what this session's ledger records and is still on the engine, and only
+# that (basecradle-noc#1715). An empty ledger needs no engine at all: a session that made nothing has
+# nothing to answer for, whatever a sibling has on the laptop or however much the shared build cache
+# grew. `sweep` refuses to quit Docker Desktop while any of it stands, because with the engine down
+# nothing could show it gone.
+check_docker_ledger() {
+  local f entries present n_all n_left kind id note file
+  if ledger_empty; then
+    echo "session-guard: Docker ledger: empty — nothing this session made is left on the engine."
+    return 0
   fi
-
-  ids="$(labelled_images)"
-  if [ -n "$ids" ]; then
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      finding "labelled image still present: $id ($(describe_image "$id"))" ".claude/session-guard.sh sweep"
-    done <<< "$ids"
+  if ! engine_up; then
+    finding "this session's ledger records Docker artefacts and the engine is not reachable, so nothing here can show they are gone." \
+            ".claude/session-guard.sh docker-up, then .claude/session-guard.sh sweep"
+    return 0
   fi
-
-  ids="$(session_builders)"
-  if [ -n "$ids" ]; then
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      finding "session buildx builder still present: $id" ".claude/session-guard.sh sweep"
-    done <<< "$ids"
+  resolve_all_pending
+  for f in "$(state_dir)/pending"/*; do
+    [ -f "$f" ] || continue
+    finding "a $(sed -n 2p "$f") of $(sed -n 1p "$f") this session started has not finished (or could not be resolved), so what it makes is not on the ledger yet." \
+            "let it finish, then re-run .claude/session-guard.sh check"
+  done
+  entries="$(ledger_entries)"
+  if ! present="$(ledger_present "$entries")"; then
+    finding "the engine did not answer a list this session's ledger needs, so nothing here can show what it recorded is gone." \
+            "re-run .claude/session-guard.sh check; if it persists, check by hand (docker ps -a; docker image ls; docker volume ls; docker buildx ls)"
+    return 0
   fi
-
-  # Everything new that the label cannot account for. Reported with the exact
-  # command and never removed: an image someone else pulled during this
-  # session is theirs, and this guard cannot tell the two apart.
-  #
-  # Only against a census. With none, the engine was down at `begin` and came up
-  # from outside this session without a `docker-up`, so there is nothing to
-  # compare against: every artefact on the laptop would read as new, with `docker
-  # rmi` of someone else's image as the repair (basecradle#707 (b)). The labelled
-  # checks above still ran. The gap itself is a finding (basecradle#709 item 3):
-  # "we could not look" is never clean, and a session that used the engine out of
-  # protocol would otherwise exit clean. Its one lever is a LATE census, taken
-  # after checking by hand, which every later `check` names as late.
-  local engine_sib=""
-  [ -n "$base_census" ] || [ "$(s_get docker_used 0)" = "1" ] || engine_sib="$(desktop_sibling "$(desktop_records)")"
-  if [ -n "$engine_sib" ]; then
-    # A sibling's engine that came up after this session began, which this session never reached
-    # through `docker-up`, is that sibling's to answer for (basecradle-noc#1255): no baseline is
-    # needed for an engine this session did not use. The labelled checks above still ran.
-    echo "session-guard: not this session's: the Docker engine is sibling session ${engine_sib}'s, brought up after this session began and never reached from it through docker-up, so it needs no Docker baseline here."
-  elif [ -z "$base_census" ]; then
-    finding "no Docker baseline — the engine came up after this session began and the session never ran docker-up, so nothing here can say what it made on the engine." \
-            "check by hand (docker ps -a; docker image ls; docker volume ls), remove anything this session made, then .claude/session-guard.sh docker-up — it takes the Docker baseline now, which check names as LATE"
-  else
-    extra="$(comm -23 <(comm -13 "$d/containers.base" <(list_containers)) <(labelled_containers))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        if sib="$(sibling_label container "$id")"; then
-          echo "session-guard: not this session's: container $id ($(describe_container "$id")) carries $sib=1, a sibling builder's label."
-          continue
-        fi
-        finding "container appeared during this session and carries no builder label of this session's: $id ($(describe_container "$id"))" \
-                "docker rm -f $id   (only if it is yours — check first)"
-      done <<< "$extra"
+  local keys; keys="$(cut -f1,2 <<< "$present")"
+  while IFS=$'\t' read -r kind id note file; do
+    [ -n "${file:-}" ] || continue
+    grep -qxF -- "$kind"$'\t'"$id" <<< "$keys" && continue
+    if entry_held "$file"; then
+      finding "the $(describe_entry "$kind" "$id" "$note") this session is making has not finished, so nothing can show yet what it leaves." \
+              "let it finish, then re-run .claude/session-guard.sh check"
     fi
-
-    extra="$(comm -23 <(comm -13 "$d/images.base" <(list_images)) <(labelled_images))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        if sib="$(sibling_label image "$id")"; then
-          echo "session-guard: not this session's: image $id ($(describe_image "$id")) carries $sib=1, a sibling builder's label."
-          continue
-        fi
-        finding "image appeared during this session and carries no builder label of this session's: $id ($(describe_image "$id"))" \
-                "docker rmi $id   (only if it is yours — check first)"
-      done <<< "$extra"
-    fi
-
-    extra="$(comm -13 "$d/volumes.base" <(list_volumes))"
-    if [ -n "$extra" ]; then
-      while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        if sib="$(sibling_label volume "$id")"; then
-          echo "session-guard: not this session's: volume $id carries $sib=1, a sibling builder's label."
-          continue
-        fi
-        finding "volume appeared during this session: $id" "docker volume rm $id   (only if it is yours — check first)"
-      done <<< "$extra"
-    fi
-
-    # Only GROWTH is a build (basecradle#707 (c)). BuildKit's own garbage collection
-    # shrinks the cache on its schedule, and comparing the printed strings for
-    # inequality read that as a build this session ran, blocking an exit nothing
-    # could clear. Growth is still unattributable — someone else's build grows it
-    # too — so it is reported like every other unlabelled artefact, never pruned.
-    local cache_now cache_base now_bytes base_bytes
-    cache_now="$(build_cache_size)"; cache_base="$(s_get build_cache.base)"
-    # An unreadable BASELINE never becomes readable by re-running `check`, so it gets its own
-    # finding with its own lever (basecradle#709 item 6); an unreadable reading NOW may be a blip.
-    if ! base_bytes="$(size_bytes "$cache_base")"; then
-      finding "the shared build cache's size could not be read when the Docker baseline was taken ('${cache_base}'), so a build on a shared builder cannot be ruled out." \
-              "compare docker system df by hand, then .claude/session-guard.sh docker-up — it re-reads the cache baseline, which check names as LATE"
-    elif ! now_bytes="$(size_bytes "$cache_now")"; then
-      finding "the shared build cache's size could not be read now ('${cache_now}'; at the baseline: '${cache_base}'), so a build on a shared builder cannot be ruled out." \
-              "re-run .claude/session-guard.sh check; if it persists, compare docker system df by hand and say what you found in the completion comment"
-    elif [ "$now_bytes" -gt "$base_bytes" ]; then
-      finding "shared build cache grew during this session ($cache_base -> $cache_now) — a build ran on a shared builder." \
-              "build on your own throwaway builder (${BUILDER_PREFIX}<something>) so 'docker buildx rm' takes its cache with it; if the build was not this session's, say whose in the completion comment"
-    fi
-  fi
+  done <<< "$entries"
+  n_all="$(distinct <<< "$entries" | grep -c .)"
+  n_left="$(distinct <<< "$present" | grep -c .)"
+  while IFS=$'\t' read -r kind id note file; do
+    [ -n "${id:-}" ] || continue
+    finding "this session created $(describe_entry "$kind" "$id" "$note") and it is still on the engine." \
+            ".claude/session-guard.sh sweep"
+  done <<< "$(distinct <<< "$present")"
+  ledger_discharge "$entries" "$present"
+  echo "session-guard: Docker ledger: $n_all artefact(s) recorded, $n_left still on the engine."
 }
 
 FINDINGS=0
@@ -1040,12 +1356,8 @@ cmd_check() {
   local base_desktop
   base_desktop="$(s_get desktop_running 0)"
 
-  if engine_up; then
-    check_engine_artefacts
-  elif engine_must_answer; then
-    finding "the Docker engine is not reachable and this session used it — nothing here can certify what it left behind." \
-            "bring the engine back (.claude/session-guard.sh docker-up) and re-check, or say so in the completion comment"
-  fi
+  check_docker_ledger
+  name_ended_ledgers
 
   # Docker Desktop, both directions, judged against the laptop's own state: a Docker Desktop that a
   # builder session started is never the laptop's own (basecradle-noc#1255).
@@ -1176,14 +1488,9 @@ cmd_check() {
   fi
 
   # A LATE baseline is an attestation, not a measurement (basecradle#709 item 5): what the session
-  # made before it was taken is in it with no trace. It is the designed path where the engine came
-  # up from outside, so it never blocks, but every check says it, so a clean verdict never hides it.
-  if [ "$(s_get docker_census)" = "late" ]; then
-    echo "session-guard: LATE: the Docker baseline was taken at $(s_get docker_census_at '(unrecorded)'), not at session start — anything this session made on the engine before then is attested by hand, not measured."
-  fi
-  if [ -n "$(s_get build_cache_late)" ]; then
-    echo "session-guard: LATE: the build cache's baseline was read at $(s_get build_cache_late) — a build before then is attested by hand, not measured."
-  fi
+  # started before it was taken is in it with no trace. It is the designed path for a session that
+  # began before the guard censused ports, so it never blocks, but every check says it, so a clean
+  # verdict never hides it.
   if [ -n "$(s_get listeners_baseline_late)" ]; then
     echo "session-guard: LATE: the listening-port baseline was taken at $(s_get listeners_baseline_late) — attested by hand, not measured from session start."
   fi
@@ -1221,6 +1528,10 @@ OWN_CLAUDE_PID="$(own_claude_pid)"
 case "$command" in
   begin)        cmd_begin ;;
   docker-up)    cmd_docker_up ;;
+  run|create)   cmd_container "$command" "$@" ;;
+  pull)         cmd_pull "$@" ;;
+  build)        cmd_build "$@" ;;
+  volume-create) cmd_volume_create "$@" ;;
   tab-open)     cmd_tab_open "$@" ;;
   tab-close)    cmd_tab_close "$@" ;;
   tabs-checked) cmd_tabs_checked ;;
