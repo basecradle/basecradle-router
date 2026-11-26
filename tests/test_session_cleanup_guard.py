@@ -23,18 +23,20 @@ Four properties are pinned here, each of which fails silently if it is dropped:
   is in when its ``SessionStart`` hook never fired. A guard that no-ops when it cannot run is the
   silent death itself (``basecradle-noc#190``), and without this the *whole* instrument reads clean
   on the one session that never armed it.
-* **Prove-it-is-ours, or report.** The sweep removes only what carries this session's own label
-  or builder prefix. Everything else that appeared during the session is **reported with the exact
-  command and never touched** — an image somebody else pulled mid-session is theirs. The capital's
-  ruling on this issue: *an empty Docker today is not a licence for ``docker system prune``.*
+* **You clean up what you created, and you know because you wrote it down** (``@origin``,
+  ``basecradle-noc#1715``). Every Docker artefact a session makes goes through the guard, which
+  records it on the session's own ledger as it is made; ``check`` reads only that ledger and the
+  sweep removes only what is on it. Nothing else blocks and nothing else is touched — a sibling's
+  pulled image included. *An empty Docker today is not a licence for ``docker system prune``.*
 * **A stop is read back off the process list.** ``osascript quit app "Docker"`` exited 0 while
   every Docker process kept running (``basecradle-noc#716``). An exit code is not a stopped
   process, so a quit that "succeeds" while the processes live must NOT be reported as stopped.
 * **The predicates are EXECUTED, never grepped.** A test asserting a label filter *appears* in the
   source cannot tell a filter that fires from one that never does (``basecradle-noc#773``). So the
   guard runs against a stub ``docker`` that records every argv, and the assertions are about what it
-  was — and was not — asked to remove. The stub also carries a **positive control**: an unlabelled
-  container and image sitting right beside the labelled ones, which the sweep must leave alone.
+  was — and was not — asked to remove. The stub also carries a **positive control**: foreign and
+  this-repo-labelled artefacts sitting right beside the recorded ones, which the sweep must leave
+  alone.
 """
 
 from __future__ import annotations
@@ -76,11 +78,14 @@ REPO_NAME = _configured_repo(CONFIG.read_text())
 LABEL = f"{REPO_NAME}-builder=1"
 BUILDER_PREFIX = f"{REPO_NAME}-builder-"
 
-# A `docker` that answers from a JSON scenario, mutates it on a removal, and records every argv.
-# Executing the guard against this is the only way to tell a filter that fires from one that does
-# not — and the calls log is what lets a test assert what was NEVER asked for.
+# A `docker` that answers from a JSON scenario, mutates it as the real engine would, and records
+# every argv. Executing the guard against this is the only way to tell a predicate that fires from
+# one that does not — and the calls log is what lets a test assert what was NEVER asked for. Its
+# removal rules are the ones measured on Docker 29.8's containerd image store (basecradle-noc#1715):
+# an unforced `rmi` of an image a container uses, running or stopped, is refused; an image with
+# several tags is not removed by its id unforced; removing one of several tags only untags.
 DOCKER_STUB = r"""#!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, sys
 
 state_path = os.environ["DOCKER_STUB_STATE"]
 with open(state_path) as fh:
@@ -92,6 +97,49 @@ with open(os.environ["DOCKER_STUB_CALLS"], "a") as fh:
 def save():
     with open(state_path, "w") as fh:
         json.dump(st, fh)
+
+
+def down():
+    if not st["engine_up"]:
+        sys.stderr.write("Cannot connect to the Docker daemon\n")
+        sys.exit(1)
+
+
+def tags(i):
+    return i.get("tags") if "tags" in i else ([i["tag"]] if i.get("tag") else [])
+
+
+def set_tags(i, new):
+    i.pop("tag", None)
+    i["tags"] = new
+
+
+def image_by(ref):
+    return next((i for i in st["images"] if i["id"] == ref or ref in tags(i)), None)
+
+
+def new_id():
+    st["next_id"] = st.get("next_id", 0) + 1
+    return "%064x" % (0xC0FFEE000 + st["next_id"])
+
+
+def take_tag(tag):
+    for i in st["images"]:
+        if tag in tags(i):
+            set_tags(i, [t for t in tags(i) if t != tag])
+
+
+def in_use(image_id):
+    return next((c for c in st["containers"] if c.get("image_id") == image_id), None)
+
+
+def labels_of(args):
+    out = {}
+    for n, x in enumerate(args):
+        if x == "--label":
+            k, _, v = args[n + 1].partition("=")
+            out[k] = v
+    return out
 
 
 a = sys.argv[1:]
@@ -107,9 +155,7 @@ def carries(o):
     return bool(own) or (o.get("labels") or {}).get(key) == value
 
 if a[:1] == ["version"]:
-    if not st["engine_up"]:
-        sys.stderr.write("Cannot connect to the Docker daemon\n")
-        sys.exit(1)
+    down()
     print("29.8.0")
 elif a[:2] == ["desktop", "status"]:
     print("Name                Value")
@@ -135,12 +181,9 @@ elif a[:2] == ["desktop", "stop"]:
         st["ps_lines"] = []
     save()
 elif a[:1] == ["ps"]:
-    if not st["engine_up"]:
+    down()
+    if st.get("ps_fails"):
         sys.exit(1)
-    if st.get("ps_kills_group") and "-a" in a:
-        # The hook's timeout, simulated: the whole census is killed mid-run.
-        import signal
-        os.killpg(os.getpgrp(), signal.SIGKILL)
     ident = next((x.split("=", 1)[1] for x in a if x.startswith("id=")), None)
     for c in st["containers"]:
         if ident is not None:
@@ -151,64 +194,152 @@ elif a[:1] == ["ps"]:
                 print(c["id"])
         else:
             print(c["id"])
-elif a[:3] == ["image", "ls", "-a"] or a[:3] == ["image", "ls", "-aq"]:
-    if not st["engine_up"]:
+elif a[:1] in (["run"], ["create"]):
+    down()
+    # The guard's own flags come first, the caller's after them; the image is the first argument
+    # that is neither a flag nor a flag's value.
+    with_value = {"--cidfile", "--pull", "--label", "--name", "-e", "-v", "--volume", "--mount"}
+    rest, image, n = a[1:], None, 0
+    while n < len(rest):
+        if rest[n] in with_value:
+            n += 2
+            continue
+        if rest[n].startswith("-"):
+            n += 1
+            continue
+        image = rest[n]
+        break
+    img = image_by(image) if image else None
+    if img is None:
+        sys.stderr.write("docker: Error response from daemon: No such image: %s\n" % image)
+        sys.exit(125)
+    cid = new_id()
+    with open(rest[rest.index("--cidfile") + 1], "w") as fh:
+        fh.write(cid)
+    if not (a[0] == "run" and "--rm" in rest):
+        st["containers"].append({
+            "id": cid,
+            "image": image,
+            "image_id": img["id"],
+            "status": "Exited (0) 1 second ago" if a[0] == "run" else "Created",
+            "labels": labels_of(rest),
+        })
+    save()
+elif a[:1] == ["pull"]:
+    down()
+    rest = a[1:]
+    ref = next(
+        x for n, x in enumerate(rest) if not x.startswith("-") and rest[n - 1] != "--platform"
+    )
+    if st.get("pull_hangs"):
+        import time
+        time.sleep(60)
+    if st.get("pull_fails"):
+        sys.stderr.write("Error response from daemon: pull access denied for %s\n" % ref)
         sys.exit(1)
+    # What the registry serves for a reference: the scenario's `registry`, else an id of its own.
+    want_id = st.get("registry", {}).get(ref)
+    want_id = want_id or "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
+    have = image_by(want_id)
+    take_tag(ref)
+    if have is None:
+        st["images"].append({"id": want_id, "tags": [ref]})
+    else:
+        set_tags(have, tags(have) + [ref])
+    save()
+    print("%s: Pulled" % ref)
+elif a[:2] == ["image", "inspect"]:
+    down()
+    img = image_by(a[-1])
+    if img is None:
+        sys.stderr.write("Error response from daemon: No such image: %s\n" % a[-1])
+        sys.exit(1)
+    if "--format" in a:
+        fmt = a[a.index("--format") + 1]
+        print(img["id"] if fmt == "{{.Id}}" else ",".join(tags(img)))
+    else:
+        print(json.dumps([img]))
+elif a[:3] == ["image", "ls", "-a"] or a[:3] == ["image", "ls", "-aq"]:
+    down()
     long_form = any("Repository" in x for x in a)
     for i in st["images"]:
         if labelled:
             if carries(i):
                 print(i["id"])
         elif long_form:
-            print("%s %s" % (i["id"], i["tag"]))
+            print("%s %s" % (i["id"], (tags(i) or ["<none>:<none>"])[0]))
         else:
             print(i["id"])
 elif a[:2] == ["volume", "ls"]:
-    if not st["engine_up"]:
-        sys.exit(1)
+    down()
     for v in st["volumes"]:
         print(v if isinstance(v, str) else v["name"])
-elif a[:2] == ["volume", "inspect"]:
-    # `{{json .Labels}}`, as Go renders it: compact JSON, `null` for none.
-    v = next((v for v in st["volumes"] if not isinstance(v, str) and v["name"] == a[-1]), None)
-    if not st["engine_up"] or (v is None and a[-1] not in st["volumes"]):
-        sys.exit(1)
-    print(json.dumps((v or {}).get("labels"), separators=(",", ":")))
-elif a[:1] == ["inspect"]:
-    # `{{json .Config.Labels}}` of a container or an image, by the `--type` asked for.
-    pool = st["containers"] if a[a.index("--type") + 1] == "container" else st["images"]
-    obj = next((o for o in pool if o["id"] == a[-1]), None)
-    if not st["engine_up"] or obj is None:
-        sys.exit(1)
-    print(json.dumps(obj.get("labels"), separators=(",", ":")))
+elif a[:2] == ["volume", "create"]:
+    down()
+    if st.get("volume_create_hangs"):
+        import time
+        time.sleep(60)
+    name = a[-1]
+    if not any((v if isinstance(v, str) else v["name"]) == name for v in st["volumes"]):
+        st["volumes"].append({"name": name, "labels": labels_of(a[2:])})
+        save()
+    print(name)
+elif a[:2] == ["volume", "rm"]:
+    down()
+    st["volumes"] = [v for v in st["volumes"] if (v if isinstance(v, str) else v["name"]) != a[-1]]
+    save()
 elif a[:2] == ["buildx", "ls"]:
-    if not st["engine_up"]:
-        sys.exit(1)
+    down()
     print("NAME/NODE           DRIVER/ENDPOINT     STATUS    BUILDKIT   PLATFORMS")
     for i, b in enumerate(st["builders"]):
         print("%s%s      docker" % (b, "*" if i == 0 else ""))
         print(" \\_ %s0       \\_ desktop-linux   running   v0.33.0    linux/arm64" % b)
-elif a[:2] == ["system", "df"]:
-    if not st["engine_up"]:
-        sys.exit(1)
-    if st.get("df_failures", 0) > 0:
-        # An engine still settling: `docker version` answers, `system df` does not, yet.
-        st["df_failures"] -= 1
-        save()
-        sys.exit(1)
-    print('{"Active":"0","Reclaimable":"0B","Size":"0B","TotalCount":"0","Type":"Images"}')
-    print('{"Active":"0","Reclaimable":"0B","Size":"%s","TotalCount":"0","Type":"Build Cache"}'
-          % st["build_cache"])
-elif a[:1] == ["rm"]:
-    st["containers"] = [c for c in st["containers"] if c["id"] not in a]
+elif a[:2] == ["buildx", "create"]:
+    down()
+    st["builders"].append(a[a.index("--name") + 1])
     save()
-elif a[:1] == ["rmi"]:
-    if st.get("rmi_fails"):
-        sys.stderr.write("conflict: image is being used by a container\n")
+elif a[:2] == ["buildx", "build"]:
+    down()
+    if st.get("build_hangs"):
+        import time
+        time.sleep(60)
+    if a[a.index("--builder") + 1] not in st["builders"] or st.get("build_fails"):
+        sys.stderr.write("ERROR: failed to build\n")
         sys.exit(1)
-    st["images"] = [i for i in st["images"] if i["id"] not in a]
+    built = [a[n + 1] for n, x in enumerate(a) if x == "-t"]
+    for t in built:
+        take_tag(t)
+    st["images"].append({"id": "sha256:" + new_id(), "tags": built, "labels": labels_of(a[2:])})
+    save()
+elif a[:1] == ["rm"]:
+    down()
+    # `rm_lies`: an exit 0 that removed nothing, the basecradle-noc#716 shape on the engine's side.
+    if not st.get("rm_lies"):
+        st["containers"] = [c for c in st["containers"] if c["id"] not in a]
+        save()
+elif a[:1] == ["rmi"]:
+    down()
+    ref = a[-1]
+    img = image_by(ref)
+    if st.get("rmi_fails") or img is None:
+        sys.stderr.write("Error response from daemon: No such image: %s\n" % ref)
+        sys.exit(1)
+    user = in_use(img["id"])
+    if ref != img["id"] and len(tags(img)) > 1:
+        set_tags(img, [t for t in tags(img) if t != ref])
+    elif ref == img["id"] and len(tags(img)) > 1:
+        sys.stderr.write("conflict: unable to delete (must be forced) - image is referenced in "
+                         "multiple repositories\n")
+        sys.exit(1)
+    elif user is not None:
+        sys.stderr.write("conflict: unable to delete (must be forced) - image is being used by "
+                         "stopped container %s\n" % user["id"][:12])
+        sys.exit(1)
+    else:
+        st["images"] = [i for i in st["images"] if i is not img]
     save()
 elif a[:2] == ["buildx", "rm"]:
+    down()
     st["builders"] = [b for b in st["builders"] if b not in a]
     save()
 else:
@@ -294,6 +425,10 @@ import json, os
 import sys
 with open(os.environ["DOCKER_STUB_STATE"]) as fh:
     st = json.load(fh)
+if st.get("lsof_kills_group"):
+    # The hook's timeout, simulated: the whole census is killed mid-run.
+    import signal
+    os.killpg(os.getpgrp(), signal.SIGKILL)
 if st.get("lsof_error"):
     # The real lsof's failure: exit 1, the same status as "nothing matched", with its reason on
     # stderr (measured on macOS's lsof 4.91).
@@ -462,88 +597,496 @@ def test_self_exit_refuses_when_the_guard_itself_is_missing(tmp_path):
     assert "terminating" not in got.stdout
 
 
-# --------------------------------------------------------- prove-it-is-ours, or report
+# -------------------------------- the ledger: you clean up what you created (basecradle-noc#1715)
 
 
-def test_a_labelled_container_blocks_the_exit_and_the_sweep_removes_it(lab):
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(containers=[CONTAINER])
+def _begun(lb):
+    """A session that has begun and looked at the browser, so only Docker can refuse its exit."""
+    _ok(lb.run("begin"))
     lb.clean_tabs()
+    return lb
+
+
+def _cid_files(lb):
+    return sorted(lb.state_root.glob("*/containers/*"))
+
+
+def test_a_container_run_through_the_guard_is_on_the_ledger_until_swept(lab):
+    """docker writes the id into the ledger itself (``--cidfile``), so a session killed mid-run is
+    still on the record. The run carries the label for a reader and ``--pull never``, because an
+    implicit pull would make an image off the record."""
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("run", "-d", "ubuntu:24.04", "sleep", "60"))
+    (run,) = [c for c in lb.calls_log() if c[:1] == ["run"]]
+    (cid_file,) = _cid_files(lb)
+    assert run[1:7] == ["--cidfile", str(cid_file), "--pull", "never", "--label", LABEL]
+    assert run[7:] == ["-d", "ubuntu:24.04", "sleep", "60"]
+    (container,) = lb.docker_state()["containers"]
+    assert cid_file.read_text() == container["id"]
 
     got = lb.run("check")
     assert got.returncode != 0
-    assert CONTAINER["id"] in got.stdout
+    assert f"this session created container {container['id']}" in _findings(got.stdout)
+    assert "repair: .claude/session-guard.sh sweep" in got.stdout
 
-    assert lb.run("sweep").returncode == 0
+    _ok(lb.run("sweep"))
     assert lb.docker_state()["containers"] == []
-    assert lb.run("check").returncode == 0
+    assert ["rm", "-f", "-v", container["id"]] in lb.calls_log()
+    assert [i["id"] for i in lb.docker_state()["images"]] == [UBUNTU["id"]]  # never this session's
+    assert not any(c[:1] == ["rmi"] for c in lb.calls_log())
+    _ok(lb.run("check"))
 
 
-def test_the_sweep_only_ever_removes_what_this_session_labelled(lab):
-    """The positive control: unlabelled artefacts sit right beside the labelled ones.
+def test_a_removal_that_exits_zero_and_removes_nothing_is_read_back_as_not_done(lab):
+    """An exit code is not a removed artefact; the engine's own list is (basecradle-noc#716's
+    lesson, turned on the sweep's removals). The entry stays on the ledger and the exit is held."""
+    lb = _begun(lab(images=[UBUNTU], rm_lies=True))
+    _ok(lb.run("run", "-d", "ubuntu:24.04"))
+    (container,) = lb.docker_state()["containers"]
+    swept = lb.run("sweep")
+    assert swept.returncode != 0
+    assert f"still on the engine: container {container['id']}" in swept.stderr
+    assert "INCOMPLETE" in swept.stderr
+    assert container["id"] in _findings(lb.run("check").stdout)
 
-    The capital's ruling on this issue — *a sweep only ever touches what the session labelled as
-    its own; an empty Docker today is not a licence for ``docker system prune``.*
-    """
-    lb = lab(
-        containers=[FOREIGN_CONTAINER],
-        images=[FOREIGN_IMAGE],
-        builders=["desktop-linux", "someone-elses-builder"],
-    )
-    assert lb.run("begin").returncode == 0
-    # ...and now the session creates its own, on top of the foreign ones.
-    lb.mutate(
-        containers=[FOREIGN_CONTAINER, CONTAINER],
-        images=[FOREIGN_IMAGE, IMAGE],
-        builders=["desktop-linux", "someone-elses-builder", f"{BUILDER_PREFIX}demo"],
-    )
-    assert lb.run("sweep").returncode == 0
 
+def test_a_container_that_removed_itself_is_gone_and_needs_no_sweep(lab):
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("run", "--rm", "ubuntu:24.04", "true"))
+    assert len(_cid_files(lb)) == 1
+    got = _ok(lb.run("check"))
+    assert "1 artefact(s) recorded, 0 still on the engine" in got.stdout
+
+
+def test_a_run_never_pulls_an_image_implicitly(lab):
+    """An image the engine does not hold is pulled through ``pull``, which records it; ``run`` asks
+    for none, so nothing reaches the laptop off the record."""
+    lb = _begun(lab())
+    got = lb.run("run", "--rm", "ubuntu:24.04", "true")
+    assert got.returncode == 125
+    assert "pull it first with .claude/session-guard.sh pull" in got.stderr
+    assert lb.docker_state()["images"] == []
+    assert not _cid_files(lb)
+    _ok(lb.run("check"))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["run", "--cidfile=/tmp/x", "ubuntu:24.04"],
+        ["run", "--pull", "always", "ubuntu:24.04"],
+        ["create", "--pull=missing", "ubuntu:24.04"],
+        ["build", "--builder", "default", "."],
+        ["build", "--push", "."],
+        ["build", "-otype=local,dest=out", "."],
+        ["build", "--output=type=registry", "."],
+        ["pull", "--all-tags", "ubuntu"],
+    ],
+)
+def test_the_flags_that_record_an_artefact_are_the_guards_own(lab, command):
+    """A caller's ``--cidfile`` or ``--pull`` would override the guard's and take the artefact off
+    the ledger; a ``--builder`` or an output other than ``--load`` would build where nothing records
+    it. Each is refused before docker is asked anything that makes something."""
+    lb = _begun(lab(images=[UBUNTU]))
+    got = lb.run(*command)
+    assert got.returncode != 0
+    assert "session-guard:" in got.stderr
+    made = {"run", "create", "pull", "buildx"}
+    assert not [c for c in lb.calls_log() if c[0] in made and c[:2] != ["buildx", "ls"]]
+
+
+def test_a_pulled_image_blocks_the_exit_until_it_is_gone(lab):
+    """The issue's case from the puller's side: the session that pulled it answers for it, with no
+    container referencing it and with one of its own (removed first, so the image can go)."""
+    lb = _begun(lab())
+    pulled = _ok(lb.run("pull", "alpine:3.20"))
+    assert "recorded image" in pulled.stdout
+    (image,) = lb.docker_state()["images"]
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert f"this session created image {image['id']} (alpine:3.20)" in _findings(got.stdout)
+
+    _ok(lb.run("run", "alpine:3.20", "true"))  # a stopped container of its own, using the image
+    _ok(lb.run("sweep"))
     st = lb.docker_state()
-    assert [c["id"] for c in st["containers"]] == [FOREIGN_CONTAINER["id"]]
-    assert [i["id"] for i in st["images"]] == [FOREIGN_IMAGE["id"]]
-    assert st["builders"] == ["desktop-linux", "someone-elses-builder"]
-
-    removals = [c for c in lb.calls_log() if c[0] in {"rm", "rmi"} or c[:2] == ["buildx", "rm"]]
-    removed = {arg for call in removals for arg in call}
-    assert FOREIGN_CONTAINER["id"] not in removed
-    assert FOREIGN_IMAGE["id"] not in removed
-    assert "someone-elses-builder" not in removed
-    assert not any("prune" in arg for call in lb.calls_log() for arg in call)
+    assert st["images"] == [] and st["containers"] == []
+    removals = [c for c in lb.calls_log() if c[:1] in (["rm"], ["rmi"])]
+    assert [c[0] for c in removals] == [
+        "rm",
+        "rmi",
+    ]  # the container first, or the image could not go
+    assert all("-f" not in c and "--force" not in c for c in removals if c[0] == "rmi")
+    _ok(lb.run("check"))
 
 
-def test_an_unlabelled_artefact_created_during_the_session_is_reported_and_never_removed(lab):
-    """An image somebody else pulled mid-session is theirs — reported, with the exact command."""
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(images=[FOREIGN_IMAGE], containers=[FOREIGN_CONTAINER], volumes=["new-volume"])
-    lb.clean_tabs()
+def test_a_pulled_image_a_siblings_container_uses_holds_the_puller_and_is_never_forced(lab):
+    """``@origin``'s rule read both ways: the session that pulled the image answers for it even
+    while a sibling's container uses it, and it never pulls the image out from under that
+    container — removal is unforced, so the sweep fails and says so until the container is gone."""
+    lb = _begun(lab())
+    _ok(lb.run("pull", "alpine:3.20"))
+    (image,) = lb.docker_state()["images"]
+    sibling = {
+        "id": "5" * 64,
+        "image": "alpine:3.20",
+        "image_id": image["id"],
+        "status": "Up 2 minutes",
+        "labels": {f"{OTHER_REPO}-builder": "1"},
+    }
+    _add(lb, "containers", sibling)
+
+    swept = lb.run("sweep")
+    assert swept.returncode != 0
+    assert "INCOMPLETE" in swept.stderr
+    assert "being used by stopped container" in swept.stderr
+    assert [c["id"] for c in lb.docker_state()["containers"]] == [sibling["id"]]
+    assert not any(c[:1] == ["rm"] for c in lb.calls_log())
+    assert image["id"] in _findings(lb.run("check").stdout)
+
+    _drop(lb, "containers", sibling["id"])  # its owner is done with it
+    _ok(lb.run("sweep"))
+    _ok(lb.run("check"))
+
+
+def test_a_pull_of_an_image_already_on_the_engine_makes_nothing_of_this_sessions(lab):
+    """Recording it would hand this session's sweep a sibling's image."""
+    lb = _begun(lab(images=[UBUNTU], registry={"ubuntu:24.04": UBUNTU["id"]}))
+    got = _ok(lb.run("pull", "ubuntu:24.04"))
+    assert "was on the engine before this pull, so it is not recorded" in got.stdout
+    _ok(lb.run("check"))
+    _ok(lb.run("sweep"))
+    assert [i["id"] for i in lb.docker_state()["images"]] == [UBUNTU["id"]]
+    assert not any(c[:1] == ["rmi"] for c in lb.calls_log())
+
+
+def test_an_image_its_owner_removed_and_this_session_pulled_again_is_this_sessions(lab):
+    """The 2026-11-04 overlap's second half: the same content id, gone and then pulled again by this
+    session. What decides is the engine just before the pull, never what was there at ``begin``."""
+    lb = _begun(lab(images=[UBUNTU], registry={"ubuntu:24.04": UBUNTU["id"]}))
+    lb.mutate(images=[])  # its owner removes it
+    _ok(lb.run("pull", "ubuntu:24.04"))
+    assert UBUNTU["id"] in _findings(lb.run("check").stdout)
+
+
+def test_a_build_runs_on_the_sessions_own_builder_and_records_all_it_makes(lab):
+    """A build on the shared builder grows a cache nobody can attribute, so the guard builds on a
+    builder of this session's own, made on first use (its image pulled through ``pull`` first) and
+    recorded before docker makes it. Its cache leaves with it. It is never made the current builder,
+    which is laptop-wide."""
+    lb = _begun(lab())
+    _ok(lb.run("build", "-t", "noc/replica:dev", "."))
+    _ok(lb.run("build", "-t", "noc/replica:dev2", "."))
+    calls = lb.calls_log()
+    (create,) = [c for c in calls if c[:2] == ["buildx", "create"]]  # made once, then reused
+    own = create[create.index("--name") + 1]
+    assert own.startswith(BUILDER_PREFIX)
+    assert "--use" not in create
+    assert "image=moby/buildkit:buildx-stable-1" in create
+    builds = [c for c in calls if c[:2] == ["buildx", "build"]]
+    assert len(builds) == 2
+    for build in builds:
+        assert build[2:7] == ["--builder", own, "--load", "--label", LABEL]
+    pull_at = calls.index(["pull", "-q", "moby/buildkit:buildx-stable-1"])
+    assert pull_at < calls.index(create)
 
     got = lb.run("check")
     assert got.returncode != 0
-    assert FOREIGN_IMAGE["id"] in got.stdout
-    assert FOREIGN_CONTAINER["id"] in got.stdout
-    assert "new-volume" in got.stdout
-    assert "only if it is yours" in got.stdout
+    findings = _findings(got.stdout)
+    assert f"buildx builder {own}" in findings
+    assert "noc/replica:dev" in findings and "noc/replica:dev2" in findings
+    assert "moby/buildkit:buildx-stable-1" in findings
+    assert "4 artefact(s) recorded, 4 still on the engine" in got.stdout
 
-    assert lb.run("sweep").returncode == 0
+    _ok(lb.run("sweep"))
     st = lb.docker_state()
-    assert [i["id"] for i in st["images"]] == [FOREIGN_IMAGE["id"]]
-    assert [c["id"] for c in st["containers"]] == [FOREIGN_CONTAINER["id"]]
-    assert st["volumes"] == ["new-volume"]
+    assert st["images"] == [] and st["builders"] == ["desktop-linux"]
+    calls = lb.calls_log()
+    assert calls.index(["buildx", "rm", own]) < min(
+        n for n, c in enumerate(calls) if c[:1] == ["rmi"]
+    )
+    _ok(lb.run("check"))
 
 
-def test_a_labelled_artefact_is_not_reported_twice(lab):
-    """It is this session's to sweep, not an unattributable stray — one finding, one repair."""
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(containers=[CONTAINER], images=[IMAGE])
+def test_a_build_that_failed_records_its_builder_and_no_image(lab):
+    lb = _begun(lab(build_fails=True))
+    assert lb.run("build", ".").returncode != 0
+    got = lb.run("check")
+    assert "left no image on the engine" not in got.stdout  # resolved by the build itself
+    assert "2 artefact(s) recorded, 2 still on the engine" in got.stdout  # its builder and buildkit
+    _ok(lb.run("sweep"))
+    _ok(lb.run("check"))
+
+
+def test_a_volume_is_recorded_before_docker_makes_it_and_a_taken_name_is_refused(lab):
+    """``docker volume create`` of a name that exists succeeds and makes nothing, so recording it
+    would hand this session's sweep a sibling's volume."""
+    lb = _begun(lab(volumes=[{"name": "sib-data", "labels": {f"{OTHER_REPO}-builder": "1"}}]))
+    taken = lb.run("volume-create", "sib-data")
+    assert taken.returncode != 0
+    assert "already exists" in taken.stderr
+    assert not any(c[:2] == ["volume", "create"] for c in lb.calls_log())
+
+    _ok(lb.run("volume-create", "replica-data"))
+    assert ["volume", "create", "--label", LABEL, "replica-data"] in lb.calls_log()
+    assert "this session created volume replica-data" in _findings(lb.run("check").stdout)
+    _ok(lb.run("sweep"))
+    assert [v["name"] for v in lb.docker_state()["volumes"]] == ["sib-data"]
+    _ok(lb.run("check"))
+
+
+def test_the_sweep_never_removes_what_its_ledger_does_not_record(lab):
+    """The positive control. Beside what this session made sit a foreign container and image, a
+    container and an image carrying THIS repo's own label (an ended session's, or a bare
+    ``docker run``'s), a builder under this repo's prefix, and a volume: none is on the ledger, so
+    none blocks and none is touched. A label is no longer ownership; the ledger is."""
+    own_labelled = {**CONTAINER, "id": "7" * 64}
+    lb = _begun(
+        lab(
+            containers=[FOREIGN_CONTAINER, own_labelled],
+            images=[FOREIGN_IMAGE, IMAGE, UBUNTU],
+            volumes=["someone-elses"],
+            builders=["desktop-linux", f"{BUILDER_PREFIX}demo"],
+        )
+    )
+    _ok(lb.run("check"))  # nothing on the ledger: nothing blocks
+    _ok(lb.run("run", "-d", "ubuntu:24.04"))
+    _ok(lb.run("pull", "alpine:3.20"))
+    _ok(lb.run("sweep"))
+
+    st = lb.docker_state()
+    assert [c["id"] for c in st["containers"]] == [FOREIGN_CONTAINER["id"], own_labelled["id"]]
+    assert [i["id"] for i in st["images"]] == [FOREIGN_IMAGE["id"], IMAGE["id"], UBUNTU["id"]]
+    assert st["builders"] == ["desktop-linux", f"{BUILDER_PREFIX}demo"]
+    assert st["volumes"] == ["someone-elses"]
+    removals = [c for c in lb.calls_log() if c[0] in {"rm", "rmi"} or c[1:2] == ["rm"]]
+    removed = {arg for call in removals for arg in call}
+    for foreign in (FOREIGN_CONTAINER["id"], own_labelled["id"], FOREIGN_IMAGE["id"], IMAGE["id"]):
+        assert foreign not in removed
+    assert UBUNTU["id"] not in removed and "ubuntu:24.04" not in removed
+    assert f"{BUILDER_PREFIX}demo" not in removed and "someone-elses" not in removed
+    assert not any("prune" in arg for call in lb.calls_log() for arg in call)
+    _ok(lb.run("check"))
+
+
+def test_a_session_that_recorded_nothing_exits_past_a_siblings_container_and_pulled_image(
+    lab, tmp_path
+):
+    """The issue's case (2026-11-22): a session that never used Docker could not exit, because a
+    sibling's pulled base image appeared while it ran and can carry no label; the only repair it was
+    offered was removing a sibling's image while the sibling's container used it."""
+    lb, a, b = _overlap_lab(lab, tmp_path)
+    _ok(a("begin"))
+    _ok(b("begin"))
+    _ok(b("docker-up"))
+    _ok(b("pull", "python:3.11-slim-bookworm"))
+    _ok(b("run", "-d", "python:3.11-slim-bookworm", "sleep", "3600"))
+    before = len(lb.calls_log())
+
+    got = _clean_exit(a)
+    assert "Docker ledger: empty — nothing this session made is left on the engine" in got.stdout
+    assert "not-clean" not in got.stdout
+    st = lb.docker_state()
+    assert len(st["images"]) == 1 and len(st["containers"]) == 1
+    after = lb.calls_log()[before:]
+    assert not [c for c in after if c[:1] in (["rm"], ["rmi"]) or c[1:2] == ["rm"]]
+
+
+def test_a_session_exits_clean_while_a_sibling_builds_an_image(lab, tmp_path):
+    """2026-11-26: a builder that ran no Docker command was held open because the shared build cache
+    grew by a sibling's build. A quantity nobody can attribute is not a finding against whoever is
+    exiting; and the sibling's build ran on its own builder, whose cache leaves with it."""
+    lb, a, b = _overlap_lab(lab, tmp_path, build_cache="333.7MB")
+    _ok(a("begin"))
+    _ok(b("begin"))
+    _ok(b("docker-up"))
+    _ok(b("build", "-t", "replica:dev", "."))
+    lb.mutate(build_cache="336.6MB")
+    got = _clean_exit(a)
+    assert "build cache" not in got.stdout
+    assert "not-clean" not in got.stdout
+    # ...and the builder answers for everything its build made.
+    assert "3 artefact(s) recorded, 3 still on the engine" in b("check").stdout
+    _ok(b("sweep"))
+    _clean_exit(b)
+    assert lb.docker_state()["images"] == []
+
+
+def _cut_off(lb, *command):
+    """Run a guard command whose docker call hangs, check while it runs, then kill it mid-call."""
+    proc = subprocess.Popen(
+        [str(GUARD), *command],
+        env=lb.env,
+        cwd=lb.tmp,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + 10
+    hung = command[0] if command[0] != "volume-create" else "volume"
+    while time.time() < deadline:
+        calls = lb.calls_log()
+        if any(c[:1] == [hung] or c[1:2] in (["build"], ["create"]) for c in calls):
+            break
+        time.sleep(0.05)
+    time.sleep(0.2)
+    try:
+        return lb.run("check")
+    finally:
+        os.killpg(proc.pid, 9)
+        proc.wait()
+
+
+def test_a_pull_cut_off_part_way_holds_the_exit_while_it_runs_and_is_never_guessed_at(lab):
+    """While the pull's own process lives, its pending record is in flight and holds the exit. Once
+    it is gone, an image under its reference may be the one it landed or one a sibling pulled since,
+    and nothing tells them apart: recording it would hand this session's sweep a sibling's image. It
+    is named, never recorded (``@origin``: it never guesses)."""
+    lb = _begun(lab(pull_hangs=True))
+    got = _cut_off(lb, "pull", "alpine:3.20")
+    assert "this session started has not finished" in _findings(got.stdout)
+    assert list(lb.state_root.glob("*/pending/*")), "the record outlives the pull that wrote it"
+
+    _add(lb, "images", {"id": "sha256:" + "9" * 64, "tags": ["alpine:3.20"]})  # a pull landed
+    got = _ok(lb.run("check"))
+    assert "was cut off before it said what it made" in got.stdout
+    assert "NOT recorded" in got.stdout
+    assert not list(lb.state_root.glob("*/pending/*"))
+    _ok(lb.run("sweep"))
+    assert [i["id"] for i in lb.docker_state()["images"]] == ["sha256:" + "9" * 64]
+
+
+def test_a_build_cut_off_part_way_is_resolved_by_the_next_check(lab):
+    """A build's tag is this session's alone, so the image under it can only be its own: a build
+    cut off is resolved by the next ``check`` exactly as it would have resolved itself."""
+    lb = _begun(lab(build_hangs=True))
+    got = _cut_off(lb, "build", ".")
+    assert "this session started has not finished" in _findings(got.stdout)
+    (pending,) = lb.state_root.glob("*/pending/*")
+    tag = pending.read_text().splitlines()[0]
+    assert tag.startswith(BUILDER_PREFIX)
+
+    _add(lb, "images", {"id": "sha256:" + "8" * 64, "tags": [tag]})  # the build had loaded
+    got = lb.run("check")
+    assert "recorded image sha256:" + "8" * 64 in got.stdout
+    assert "sha256:" + "8" * 64 in _findings(got.stdout)
+    _ok(lb.run("sweep"))
+    _ok(lb.run("check"))
+
+
+def test_a_record_written_before_its_artefact_exists_is_never_discharged_while_it_is_made(lab):
+    """A volume (and a builder) is recorded BEFORE docker makes it. A concurrent ``check`` of the
+    same session that finds it not there yet must not discharge the record, or the volume, made a
+    moment later, would be off the ledger; it is in flight, and holds the exit."""
+    lb = _begun(lab(volume_create_hangs=True))
+    got = _cut_off(lb, "volume-create", "replica-data")
+    assert "volume replica-data this session is making has not finished" in _findings(got.stdout)
+    (record,) = lb.state_root.glob("*/records/*")
+    assert record.read_text().startswith("volume\treplica-data\t")
+
+    _add(lb, "volumes", {"name": "replica-data", "labels": {}})  # docker had made it
+    assert "this session created volume replica-data" in _findings(lb.run("check").stdout)
+
+
+def test_a_failed_volume_create_leaves_no_record_behind(lab):
+    """A record that outlived a failed create would hand this session's sweep a sibling's volume
+    that later took the name."""
+    lb = _begun(lab())
+    stub = lb.bin / "docker"
+    real = stub.read_text()
+    stub.write_text(
+        real.replace(
+            'elif a[:2] == ["volume", "create"]:\n    down()',
+            'elif a[:2] == ["volume", "create"]:\n    sys.exit(1)',
+            1,
+        )
+    )
+    assert lb.run("volume-create", "replica-data").returncode != 0
+    stub.write_text(real)
+    assert not list(lb.state_root.glob("*/records/*"))
+    _add(lb, "volumes", {"name": "replica-data", "labels": {}})  # a sibling takes the name
+    _ok(lb.run("check"))
+    _ok(lb.run("sweep"))
+    assert [v["name"] for v in lb.docker_state()["volumes"]] == ["replica-data"]
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        ["-v", "pgdata:/var/lib/postgresql/data"],
+        ["--volume=pgdata:/data"],
+        ["-vpgdata:/data"],
+        ["--mount", "type=volume,src=pgdata,dst=/data"],
+        ["--mount=source=pgdata,target=/data"],
+    ],
+)
+def test_a_run_that_would_make_a_named_volume_off_the_record_is_refused(lab, mount):
+    """Docker makes a named volume a run mounts if it is missing, and ``rm -v`` removes only
+    anonymous ones, so it would outlive the session off the record. Made first through
+    ``volume-create`` (or already there), the same run goes ahead."""
+    lb = _begun(lab(images=[UBUNTU]))
+    got = lb.run("run", *mount, "ubuntu:24.04")
+    assert got.returncode != 0
+    assert "pgdata do not exist" in got.stderr
+    assert not any(c[:1] == ["run"] for c in lb.calls_log())
+    _ok(lb.run("volume-create", "pgdata"))
+    _ok(lb.run("run", *mount, "ubuntu:24.04"))
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        ["-v", "/tmp/x:/x"],
+        ["-v", "./x:/x"],
+        ["-v", "/data"],
+        ["--mount", "type=bind,src=/x,dst=/x"],
+    ],
+)
+def test_a_bind_mount_or_an_anonymous_volume_is_not_refused(lab, mount):
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("run", "--rm", *mount, "ubuntu:24.04", "true"))
+
+
+def test_a_pull_names_its_one_reference_wherever_it_sits(lab):
+    lb = _begun(lab())
+    got = _ok(lb.run("pull", "alpine:3.20", "-q"))
+    assert "recorded image" in got.stdout and "(alpine:3.20)" in got.stdout
+    _ok(lb.run("pull", "--platform", "linux/arm64", "busybox:1"))
+    assert "busybox:1" in _findings(lb.run("check").stdout)
+    assert lb.run("pull", "alpine:3.20", "busybox:1").returncode != 0
+    assert lb.run("pull", "-q").returncode != 0
+
+
+def test_a_begin_re_run_after_one_cut_off_keeps_the_ledger_it_found(lab):
+    """A ``begin`` cut off after it adopted a predecessor's ledger leaves no ``began_at``, so the
+    next one replaces the state directory: everything but the ledger, which is never deleted
+    unread."""
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("run", "-d", "ubuntu:24.04"))
+    (lb.state_root / "test-session" / "began_at").unlink()  # the shape a cut-off begin leaves
+    again = _ok(lb.run("begin"))
+    assert "its Docker ledger, if any, is kept" in again.stderr
+    assert "docker ledger: 1 artefact(s) recorded" in again.stdout
     lb.clean_tabs()
-    out = lb.run("check").stdout
-    assert out.count(CONTAINER["id"]) == 1
-    assert out.count(IMAGE["id"]) == 1
-    assert "only if it is yours" not in out
+    assert lb.docker_state()["containers"][0]["id"] in _findings(lb.run("check").stdout)
+
+
+def test_an_engine_that_died_mid_session_cannot_show_the_ledger_is_clear(lab):
+    """The 2026-09-20 state exactly: the engine answering 500, nothing listable. "We could not
+    look" is not "there is nothing there" — but only a session with something on its ledger needs
+    a look."""
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("check"))
+    lb.mutate(engine_up=False)
+    _ok(lb.run("check"))  # it made nothing: a dead engine is no finding of its own
+
+    lb.mutate(engine_up=True)
+    _ok(lb.run("run", "-d", "ubuntu:24.04"))
+    lb.mutate(engine_up=False)
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "engine is not reachable" in _findings(got.stdout)
+    swept = lb.run("sweep")
+    assert swept.returncode != 0 and "not reachable" in swept.stderr
 
 
 def test_what_was_already_there_at_session_start_is_not_a_finding(lab):
@@ -552,22 +1095,6 @@ def test_what_was_already_there_at_session_start_is_not_a_finding(lab):
     assert lb.run("begin").returncode == 0
     lb.clean_tabs()
     assert lb.run("check").returncode == 0
-
-
-def test_a_build_on_a_shared_builder_is_reported(lab):
-    """The 233 MB of orphaned build cache the capital swept, caught at its source.
-
-    A cache record carries no label we control, so this reports and points at the throwaway
-    builder — whose ``docker buildx rm`` takes its whole cache with it.
-    """
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(build_cache="233MB")
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "233MB" in got.stdout
-    assert BUILDER_PREFIX in got.stdout
 
 
 # ------------------------------------------------------------------------ Docker Desktop
@@ -654,20 +1181,6 @@ def test_docker_desktop_stopped_during_the_session_is_a_finding_too(lab):
     assert "was running at session start and is not now" in got.stdout
 
 
-def test_an_engine_that_died_mid_session_cannot_certify_anything(lab):
-    """The 2026-09-20 state exactly: the engine answering 500, nothing listable.
-
-    "We could not look" is not "there is nothing there" — the founding rule of this repo.
-    """
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(engine_up=False)
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "not reachable" in got.stdout
-
-
 # ------------------------------------------------------------------------- browser tabs
 
 
@@ -725,15 +1238,13 @@ def test_touching_the_browser_after_the_last_check_invalidates_it(lab):
 
 
 def test_done_clears_the_state_only_on_a_clean_check(lab):
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(containers=[CONTAINER])
-    lb.clean_tabs()
+    lb = _begun(lab(images=[UBUNTU]))
+    _ok(lb.run("run", "-d", "ubuntu:24.04"))
     assert lb.run("done").returncode != 0
     assert (lb.state_root / "test-session").is_dir()
 
-    assert lb.run("sweep").returncode == 0
-    assert lb.run("done").returncode == 0
+    _ok(lb.run("sweep"))
+    _ok(lb.run("done"))
     assert not (lb.state_root / "test-session").exists()
 
 
@@ -1065,65 +1576,6 @@ def test_the_census_is_printed_and_only_this_sessions_share_refuses(lab):
     )
 
 
-# Another carrier's label, distinct from this checkout's by construction.
-SIBLING_KEY = f"{REPO_NAME}-sibling-builder"
-
-
-def test_an_artefact_carrying_a_sibling_builders_label_is_named_and_never_blocks(lab):
-    """Docker's attribution is the label, and every carrier writes its own ``<repo>-builder=1``:
-    a sibling's artefact is provably that sibling's. An unlabelled one beside it is still found."""
-    labels = {SIBLING_KEY: "1", "org.opencontainers.image.title": "replica"}
-    sib_container = {
-        "id": "d" * 64,
-        "image": "sib",
-        "status": "Up",
-        "labelled": False,
-        "labels": labels,
-    }
-    sib_image = {
-        "id": "sha256:" + "d" * 64,
-        "tag": "sib:latest",
-        "labelled": False,
-        "labels": labels,
-    }
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.clean_tabs()
-    lb.mutate(
-        containers=[sib_container],
-        images=[sib_image],
-        volumes=[{"name": "sib-volume", "labels": labels}],
-    )
-    got = lb.run("check")
-    assert got.returncode == 0, got.stdout
-    for name in (sib_container["id"], sib_image["id"], "volume sib-volume"):
-        assert f"{name}" in got.stdout
-    assert got.stdout.count(f"carries {SIBLING_KEY}=1, a sibling builder's label") == 3
-
-    lb.mutate(containers=[sib_container, FOREIGN_CONTAINER])
-    got = lb.run("check")
-    assert got.returncode == 1
-    assert FOREIGN_CONTAINER["id"] in _findings(got.stdout)
-    assert sib_container["id"] not in _findings(got.stdout)
-    # Reported, never removed: a sibling's artefact is not this session's to sweep.
-    assert lb.run("sweep").returncode == 0
-    assert {c["id"] for c in lb.docker_state()["containers"]} == {
-        sib_container["id"],
-        FOREIGN_CONTAINER["id"],
-    }
-
-
-def test_a_builder_label_that_is_not_set_to_one_attributes_nothing(lab):
-    """The convention is ``=1`` exactly; anything else is an unattributed artefact."""
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.clean_tabs()
-    lb.mutate(volumes=[{"name": "odd-volume", "labels": {SIBLING_KEY: "true"}}])
-    got = lb.run("check")
-    assert got.returncode == 1
-    assert "volume appeared during this session: odd-volume" in got.stdout
-
-
 def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
     lab_obj = lab()
     (lab_obj.bin / "lsof").unlink()  # the lab's own stub goes, and the system's is hidden below
@@ -1186,8 +1638,8 @@ def test_a_second_session_start_keeps_the_baseline_and_what_the_session_recorded
 def test_a_census_cut_off_part_way_leaves_no_baseline(lab):
     """``began_at`` is the "a baseline exists" marker, so it is written last. A census that dies
     mid-run must leave ``check`` refusing, never a baseline that reads complete without its
-    ``.base`` files (which would make every new container invisible)."""
-    lb = lab(ps_kills_group=True)
+    listener census (which would make every new listener invisible)."""
+    lb = lab(lsof_kills_group=True)
     got = subprocess.run(
         [str(GUARD), "begin"],
         env=lb.env,
@@ -1197,7 +1649,7 @@ def test_a_census_cut_off_part_way_leaves_no_baseline(lab):
         check=False,
     )
     assert got.returncode < 0, "the stub was meant to kill the census"
-    lb.mutate(ps_kills_group=False)
+    lb.mutate(lsof_kills_group=False)
     check = lb.run("check")
     assert check.returncode != 0
     assert "no session baseline" in check.stdout
@@ -1236,12 +1688,14 @@ def test_a_live_session_is_not_swept_as_stale_by_another_sessions_start(lab):
 def test_a_failed_removal_fails_the_sweep_and_keeps_the_engine_up(lab):
     """A sweep that could not remove something is not complete, and quitting the engine under it
     would hide the leftover from the ``check`` that follows."""
-    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], images=[IMAGE], rmi_fails=True)
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], rmi_fails=True)
     assert lb.run("begin").returncode == 0
     assert lb.run("docker-up").returncode == 0
+    _ok(lb.run("pull", "alpine:3.20"))
     got = lb.run("sweep")
     assert got.returncode != 0
     assert "INCOMPLETE" in got.stderr
+    assert "could not remove image" in got.stderr
     assert ["desktop", "stop"] not in lb.calls_log()
 
 
@@ -1402,10 +1856,10 @@ def test_a_census_failure_at_session_start_leaves_no_listener_baseline(lab):
     assert "no listening-port baseline" in got.stdout
 
 
-def test_an_engine_down_at_session_start_is_censused_by_docker_up(lab):
-    """(b): with the engine down at ``begin`` there is nothing to list, and comparing against that
-    empty list read every image already on the laptop as this session's — with ``docker rmi`` of
-    someone else's image as the repair — the moment ``docker-up`` brought the engine up."""
+def test_an_engine_down_at_session_start_needs_no_census(lab):
+    """(b) is gone by construction: nothing is compared against a census, so an image already on
+    the laptop when ``docker-up`` brought the engine up is never read as this session's — with
+    ``docker rmi`` of someone else's image as the repair."""
     lb = lab(
         engine_up=False,
         desktop_status="stopped",
@@ -1413,78 +1867,26 @@ def test_an_engine_down_at_session_start_is_censused_by_docker_up(lab):
         images=[FOREIGN_IMAGE],
         containers=[FOREIGN_CONTAINER],
     )
-    assert lb.run("begin").returncode == 0
-    assert lb.run("docker-up").returncode == 0
+    _ok(lb.run("begin"))
+    _ok(lb.run("docker-up"))
     lb.clean_tabs()
-    got = lb.run("check")
-    assert FOREIGN_IMAGE["id"] not in got.stdout
-    assert FOREIGN_CONTAINER["id"] not in got.stdout
-    lb.mutate(images=[FOREIGN_IMAGE, {**IMAGE, "labelled": False}])
-    assert IMAGE["id"] in lb.run("check").stdout  # what came after the census still shows
+    findings = _findings(lb.run("check").stdout)
+    assert FOREIGN_IMAGE["id"] not in findings and FOREIGN_CONTAINER["id"] not in findings
+    _ok(lb.run("pull", "alpine:3.20"))
+    assert "this session created image" in _findings(lb.run("check").stdout)
 
 
-def test_an_engine_that_came_up_from_outside_is_a_finding_never_blamed_on_what_was_there(lab):
-    """(b), as decided on basecradle#709 item 3: an engine that came up after ``begin`` without a
-    ``docker-up`` has no baseline to compare against. The labelled checks still run and nothing
-    that was already there is blamed — but the gap is a FINDING, because "we could not look" is
-    never clean and a session that used the engine out of protocol would otherwise exit clean. Its
-    lever is a late census, which every later ``check`` names."""
+def test_an_engine_that_came_up_from_outside_is_no_finding_for_a_session_that_made_nothing(lab):
+    """basecradle#709 item 3 made this a finding, because a session that reached such an engine out
+    of protocol would otherwise exit clean. Under the ledger it needs no look at all: a session
+    answers for what it recorded, and an artefact made around the guard is the capital's
+    leftovers check's to name (basecradle-noc#1715)."""
     lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
-    assert lb.run("begin").returncode == 0
+    _ok(lb.run("begin"))
     lb.mutate(engine_up=True, images=[FOREIGN_IMAGE, IMAGE])
     lb.clean_tabs()
-    got = lb.run("check")
-    assert FOREIGN_IMAGE["id"] not in got.stdout
-    assert f"labelled image still present: {IMAGE['id']}" in got.stdout
-
-    lb.mutate(images=[FOREIGN_IMAGE])  # the labelled finding is not what makes this one fail
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "not-clean: no Docker baseline" in got.stdout
-    assert lb.run("docker-up").returncode == 0
-    got = lb.run("check")
-    assert got.returncode == 0, got.stdout
-    assert "LATE: the Docker baseline was taken at" in got.stdout
-
-
-def test_a_build_cache_that_shrank_is_not_a_build(lab):
-    """(c): BuildKit's garbage collection shrinks the cache on its own schedule. Compared as
-    strings, that read as a build this session ran and blocked an exit nothing could clear."""
-    lb = lab(build_cache="1.234GB")
-    assert lb.run("begin").returncode == 0
-    lb.mutate(build_cache="233MB")
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode == 0, got.stdout
-
-
-def test_a_build_cache_whose_size_cannot_be_read_is_not_clean(lab):
-    """(c): a size the guard cannot parse is "we could not look", never "it did not grow"."""
-    lb = lab()
-    assert lb.run("begin").returncode == 0
-    lb.mutate(build_cache="garbled")
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "could not be read" in got.stdout
-
-
-def test_a_build_cache_unreadable_at_the_baseline_is_cleared_by_a_late_reading(lab):
-    """basecradle#709 item 6: a cache size that could not be read at the census never becomes
-    readable by re-running ``check``, so the finding it raised could never clear, and self-exit has
-    no override. ``docker-up`` re-reads it, and ``check`` names the reading as late."""
-    lb = lab(build_cache="garbled")
-    assert lb.run("begin").returncode == 0
-    lb.mutate(build_cache="1.2GB")
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "could not be read when the Docker baseline was taken" in got.stdout
-
-    assert lb.run("docker-up").returncode == 0
-    got = lb.run("check")
-    assert got.returncode == 0, got.stdout
-    assert "LATE: the build cache's baseline was read at" in got.stdout
+    got = _ok(lb.run("check"))
+    assert "not-clean" not in got.stdout
 
 
 def test_a_late_listener_baseline_is_named_on_every_check(lab):
@@ -1646,6 +2048,111 @@ def test_a_record_with_no_process_to_prove_it_is_reported_and_never_adopted(lab)
     assert _record_of(lb, "4711").is_file()
 
 
+# ------------------------------------------------ a resume keeps its ledger (basecradle-noc#1715)
+
+
+def _conversation_lab(lab):
+    """Sessions of one repo keyed on their ``claude`` process, each in a conversation of its own:
+    A (``claude`` 4711) pulls an image and runs a container, then may be killed."""
+    lb = lab(images=[UBUNTU], lstart={"4711": 1792656776, "4712": 1792660000, "4713": 1792660100})
+
+    def session(pid, conversation):
+        env = lb.env | {"CLAUDE_PID": pid, "CLAUDE_CODE_SESSION_ID": conversation}
+        return lambda *a: subprocess.run(
+            [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+        )
+
+    a = session("4711", "conversation-1")
+    _ok(a("begin"))
+    _ok(a("pull", "alpine:3.20"))
+    _ok(a("run", "-d", "ubuntu:24.04"))
+    return lb, session
+
+
+def test_a_resume_adopts_the_ledger_its_crashed_predecessor_wrote(lab):
+    """A resume is a new ``claude`` process in the same conversation, so it takes a new key, and the
+    ledger the crashed session wrote sits under the old one. What it created, this conversation
+    created: the resume adopts it out loud, and its sweep removes it."""
+    lb, session = _conversation_lab(lab)
+    (pulled,) = [i["id"] for i in lb.docker_state()["images"] if i["id"] != UBUNTU["id"]]
+    (container,) = lb.docker_state()["containers"]
+    _kill(lb, "4711")
+    b = session("4712", "conversation-1")
+    began = _ok(b("begin"))
+    assert "ADOPTED: session claude-4711-" in began.stdout
+    assert not list((_state_of(lb, "4711") / "records").iterdir())
+
+    _ok(b("tabs-checked"))
+    findings = _findings(b("check").stdout)
+    assert container["id"] in findings and pulled in findings
+    _ok(b("sweep"))
+    st = lb.docker_state()
+    assert [i["id"] for i in st["images"]] == [UBUNTU["id"]] and st["containers"] == []
+    _ok(b("check"))
+
+
+def test_an_ended_sessions_ledger_of_another_conversation_is_named_and_never_adopted(lab):
+    """A stale ledger from a dead session is named on every ``begin`` and ``check``, never blocks a
+    session it is not, and is never swept by one. Once what it records is gone from the engine, it
+    clears itself."""
+    lb, session = _conversation_lab(lab)
+    _kill(lb, "4711")
+    c = session("4713", "conversation-2")
+    began = _ok(c("begin"))
+    assert "ADOPTED" not in began.stdout
+    assert "ended with a Docker ledger that still records 2 artefact(s)" in began.stdout
+    _ok(c("tabs-checked"))
+    got = _ok(c("check"))
+    assert "not this session's: session claude-4711-" in got.stdout
+    _ok(c("sweep"))
+    assert len(lb.docker_state()["containers"]) == 1
+    assert not any(call[:1] in (["rm"], ["rmi"]) for call in lb.calls_log())
+
+    lb.mutate(containers=[], images=[UBUNTU])  # whoever clears them, by hand
+    got = _ok(c("check"))
+    assert "cleared ended session claude-4711-" in got.stdout
+    assert not (_state_of(lb, "4711") / "records").exists()
+    assert "ended with a Docker ledger" not in _ok(c("check")).stdout
+
+
+def test_an_ended_sessions_unresolved_operation_is_dropped_by_name_so_its_ledger_clears(lab):
+    lb, session = _conversation_lab(lab)
+    _kill(lb, "4711")
+    pending = _state_of(lb, "4711") / "pending"
+    pending.mkdir(exist_ok=True)
+    (pending / "1.2.3").write_text("busybox:1\npull\n4711\n")
+    lb.mutate(containers=[], images=[UBUNTU])
+    got = _ok(session("4713", "conversation-2")("begin"))
+    assert "left a pull of busybox:1 unresolved" in got.stdout
+    assert "cleared ended session claude-4711-" in got.stdout
+    assert not list(pending.iterdir())
+
+
+def test_a_live_sessions_ledger_is_neither_adopted_nor_named(lab):
+    """A second process of the same conversation while the first still runs is not a resume."""
+    lb, session = _conversation_lab(lab)
+    began = _ok(session("4712", "conversation-1")("begin"))
+    assert "ADOPTED" not in began.stdout
+    assert "ended with a Docker ledger" not in began.stdout
+    assert list((_state_of(lb, "4711") / "records").iterdir())
+
+
+def test_a_stale_state_directory_whose_ledger_still_records_something_is_never_deleted(lab):
+    """The stale-state sweep removes the guard's own leftovers past their window, but never a
+    ledger that still records an artefact: deleted unread, the record would be lost."""
+    lb, session = _conversation_lab(lab)
+    _kill(lb, "4711")
+    old = time.time() - 30 * 86400
+    kept = _state_of(lb, "4711")
+    os.utime(kept, (old, old))
+    gone = lb.state_root / "claude-1-ThuOct010000002026"
+    gone.mkdir()
+    os.utime(gone, (old, old))
+    _ok(session("4713", "conversation-2")("begin"))
+    assert list((kept / "records").iterdir())
+    assert not gone.exists()
+
+
 # ---------------------------- overlapping builders share one Docker Desktop (basecradle-noc#1255)
 
 OTHER_REPO = "basecradle-example"
@@ -1713,39 +2220,32 @@ def test_overlapping_builders_leave_no_docker_desktop_and_no_image_in_either_exi
     """The 2026-11-04 overlap: the harness builder started Docker Desktop, the router builder began
     beside it and read it as the laptop's own, and between them they left Docker Desktop running
     and an ``ubuntu:24.04`` on a laptop that had neither. A records starting it in the ledger, so B
-    reads it as A's. In the starter-first order, A quits it under B, B starts its own and pulls
-    ``ubuntu:24.04`` again under the ID its baseline already held; the narrowed baseline and the
-    sweep's refusal to quit over an unlabelled image are what catch that copy."""
+    reads it as A's, and each answers for exactly what its own ledger records. In the starter-first
+    order A quits Docker Desktop under B, and B's next ``docker-up`` starts its own, under which
+    B's artefacts are still there for its sweep."""
     lb, a, b = _overlap_lab(lab, tmp_path)
     _ok(a("begin"))
     _ok(a("docker-up"))
-    _add(lb, "images", UBUNTU)  # A pulls it
-    _add(lb, "containers", CONTAINER)  # A's labelled container
+    _ok(a("pull", "ubuntu:24.04"))
+    _ok(a("run", "-d", "ubuntu:24.04", "sleep", "60"))
 
     began = _ok(b("begin"))
     assert "started by builder session claude-4711" in began.stdout
     assert "sibling session claude-4711" in _ok(b("docker-up")).stdout
-    b_container = {**FOREIGN_CONTAINER, "id": "9" * 64, "labels": {OTHER_KEY: "1"}}
-    _add(lb, "containers", b_container)
+    _ok(b("pull", "alpine:3.20"))
+    _ok(b("run", "-d", "alpine:3.20", "sleep", "60"))
+    a_container, b_container = (c["id"] for c in lb.docker_state()["containers"])
 
     if first_out == "starter":
         got = a("check")
-        assert UBUNTU["id"] in _findings(got.stdout)  # A pulled it, A answers for it
-        assert b_container["id"] not in _findings(got.stdout)
-        _drop(lb, "images", UBUNTU["id"])
+        assert a_container in _findings(got.stdout)
+        assert b_container not in _findings(got.stdout)
         _ok(a("sweep"))
         assert ["desktop", "stop"] in lb.calls_log()
         _clean_exit(a)
 
-        # B's next Docker use starts its own Docker Desktop, and pulls the image A removed.
         assert "starting Docker Desktop" in _ok(b("docker-up")).stdout
-        _add(lb, "images", UBUNTU)
-        swept = b("sweep")
-        assert swept.returncode != 0
-        assert "not quitting Docker Desktop" in swept.stderr
-        assert UBUNTU["id"] in swept.stdout
-        assert lb.docker_state()["desktop_status"] == "running"
-        _drop(lb, "images", UBUNTU["id"])
+        assert b_container in _findings(b("check").stdout)
         _ok(b("sweep"))
         _clean_exit(b)
     else:
@@ -1754,8 +2254,7 @@ def test_overlapping_builders_leave_no_docker_desktop_and_no_image_in_either_exi
         got = _clean_exit(b)
         assert "Docker Desktop is running for sibling session claude-4711" in got.stdout
 
-        assert UBUNTU["id"] in _findings(a("check").stdout)
-        _drop(lb, "images", UBUNTU["id"])
+        assert a_container in _findings(a("check").stdout)
         _ok(a("sweep"))
         _clean_exit(a)
 
@@ -1785,14 +2284,14 @@ def test_a_session_whose_own_leftovers_are_gone_exits_past_a_siblings_docker_des
 
 
 def test_a_session_that_never_used_docker_exits_past_a_sibling_engine_either_way(lab, tmp_path):
-    """No Docker use at all: a sibling's engine that came up after this session began needs no
-    Docker baseline here, and one that was up at ``begin`` going down is the sibling's sweep."""
+    """No Docker use at all: a sibling's engine that came up after this session began needs no look
+    here, and one that was up at ``begin`` going down is the sibling's sweep."""
     _, a, b = _overlap_lab(lab, tmp_path)
     _ok(a("begin"))
     _ok(b("begin"))
     _ok(b("docker-up"))
     got = _clean_exit(a)
-    assert "never reached from it through docker-up" in got.stdout
+    assert "Docker ledger: empty — nothing this session made is left on the engine" in got.stdout
 
     _ok(a("begin"))  # a fresh session of A, beside B's running engine
     _ok(b("sweep"))
@@ -1851,50 +2350,20 @@ def test_a_sibling_that_ended_without_quitting_is_adopted_by_a_running_sessions_
 
 
 def test_an_image_this_session_pulled_keeps_its_own_docker_desktop_up_until_removed(lab):
-    """A pulled image carries no label. Quitting the engine over it took it out of ``check``'s
-    sight, and the session exited clean with the image on the laptop."""
-    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
+    """A pulled image carries no label. Quitting the engine over it would take it out of ``check``'s
+    sight, and the session would exit clean with the image on the laptop."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], rmi_fails=True)
     _ok(lb.run("begin"))
     _ok(lb.run("docker-up"))
-    lb.mutate(ps_lines=[DESKTOP_LINE], images=[UBUNTU])
+    lb.mutate(ps_lines=[DESKTOP_LINE])
+    _ok(lb.run("pull", "ubuntu:24.04"))
     swept = lb.run("sweep")
     assert swept.returncode != 0
     assert ["desktop", "stop"] not in lb.calls_log()
-    lb.mutate(images=[])
+    lb.mutate(rmi_fails=False)
     _ok(lb.run("sweep"))
     assert ["desktop", "stop"] in lb.calls_log()
-
-
-def test_an_artefact_removed_and_made_again_during_the_session_is_new(lab):
-    """The baseline is narrowed each time ``docker-up`` reaches the engine: an image the baseline
-    held that is gone by then and comes back afterwards was made during this session, whatever its
-    content ID says."""
-    lb = lab(images=[UBUNTU])
-    _ok(lb.run("begin"))
-    lb.mutate(images=[])  # its owner removes it
-    assert "narrowed the Docker baseline: 1 artefact(s)" in _ok(lb.run("docker-up")).stdout
-    lb.mutate(images=[UBUNTU])  # and this session pulls it again
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert UBUNTU["id"] in _findings(got.stdout)
-
-
-def test_a_narrowing_the_engine_did_not_answer_keeps_the_baseline(lab):
-    """An empty list is not an empty engine: narrowing to it would read every artefact on the
-    laptop as this session's (basecradle#707 (b))."""
-    lb = lab(containers=[FOREIGN_CONTAINER])
-    _ok(lb.run("begin"))
-    stub = lb.bin / "docker"
-    real = stub.read_text()
-    # `docker ps` alone stops answering; everything else, `docker version` included, still does.
-    stub.write_text(real.replace('elif a[:1] == ["ps"]:', 'elif a[:1] == ["ps"] and False:', 1))
-    got = lb.run("docker-up")
-    stub.write_text(real)
-    assert "did not list containers; that baseline is kept as it was" in got.stderr
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode == 0, got.stdout
+    assert lb.docker_state()["images"] == []
 
 
 # ------------------------------------- one script, every laptop builder (basecradle-noc#1110)
@@ -1936,31 +2405,38 @@ def test_a_carrier_without_a_valid_config_takes_no_baseline_and_cannot_exit(lab,
     assert lb.run("check", script=guard).returncode != 0
 
 
-def test_a_carriers_label_prefix_and_state_root_come_from_its_config(lab, tmp_path):
-    """The one per-repo value: the label the sweep filters on, the builder prefix and the default
-    state root are all derived from it, so the same bytes serve every carrier. The other carrier
-    is a name no real one holds, and the builder it must leave alone is this checkout's own, so the
-    copy's config, never the checkout it was copied from, is what decides."""
+def test_a_carriers_label_builder_and_state_root_come_from_its_config(lab, tmp_path):
+    """The one per-repo value: the label every artefact carries, the name of the session's own
+    builder and the default state root (where the ledger lives) are all derived from it, so the
+    same bytes serve every carrier. The other carrier is a name no real one holds, and the builder
+    it must leave alone is this checkout's own, so the copy's config, never the checkout it was
+    copied from, is what decides."""
     other = "basecradle-example"
     guard = _carrier(tmp_path, f"# a comment\n\nSESSION_GUARD_REPO={other}\n")
-    lb = lab(
-        containers=[CONTAINER],
-        builders=["desktop-linux", f"{other}-builder-x", f"{BUILDER_PREFIX}y"],
-    )
+    lb = lab(images=[UBUNTU], builders=["desktop-linux", f"{BUILDER_PREFIX}y"])
     env = lb.env | {"DOCKER_STUB_LABEL": f"{other}-builder=1", "HOME": str(tmp_path)}
     del env["SESSION_GUARD_STATE_ROOT"]
 
-    def run(*a):
+    def g(*a):
         return subprocess.run(
             [str(guard), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
         )
 
-    assert run("begin").returncode == 0
-    assert (tmp_path / f".cache/{other}/builder-sessions/test-session/began_at").is_file()
-    assert run("sweep").returncode == 0
+    assert g("begin").returncode == 0
+    state = tmp_path / f".cache/{other}/builder-sessions/test-session"
+    assert (state / "began_at").is_file()
+    _ok(g("run", "-d", "ubuntu:24.04"))
+    _ok(g("build", "."))
     calls = lb.calls_log()
-    assert ["rm", "-f", CONTAINER["id"]] in calls
-    assert ["buildx", "rm", f"{other}-builder-x"] in calls
+    (run,) = [c for c in calls if c[:1] == ["run"]]
+    assert run[2].startswith(str(state / "containers"))
+    assert run[5:7] == ["--label", f"{other}-builder=1"]
+    (create,) = [c for c in calls if c[:2] == ["buildx", "create"]]
+    assert create[create.index("--name") + 1] == f"{other}-builder-test-session"
+
+    assert g("sweep").returncode == 0
+    calls = lb.calls_log()
+    assert ["buildx", "rm", f"{other}-builder-test-session"] in calls
     assert ["buildx", "rm", f"{BUILDER_PREFIX}y"] not in calls
 
 
@@ -2035,13 +2511,3 @@ def test_an_lsof_stderr_redirect_that_fails_is_a_failed_census(lab, tmp_path):
     assert got.returncode != 0
     assert "census failed" in got.stdout
     assert "listening-port census:" not in got.stdout  # no count from a census that failed
-
-
-def test_one_failed_cache_read_at_the_census_is_read_again_before_it_is_stored(lab):
-    """basecradle#710 item 2: the ``started`` census runs the moment ``docker version`` first
-    answers, and one failed ``docker system df`` stored an unreadable baseline for the session."""
-    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], build_cache="1.2GB")
-    assert lb.run("begin").returncode == 0
-    lb.mutate(df_failures=1)
-    assert lb.run("docker-up").returncode == 0
-    assert (lb.state_root / "test-session" / "build_cache.base").read_text() == "1.2GB\n"
