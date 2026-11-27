@@ -107,6 +107,28 @@ RestartSec=2s
 KillMode=mixed
 TimeoutStopSec=30min
 
+# A CLEAN STOP IS A SUCCESS (#559). On the stop's SIGTERM uvicorn drains, then re-raises the
+# signal on itself, so it dies BY SIGTERM, which systemd already counts as clean. But the main
+# process is `uv run`, and uv reports its child's signal death as the shell-style exit 128+15 =
+# 143: proven with the locked uvicorn (0.54.0) under uv 0.12.13 offline, and read in the box's
+# journal under its uv 0.13.7. uv is installed on the box, not locked here, so a uv that renders
+# a signal death differently changes this contract. Without this line every deploy restart,
+# idle restart and reboot drain read `Result=exit-code`, and a bare `systemctl stop` left the
+# unit `failed`, so a clean stop and a broken one looked the same to the NOC.
+#   143 and nothing wider: it is exactly the SIGTERM death systemd's default already treats as
+# clean, rendered as uv renders it. An application error (uvicorn exits 1 or 3), any other
+# signal death (137 for the OOM killer's SIGKILL, 134, 139) and a stop killed at TimeoutStopSec
+# (`Result=timeout`) all still read as failures. What a 143 proves is that the process ended on
+# the stop signal, not that the drain inside it finished: uvicorn re-raises the signal after a
+# failed lifespan shutdown too, and logs that failure itself.
+#   RestartForceExitStatus=143 keeps the one thing listing 143 as a success would otherwise
+# take away. A clean exit is never restarted by Restart=on-failure, so a SIGTERM from outside a
+# stop job (an operator's `kill`, a stray signal) would leave the fleet's only wake path down,
+# where today it is back in RestartSec. A listed status forces the restart; a stop or restart
+# job never restarts the unit whatever its status, so a real stop still ends `inactive`.
+SuccessExitStatus=143
+RestartForceExitStatus=143
+
 # --- Hardening -------------------------------------------------------------
 # The wake (sudo -> runuser -> claude) runs as a CHILD of this service and so
 # inherits this unit's sandbox namespace. That bounds what we can lock down:
