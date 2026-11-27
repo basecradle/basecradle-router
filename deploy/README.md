@@ -1620,6 +1620,22 @@ the wrapper and the managed units in lockstep with `main` on every deploy.)
   the wake scheduler and the per-agent lock are per-process) as `router`, `EnvironmentFile=/etc/basecradle-router/router.env`,
   `Restart=on-failure`, `KillMode=mixed` + a generous `TimeoutStopSec` (30min) to let the app drain
   its (unbounded) in-flight wakes on shutdown, bound to localhost (Caddy fronts it).
+  > **A clean stop reads `Result=success` (#559).** The unit's main process is `uv run`: on the stop's
+  > SIGTERM uvicorn drains and dies by the signal it re-raises, and uv reports that as exit `143`
+  > (128 + 15). `SuccessExitStatus=143` makes that the success it is, so a deploy restart, an idle
+  > restart or a reboot drain leaves `Result=success` and no `Failed with result 'exit-code'` line,
+  > and a bare `systemctl stop` leaves the unit `inactive`, never `failed`. Nothing wider is listed: an
+  > application error (uvicorn's `1` or `3`), any other signal death (`137` for an OOM kill) and a stop
+  > SIGKILLed at `TimeoutStopSec` (`Result=timeout`) still read as failures, so `Result=` stays a
+  > signal the NOC can trust. It says the process ended on the stop signal, never that the drain inside
+  > it finished: uvicorn re-raises the signal after a failed lifespan shutdown too, and logs that
+  > failure itself. A clean exit is never restarted by `Restart=on-failure`, so the unit also lists
+  > `RestartForceExitStatus=143`: a SIGTERM from outside a stop job (an operator's `kill`, a stray
+  > signal) still restarts the daemon in `RestartSec`, as it did before, while a `systemctl stop` or a
+  > deploy restart never auto-restarts it, whatever its status. The `143` comes from uv, which the box
+  > installs rather than this repo's lock: proven offline under uv 0.12.13 with the locked uvicorn and
+  > read on `ai.basecradle.com` under uv 0.13.7, so a uv that renders a signal death differently
+  > changes this contract.
   > **Sandboxing is constrained by the in-process wake.** The wake (`sudo`→`runuser`→`claude`) runs as a
   > *child* of this service and inherits its namespace, so the strong filesystem directives **cannot**
   > be used: `NoNewPrivileges=yes` would block the `sudo`→wrapper escalation; `ProtectHome=yes` would

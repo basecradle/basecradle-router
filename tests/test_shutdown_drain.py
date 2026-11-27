@@ -81,6 +81,52 @@ def test_the_drain_tolerates_a_full_length_wake() -> None:
     )
 
 
+def _exit_statuses(unit: Path, key: str) -> set[str]:
+    """Every status a list directive such as ``SuccessExitStatus=`` names, as systemd reads it.
+
+    The directive accumulates across lines and an empty assignment resets the list, so a
+    second line could widen it where a last-line read would never see it.
+    """
+    statuses: set[str] = set()
+    for line in unit.read_text().splitlines():
+        m = re.match(rf"{re.escape(key)}\s*=(.*)$", line.strip())
+        if m:
+            values = m.group(1).split()
+            statuses = statuses | set(values) if values else set()
+    return statuses
+
+
+def test_a_clean_stop_reads_as_a_success_and_nothing_wider_does() -> None:
+    # The main process is `uv run`, and uv reports uvicorn's SIGTERM death (it drains, then
+    # re-raises the stop's signal) as exit 143. Unlisted, every clean stop read
+    # `Result=exit-code` and a bare stop left the unit `failed` (#559). Exactly 143, so an
+    # application error, any other signal death and a stop killed at the timeout still fail.
+    assert _exit_statuses(ROUTER_UNIT, "SuccessExitStatus") == {"143"}, (
+        "router.service must list exactly SuccessExitStatus=143: without it every clean stop "
+        "reads as a failed unit, and anything wider hides a real failure"
+    )
+
+
+def test_a_sigterm_outside_a_stop_still_restarts_the_daemon() -> None:
+    # A clean exit is never restarted by Restart=on-failure, so listing 143 as a success
+    # alone would leave the fleet's only wake path down after a SIGTERM from outside a stop
+    # job. Forcing the restart on 143 keeps it; a stop or restart job never restarts (#559).
+    assert _directive(ROUTER_UNIT, "Restart") == "on-failure"
+    assert _exit_statuses(ROUTER_UNIT, "RestartForceExitStatus") == {"143"}, (
+        "router.service must list RestartForceExitStatus=143, or a stray SIGTERM leaves the "
+        "daemon down where it used to restart"
+    )
+
+
+def test_no_drop_in_can_rewrite_the_router_units_exit_statuses() -> None:
+    # The exit-status tests read the unit file alone. A drop-in the deploy installed beside it
+    # could widen or reset either list and they would still pass, so none may ship.
+    assert not (_SYSTEMD / "basecradle-router.service.d").exists(), (
+        "a basecradle-router.service.d drop-in would escape the exit-status tests; read it "
+        "into them before shipping one"
+    )
+
+
 def test_the_reboot_orchestrator_outlasts_the_drain() -> None:
     # The reboot orchestrator (reboot-if-required.sh) blocks on `systemctl stop
     # basecradle-router`, which blocks on the drain above. Its own TimeoutStartSec must
