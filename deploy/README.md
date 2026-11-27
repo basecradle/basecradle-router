@@ -1193,6 +1193,7 @@ the NOC schedules one stable path:
 /opt/basecradle-router/app/deploy/bin/router-admin claims --out-dir DIR   # one single-subject file per subject
 /opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json # the freeze-readability probe
 /opt/basecradle-router/app/deploy/bin/router-admin evidence               # the raw evidence document
+/opt/basecradle-router/bin/router-admin pending                           # wakes queued or in flight now (Part 4)
 
 # the synthetic wake — marker on STDIN, minted by the NOC with that agent's own secret
 <mint> | /opt/basecradle-router/app/deploy/bin/router-admin probe wake --agent <slug> --json
@@ -2168,9 +2169,10 @@ Two halves, mirroring the deploy loop's "do it, then verify it" shape:
 
 - **Perform the reboot cleanly — [`deploy/bin/reboot-if-required.sh`](bin/reboot-if-required.sh).** A no-op
   unless `/var/run/reboot-required` exists (the flag apt drops when an installed package needs a
-  reboot). When it does: it **drains** the router first — `systemctl stop basecradle-router`, which
-  blocks on the unit's lifespan drain (bounded by `TimeoutStopSec`) so in-flight wakes finish rather
-  than being severed — then performs a controlled `systemctl reboot`. A drain failure is logged but does
+  reboot). When it does: it first **waits for an idle router** (below), then **drains** it —
+  `systemctl stop basecradle-router`, which blocks on the unit's lifespan drain (bounded by
+  `TimeoutStopSec`) so in-flight wakes finish rather than being severed — then performs a controlled
+  `systemctl reboot`. A drain failure is logged but does
   **not** abort the reboot (a stuck unit must never pin an unpatched kernel forever). It is the one
   scheduled unit of ours that **genuinely needs root** — `systemctl stop` and `systemctl reboot` are not
   things an unprivileged account can do — so it lives in `deploy/bin/`, installed root-owned to
@@ -2218,7 +2220,58 @@ mechanism existed and was verified working — now it is, so the box reboots its
 patches, and the recovery gate confirms it came back (or alarms). It pairs with the hardening duty
 (`unattended-upgrades` — the install half; this is the reboot half). The manual fallback still works
 (`systemctl start basecradle-router-reboot.service`, or `/opt/basecradle-router/bin/reboot-if-required.sh`
-by hand as root) for an out-of-window reboot.
+by hand as root) for an out-of-window reboot; it waits for an idle router like the timer's run (below).
+
+### The reboot waits for an idle router (#557)
+`systemctl stop basecradle-router` closes the daemon's port at once and only then waits for every running
+wake to end. A stop issued under a wake therefore holds `/up` and every delivery down for as long as that
+wake runs, before the reboot even begins (2026-11-27: 4 min 8 s of 502 from the same stop, started by
+`needrestart`, Better Stack incident 1058963686). So the reboot stops nothing until the router is idle:
+
+- **Idle is the router's own statement.** Every agent's `agent_wakes.<agent>.queued` is 0 in the evidence
+  document, the state the drain waits on, read by `/opt/basecradle-router/bin/router-admin pending` (the
+  root-owned copy), run as the daemon's user (`setpriv`, which execs rather than forks, so the 60 s
+  `timeout` on a reading signals the reader itself). It is the same field the NOC's deploy gate reads
+  before it restarts the daemon (basecradle-noc#695), never a second spelling such as a process count. A
+  stopped or failed daemon is idle, and so is one in systemd's auto-restart (crashed, waiting to start
+  again); one starting or stopping is not. Anything the reading cannot vouch for (an absent, garbled or
+  disabled document; a failed read) is **not** idle: `pending` exits `75` and never prints a zero, and the
+  script waits on it like a busy router.
+- **What the reading cannot see.** If the daemon could not write the document, it keeps evidence in
+  memory and logs `WARNING event=evidence_write_failed` once, and the file keeps the last depth it wrote.
+  That depth can be a stale `0`, so a reboot then would stop the router under a wake, exactly as it did
+  before #557. The NOC's deploy gate reads the same file and has the same limit. The warning is the signal.
+- **The wait is bounded: 30 minutes** (`REBOOT_IDLE_WAIT_S=1800`), reading every 15 s, with the port open
+  and deliveries arriving the whole time. Once the router is idle the stop takes seconds.
+- **Never idle inside the slot → the reboot defers to the next slot**, exit `0`, on one line at WARNING
+  priority in the journal (shipped to Better Stack with the rest of the unit's output):
+  `reboot-if-required: event=reboot_deferred deferred_since=<UTC> deferred_for_s=<n> max_defer_s=129600:
+  the reboot waits for the next slot, because <n> wake(s) queued or in flight after 1800s
+  (<agent>=<n>,…); …`
+- **The deferral is bounded by time: 36 hours** (`REBOOT_MAX_DEFER_S=129600`) from the first deferral.
+  With the daily timer that makes the third slot the last: it still waits the full 30 minutes for idle,
+  and if the router is still busy it writes `reboot-if-required: event=reboot_overdue max_defer_s=129600:
+  rebooting anyway, because it has been deferred since <UTC> (<n>s), the longest allowed (129600s); …`
+  and drains and reboots whatever is running (the stop then closes the port until the drain ends, up to
+  `TimeoutStopSec`). So a staged kernel update waits **at most two days and one slot's wait** past its
+  first slot, and never in silence. The bound is a time and never a count, so a run by hand cannot
+  spend it, and the 12 hours to spare absorb the timer's 15-minute randomized delay. A deferral that
+  cannot be bounded is never taken: a record the script cannot read or keep, or one dated in the future
+  (a clock set back), goes straight to the overdue reboot.
+- **The deferral record** is `/run/basecradle-router-reboot/deferrals` (`<first deferral, epoch seconds>
+  <the same, UTC>`, root-only), on the `/run` tmpfs, so it lives exactly as long as the pending reboot it
+  bounds: the reboot clears it, and a run that finds no reboot pending removes the file and its
+  directory.
+- **By hand**, `systemctl start basecradle-router-reboot.service` runs exactly what the timer runs, so it
+  waits for idle and may defer. To reboot now whatever is running, run
+  `REBOOT_IDLE_WAIT_S=0 REBOOT_MAX_DEFER_S=0 /opt/basecradle-router/bin/reboot-if-required.sh` as root.
+- **The unit's `TimeoutStartSec=65min`** covers the longest run: the 30-minute wait, one more poll and
+  reading (80 s at most: 15 s, then 60 s and the 5 s kill), then the 30-minute drain
+  (`tests/test_shutdown_drain.py` holds the sum).
+- **One window stays open, deliberately small:** a wake that arrives between the last idle reading and the
+  stop, milliseconds later, is drained with the port closed, as the NOC's deploy gate accepts for its
+  restart. Closing it would need the daemon to refuse new wakes while it stays up, which no part of the
+  router does today.
 
 ---
 

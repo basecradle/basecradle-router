@@ -8,6 +8,7 @@
 #   /opt/basecradle-router/app/deploy/bin/router-admin selftest freeze --json
 #   /opt/basecradle-router/app/deploy/bin/router-admin claims
 #   /opt/basecradle-router/app/deploy/bin/router-admin evidence
+#   /opt/basecradle-router/bin/router-admin pending                # the reboot's idle read (#557)
 #   <mint> | .../router-admin probe wake --agent <slug> --json     # the synthetic wake (#208)
 #
 # `probe wake` needs the drop for a second reason on top of the one below: it reads the
