@@ -87,9 +87,38 @@ def test_the_reboot_orchestrator_outlasts_the_drain() -> None:
     # stay ABOVE the drain bound, or systemd kills the orchestrator mid-drain — skipping
     # the reboot and marking the unit failed, so a staged kernel patch never lands (#180,
     # #66). This coupling is enforced only by a comment in the unit; this test is the guard.
+    #
+    # Since #557 the drain is preceded by a bounded wait for an idle router, so the bound
+    # the orchestrator must outlast is the whole run end to end: the reboot that will not
+    # defer again waits the full wait, can start one last reading up to a poll later, lets
+    # that reading run to its timeout and the kill after it, and then drains.
     drain = _to_seconds(_directive(ROUTER_UNIT, "TimeoutStopSec"))
     orchestrator = _to_seconds(_directive(REBOOT_UNIT, "TimeoutStartSec"))
-    assert orchestrator > drain, (
-        f"reboot TimeoutStartSec ({orchestrator:.0f}s) must exceed router TimeoutStopSec "
-        f"({drain:.0f}s), or systemd kills the reboot orchestrator mid-drain"
+    wait = _script_default("REBOOT_IDLE_WAIT_S")
+    poll = _script_default("REBOOT_IDLE_POLL_S")
+    reading = _script_default("REBOOT_READ_TIMEOUT_S") + _kill_after()
+    assert orchestrator > wait + poll + reading + drain, (
+        f"reboot TimeoutStartSec ({orchestrator:.0f}s) must exceed the idle wait ({wait}s), "
+        f"one more poll ({poll}s) and reading ({reading}s) and router TimeoutStopSec "
+        f"({drain:.0f}s) together, or systemd kills the reboot orchestrator mid-wait or "
+        "mid-drain"
     )
+
+
+REBOOT_SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "reboot-if-required.sh"
+
+
+def _script_default(name: str) -> int:
+    """The default the shipped reboot script gives ``name`` (``NAME="${NAME:-<n>}"``)."""
+    match = re.search(
+        rf'^{name}="\$\{{{name}:-([0-9]+)\}}"$', REBOOT_SCRIPT.read_text(), re.MULTILINE
+    )
+    assert match, f"{name} has no numeric default in {REBOOT_SCRIPT.name}"
+    return int(match.group(1))
+
+
+def _kill_after() -> int:
+    """The grace ``timeout`` gives a reading past its bound before it kills it."""
+    match = re.search(r"timeout --kill-after=([0-9]+) ", REBOOT_SCRIPT.read_text())
+    assert match, f"the idle reading in {REBOOT_SCRIPT.name} is not bounded by timeout"
+    return int(match.group(1))

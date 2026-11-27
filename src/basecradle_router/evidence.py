@@ -1065,3 +1065,68 @@ def read_evidence(path: str | None = DEFAULT_EVIDENCE_FILE) -> EvidenceDocument:
     if path is None:
         return EvidenceDocument()
     return _load(path)
+
+
+class PendingUnreadable(Exception):
+    """The pending-wake depth could not be read, so nobody may call the router idle."""
+
+
+def read_pending_wakes(path: str | None = DEFAULT_EVIDENCE_FILE) -> dict[str, int]:
+    """Every agent with a wake queued or in flight right now, and how many — strictly.
+
+    This is the router's one spelling of *idle*: each agent's ``queued`` depth, the
+    live reading the scheduler publishes and the drain on stop waits on, so an empty
+    result means a stop now would have nothing to wait for. A process that must not
+    stop the router under a wake asks this before it does (the reboot orchestrator,
+    basecradle-router#557); the NOC's deploy gate reads the same field with the same
+    rules (basecradle-noc#695).
+
+    **Strict where :func:`read_evidence` is tolerant, because the two answer different
+    questions.** The emitter's honest answer to an unreadable document is *never
+    proven*. Here the tolerant answer would be an empty document, and an empty
+    document reads as idle, which is the one answer that stops the router under a
+    wake. So anything this reader cannot vouch for raises :class:`PendingUnreadable`
+    and is never a zero: persistence disabled, the document absent, unreadable, not
+    version :data:`EVIDENCE_VERSION`, its ``agent_wakes`` not a map, or a ``queued``
+    depth that is not a non-negative integer. An agent with no ``queued`` field
+    counts zero, which is what the daemon means by leaving it out.
+
+    **What it cannot see:** a document the daemon has stopped being able to write. The
+    store then keeps evidence in memory and logs ``event=evidence_write_failed`` once
+    (:meth:`EvidenceStore._flush_locked`), and the file keeps the last depth it wrote,
+    which can be a stale zero. Nothing in the file tells a quiet idle daemon from that
+    one; the warning is the signal.
+    """
+    if path is None:
+        raise PendingUnreadable(
+            "the evidence document is disabled (in memory only), so the pending wakes "
+            "cannot be read"
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        raise PendingUnreadable(f"no evidence document at {path}") from None
+    except (OSError, ValueError) as exc:
+        raise PendingUnreadable(
+            f"the evidence document {path} cannot be read: {_reason(exc)}"
+        ) from None
+    if not isinstance(raw, dict) or raw.get("version") != EVIDENCE_VERSION:
+        raise PendingUnreadable(
+            f"the evidence document {path} is not a version {EVIDENCE_VERSION} document"
+        )
+    wakes = raw.get("agent_wakes")
+    if not isinstance(wakes, dict):
+        raise PendingUnreadable(f"the evidence document {path} has no agent_wakes map")
+    pending: dict[str, int] = {}
+    for agent, fields in sorted(wakes.items()):
+        queued = fields.get("queued", 0) if isinstance(fields, dict) else None
+        depth = _count_or_none(queued)
+        if depth is None:
+            raise PendingUnreadable(
+                f"the evidence document {path} holds a queued depth for {agent!r} "
+                "that is not a non-negative integer"
+            )
+        if depth:
+            pending[agent] = depth
+    return pending

@@ -1,14 +1,17 @@
 # BaseCradle router — clean reboot when an OS update has staged one (oneshot).
 #
 # Runs deploy/bin/reboot-if-required.sh: a no-op unless /var/run/reboot-required exists,
-# otherwise it drains the router and performs a controlled reboot. This is the
+# otherwise it waits, bounded, for the router to be idle (deferring to the next slot, for
+# at most 36 hours, when it never is — #557), drains it, and performs a controlled
+# reboot. This is the
 # "perform the reboot cleanly" half of issue #66; the post-boot health gate is
 # basecradle-router-recovery.service.
 #
 # Driven by basecradle-router-reboot.timer (ENABLED — automatic reboots are ON per
 # the founder decision in issue #66). This service is `static` (no [Install]); the
-# timer activates it. It is also safe to `systemctl start` by hand to force an
-# immediate clean reboot check (it no-ops unless a reboot is actually pending).
+# timer activates it. It is also safe to `systemctl start` by hand for an immediate
+# clean reboot check (it no-ops unless a reboot is actually pending); like the timer's
+# run, it waits for an idle router and may defer.
 #
 # Install (the timer is what gets enabled):
 #   systemctl daemon-reload && systemctl enable --now basecradle-router-reboot.timer
@@ -19,12 +22,17 @@ Documentation=https://github.com/basecradle/basecradle-router
 
 [Service]
 Type=oneshot
-# The drain (systemctl stop basecradle-router) blocks until in-flight wakes finish,
-# bounded by that unit's TimeoutStopSec (30min — wakes are unbounded, so the drain
-# tolerates a full-length agent turn). Keep this start timeout above that bound so
-# systemd never kills the orchestrator mid-drain (which would skip the reboot and
-# mark the unit failed). Once it reaches `exec systemctl reboot`, the box goes down.
-TimeoutStartSec=35min
+# The longest run is three bounds end to end: the wait for an idle router
+# (REBOOT_IDLE_WAIT_S, 30min), one more poll and reading of it (REBOOT_IDLE_POLL_S and
+# REBOOT_READ_TIMEOUT_S with its kill, 80s), then — on the reboot that will not defer
+# again — the drain (systemctl stop
+# basecradle-router), which blocks until in-flight wakes finish, bounded by that unit's
+# TimeoutStopSec (30min — wakes are unbounded, so the drain tolerates a full-length agent
+# turn). Keep this start timeout above their sum so systemd never kills the
+# orchestrator mid-wait or mid-drain (which would skip the reboot and mark the unit
+# failed); tests/test_shutdown_drain.py holds it. Once it reaches `exec systemctl
+# reboot`, the box goes down.
+TimeoutStartSec=65min
 # ROOT, DELIBERATELY — and therefore NOT out of the app tree (#297).
 # Root is genuine here: the orchestrator runs `systemctl stop basecradle-router` and
 # `systemctl reboot`, neither of which an unprivileged account can do. (Contrast

@@ -5,13 +5,16 @@
     python -m basecradle_router probe wake …      # prove one agent's wake edge, by using it
     python -m basecradle_router probe log-grammar    # prove the alarm's needle line is written
     python -m basecradle_router evidence          # dump the raw evidence document
+    python -m basecradle_router pending           # the wakes queued or in flight now
 
-Four subcommands, one purpose: everything the claims-vs-evidence ledger
-(basecradle/basecradle#460, basecradle-noc#406) needs from this component, reached
-without the running daemon. That matters — the emitter and the probe run from the
-NOC's converge, in a *different process* from the daemon, which is why the daemon
-writes its evidence to a file (:mod:`basecradle_router.evidence`) instead of
-keeping it in memory where only it could see it.
+One purpose: everything a process outside the daemon needs from it, reached without
+the running daemon — the claims-vs-evidence ledger (basecradle/basecradle#460,
+basecradle-noc#406) above all, and ``pending`` for anything that must not stop the
+router under a wake (the reboot orchestrator, basecradle-router#557). That matters —
+the emitter and the probe run from the NOC's converge, in a *different process* from
+the daemon, which is why the daemon writes its evidence to a file
+(:mod:`basecradle_router.evidence`) instead of keeping it in memory where only it
+could see it.
 
 **Run it as the daemon's user.** ``selftest freeze`` proves the wake-lock surface
 is readable *with the credentials the daemon actually has*; root bypasses file
@@ -69,7 +72,7 @@ from basecradle_router.config import (
     load_self_url,
     load_wake_lock_dir,
 )
-from basecradle_router.evidence import read_evidence
+from basecradle_router.evidence import PendingUnreadable, read_evidence, read_pending_wakes
 from basecradle_router.log_grammar import (
     LINE_CLASS,
     LogGrammarError,
@@ -224,6 +227,18 @@ def _parser() -> argparse.ArgumentParser:
         help="print the evidence document the daemon writes (delivery + wake proof)",
     )
     evidence.set_defaults(handler=_cmd_evidence)
+
+    pending = sub.add_parser(
+        "pending",
+        help="print the wakes queued or in flight right now (the router's idle signal)",
+        description=(
+            "Read each agent's pending-wake depth from the evidence document the daemon "
+            "writes, the state its drain on stop waits on. Prints '<total>' when idle, or "
+            "'<total> <agent>=<n>,...', and exits 0. Exits 75, the cause on stderr, when "
+            "the depth cannot be read: an unreadable document is never a zero."
+        ),
+    )
+    pending.set_defaults(handler=_cmd_pending)
 
     return parser
 
@@ -402,6 +417,17 @@ def _cmd_probe_log_grammar(args: argparse.Namespace) -> int:
 def _cmd_evidence(args: argparse.Namespace) -> int:
     document = read_evidence(load_evidence_path())
     print(json.dumps(document.to_json(), indent=2))
+    return 0
+
+
+def _cmd_pending(args: argparse.Namespace) -> int:
+    try:
+        pending = read_pending_wakes(load_evidence_path())
+    except PendingUnreadable as exc:
+        print(f"pending: unprovable: {exc}", file=sys.stderr)
+        return EXIT_UNPROVABLE
+    agents = ",".join(f"{agent}={depth}" for agent, depth in pending.items())
+    print(f"{sum(pending.values())} {agents}".rstrip())
     return 0
 
 

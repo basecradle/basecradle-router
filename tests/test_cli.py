@@ -271,6 +271,102 @@ def test_evidence_on_a_box_that_has_produced_none_is_empty_not_an_error(box, cap
     assert _json_out(capsys)["agent_wakes"] == {}
 
 
+# --- pending ----------------------------------------------------------------
+#
+# The router's idle signal (#557): what the reboot orchestrator reads before it stops
+# anything. Strict where `evidence` is tolerant, because an empty document reads as idle.
+
+
+def test_pending_reads_the_depth_the_daemon_wrote(box, capsys) -> None:
+    from basecradle_router.evidence import EvidenceStore
+
+    store = EvidenceStore(str(box.evidence))
+    store.record_queue_depth("nova", 2)
+    store.record_queue_depth("john", 3)
+    store.record_queue_depth("john", 1)
+
+    assert main(["pending"]) == 0
+    assert capsys.readouterr().out == "3 john=1,nova=2\n"
+
+
+def test_pending_on_an_idle_router_prints_a_bare_zero(box, capsys) -> None:
+    from basecradle_router.evidence import EvidenceStore
+
+    store = EvidenceStore(str(box.evidence))
+    store.record_queue_depth("nova", 1)
+    store.record_queue_depth("nova", 0)
+
+    assert main(["pending"]) == 0
+    assert capsys.readouterr().out == "0\n"
+
+
+@pytest.mark.parametrize(
+    ("document", "cause"),
+    [
+        (None, "no evidence document"),
+        ("{not json", "cannot be read"),
+        ({"version": 2, "agent_wakes": {}}, "not a version 1 document"),
+        ({"version": 1}, "no agent_wakes map"),
+        ({"version": 1, "agent_wakes": []}, "no agent_wakes map"),
+        ({"version": 1, "agent_wakes": {"nova": {"queued": "1"}}}, "'nova'"),
+        ({"version": 1, "agent_wakes": {"nova": {"queued": 1.5}}}, "'nova'"),
+        ({"version": 1, "agent_wakes": {"nova": {"queued": -1}}}, "'nova'"),
+        ({"version": 1, "agent_wakes": {"nova": {"queued": True}}}, "'nova'"),
+        ({"version": 1, "agent_wakes": {"nova": 1}}, "'nova'"),
+    ],
+    ids=[
+        "absent",
+        "garbled",
+        "v2",
+        "no-map",
+        "not-a-map",
+        "string",
+        "fraction",
+        "negative",
+        "bool",
+        "not-an-object",
+    ],
+)
+def test_pending_that_cannot_be_read_is_unprovable_never_zero(box, capsys, document, cause) -> None:
+    if document is not None:
+        box.evidence.write_text(
+            document if isinstance(document, str) else json.dumps(document), encoding="utf-8"
+        )
+
+    assert main(["pending"]) == EXIT_UNPROVABLE
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("pending: unprovable: ") and cause in err
+
+
+@pytest.mark.parametrize("disabled", ["none", ""])
+def test_pending_with_persistence_disabled_is_unprovable(box, capsys, monkeypatch, disabled):
+    # In memory only, the daemon's depth is in a process this one cannot see.
+    monkeypatch.setenv("BASECRADLE_ROUTER_EVIDENCE_FILE", disabled)
+
+    assert main(["pending"]) == EXIT_UNPROVABLE
+    assert "disabled" in capsys.readouterr().err
+
+
+def test_an_agent_with_no_queued_field_counts_zero(box, capsys) -> None:
+    box.evidence.write_text(
+        json.dumps({"version": 1, "agent_wakes": {"nova": {"ok": 4}}}), encoding="utf-8"
+    )
+
+    assert main(["pending"]) == 0
+    assert capsys.readouterr().out == "0\n"
+
+
+def test_pending_never_writes_the_daemons_evidence_file(box) -> None:
+    from basecradle_router.evidence import EvidenceStore
+
+    EvidenceStore(str(box.evidence)).record_queue_depth("nova", 1)
+    before = box.evidence.read_bytes(), box.evidence.stat().st_mtime_ns
+
+    assert main(["pending"]) == 0
+    assert (box.evidence.read_bytes(), box.evidence.stat().st_mtime_ns) == before
+
+
 # --- probe wake -------------------------------------------------------------
 
 
