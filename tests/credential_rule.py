@@ -309,18 +309,32 @@ RUN_GAP = _run(f"{GAP}*(?:{_KEPT})", f"{GAP}*", INNER_NAMES_GAP, SCHEME_CHAIN_GA
 #: the first reading wrote there would keep from it (VRL's regex has no look-ahead to read past one).
 RUN_UNBROKEN = _run(_KEPT, "", INNER_NAMES, SCHEME_CHAIN, record_break=False)
 
-#: The gap reading's value from a name's `=` (#561): how far `RUN_GAP` reads it. The first reading
-#: leaves to the gap reading every value this reaches farther, as the print site's first reading
-#: does (`logfmt.redact_credentials`): a marker over the shorter value would be one the gap reading
-#: keeps, and what it would have read past the marker would ship.
+#: The gap reading's value from a name's `=` (#561), read within a window to say whether it reaches
+#: farther than the first reading: `RUN_GAP`'s value alternatives, built from its pieces, without
+#: its kept marker and record break (neither reads past a value), and with one more: a double quote
+#: still open at the window's end, whose close the window cut off. It reads the first reading's
+#: input (`parity`), where `RUN_GAP` reads what the first reading and `PARITY_GAP` left: an
+#: approximation of how far `RUN_GAP` will read, which the differential holds. The first reading
+#: leaves to the gap reading every value this reaches farther: a marker over the shorter value
+#: would be one the gap reading keeps, and what it would have read past the marker would ship.
 VALUE_GAP = (
     f"{GAP}*{INNER_NAMES_GAP}"
-    f"(?:{CLOSED_QUOTED_VALUE}|{SCHEME_CHAIN_GAP}+{OPEN_PIECE}+|{OPEN_PIECE}+)"
+    f"(?:{CLOSED_QUOTED_VALUE}|"
+    + r'"(?:[^"\\]|\\[\s\S])*\z'
+    + f"|{SCHEME_CHAIN_GAP}+{OPEN_PIECE}+|{OPEN_PIECE}+)"
 )
 
 #: How far past a value the gap reading is read to say whether it reaches farther: a reading that
 #: reaches the window's end is farther.
 FARTHER_WINDOW = 4096
+
+#: How many of a field's values are read for whether the gap reading reaches farther. Each check
+#: reads a window, so past this many a field is read as the block before this rule read it, and a
+#: field however long and however many assignments it holds costs a bounded time.
+FARTHER_CHECKS = 64
+
+#: After a name's `=` that ends a gap reading: a gap and then a value its own reading takes.
+_AFTER_AN_UNREAD_NAME = r"\A" + GAP + "+[^" + GAP[1:-1] + ",}]"
 
 BLOCK = (
     COMMENT
@@ -343,6 +357,7 @@ BLOCK = (
               # marker over it here would be one that reading keeps. This pass goes on past it as it
               # always did (#561). A gap reading that ends at an unread name's `=` is no farther.
               taken_at = 0
+              taken_checks = 0
               taken = replace_with(parity, r'(?x)(?P<pre>[\\s\\S]*?)(?:{RUN_UNBROKEN.removeprefix("(?x)")})') -> |assignment| {{
                   taken_pre = string(assignment.pre) ?? ""
                   taken_name = string(assignment.name) ?? ""
@@ -350,14 +365,16 @@ BLOCK = (
                   taken_from = taken_at + length(taken_pre) + length(taken_name)
                   taken_at = taken_at + length(assignment.string)
                   taken_farther = 0
-                  if assignment.kept == null {{
+                  if assignment.kept == null && taken_checks < {FARTHER_CHECKS} {{
+                      taken_checks = taken_checks + 1
                       taken_window = slice(parity, taken_from, taken_from + length(taken_value) + {FARTHER_WINDOW}) ?? ""
                       taken_gap = parse_regex(taken_window, r'(?x)\\A(?P<gap>{VALUE_GAP})') ?? {{}}
                       taken_reach = string(taken_gap.gap) ?? ""
-                      # A reading that ends at a name's `=` has not read that name's value: the pass
-                      # after would take the name with it and leave its value, so this one is no
-                      # farther, and the first reading's marker stands, as before.
-                      if !match(taken_reach, r'(?:{"|".join(CREDENTIAL_WORDS)})(?:{CREDENTIAL_TAIL})?=\\z') {{
+                      # A reading that ends at a name's `=` with a gap and a value after it has not
+                      # read that name's value: the pass after would take the name with it and leave
+                      # its value, so this one is no farther, and the first reading's marker stands.
+                      taken_after = slice(taken_window, length(taken_reach)) ?? ""
+                      if !(match(taken_reach, r'(?:{"|".join(CREDENTIAL_WORDS)})(?:{CREDENTIAL_TAIL})?=\\z') && match(taken_after, r'{_AFTER_AN_UNREAD_NAME}')) {{
                           taken_farther = length(taken_reach)
                       }}
                   }}

@@ -403,6 +403,10 @@ _LONG_TEXTS = {
     "credential escaped quotes": "A_TOKEN=" + _fill('\\"'),
     "credential bearer words": "A_TOKEN=" + _fill("Bearer\t"),
     "credential glued bearers": "A_TOKEN=" + _fill("xbearer"),
+    # Values the every-field block's first reading leaves to the gap reading, each read for it
+    # within a window (#561): a field of them costs a bounded time.
+    "credential gaps after inner names": "A_TOKEN=" + _fill("xB_TOKEN= A_TOKEN="),
+    "credential gaps before an open quote": _fill('A_TOKEN=Bearer\n"'),
     "credential runs of scheme words": "A_TOKEN=" + _fill("xBearer\tBearer "),
     # Lead words before a scheme word a tab glues to a value (#502), names behind tabs, and bare
     # names with the one tail (#504).
@@ -435,7 +439,8 @@ def test_the_scrub_is_linear_on_a_long_space_free_text(shape: str, tmp_path: Pat
     program = tmp_path / "scrub.vrl"
     program.write_text(_without_the_writer_check(_scrub_vrl("ai.basecradle.com")))
     event = tmp_path / "event.json"
-    line = {"SYSLOG_IDENTIFIER": "nova", "message": _LONG_TEXTS[shape]}
+    # In the message, and in a field of its own, which the every-field block reads (#561).
+    line = {"SYSLOG_IDENTIFIER": "nova", "message": _LONG_TEXTS[shape], "NOTE": _LONG_TEXTS[shape]}
     event.write_text(json.dumps(line) + "\n")
     started = time.monotonic()
     got = subprocess.run(
@@ -450,6 +455,7 @@ def test_the_scrub_is_linear_on_a_long_space_free_text(shape: str, tmp_path: Pat
     assert got.returncode == 0, got.stdout + got.stderr
     # `vector vrl -o` prints VRL's display of the event, not JSON, so read it as text.
     assert '"message": "[nova] ' in got.stdout, got.stdout[:400]
+    assert '"NOTE": ' in got.stdout, got.stdout[:400]
     assert elapsed < _TIME_BOUND_SECONDS, f"{shape}: {elapsed:.1f}s"
 
 

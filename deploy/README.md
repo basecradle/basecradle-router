@@ -2669,8 +2669,8 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   alone; and none over a value the gap reading reaches farther from the same `=` (a value the first
   reading cuts short before an inner name's gap, `A_TOKEN=aB_TOKEN= value`), unless the gap
   reading ends at a name's `=` whose value it has not read, since the pass after would take that
-  name and leave its value. The print site's first reading leaves a value to its gap reading by
-  the same rule (`logfmt.redact_credentials`).
+  name and leave its value. Only a field's first 64 values are read for it, so
+  a field however long costs a bounded time; past them it is read as before this rule.
   An empty value (nothing but a gap to the record's end) is left as it is, except right before a
   record break: the canary's run crosses a break, so the marker stands between the `=` and the
   break, and nothing is taken.
