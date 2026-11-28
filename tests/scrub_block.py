@@ -165,11 +165,15 @@ API_VALUE = rf"""(?:\\*")?(?:(?:bearer\s+)+(?:{API_GLUED}|{API_WORD})|{API_GLUED
 KEPT = f'(?P<kept>(?-i:{MARKERS})(?:[\\x20\\t",}}{BRK}]|\\z))'
 GLUED_MARKER = f'(?-i:{MARKERS})(?:[^&\\x20\\t",}}\\\\{BRK}]|\\\\+[^&\\x20\\t",}}\\\\{BRK}])*'
 API_LABEL = "api[-_]?key="
+#: The gap a label's value may open after (`credential_rule.GAP`, #561): whitespace or control
+#: characters, line breaks included, taken with the value.
+GAP = credential_rule.GAP
 #: Each `api_key=` label a value holds is read apart (basecradle-router#516, F6): the value reads
-#: on through it, by a repetition, to the last label's own value.
+#: on through it, by a repetition, to the last label's own value. Each label's value reads past the
+#: gap after its `=` (#561).
 API_KEY = (
-    f"(?i)(?P<label>{API_LABEL})"
-    f'(?:{KEPT}|(?:(?-i:{MARKERS})?(?:\\\\*")?(?:bearer\\s+)*{API_RUN}*?(?:bearer\\s+{API_RUN}*?)?\\\\*{API_LABEL})*'
+    f"(?i)(?P<label>{API_LABEL}){GAP}*"
+    f'(?:{KEPT}|(?:(?-i:{MARKERS})?(?:\\\\*")?(?:bearer\\s+)*{API_RUN}*?(?:bearer\\s+{API_RUN}*?)?\\\\*{API_LABEL}{GAP}*)*'
     f"(?:{GLUED_MARKER}|{API_VALUE}))"
 )
 QUERY = (
@@ -529,7 +533,7 @@ def _body(only: str | None = None) -> str:
         PARITY.removeprefix("(?x)"),
         "segment",
         f'{_R}if segment.value != null && !includes(["\\"\'<a redacted value>\'\\"", '
-        f'"\\"\'<a value the box redacted>\'\\""], segment.value) {{\n'
+        f'"\\"\'<a value the box redacted>\'\\""], segment.word) {{\n'
         f'{_R}    span_from = span_at + length(string(segment.head) ?? "")\n'
         f"{_R}    span_to = scrub_pos + length(segment.string)\n"
         f"{_R}    if scrub_count < scrub_most {{\n"

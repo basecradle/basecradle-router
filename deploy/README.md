@@ -2375,10 +2375,15 @@ Caddy, no database) and has three load-bearing properties:
      (`api_key=KBearer eyJ…`) goes with it (basecradle-router#423, basecradle-harness#866), it
      reads on through every `api_key=` label it holds, so each label's value is read, and it takes a
      backslash only before another character of the value, never before the quote it escapes, so a
-     value inside a JSON string keeps its line JSON. **A key in a URL's query** (`?token=`, `&key=`,
+     value inside a JSON string keeps its line JSON. Each label's value reads past a gap after its
+     `=` (whitespace or control characters, line breaks included, basecradle-router#561), taken
+     with it. **A key in a URL's query** (`?token=`, `&key=`,
      `?access_token=`, `?api_key=`, any case; basecradle-router#516, the harness's `_QUERY`, the
      web hosts' rule) loses its value to the next `&`, blank or `"`, the label kept
-     (`?token=[REDACTED]`).
+     (`?token=[REDACTED]`). It reads no gap after its `=` (basecradle-router#561, named): a URL
+     holds no blank, so text after one is not that query's, and a gap there let the value swallow
+     the next `?token=` label and leave its value. (`?api_key=` holds the `api[-_]?key=` label, so
+     that rule reads the gap after it.)
      - **The bearer header's token is taken whole, quoted or not, and a run of scheme words goes
        with the token after it** (basecradle-router#507, the harness's definition from
        basecradle-harness#929). The scheme word is `bearer` in any case, glued to anything before
@@ -2629,8 +2634,20 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
      lets a quoted value through; then the word, its pieces allowed to stay open (each to its close
      or to a bare `"` or a record break).
 
-  An empty value is left as it is, except right before a record break: the canary's run crosses a
-  break, so the marker stands between the `=` and the break, and nothing is taken.
+  **A gap before a value is the value's** (basecradle-router#561): a run of whitespace or control
+  characters, line breaks included, after a name's `=`, an inner name's `=` or a scheme word is read
+  past, and the value after it is taken with it, so the marker stands directly after the name
+  (`A_TOKEN=<NEWLINE>value` ships as `A_TOKEN='<a value the box redacted>'`), the one place the
+  NOC counts it. The gap is Unicode's whitespace and its `Cc` category, one set in every engine
+  (`logfmt.VALUE_GAP_RANGES`). A word of prose after `NAME= ` is the accepted cost; a credential
+  written in full is not. An inner name's gap is read only after pieces the run reads the same way
+  open or closed (no bare `$` or `(`, no escaped `"`), since leftmost-first keeps the first reading
+  that matches, not the longest, and a gap read after any piece let a shorter reading win.
+  A marker after a gap is kept with its gap, as its source wrote it: only the box's own marker is
+  written directly after the name, so the count of it stays what a source let through.
+  An empty value (nothing but a gap to the record's end) is left as it is, except right before a
+  record break: the canary's run crosses a break, so the marker stands between the `=` and the
+  break, and nothing is taken.
   **The patterns are generated.** VRL composes no pattern from parts, so each host's file spells
   every piece out many times; `tests/credential_rule.py` writes each piece once, with what it reads
   (the fleet's scrub block, `tests/scrub_block.py`, carries the same two patterns for the message),

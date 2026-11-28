@@ -63,6 +63,7 @@ from basecradle_router.logfmt import (
     REDACTED_VALUE,
     log_fields,
     redact_credentials,
+    value_gap_class,
 )
 from conftest import BOX_REDACTED_VALUE, FORGED_REPLY, NOC_CREDENTIAL_ASSIGNMENT
 from fleet_writers_box import ACCOUNTS, REGISTRY, fw
@@ -472,7 +473,7 @@ _AGREED = [
     "A_PASSWORD='fabricated pass phrase' next=1",
     'B_PASSWORD="fabricated pass phrase" next=2',
     'C_PASSWORD="fabricated end"',
-    "EMPTY_TOKEN= next=1 | LAST_TOKEN=",
+    "LAST_TOKEN=",
     "x_token=abcdefghij TOKEN_FILE=/run/fabricated KEY=abcdefghij PASSWORD=abcdefghij",
     "GH_TOKEN=ghp_Fab1catedGithubToken000000000000 OPENAI_API_KEY=sk-proj-Fab1catedKey00000000",
     "INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2"
@@ -568,7 +569,7 @@ _AGREED = [
     "D_TOKEN=x'q'E=x'q'F_TOKEN=Bearer fabricatedSecret3 next=1",
     "G_TOKEN=Bearer ;H_KEY=:KBearer :\tBearer fabricatedSecret4 next=1",
     "I_TOKEN='q'J_TOKEN=x\tBearer fabricatedSecret5 next=1",
-    "K_TOKEN=x'q'L_TOKEN= next=1 | M_TOKEN='N_TOKEN=x' next=2 other=3",
+    "K_TOKEN=x'q'L_TOKEN=\tnext=1 | M_TOKEN='N_TOKEN=x' next=2 other=3",
 ]
 
 #: Lines the router renders itself: the print site has already redacted them, so the box must pass
@@ -645,11 +646,25 @@ _DIFFERENT = {
     "B_TOKEN=fabricatedValue0004\u2028next=1\rC_TOKEN=fabricatedValue0005\x00next=2": (
         f"B_TOKEN={BOX_REDACTED_VALUE}\u2028next=1\rC_TOKEN={BOX_REDACTED_VALUE}\x00next=2"
     ),
-    # A record break right after the `=`: the print site's value is empty, and the box's is too,
-    # but the canary's run crosses the break, so the box writes its marker before it.
-    "X_TOKEN=\nfabricatedAfterBreak0005 next=1": (
-        f"X_TOKEN={BOX_REDACTED_VALUE}\nfabricatedAfterBreak0005 next=1"
+    # A gap before a value is the value's (#561), and the marker stands directly after the name:
+    # a word of prose after `NAME= ` is the accepted cost. The box reads it first, as the fleet's
+    # last layer; the print site's reading of the gap follows in its own change (#561), and these
+    # move to `_AGREED` with it.
+    "EMPTY_TOKEN= next=1 | LAST_TOKEN=": f"EMPTY_TOKEN={BOX_REDACTED_VALUE} | LAST_TOKEN=",
+    "X_TOKEN=\nfabricatedAfterBreak0005 next=1": f"X_TOKEN={BOX_REDACTED_VALUE} next=1",
+    "A_TOKEN=\r\nfabricatedAfterBreak0006 next=1 | B_TOKEN=\t fabricatedGap0007 next=2": (
+        f"A_TOKEN={BOX_REDACTED_VALUE} next=1 | B_TOKEN={BOX_REDACTED_VALUE} next=2"
     ),
+    "C_TOKEN=\n  fabricatedIndent0008 next=1 | D_TOKEN=  fabricatedGap0009 next=2": (
+        f"C_TOKEN={BOX_REDACTED_VALUE} next=1 | D_TOKEN={BOX_REDACTED_VALUE} next=2"
+    ),
+    # An inner name's value after its gap goes with the value that holds it (#561).
+    "K_TOKEN=x'q'L_TOKEN= next=1 | M_TOKEN='N_TOKEN=x' next=2 other=3": (
+        f"K_TOKEN={BOX_REDACTED_VALUE} | M_TOKEN={BOX_REDACTED_VALUE} next=2 other=3"
+    ),
+    # A record break right after the `=` with no value after it: the canary's run crosses the
+    # break, so the box writes its marker before it, and takes nothing.
+    "X_TOKEN=\n,next=1": f"X_TOKEN={BOX_REDACTED_VALUE}\n,next=1",
     # A canary stop ends a bearer token, as it ends every value: in a JSON line it is structure.
     "X_TOKEN=Bearer abc,fabricatedTail next=1": (
         f"X_TOKEN={BOX_REDACTED_VALUE},fabricatedTail next=1"
@@ -786,9 +801,20 @@ _FUZZ_PIECES = [
     "cost=0.1",
 ]
 
-#: The characters an empty value may end at: a blank or a canary stop. A record break, a tab or
-#: anything else right after a credential name's `=` is a value the box should have taken.
-_EMPTY_VALUE_ENDS = set(CANARY_VALUE_STOPS)
+#: The gaps a value may open after (#561), beyond the fuzz pieces' blanks and breaks: a non-breaking
+#: space, an escape, a CRLF, a break and an indent, and a gap before a quoted value. Kept apart from
+#: `_FUZZ_PIECES`, which `tests/scrub_differential.py` seeds its corpus from: a piece added there
+#: reshuffles that corpus and loses the shapes its own checks are proven on.
+_GAP_PIECES = ["\xa0", "\x1b", "\r\n", "\n  ", ' "', "\t "]
+
+#: The characters an empty value may end at, after its gap (#561): a canary stop, which ends the
+#: box's value. Anything else after a credential name's `=` and its gap is a value the box should
+#: have taken, and a marker it writes stands directly after the `=`.
+_EMPTY_VALUE_ENDS = set(CANARY_VALUE_STOPS) - {" "}
+
+#: The gap a value may open after (`logfmt.VALUE_GAP_RANGES`, #561).
+_GAP_CLASS = value_gap_class(lambda point: re.escape(chr(point)))
+_GAP = re.compile(_GAP_CLASS + "*")
 
 
 #: The canary's name with its `=`, as tests/conftest.py holds it.
@@ -823,11 +849,11 @@ _BOX_SCHEME_WORD = f"(?i:bearer)|[{credential_rule.SCHEME_GLUE}]*Bearer"
 #: tab glues one to (#502): a quoted value after them is still the name's, and the parity pass takes
 #: it with them.
 _SCHEME_RUN = re.compile(
-    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _BOX_SCHEME_WORD + ")[ \t]+)*"
+    "(?:\t*(?:" + _LEAD_WORD.pattern + ")*(?:" + _BOX_SCHEME_WORD + ")" + _GAP_CLASS + "+)*"
 )
 
 #: After a marker, only scheme words glued to it: the marker is no lead word.
-_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _BOX_SCHEME_WORD + ")[ \t]+)*")
+_GLUED_SCHEME_RUN = re.compile("(?:(?:" + _BOX_SCHEME_WORD + ")" + _GAP_CLASS + "+)*")
 
 #: What may follow a quoted marker the parity pass keeps whole: anything that ends its word, the
 #: line's end included.
@@ -849,6 +875,7 @@ def _opens_a_quoted_value(line: str) -> str | None:
     closes the quoted value the name sits in is the end of an empty value."""
     for name in _CREDENTIAL_NAME.finditer(line):
         rest = line[name.end() :]
+        rest = rest[_GAP.match(rest).end() :]  # a gap before a value is the value's (#561)
         if any(
             rest.startswith(f'"{marker}"')
             and rest[len(marker) + 2 : len(marker) + 3] in _QUOTED_MARKER_END
@@ -883,12 +910,13 @@ def _ships_a_value(line: str) -> str | None:
     test below), or None: what the whole rule must leave none of."""
     for name in _CREDENTIAL_NAME.finditer(line):
         rest = line[name.end() :]
-        after = _after_marker(rest)
-        if after is not rest:
+        value = rest[_GAP.match(rest).end() :]  # a gap before a value is the value's (#561)
+        after = _after_marker(value)
+        if after is not value:
             if after and _VALUE_CHAR.match(after) and after[0] != '"':
                 return line[name.start() : name.end() + 40]
             continue
-        if not rest or rest[0] in _EMPTY_VALUE_ENDS:
+        if not value or value[0] in _EMPTY_VALUE_ENDS:
             continue
         return line[name.start() : name.end() + 24]
     return None
@@ -900,7 +928,8 @@ def test_the_canary_reads_nothing_the_box_ships(tmp_path: Path) -> None:
     # seeded fuzz over the pieces the rule reads: 3,000 lines of 1 to 24 pieces each.
     rng = random.Random(494)
     lines = [
-        "".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(1, 24))) for _ in range(3000)
+        "".join(rng.choice(_FUZZ_PIECES + _GAP_PIECES) for _ in range(rng.randint(1, 24)))
+        for _ in range(3000)
     ]
     canary = re.compile(NOC_CREDENTIAL_ASSIGNMENT)
     box = _scrub_lines(_vector(), tmp_path, lines)
