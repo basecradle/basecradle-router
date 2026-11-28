@@ -117,12 +117,17 @@ def test_the_regression_check_bites(vector: str, tmp_path: Path) -> None:
     sources = sd.host_sources()
     host = sorted(sources)[-1]
     source = sources[host]
-    assert source.count(scrub_block.BEARER) == 1 and source.count(scrub_block.BEARER_WORDS) == 1
+    readings = (
+        scrub_block.BEARER,
+        scrub_block.BEARER_WORDS,
+        scrub_block.BEARER_GAP,  # the gap readings beside them (#561), or they take the same
+        scrub_block.BEARER_WORDS_GAP,
+    )
+    assert all(source.count(reading) == 1 for reading in readings)
     never = r"[^\s\S]"
-    weakened = {
-        **sources,
-        host: source.replace(scrub_block.BEARER, never).replace(scrub_block.BEARER_WORDS, never),
-    }
+    for reading in readings:
+        source = source.replace(reading, never)
+    weakened = {**sources, host: source}
     lines = sd.texts(sd.SEED, 2000)
     found = sd.regressions(vector, sources, weakened, lines, tmp_path)
     assert found and {row[0] for row in found} == {host}

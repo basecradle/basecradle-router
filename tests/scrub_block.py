@@ -41,6 +41,7 @@ hold the one and Vector interpolates the other across the whole file.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import bearer_rule
@@ -67,9 +68,17 @@ def _between(text: str, start: str, end: str) -> str:
 #: message and every other field read a value alike: the parity pass, whose matches already run
 #: end to end, and the run, which reads the text as it came here, where in the every-field block
 #: it reads the parity pass's output.
-PARITY = _between(credential_rule.BLOCK, "parity = replace_with(text, r'", "') -> |segment| {")
-RUN = _between(credential_rule.BLOCK, "replace_with(parity, r'", "') -> |assignment| {")
+PARITY = credential_rule.PARITY
+RUN = credential_rule.RUN
+assert _between(credential_rule.BLOCK, "parity = replace_with(text, r'", "') -> |") == PARITY
 assert RUN.startswith("(?x)\n"), RUN[:20]
+
+#: The credential rule's gap reading (#561), beside the two above: the union takes what either
+#: takes.
+PARITY_GAP = credential_rule.PARITY_GAP
+RUN_GAP = credential_rule.RUN_GAP
+assert _between(credential_rule.BLOCK, "replace_with(taken, r'", "') -> |") == PARITY_GAP
+assert _between(credential_rule.BLOCK, "replace_with(gapped, r'", "') -> |") == RUN_GAP
 
 #: A third reading of a value, the run with two pieces more, for the message alone: a parameter
 #: expansion (basecradle-router#516, F4), and a value opening at a `,` or a `}` (limit 2), as the
@@ -101,6 +110,17 @@ RUN_WIDE = _widened(
     )
 )
 
+#: The wide run's gap reading (#561), beside it, as the gap reading is beside the run: a value past
+#: a gap may open at a `,` or a `}` as well (`A_TOKEN= }…`), as the block that first read the gap
+#: (#562) read it, under the same guard, so the box never takes less than that block did and reads
+#: no more widely than it.
+assert RUN_GAP.count(_LAST) == 1
+RUN_WIDE_GAP = _widened(
+    RUN_GAP.replace(
+        _LAST, _LAST + f"                            | [,}}]+{credential_rule.OPEN_PIECE}+\n"
+    )
+)
+
 #: The value as the run reads it, and as the wide run reads it, for the reading a marker gets
 #: again (`_reread`).
 VALUE_NARROW = (
@@ -116,6 +136,33 @@ VALUE = _widened(
     f"|{credential_rule.OPEN_PIECE}+"
     f"|[,}}]+{credential_rule.OPEN_PIECE}+)"
 )
+
+#: The same two values read by the gap reading's pieces (#561), the reread's other two readings: its
+#: inner names and scheme words reach on past a gap, so the reread never stops shorter than the
+#: block that first read the gap (#562) did.
+VALUE_NARROW_GAP = (
+    f"{credential_rule.INNER_NAMES_GAP}"
+    f"(?:{credential_rule.CLOSED_QUOTED_VALUE}"
+    f"|{credential_rule.SCHEME_CHAIN_GAP}+{credential_rule.OPEN_PIECE}+"
+    f"|{credential_rule.OPEN_PIECE}+)"
+)
+VALUE_GAP = _widened(
+    f"{credential_rule.INNER_NAMES_GAP}"
+    f"(?:{credential_rule.CLOSED_QUOTED_VALUE}"
+    f"|{credential_rule.SCHEME_CHAIN_GAP}+{credential_rule.OPEN_PIECE}+"
+    f"|{credential_rule.OPEN_PIECE}+"
+    f"|[,}}]+{credential_rule.OPEN_PIECE}+)"
+)
+
+#: The gap a value may open after its separator (`credential_rule.GAP`, #561): whitespace or control
+#: characters, line breaks included, taken with the value. Each rule that anchors a value to a
+#: separator is read twice, as one rule's two readings whose union the pass takes: as it read
+#: before (`BLANK`, whitespace, or no gap at all), and with this gap. A reading beside the rule,
+#: never in its place: widened in place, the gap let one rule's match consume a label or a name
+#: whose own match took more (leftmost-first keeps the first reading that matches, not the
+#: longest), and the union then took less than the rule had (the NOC's differential on #561).
+GAP = credential_rule.GAP
+BLANK = r"\s"
 
 #: The heartbeat URL, from the scheme on where it has one; a kv value's closing quote ending the
 #: run stays (basecradle-router#423), read from what follows it (`after`).
@@ -140,17 +187,34 @@ HEARTBEAT_TO_QUOTE = (
 )
 assert HEARTBEAT.startswith(r"(?P<url>(?:https?://\S*)?/heartbeat/\S+)(?P<after>"), HEARTBEAT
 
+
 #: The `x-api-key` header (basecradle-router#423, basecradle-harness#861): its label, a quote at
 #: any depth of escaping (basecradle-harness#935), and a value that reads on through every header
 #: whose label it holds, as `_x_api_key_spans` does, by a repetition in its own pattern.
-X_LABEL = r"""(?i:x[-_]api[-_]?key)(?:\\*["\x27]\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\*["\x27])?"""
+#: Its separator, and each bearer scheme word in its value, read `blank` after it.
+def x_label(blank: str) -> str:
+    return (
+        rf"""(?i:x[-_]api[-_]?key)(?:\\*["\x27]{blank}*(?:=>|[:=,])|{blank}*(?::|=>))"""
+        rf"""{blank}*(?:b?\\*["\x27])?"""
+    )
+
+
 X_RUN = r"""[^\s"\x27&\\]"""
-X_GLUED = rf"""{X_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}"""
 X_WORD = r"""(?:[^\s"\x27&\\`\x24]|\x24[^\s"\x27&\\({])[^\s"\x27&\\]*"""
-X_API_KEY = (
-    f"{X_LABEL}(?:(?:(?i:bearer)\\s+)*{X_RUN}*?(?:(?i:bearer)\\s+{X_RUN}*?)?{X_LABEL})*"
-    rf"""(?:(?:(?i:bearer)\s+)+(?:{X_GLUED}|{X_WORD})|{X_GLUED}|{X_RUN}+)"""
-)
+
+
+def x_api_key(blank: str) -> str:
+    label = x_label(blank)
+    glued = rf"""{X_RUN}*?(?i:bearer){blank}+[A-Za-z0-9._~+/-]{{8,}}"""
+    return (
+        f"{label}(?:(?:(?i:bearer){blank}+)*{X_RUN}*?(?:(?i:bearer){blank}+{X_RUN}*?)?{label})*"
+        rf"""(?:(?:(?i:bearer){blank}+)+(?:{glued}|{X_WORD})|{glued}|{X_RUN}+)"""
+    )
+
+
+X_LABEL = x_label(BLANK)
+X_API_KEY = x_api_key(BLANK)
+X_API_KEY_GAP = x_api_key(GAP)
 
 #: An `api[-_]?key=` value (the box's own query value too), and a key in a URL's query
 #: (basecradle-router#516, F1: the harness's `_QUERY`, the web hosts' rule): one value reading.
@@ -159,23 +223,37 @@ X_API_KEY = (
 #: A backslash goes into a value only before another character of the value, never before the
 #: quote it escapes, so a value inside a JSON string (`\"api_key=K9\"`) keeps its line JSON.
 API_RUN = r"""(?:[^&\s"\\]|\\+[^&\s"\\])"""
-API_GLUED = rf"""{API_RUN}*?bearer\s+[A-Za-z0-9._~+/\-]{{8,}}"""
 API_WORD = rf"""(?:[^&\s"\x27`\x24\\]|\x24[^&\s"\x27({{]|\\+[^&\s"\x27\\]){API_RUN}*"""
-API_VALUE = rf"""(?:\\*")?(?:(?:bearer\s+)+(?:{API_GLUED}|{API_WORD})|{API_GLUED}|{API_RUN}+)"""
+
+
+def api_value(blank: str) -> str:
+    """The value, each bearer scheme word in it read `blank` after it."""
+    glued = rf"""{API_RUN}*?bearer{blank}+[A-Za-z0-9._~+/\-]{{8,}}"""
+    return rf"""(?:\\*")?(?:(?:bearer{blank}+)+(?:{glued}|{API_WORD})|{glued}|{API_RUN}+)"""
+
+
+API_VALUE = api_value(BLANK)
 KEPT = f'(?P<kept>(?-i:{MARKERS})(?:[\\x20\\t",}}{BRK}]|\\z))'
 GLUED_MARKER = f'(?-i:{MARKERS})(?:[^&\\x20\\t",}}\\\\{BRK}]|\\\\+[^&\\x20\\t",}}\\\\{BRK}])*'
 API_LABEL = "api[-_]?key="
-#: The gap a label's value may open after (`credential_rule.GAP`, #561): whitespace or control
-#: characters, line breaks included, taken with the value.
-GAP = credential_rule.GAP
 #: Each `api_key=` label a value holds is read apart (basecradle-router#516, F6): the value reads
-#: on through it, by a repetition, to the last label's own value. Each label's value reads past the
-#: gap after its `=` (#561).
-API_KEY = (
-    f"(?i)(?P<label>{API_LABEL}){GAP}*"
-    f'(?:{KEPT}|(?:(?-i:{MARKERS})?(?:\\\\*")?(?:bearer\\s+)*{API_RUN}*?(?:bearer\\s+{API_RUN}*?)?\\\\*{API_LABEL}{GAP}*)*'
-    f"(?:{GLUED_MARKER}|{API_VALUE}))"
-)
+#: on through it, by a repetition, to the last label's own value. In the gap reading each label's
+#: value reads past the gap after its `=`, and each scheme word past the gap after it (#561).
+
+
+def api_key(gap: str, blank: str) -> str:
+    return (
+        f"(?i)(?P<label>{API_LABEL}){gap}"
+        f'(?:{KEPT}|(?:(?-i:{MARKERS})?(?:\\\\*")?(?:bearer{blank}+)*{API_RUN}*?(?:bearer{blank}+{API_RUN}*?)?\\\\*{API_LABEL}{gap})*'
+        f"(?:{GLUED_MARKER}|{api_value(blank)}))"
+    )
+
+
+API_KEY = api_key("", BLANK)
+API_KEY_GAP = api_key(f"{GAP}*", GAP)
+#: The labels' gap with whitespace after a scheme word, as the block that first read the gap (#562)
+#: read it: a third reading, so the box never takes less than that block did.
+API_KEY_LABEL_GAP = api_key(f"{GAP}*", BLANK)
 QUERY = (
     "(?i)(?P<label>[?&](?:api[-_]?key|access[-_]?token|token|key)=)"
     f"(?:{KEPT}|{GLUED_MARKER}|{API_VALUE})"
@@ -198,17 +276,25 @@ MEMBER_NAME = (
     "|authorization)"
 )
 MEMBER_DEPTHS = (1, 3, 7, 15, 31)
-MEMBER = "|".join(
-    [
-        rf"""(?P<member_0>"{MEMBER_NAME}"\s*:\s*")(?:[^"\\]|\\[\s\S])*""",
-        *(
-            rf"""(?P<member_{n}>\\{{{n}}}"{MEMBER_NAME}\\{{{n}}}"\s*:\s*\\{{{n}}}")"""
-            rf"""(?:[^"\\]|\\+[^"\\]|\\{{{n + 1},}}")*"""
-            for n in MEMBER_DEPTHS
-        ),
-        rf"""(?P<member_any>\\+"{MEMBER_NAME}\\+"\s*:\s*\\+")(?:[^"\\]|\\+[^"\\])*""",
-    ]
-)
+#: Its colon reads `blank` on either side of it: JSON's whitespace, and in the gap reading the gap.
+
+
+def member(blank: str) -> str:
+    return "|".join(
+        [
+            rf"""(?P<member_0>"{MEMBER_NAME}"{blank}*:{blank}*")(?:[^"\\]|\\[\s\S])*""",
+            *(
+                rf"""(?P<member_{n}>\\{{{n}}}"{MEMBER_NAME}\\{{{n}}}"{blank}*:{blank}*\\{{{n}}}")"""
+                rf"""(?:[^"\\]|\\+[^"\\]|\\{{{n + 1},}}")*"""
+                for n in MEMBER_DEPTHS
+            ),
+            rf"""(?P<member_any>\\+"{MEMBER_NAME}\\+"{blank}*:{blank}*\\+")(?:[^"\\]|\\+[^"\\])*""",
+        ]
+    )
+
+
+MEMBER = member(BLANK)
+MEMBER_GAP = member(GAP)
 _MEMBER_HEADS = " ?? ".join(
     f"string(member.member_{n})" for n in ("0", *map(str, MEMBER_DEPTHS), "any")
 )
@@ -233,11 +319,21 @@ OPEN_TAIL = (
     r"""|\x24\{(?:[^}\\"\n]|\\+[^}\\"\n])*)"""
 )
 WORD_PIECE = f"""(?:{CLOSED_OPENERS}|\\\\+[^"\\\\\\s]|[^\\s\\x27"`\\\\])"""
-BEARER = (
-    f"{bearer_rule.SCHEME}(?:(?:{bearer_rule.ESCAPED_PIECE}\\S*?|{WORD_PIECE}*?){bearer_rule.SCHEME})*"
-    f"(?:{bearer_rule.ESCAPED_PIECE}\\S*|(?:{CLOSED_OPENERS}){WORD_PIECE}*{OPEN_TAIL}?|{OPEN_TAIL}"
-    f"|(?P<bare>[A-Za-z0-9._~+/\\-]+)=*)"
-)
+
+
+def bearer(blank: str) -> str:
+    """The header, each scheme word read `blank` after it."""
+    scheme = bearer_rule.scheme(blank)
+    return (
+        f"{scheme}(?:(?:{bearer_rule.ESCAPED_PIECE}\\S*?|{WORD_PIECE}*?){scheme})*"
+        f"(?:{bearer_rule.ESCAPED_PIECE}\\S*|(?:{CLOSED_OPENERS}){WORD_PIECE}*{OPEN_TAIL}?|{OPEN_TAIL}"
+        f"|(?P<bare>[A-Za-z0-9._~+/\\-]+)=*)"
+    )
+
+
+BEARER = bearer(bearer_rule.BLANK)
+BEARER_GAP = bearer(GAP)
+
 
 #: The bearer header as the box read it before (`tests/bearer_rule.py`), a second reading of the
 #: same rule: a word ending in a scheme word may hold a piece it leaves open, and what follows
@@ -245,10 +341,14 @@ BEARER = (
 #: (`BEARER` reads a token's quote to its close or its line's end, this one reads past a quote it
 #: never pairs), and the union takes both, so the box never takes less of a bearer header than
 #: either reading did alone.
-BEARER_WORDS = bearer_rule.HEADER.replace(
-    r"[A-Za-z0-9._~+/\-]+=*)", r"(?P<bare>[A-Za-z0-9._~+/\-]+)=*)"
-)
-assert BEARER_WORDS.endswith("(?P<bare>[A-Za-z0-9._~+/\\-]+)=*)"), BEARER_WORDS[-60:]
+def bearer_words(header: str) -> str:
+    words = header.replace(r"[A-Za-z0-9._~+/\-]+=*)", r"(?P<bare>[A-Za-z0-9._~+/\-]+)=*)")
+    assert words.endswith("(?P<bare>[A-Za-z0-9._~+/\\-]+)=*)"), words[-60:]
+    return words
+
+
+BEARER_WORDS = bearer_words(bearer_rule.HEADER)
+BEARER_WORDS_GAP = bearer_words(bearer_rule.HEADER_GAP)
 
 #: The prefix rules, rule for rule, in pattern order: the prefix as written, the name its run is
 #: captured under, the run's class and its minimum (the box's; a subset of the harness's
@@ -344,21 +444,23 @@ _I = "      "  # the transform's own indent in the host file
 
 def _add(indent: str, start: str, end: str, kind: str) -> str:
     """The statements that record one span, at `indent`: a start keeps its first rule and its
-    longest end, and past `scrub_most` spans nothing more is recorded and the pass has failed."""
+    longest end, and past `scrub_most` spans nothing more is recorded and the pass has failed. A
+    start already recorded is never refused: two readings of one rule (#561) record one span
+    there, which counts once."""
     lines = [
-        "if scrub_count >= scrub_most { scrub_failed = true } else {",
-        f'    span_key = slice("000000000" + to_string({start}), -9) ?? ""',
-        "    span_had = -1",
-        "    span_prior = get(scrub_spans, [span_key, 0]) ?? null",
-        "    if span_prior != null { span_had = to_int(span_prior) ?? -1 }",
-        f"    if span_had < 0 || {end} > span_had {{",
-        f'        span_kind = "{kind}"',
-        "        if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "
+        f'span_key = slice("000000000" + to_string({start}), -9) ?? ""',
+        "span_had = -1",
+        "span_prior = get(scrub_spans, [span_key, 0]) ?? null",
+        "if span_prior != null { span_had = to_int(span_prior) ?? -1 }",
+        "if span_had < 0 && scrub_count >= scrub_most {",
+        "    scrub_failed = true",
+        f"}} else if span_had < 0 || {end} > span_had {{",
+        f'    span_kind = "{kind}"',
+        "    if span_had >= 0 { span_kind = string(get(scrub_spans, [span_key, 1]) ?? "
         f'"{kind}") ?? "{kind}" }}',
-        f"        span_new, span_err = set(scrub_spans, [span_key], [{end}, span_kind])",
-        "        if span_err == null { scrub_spans = span_new } else { scrub_failed = true }",
-        "        if span_had < 0 { scrub_count = scrub_count + 1 }",
-        "    }",
+        f"    span_new, span_err = set(scrub_spans, [span_key], [{end}, span_kind])",
+        "    if span_err == null { scrub_spans = span_new } else { scrub_failed = true }",
+        "    if span_had < 0 { scrub_count = scrub_count + 1 }",
         "}",
     ]
     return "".join(f"{indent}{line}\n" for line in lines)
@@ -396,13 +498,23 @@ def _rule(
     )
 
 
-def _from_parity(indent: str, at: str, out: str, *, end: bool) -> str:
+def _both(*readings_then_var_and_body: str, **kwargs: str) -> str:
+    """A rule's readings, as it read before the gap and with it (#561), one statement each, each
+    recording its own spans, so the union takes what any takes. The last two arguments are the
+    closure's variable and body."""
+    *readings, var, body = readings_then_var_and_body
+    return "".join(_rule(reading, var, body, **kwargs) for reading in readings)
+
+
+def _from_parity(indent: str, at: str, out: str, *, end: bool, reading: str = "") -> str:
     """Statements, at `indent`, that set `out` to the offset in the message of `at`, an offset in
     the parity pass's output (`scrub_parity`), where each value the parity pass took
     (`scrub_taken`, in order) stands as the box's marker: a start inside a marker maps to its
     value's start, an end inside one or at its end to its value's end. The run's matches come in
     order, so a marker every later offset lies past is passed once for all (`map_cursor`, with the
-    shift before it, `map_base`), and only a compare is spent on it again."""
+    shift before it, `map_base`), and only a compare is spent on it again. `reading` names the
+    parity pass whose output it is: the first's (no suffix) or the gap reading's (`_gap`, #561),
+    each with its own taken values and cursor."""
     size = len(MARKS["c"].encode())
     inside = f"{at} <= map_end" if end else f"{at} < map_end"
     before = f"{at} <= map_start" if end else f"{at} < map_start"
@@ -411,6 +523,8 @@ def _from_parity(indent: str, at: str, out: str, *, end: bool) -> str:
         "map_done = false",
         "for_each(scrub_taken) -> |map_index, taken| {",
         "    if !map_done && map_index >= map_cursor {",
+    ]
+    lines += [
         "        taken_from = to_int(get(taken, [0]) ?? 0) ?? 0",
         "        taken_to = to_int(get(taken, [1]) ?? 0) ?? 0",
         "        map_start = taken_from - map_delta",
@@ -430,6 +544,11 @@ def _from_parity(indent: str, at: str, out: str, *, end: bool) -> str:
         "}",
         f"if !map_done {{ {out} = {at} + map_delta }}",
     ]
+    if reading:
+        lines = [
+            re.sub(r"\b(scrub_taken|map_cursor|map_base)\b", rf"\1{reading}", line)
+            for line in lines
+        ]
     return "".join(f"{indent}{line}\n" for line in lines)
 
 
@@ -444,13 +563,19 @@ def _reread(indent: str, at: str, out: str) -> str:
     reached its window's end, so a value costs about its own length to read again."""
     mark, size = MARKS["c"], len(MARKS["c"].encode())
     read = []
-    for name, value in (("reread_grown", VALUE_NARROW), ("reread_wide", VALUE)):
+    readings = (
+        ("reread_grown", VALUE_NARROW),
+        ("reread_wide", VALUE),
+        ("reread_gap", VALUE_NARROW_GAP),
+        ("reread_wide_gap", VALUE_GAP),
+    )
+    for name, value in readings:
         read += [
             f'reread = parse_regex("{mark}" + reread_window, '
             f"r'(?x)\\A(?P<grown>{value})') ?? {{}}",
             f'{name} = length(string(reread.grown) ?? "") - {size}',
         ]
-    read.append("if reread_wide > reread_grown { reread_grown = reread_wide }")
+    read += [f"if {name} > reread_grown {{ reread_grown = {name} }}" for name, _ in readings[1:]]
     big = WINDOW * 16
     lines = [
         f"reread_at = {at}",
@@ -473,8 +598,12 @@ def _reread(indent: str, at: str, out: str) -> str:
     return "".join(f"{indent}{line}\n" for line in lines)
 
 
+#: A merged span that holds a credential value reads on at its end, whichever rule's span starts it
+#: (#561): a span another rule takes from before the name (an `api_key=` gap reading on into a
+#: credential assignment) never stops the credential value reading on through what is glued after
+#: the merged span, as it did when the credential span started it.
 _EXTEND = (
-    f'{_I}    if scrub_open >= 0 && scrub_open_kind == "c" {{\n'
+    f"{_I}    if scrub_open >= 0 && scrub_open_holds_c {{\n"
     + _reread(_I + "        ", "scrub_open_end", "scrub_open_end")
     + f"{_I}    }}\n"
 )
@@ -514,8 +643,9 @@ COMMENT = f"""\
       # each merged span written as the marker of the rule whose span starts it (a credential
       # value's starts where its name ends, and the name stays). No rule reads another's output,
       # so no rule's value or marker is another rule's boundary (basecradle-router#510). A merged
-      # span that writes the box's marker and ends inside a word reads on, once more, as a value
-      # read with the marker as its first piece (the harness's `_past_marker`).
+      # span that holds a credential value and ends inside a word reads on, once more, as a value
+      # read with the marker as its first piece (the harness's `_past_marker`), whichever rule's
+      # span starts it (basecradle-router#561).
       #
       # FAILS CLOSED. Nothing here can raise an error, and a pass that cannot vouch for its output
       # (an offset that does not fit, a message longer than `scrub_longest`, more spans than
@@ -533,7 +663,7 @@ def _body(only: str | None = None) -> str:
         PARITY.removeprefix("(?x)"),
         "segment",
         f'{_R}if segment.value != null && !includes(["\\"\'<a redacted value>\'\\"", '
-        f'"\\"\'<a value the box redacted>\'\\""], segment.word) {{\n'
+        f'"\\"\'<a value the box redacted>\'\\""], segment.value) {{\n'
         f'{_R}    span_from = span_at + length(string(segment.head) ?? "")\n'
         f"{_R}    span_to = scrub_pos + length(segment.string)\n"
         f"{_R}    if scrub_count < scrub_most {{\n"
@@ -543,6 +673,28 @@ def _body(only: str | None = None) -> str:
         flags="(?x)",
         i=_I + "            ",
         into="scrub_parity",
+        gives="parity_gives",
+    ).replace(
+        "    if !scrub_failed {",
+        "    parity_gives = segment.string\n" + _I + "                if !scrub_failed {",
+        1,
+    )
+    # The gap reading's parity pass (#561) writes an output of its own, as the first's does, so the
+    # gap reading's run reads it too, its spans mapped back by its own taken values.
+    credential_parity_gap = _rule(
+        PARITY_GAP.removeprefix("(?x)"),
+        "segment",
+        f'{_R}if segment.value != null && !includes(["\\"\'<a redacted value>\'\\"", '
+        f'"\\"\'<a value the box redacted>\'\\""], segment.word) {{\n'
+        f'{_R}    span_from = span_at + length(string(segment.head) ?? "")\n'
+        f"{_R}    span_to = scrub_pos + length(segment.string)\n"
+        f"{_R}    if scrub_count < scrub_most {{\n"
+        f"{_R}        scrub_taken_gap = push(scrub_taken_gap, [span_from, span_to])\n"
+        f'{_R}        parity_gives = (string(segment.head) ?? "") + "{MARKS["c"]}"\n'
+        f"{_R}    }}\n" + _add(_R + "    ", "span_from", "span_to", "c") + f"{_R}}}\n",
+        flags="(?x)",
+        i=_I + "            ",
+        into="scrub_parity_gap",
         gives="parity_gives",
     ).replace(
         "    if !scrub_failed {",
@@ -571,6 +723,13 @@ def _body(only: str | None = None) -> str:
         + _add(_R + "    ", "span_from", "span_to", "c")
         + f"{_R}}}\n"
     )
+    parity_body_gap = parity_body
+    for at, out, end in (("parity_from", "span_from", False), ("parity_to", "span_to", True)):
+        first = _from_parity(_R + "    ", at, out, end=end)
+        assert parity_body_gap.count(first) == 1, (at, "the gap run maps by its own taken values")
+        parity_body_gap = parity_body_gap.replace(
+            first, _from_parity(_R + "    ", at, out, end=end, reading="_gap")
+        )
     credential_run = (
         f"{_I}        if length(scrub_taken) > 0 {{\n"
         + _rule(
@@ -582,10 +741,32 @@ def _body(only: str | None = None) -> str:
             text="scrub_parity",
         )
         + f"{_I}        }}\n"
+        + f"{_I}        if length(scrub_taken_gap) > 0 {{\n"
+        + _rule(
+            RUN_GAP.removeprefix("(?x)"),
+            "assignment",
+            parity_body_gap,
+            flags="(?x)",
+            i=_I + "            ",
+            text="scrub_parity_gap",
+        )
+        + f"{_I}        }}\n"
         + _rule(RUN.removeprefix("(?x)"), "assignment", run_body, flags="(?x)", i=_I + "        ")
+        + _rule(
+            RUN_GAP.removeprefix("(?x)"), "assignment", run_body, flags="(?x)", i=_I + "        "
+        )
         + f"{_I}        if match(scrub_text, r'\\x24\\{{|=[,}}]') {{\n"
         + _rule(
             RUN_WIDE.removeprefix("(?x)"),
+            "assignment",
+            run_body,
+            flags="(?x)",
+            i=_I + "            ",
+        )
+        + f"{_I}        }}\n"
+        + f"{_I}        if match(scrub_text, r'\\x24\\{{|=[,}}]') {{\n"
+        + _rule(
+            RUN_WIDE_GAP.removeprefix("(?x)"),
             "assignment",
             run_body,
             flags="(?x)",
@@ -612,13 +793,16 @@ def _body(only: str | None = None) -> str:
         + _rule(HEARTBEAT, "hb", heartbeat_body, i=_I + "        ")
         + f"{_I}    }}\n"
     )
-    x_api_key = _rule(
+    x_api_key = _both(
         X_API_KEY,
+        X_API_KEY_GAP,
         "header",
         f"{_R}span_to = scrub_pos + length(header.string)\n" + _add(_R, "span_at", "span_to", "x"),
     )
-    api_key = _rule(
+    api_key = _both(
         API_KEY,
+        API_KEY_GAP,
+        API_KEY_LABEL_GAP,
         "assignment",
         f"{_R}if assignment.kept == null {{\n"
         f"{_R}    span_from = span_at\n"
@@ -645,7 +829,9 @@ def _body(only: str | None = None) -> str:
         + _add(_R + "    ", "span_at", "span_to", "b")
         + f"{_R}}}\n"
     )
-    bearer = _rule(BEARER, "header", bearer_body) + _rule(BEARER_WORDS, "header", bearer_body)
+    bearer = _both(BEARER, BEARER_GAP, "header", bearer_body) + _both(
+        BEARER_WORDS, BEARER_WORDS_GAP, "header", bearer_body
+    )
     prefix = _rule(
         PREFIX,
         "key",
@@ -671,8 +857,9 @@ def _body(only: str | None = None) -> str:
         + f"{_R}}}\n",
         flags="(?x)",
     )
-    member = _rule(
+    member = _both(
         MEMBER,
+        MEMBER_GAP,
         "member",
         f'{_R}span_from = span_at + length({_MEMBER_HEADS} ?? "")\n'
         f"{_R}span_to = scrub_pos + length(member.string)\n"
@@ -682,7 +869,7 @@ def _body(only: str | None = None) -> str:
         + f"{_R}}}\n",
     )
     rules = {
-        "credential": (credential_parity, credential_run),
+        "credential": (credential_parity + credential_parity_gap, credential_run),
         "heartbeat": heartbeat,
         "x-api-key": x_api_key,
         "api_key": api_key,
@@ -714,6 +901,10 @@ def _body(only: str | None = None) -> str:
 {_I}scrub_parity = ""
 {_I}map_cursor = 0
 {_I}map_base = 0
+{_I}scrub_taken_gap = []
+{_I}scrub_parity_gap = ""
+{_I}map_cursor_gap = 0
+{_I}map_base_gap = 0
 {_I}scrub_count = 0
 {_I}scrub_pos = 0
 {_I}scrub_failed = scrub_size > scrub_longest
@@ -724,6 +915,7 @@ def _body(only: str | None = None) -> str:
 {_I}scrub_open = -1
 {_I}scrub_open_end = -1
 {_I}scrub_open_kind = ""
+{_I}scrub_open_holds_c = false
 {_I}for_each(scrub_spans) -> |span_key, span| {{
 {_I}    span_from = parse_int(span_key, base: 10) ?? -1
 {_I}    span_to = to_int(get(span, [0]) ?? -1) ?? -1
@@ -732,12 +924,15 @@ def _body(only: str | None = None) -> str:
 {_reread(_I + "        ", "span_to", "span_to")}{_I}    }}
 {_I}    if scrub_open >= 0 && span_from > scrub_open_end {{
 {_EXTEND.replace(_I + "    ", _I + "        ") * 2}{_I}    }}
+{_I}    span_kind_here = string(get(span, [1]) ?? "") ?? ""
 {_I}    if scrub_open >= 0 && span_from <= scrub_open_end {{
 {_I}        if span_to > scrub_open_end {{ scrub_open_end = span_to }}
+{_I}        if span_kind_here == "c" {{ scrub_open_holds_c = true }}
 {_I}    }} else {{
 {_FLUSH.replace(_I + "    ", _I + "        ")}{_I}        scrub_open = span_from
 {_I}        scrub_open_end = span_to
-{_I}        scrub_open_kind = string(get(span, [1]) ?? "") ?? ""
+{_I}        scrub_open_kind = span_kind_here
+{_I}        scrub_open_holds_c = span_kind_here == "c"
 {_I}    }}
 {_I}}}
 {_EXTEND}{_EXTEND}{_FLUSH}{_I}scrub_rest = slice(scrub_text, scrub_done) ?? null

@@ -592,9 +592,9 @@ _RENDERED = [
 #: the line's own structure: the close of the quoted value an assignment sits in, a `"` a
 #: single-quoted value would cross, a `,` or `}`, a record break, a shell substitution.
 _DIFFERENT = {
-    # The bearer rule's gap after its scheme word is any whitespace, as the harness's is, so a
-    # scheme word ending a line takes the first word of the next; the print site's value ends at
-    # the break. The box takes more, never less (#516).
+    # The bearer rule's gap after its scheme word is whitespace or control characters (#561),
+    # wider than the harness's whitespace, so a scheme word ending a line takes the first word of
+    # the next; the print site's value ends at the break. The box takes more, never less (#516).
     "G_TOKEN=Bearer \nfabricated next=1 | H_TOKEN=Bearer": (
         f"G_TOKEN={BOX_REDACTED_VALUE} next=1 | H_TOKEN={BOX_REDACTED_VALUE}"
     ),
@@ -687,12 +687,15 @@ def _credential_rule() -> str:
 
 
 def _parity_pass() -> str:
-    """The credential rule with its second pass taken out: quote parity alone."""
+    """The credential rule with its run passes taken out: quote parity alone, the first reading's
+    and the gap reading's after it (#561)."""
     rule = _credential_rule()
-    assert rule.count("replace_with(parity, ") == 1
-    start = rule.index("        replace_with(parity, r'(?x)")
-    end = rule.index("\n    } else {\n        value\n", start) + 1
-    return rule[:start] + "        parity\n" + rule[end:]
+    for head, stands in (("replace_with(parity, ", "parity"), ("replace_with(gapped, ", "gapped")):
+        assert rule.count(head) == 1, head
+        start = rule.index(head)
+        end = rule.index("\n        }\n", start) + len("\n        }\n")
+        rule = rule[:start] + stands + "\n" + rule[end:]
+    return rule
 
 
 def _scrub_lines(vector: str, tmp_path: Path, lines: list[str], *, alone: str = "") -> list[str]:

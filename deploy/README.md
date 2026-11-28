@@ -2370,7 +2370,9 @@ Caddy, no database) and has three load-bearing properties:
      a Ruby `=>`, a `('x-api-key', '…')` tuple, any case, `_` for either hyphen, a quote escaped to
      any depth (basecradle-harness#935) — and its value reads on through every header whose label
      it holds, by a repetition in its own pattern, as the harness's `_x_api_key_spans` does
-     (`x-api-key: "x-api-key": "K9…"`). The assignment rule's value may open with a `"` or a quote
+     (`x-api-key: "x-api-key": "K9…"`). Its separator reads the gap on either side of it
+     (whitespace or control characters, basecradle-router#561), so `x-api-key:<NUL>"K9…"` loses its
+     value. The assignment rule's value may open with a `"` or a quote
      escaped to any depth (`api_key=\"K9…\"`, basecradle-router#515), a bearer header glued to it
      (`api_key=KBearer eyJ…`) goes with it (basecradle-router#423, basecradle-harness#866), it
      reads on through every `api_key=` label it holds, so each label's value is read, and it takes a
@@ -2387,7 +2389,9 @@ Caddy, no database) and has three load-bearing properties:
      - **The bearer header's token is taken whole, quoted or not, and a run of scheme words goes
        with the token after it** (basecradle-router#507, the harness's definition from
        basecradle-harness#929). The scheme word is `bearer` in any case, glued to anything before
-       it, followed by whitespace; the token is a run of `[A-Za-z0-9._~+/-]` (any length on the box;
+       it, followed by a gap (whitespace or control characters, line breaks included,
+       basecradle-router#561: wider than the harness's whitespace, so an escape or a NUL never
+       leaves a token); the token is a run of `[A-Za-z0-9._~+/-]` (any length on the box;
        the source needs eight), or the whole shell word a quote, a dollar-sign quote, a backquote or
        a substitution opens (to its close, or its line's end when it never closes) and what is glued
        after it, or an escaped quote and the rest of its word; while the word read as the token ends
@@ -2407,8 +2411,8 @@ Caddy, no database) and has three load-bearing properties:
        read one level deep in both. **Every record break ends a bearer token on the box**, as it
        ends a credential's value, where the source's opened word runs on through a `\r`, a NUL or a
        U+2028 outside a quote (`Bearer `q`<CR>eyJ…` keeps `eyJ…`; basecradle-router#516), though the
-       gap after a scheme word is any whitespace, as the harness's is, so a scheme word ending a
-       line takes the first word of the next (`Bearer <LF>word`). It is
+       gap after a scheme word is crossed whole, so a scheme word ending a line takes the first
+       word of the next (`Bearer <LF>word`). It is
        the one rule that reads a header, and it reads every one, wherever another rule's match
        ends, so `x-api-key: KBearer 'eyJ…'` and `api_key=Bearer "eyJ…"` lose the token. Its pieces
        are stated once in `tests/bearer_rule.py`.
@@ -2634,9 +2638,10 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
      lets a quoted value through; then the word, its pieces allowed to stay open (each to its close
      or to a bare `"` or a record break).
 
-  **A gap before a value is the value's** (basecradle-router#561): a run of whitespace or control
-  characters, line breaks included, after a name's `=`, an inner name's `=` or a scheme word is read
-  past, and the value after it is taken with it, so the marker stands directly after the name
+  **A gap before a value is the value's** (basecradle-router#561), in a second reading beside the
+  first, never in its place: a run of whitespace or control characters, line breaks included,
+  after a name's `=`, an inner name's `=` or a scheme word is read past, and the value after it is
+  taken with it, so the marker stands directly after the name
   (`A_TOKEN=<NEWLINE>value` ships as `A_TOKEN='<a value the box redacted>'`), the one place the
   NOC counts it. The gap is Unicode's whitespace and its `Cc` category, one set in every engine
   (`logfmt.VALUE_GAP_RANGES`). A word of prose after `NAME= ` is the accepted cost; a credential
@@ -2644,7 +2649,26 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   open or closed (no bare `$` or `(`, no escaped `"`), since leftmost-first keeps the first reading
   that matches, not the longest, and a gap read after any piece let a shorter reading win.
   A marker after a gap is kept with its gap, as its source wrote it: only the box's own marker is
-  written directly after the name, so the count of it stays what a source let through.
+  written directly after the name, so the count of it stays what a source let through. One
+  exception, as before #561: in the message, a record break right after the `=` gets the box's
+  marker before it from the first reading, whatever follows the break. A gap reading after an
+  empty assignment reads a credential name in the value as an inner name, so
+  `A_TOKEN= B_TOKEN=x` ships as one marker after `A_TOKEN=`.
+  **Why a second reading.** Read in place, a value past a gap consumed a later credential name or
+  label whose own match took more, since leftmost-first keeps the first reading that matches, not
+  the longest, and the box took less than it had: the NOC's differential found it in #562's block,
+  and this repository's found sixteen more shapes. So every rule that anchors a value to a
+  separator keeps its first reading byte for byte and gains a gap reading beside it: in the
+  message, the union of the two readings' spans (the credential rule's two passes, `x-api-key`,
+  `api[-_]?key=`, the bearer header's two readings and the JSON member, with the readings of the
+  block that first read the gap, #562, so the message takes what either block before took). In
+  every other field the credential rule's gap reading runs after the first, on what the first
+  left, and only writes a marker over it: that field takes at least what the block before #562
+  took there, but a value the first reading cut short before an inner name's gap keeps the first
+  reading's marker, where #562 read on past it (named on #561, closed by reading every field by the
+  message's union). The first reading in every other field is the one before #562 with two
+  changes: no marker before a record break, and none over a value of gap characters alone, both
+  left to the gap reading.
   An empty value (nothing but a gap to the record's end) is left as it is, except right before a
   record break: the canary's run crosses a break, so the marker stands between the `=` and the
   break, and nothing is taken.
@@ -2685,9 +2709,10 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   **The credential rule's own two passes stay one rule.** Its run reads the parity pass's output,
   where each value the parity pass took stands as the box's marker (the marker and what is glued to
   it are read as one word), and the union carries that reading as it is: the run over the parity
-  pass's output, its spans mapped back to the message. A merged span that writes the box's marker
+  pass's output, its spans mapped back to the message. A merged span that holds a credential value
   and ends inside a word reads on once more, as a value whose first piece is the marker (the
-  harness's `_past_marker`), as does every credential span at its own end.
+  harness's `_past_marker`), whichever rule's span starts it (an `api_key=` gap reading on into a
+  credential assignment, basecradle-router#561), as does every credential span at its own end.
   **Four properties hold by seeded fuzz in CI** (and over 30,000 lines each when this was
   written): the canary reads nothing the box ships; no credential-named assignment the rule leaves
   is followed by a value, by the rule's own reading of quotes; a quoted value closed before a word's
@@ -2757,7 +2782,9 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   name that only holds one: `my_password` keeps its value). The name stays, and the value becomes
   the box's marker, `'<a value the box redacted>'`, to the JSON string's close, which stays, so the
   line stays JSON: `{"password":"…","n":1}` ships as `{"password":"'<a value the box
-  redacted>'","n":1}`. The member's quotes may be escaped at any depth, its three at the same one:
+  redacted>'","n":1}`. The colon reads the gap on either side of it (whitespace or control
+  characters, basecradle-router#561), so an escape or a NUL before the value's quote never leaves
+  the value. The member's quotes may be escaped at any depth, its three at the same one:
   unescaped the value is read as JSON reads a string, and inside one to five JSON strings a quote
   behind a longer run of backslashes than the opener's is the value's own; at any other depth the
   value ends at its first quote. A value that is a marker already (the box's, the print site's, the

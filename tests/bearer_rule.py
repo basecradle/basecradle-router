@@ -5,6 +5,9 @@ The fleet's one definition is basecradle-harness `docs/telemetry.md` → Credent
 scheme words goes with the token after it.**
 
 1. The scheme word is `bearer` in any case, glued to anything before it, followed by whitespace.
+   The box also reads the header with a wider gap there, beside it (`HEADER_GAP`): whitespace or
+   control characters, line breaks included (`credential_rule.GAP`, basecradle-router#561), so
+   an escape or a NUL between the scheme word and its token never leaves the token.
 2. The token is a run of `[A-Za-z0-9._~+/-]`, or the whole shell word a quote or substitution
    opens, or an escaped quote and the rest of its word.
 3. While the word read as the token ends in `bearer`, the next word is the token in its place.
@@ -24,9 +27,19 @@ and Vector interpolates the other across the whole file.
 
 from __future__ import annotations
 
-#: The scheme word and the whitespace after it (rule 1). Unanchored on its left, so a word glued
-#: to anything before it is one (`x.Bearer`, `a=Bearer`, `KBearer`, `abc-bearer`).
-SCHEME = r"(?i:bearer)\s+"
+from credential_rule import GAP
+
+#: What stands between a scheme word and its token in the header's first reading: whitespace.
+BLANK = r"\s"
+
+
+def scheme(blank: str) -> str:
+    """The scheme word and the `blank` run after it (rule 1). Unanchored on its left, so a word
+    glued to anything before it is one (`x.Bearer`, `a=Bearer`, `KBearer`, `abc-bearer`)."""
+    return rf"(?i:bearer){blank}+"
+
+
+SCHEME = scheme(BLANK)
 
 #: The pieces of a word read as a token that ends in a scheme word (rule 3), as the fleet's
 #: minimum reads them: closed quoted pieces and any other character but a blank or an opening
@@ -61,8 +74,23 @@ MIDDLE_WORD = (
     rf"(?:{OPENED}\S*?|(?:{'|'.join([*MINIMUM_PIECES[:3], ESCAPED_PIECE, MINIMUM_PIECES[3]])})*)"
 )
 
+
+def header(blank: str) -> str:
+    """A bearer header from its first scheme word to its token, each scheme word followed by a
+    `blank` run: the bearer rule's whole pattern. The scheme words after the first are each a
+    middle word and its run."""
+    return f"{scheme(blank)}(?:{MIDDLE_WORD}{scheme(blank)})*{TOKEN}"
+
+
 #: The scheme words after the first, each a middle word and its whitespace.
 SCHEME_RUN = f"(?:{MIDDLE_WORD}{SCHEME})*"
 
 #: A bearer header from its first scheme word to its token: the bearer rule's whole pattern.
-HEADER = f"{SCHEME}{SCHEME_RUN}{TOKEN}"
+HEADER = header(BLANK)
+assert f"{SCHEME}{SCHEME_RUN}{TOKEN}" == HEADER
+
+#: The same header with the gap after each scheme word (#561): a reading beside `HEADER`, never in
+#: its place, so the scrub's union takes what either takes. Widened in place, the gap let a
+#: shorter reading win where the whitespace one read on (leftmost-first keeps the first reading
+#: that matches, not the longest).
+HEADER_GAP = header(GAP)
