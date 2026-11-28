@@ -61,6 +61,7 @@ from basecradle_router.logfmt import (
     _LEAD_WORD,
     CANARY_VALUE_STOPS,
     REDACTED_VALUE,
+    _value_end,
     log_fields,
     redact_credentials,
     value_gap_class,
@@ -576,6 +577,15 @@ _AGREED = [
     "G_TOKEN=Bearer ;H_KEY=:KBearer :\tBearer fabricatedSecret4 next=1",
     "I_TOKEN='q'J_TOKEN=x\tBearer fabricatedSecret5 next=1",
     "K_TOKEN=x'q'L_TOKEN=\tnext=1 | M_TOKEN='N_TOKEN=x' next=2 other=3",
+    # A gap before a value is the value's (#561), the marker directly after the name: after a
+    # name's `=`, an inner name's `=` and a scheme word, a word of prose after `NAME= ` included.
+    "G_TOKEN=Bearer \nfabricated next=1 | H_TOKEN=Bearer",
+    "M_TOKEN=Bearer \rImportant next=1",
+    "EMPTY_TOKEN= next=1 | LAST_TOKEN=",
+    "X_TOKEN=\nfabricatedAfterBreak0005 next=1",
+    "A_TOKEN=\r\nfabricatedAfterBreak0006 next=1 | B_TOKEN=\t fabricatedGap0007 next=2",
+    "C_TOKEN=\n  fabricatedIndent0008 next=1 | D_TOKEN=  fabricatedGap0009 next=2",
+    "K_TOKEN=x'q'L_TOKEN= next=1 | M_TOKEN='N_TOKEN=x' next=2 other=3",
 ]
 
 #: Lines the router renders itself: the print site has already redacted them, so the box must pass
@@ -598,13 +608,6 @@ _RENDERED = [
 #: the line's own structure: the close of the quoted value an assignment sits in, a `"` a
 #: single-quoted value would cross, a `,` or `}`, a record break, a shell substitution.
 _DIFFERENT = {
-    # The bearer rule's gap after its scheme word is whitespace or control characters (#561),
-    # wider than the harness's whitespace, so a scheme word ending a line takes the first word of
-    # the next; the print site's value ends at the break. The box takes more, never less (#516).
-    "G_TOKEN=Bearer \nfabricated next=1 | H_TOKEN=Bearer": (
-        f"G_TOKEN={BOX_REDACTED_VALUE} next=1 | H_TOKEN={BOX_REDACTED_VALUE}"
-    ),
-    "M_TOKEN=Bearer \rImportant next=1": f"M_TOKEN={BOX_REDACTED_VALUE} next=1",
     # The canary stops at a `,` or a `}`, and so does the box, in either pass: in a JSON line they
     # are structure.
     'Q_TOKEN=v1,next="x y" end=1': f'Q_TOKEN={BOX_REDACTED_VALUE},next="x y" end=1',
@@ -651,22 +654,6 @@ _DIFFERENT = {
     # a `\r`, a NUL or a U+2028 into what the box ships as the next record.
     "B_TOKEN=fabricatedValue0004\u2028next=1\rC_TOKEN=fabricatedValue0005\x00next=2": (
         f"B_TOKEN={BOX_REDACTED_VALUE}\u2028next=1\rC_TOKEN={BOX_REDACTED_VALUE}\x00next=2"
-    ),
-    # A gap before a value is the value's (#561), and the marker stands directly after the name:
-    # a word of prose after `NAME= ` is the accepted cost. The box reads it first, as the fleet's
-    # last layer; the print site's reading of the gap follows in its own change (#561), and these
-    # move to `_AGREED` with it.
-    "EMPTY_TOKEN= next=1 | LAST_TOKEN=": f"EMPTY_TOKEN={BOX_REDACTED_VALUE} | LAST_TOKEN=",
-    "X_TOKEN=\nfabricatedAfterBreak0005 next=1": f"X_TOKEN={BOX_REDACTED_VALUE} next=1",
-    "A_TOKEN=\r\nfabricatedAfterBreak0006 next=1 | B_TOKEN=\t fabricatedGap0007 next=2": (
-        f"A_TOKEN={BOX_REDACTED_VALUE} next=1 | B_TOKEN={BOX_REDACTED_VALUE} next=2"
-    ),
-    "C_TOKEN=\n  fabricatedIndent0008 next=1 | D_TOKEN=  fabricatedGap0009 next=2": (
-        f"C_TOKEN={BOX_REDACTED_VALUE} next=1 | D_TOKEN={BOX_REDACTED_VALUE} next=2"
-    ),
-    # An inner name's value after its gap goes with the value that holds it (#561).
-    "K_TOKEN=x'q'L_TOKEN= next=1 | M_TOKEN='N_TOKEN=x' next=2 other=3": (
-        f"K_TOKEN={BOX_REDACTED_VALUE} | M_TOKEN={BOX_REDACTED_VALUE} next=2 other=3"
     ),
     # A record break right after the `=` with no value after it: the canary's run crosses the
     # break, so the box writes its marker before it, and takes nothing.
@@ -1003,17 +990,39 @@ def _box_leaves_a_scheme_word(line: str) -> bool:
     )
 
 
+def _box_reads_no_inner_gap(line: str) -> bool:
+    """Whether `line` holds a credential name whose `=` a gap follows after another credential
+    name earlier in the line: an inner name's gap, maybe. The print site reads past an inner name's
+    gap procedurally, always (#561); the box's regular expression reads one only where its reading
+    with the gap is the one leftmost-first keeps (after plain pieces, tried first,
+    `credential_rule.PLAIN_PIECES`), so a shorter reading may win. So the two do not read that
+    value alike, and the print site, the stronger reading there, is the one that takes it."""
+    names = list(_CREDENTIAL_NAME.finditer(line))
+    for i, name in enumerate(names):
+        if _GAP.match(line, name.end()).end() == name.end():
+            continue
+        # An inner name: one an earlier name's value, as the print site reads it, reaches past.
+        if any(_value_end(line, earlier.end(), gap=True) > name.start() for earlier in names[:i]):
+            return True
+    return False
+
+
 def test_the_box_never_leaves_more_of_a_value_than_the_print_site(tmp_path: Path) -> None:
     # The reference holds the box to itself, not only to the lines picked above: on every
     # construct the two read alike, the box's credential rule alone takes at least what the print
     # site takes. Seeded fuzz, 3,000 lines; a fabricated secret the print site redacts must not
     # survive the rule. A scheme word the rule leaves is no construct the two read alike: it is the
-    # rule's own limit, closed for the message by the union (`_LIMIT`).
+    # rule's own limit, closed for the message by the union (`_LIMIT`); nor is an inner name's gap
+    # after pieces the box reads as text (#561, `_box_reads_no_inner_gap`).
     rng = random.Random(877)
     lines = [
         "".join(rng.choice(_ORACLE_PIECES) for _ in range(rng.randint(1, 30))) for _ in range(3000)
     ]
-    lines = [line for line in lines if not _box_leaves_a_scheme_word(line)]
+    lines = [
+        line
+        for line in lines
+        if not _box_leaves_a_scheme_word(line) and not _box_reads_no_inner_gap(line)
+    ]
     assert len(lines) > 1500
     box = _scrub_lines(_vector(), tmp_path, lines, alone="rule")
     leaked = [

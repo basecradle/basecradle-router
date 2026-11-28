@@ -48,6 +48,8 @@ from basecradle_router.logfmt import (
     RECORD_BREAKS,
     REDACTED_VALUE,
     SCHEME_WORD,
+    VALUE_GAP_RANGES,
+    value_gap_class,
 )
 
 WAKE_RUNNER = Path(__file__).resolve().parents[1] / "deploy" / "bin" / "wake-runner"
@@ -111,10 +113,26 @@ def bare(but: str = "") -> str:
 
 PIECE = f"(?:{bare()}|{DOUBLE}?|{SINGLE}?|{SUBSTITUTION}?|{BACKQUOTED}?|{ESCAPE})"
 
+#: The gap characters a shell word holds (all but its blanks): a carriage return, a NUL, an escape.
+WORD_GAP = "".join(
+    chr(point)
+    for a, b in VALUE_GAP_RANGES
+    for point in range(a, b + 1)
+    if chr(point) not in " \t\n"
+)
+
 #: The same pieces, each closed, and no bare `=` that ends a credential name: what stands before an
 #: inner name's `=`, so a name inside a quote is the quote's text. A plain character first (#509).
+#: A gap character a shell word holds is a piece of it, except right after a scheme word where it and
+#: the ones after it end the word: there they are the scheme word's gap (`Bearer<CR><LF>token`,
+#: #561), as the translator reads a scheme word before the gap characters its word ends in.
+WORD_GAP_PIECE = (
+    f"(?:(?<!{SCHEME_WORD})|(?![{jq(WORD_GAP)}]*+(?:[{jq(' ' + chr(9) + chr(10))}]|\\\\z)))"
+    f"[{jq(WORD_GAP)}]"
+)
 CLOSED_PIECE = (
-    f"(?:{bare('=')}|{NOT_A_NAMES_EQ}|{DOUBLE}|{SINGLE}|{SUBSTITUTION}|{BACKQUOTED}|{ESCAPE})"
+    f"(?:{bare('=' + WORD_GAP)}|{NOT_A_NAMES_EQ}|{DOUBLE}|{SINGLE}|{SUBSTITUTION}|{BACKQUOTED}"
+    f"|{ESCAPE}|{WORD_GAP_PIECE})"
 )
 
 #: Where a word after a tab may start (`logfmt._reached`): not at a blank, a canary stop other than
@@ -138,35 +156,84 @@ LEAD_PIECE = (
 )
 LEAD = f"(?:{LEAD_PIECE}++(?:{BACKSLASH})?|{BACKSLASH})\\t+"
 
-#: Where a bearer scheme word ends: the scheme word, looked behind at the end of a word of closed
-#: pieces (`logfmt.SCHEME_WORD`, glued to anything before it, #510), then its blanks, a word reached
-#: after them.
-SCHEME_END = f"(?<={SCHEME_WORD})[ \\t]+(?={REACH})"
+#: The gap a value opens after (`logfmt.VALUE_GAP_RANGES`, #561): whitespace or control characters,
+#: line breaks included, each one spelled for a jq string.
+VALUE_GAP = value_gap_class(lambda point: jq(chr(point)))
 
-#: The tabs a value opens with, before a word the canary's run reaches.
-OPENING_TABS = f"(?:\\t++(?={REACH}))?"
+#: A gap's characters the canary's run crosses (a tab, an escape, a non-breaking space): where a value
+#: that is a gap alone ends, as `logfmt._value_end` ends it, at the canary's run.
+GAP_RUN = "(?:(?![ " + BRK + "])" + VALUE_GAP + ")"
+
+#: Where a bearer scheme word ends: the scheme word, looked behind at the end of a word of closed
+#: pieces (`logfmt.SCHEME_WORD`, glued to anything before it, #510), then its gap (#561), a word
+#: reached after it.
+SCHEME_END = f"(?<={SCHEME_WORD}){VALUE_GAP}++(?={REACH})"
+
+#: The gap a value opens with (#561), read possessively: the value is whatever follows it.
+OPENING_GAP = f"{VALUE_GAP}*+"
+
+#: A value that is a gap alone, to the text's end or before a `,` or a `}`: the gap's run, as the
+#: canary reads it (`logfmt._value_end`, as after a scheme word's gap).
+GAP_ALONE = f"{GAP_RUN}*(?={VALUE_GAP}*+(?:[,}}]|\\\\z))"
 
 #: An inner credential name: the closed pieces up to its `=`, possessive, then its value's tabs.
 TO_A_NAME = f"{CLOSED_PIECE}*+{A_NAMES_EQ}"
+
+#: A marker where the canary's run would end after it is the whole value (`logfmt._MARKER_ENDS`),
+#: after the gap it opens with (#561), a name's or an inner name's alike.
+MARKER = jq(REDACTED_VALUE)
+KEPT = f"{MARKER}(?=[{jq(chr(9) + CANARY_VALUE_STOPS + _BREAK_CHARS)}]|\\\\z)"
+KEPT_MARKER = f"{OPENING_GAP}{KEPT}"
 
 #: One item: the closed pieces up to an inner name's `=` (and its value's tabs) or to the end of a
 #: scheme word (and its blanks), in one possessive reading, so a word that ends in neither costs one
 #: reading of it, as it did before the scheme word was any word ending in one (#510); or a lead word.
 #: A reading of no pieces never looks behind at a scheme word: an item ends at an `=`, a tab or a
 #: blank, and a value opens after an `=`.
-ITEM = f"(?:{CLOSED_PIECE}*+(?:{A_NAMES_EQ}{OPENING_TABS}|{SCHEME_END})|{LEAD}(?={REACH}))"
+ITEM = f"(?:{CLOSED_PIECE}*+(?:{A_NAMES_EQ}{OPENING_GAP}(?![,}}]|\\\\z|{KEPT})|{SCHEME_END})|{LEAD}(?={REACH}))"
 
-#: A last inner name whose value is empty or tabs alone: the value ends there, past the tabs.
-LAST_INNER_NAME = f"{TO_A_NAME}(?:\\t+(?!{REACH})|(?=[ {BRK}]|\\\\z))"
+#: A last inner name whose value is a kept marker, which ends the value after it (an inner name's
+#: value is read as a value of its own, `logfmt._value_end`), or a gap alone, to the text's end,
+#: which ends it at the gap's run. One reading of the pieces before the name, for both: each
+#: reading of them costs the engine its retries (#509).
+LAST_INNER_NAME = f"{TO_A_NAME}(?:{KEPT_MARKER}|{GAP_ALONE})"
 
-#: A marker where the canary's run would end after it is the whole value (`logfmt._MARKER_ENDS`).
-MARKER = jq(REDACTED_VALUE)
-KEPT_MARKER = f"{MARKER}(?=[{jq(chr(9) + CANARY_VALUE_STOPS + _BREAK_CHARS)}]|\\\\z)"
 
-#: The value: a kept marker; or its items, then a last inner name, one lead word or a run of the last
-#: word's pieces (one lead word, never a repeat of them: the possessive lead tried at every piece
-#: would read the word again at each); or tabs alone.
-VALUE = f"(?:{KEPT_MARKER}|{OPENING_TABS}{ITEM}*(?:{LAST_INNER_NAME}|{LEAD}|{PIECE}+)|\\t+)"
+#: The value: a kept marker; or, past its gap, its items, then a last inner name, one lead word or a
+#: run of the last word's pieces (one lead word, never a repeat of them: the possessive lead tried
+#: at every piece would read the word again at each); or a gap alone, to the text's end.
+VALUE = f"(?:{KEPT_MARKER}|{OPENING_GAP}(?![,}}]){ITEM}*(?:{LAST_INNER_NAME}|{LEAD}|{PIECE}+)|{GAP_RUN}+(?={VALUE_GAP}*+(?:[,}}]|\\\\z)))"
+
+#: The first reading's value (#561): the value as the translator's first reading reads it, the one
+#: before the gap, byte for byte (pinned by a test): no gap after a name's or an inner name's `=`,
+#: blanks after a scheme word, and every gap character a piece of the word. The program reads it
+#: first, then `VALUE` on what it left, as the translator does (`logfmt.redact_credentials`). The
+#: translator's first reading also leaves to the gap reading a value that reading reaches farther
+#: (a scheme word's or an inner name's gap); this one leaves it only a value of gap characters alone,
+#: since telling farther costs a reading of the rest of the text an assignment, which jq 1.7
+#: measures from its start (#505). So where the translator reads past such a gap, the fallback
+#: writes the first reading's marker over the shorter value, as it did before #561, and the value
+#: past the gap ships in the clear (`A_TOKEN=Bearer<LF>token`, `A_TOKEN=aB_TOKEN= value`): named on
+#: #561. The fallback writes the reply only when the translator has died.
+CLOSED_PIECE_PLAIN = (
+    f"(?:{bare('=')}|{NOT_A_NAMES_EQ}|{DOUBLE}|{SINGLE}|{SUBSTITUTION}|{BACKQUOTED}|{ESCAPE})"
+)
+_SCHEME_END_PLAIN = f"(?<={SCHEME_WORD})[ \\t]+(?={REACH})"
+_OPENING_TABS = f"(?:\\t++(?={REACH}))?"
+_TO_A_NAME_PLAIN = f"{CLOSED_PIECE_PLAIN}*+{A_NAMES_EQ}"
+_ITEM_PLAIN = (
+    f"(?:{CLOSED_PIECE_PLAIN}*+(?:{A_NAMES_EQ}{_OPENING_TABS}|{_SCHEME_END_PLAIN})"
+    f"|{LEAD}(?={REACH}))"
+)
+_LAST_INNER_NAME_PLAIN = f"{_TO_A_NAME_PLAIN}(?:\\t+(?!{REACH})|(?=[ {BRK}]|\\\\z))"
+_KEPT_MARKER_PLAIN = f"{MARKER}(?=[{jq(chr(9) + CANARY_VALUE_STOPS + _BREAK_CHARS)}]|\\\\z)"
+VALUE_PLAIN = (
+    f"(?:{_KEPT_MARKER_PLAIN}|{_OPENING_TABS}{_ITEM_PLAIN}*"
+    f"(?:{_LAST_INNER_NAME_PLAIN}|{LEAD}|{PIECE}+)|\\t+)"
+)
+
+#: A value of gap characters alone, which the first reading leaves to the gap reading.
+GAPS_ALONE = f"\\\\A{VALUE_GAP}+\\\\z"
 
 #: Any canary-length run a value left, as the canary reads one.
 RUN = run_char() + "{" + str(CANARY_VALUE_FLOOR) + ",}"
@@ -184,8 +251,11 @@ GAP = 4096
 SPAN = 65536
 
 
-def redactor(units: int = UNITS, gap: int = GAP) -> str:
-    """The jq `redact($body)`: what `GSUB` writes, with up to `units` assignments read per search.
+def redactor(
+    units: int = UNITS, gap: int = GAP, *, name: str = "redact", keep_gaps: bool = False
+) -> str:
+    """The jq `redact($body)` (or `name`): what `GSUB` writes, with up to `units` assignments read
+    per search; with `keep_gaps`, a value of gap characters alone left as it is (`GSUB_FIRST`).
 
     A search runs on the rest of the text, so every reading sees all that follows, as `gsub`'s
     did, and the rest starts where `gsub`'s next search would. The rest cannot see the character
@@ -202,7 +272,7 @@ def redactor(units: int = UNITS, gap: int = GAP) -> str:
     that holds only the rest of the text, never a copy for each search made."""
     unit = f'"(?:(?<g>(?:(?!\\\\g<x>)(?s:.)){{0,{gap}}}+)(?<u>\\\\g<x>)"'
     return (
-        'def redact($body): ("(?<x>" + $n + $body + "){0}") as $x'
+        f'def {name}($body): ("(?<x>" + $n + $body + "){{0}}") as $x'
         ' | def search($k): ["(?<u>\\\\g<x>)", (range(1; $k) | '
         + unit
         + '), (range(1; $k) | ")?"), $x] | add;'
@@ -217,8 +287,14 @@ def redactor(units: int = UNITS, gap: int = GAP) -> str:
         + ' and ([$c[] | select(.name == "u")] | length) == $k then [$k * 4, '
         + str(units)
         + "] | min else $k end), out: [$t[:$m.offset], ($c[]"
-        ' | if .name == "g" then .string else (.string | .[:index("=") + 1]), $r end)]} end;'
-        " .out[], if .t == null then break $done else empty end)] | add;"
+        + (
+            ' | if .name == "g" then .string else .string as $s | ($s | index("=")) as $e'
+            f' | if ($s[$e + 1:] | test("{GAPS_ALONE}")) then $s else $s[:$e + 1], $r end end)]}}'
+            " end;"
+            if keep_gaps
+            else ' | if .name == "g" then .string else (.string | .[:index("=") + 1]), $r end)]} end;'
+        )
+        + " .out[], if .t == null then break $done else empty end)] | add;"
     )
 
 
@@ -240,6 +316,10 @@ CUT = (
 #: The program before #505, its redaction and its cut, which the program must read exactly as: one
 #: `gsub` search an assignment, and a `splits` and a slice of the string a record.
 GSUB = 'def redact($body): gsub("(?<n>" + $n + ")" + $body; "\\(.n)\\($r)");'
+GSUB_FIRST = (
+    'def redact_first($body): gsub("(?<n>" + $n + ")(?<v>" + $body + ")";'
+    f' if (.v | test("{GAPS_ALONE}")) then "\\(.n)\\(.v)" else "\\(.n)\\($r)" end);'
+)
 SPLITS = (
     f'"{jq(RECORD_BREAKS)}" as $b | sub("(?:" + $b + ")\\\\z"; "") | splits($b)'
     f' | if . == "" then ">" else . as $l | range(0; length; {QUOTED_PIECE}) as $i'
@@ -253,13 +333,15 @@ def program_jq(
     """The fallback's program, reading `units` assignments per search (or by `redaction`)."""
     return (
         'fromjson? | select(type == "object" and .type == "result") | .result | strings'
-        f' | "{CREDENTIAL_NAME}" as $n | "{MARKER}" as $r | {redaction or redactor(units, gap)}'
-        f' redact("{VALUE}") | redact("{RUN}") | {cut}'
+        f' | "{CREDENTIAL_NAME}" as $n | "{MARKER}" as $r'
+        f" | {redaction or redactor(units, gap, name='redact_first', keep_gaps=True)}"
+        f" {'' if redaction else redactor(units, gap)}"
+        f' redact_first("{VALUE_PLAIN}") | redact("{VALUE}") | redact("{RUN}") | {cut}'
     )
 
 
 #: The program before #505.
-BEFORE_JQ = program_jq(redaction=GSUB, cut=SPLITS)
+BEFORE_JQ = program_jq(redaction=GSUB_FIRST + " " + GSUB, cut=SPLITS)
 
 PROGRAM_JQ = program_jq()
 
