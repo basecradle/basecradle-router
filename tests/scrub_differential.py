@@ -497,6 +497,32 @@ REPRODUCTIONS = [
         'api_key=\\Bearer X-API-KEY="eyJfabricatedSecretValue14" next=1',
         'x-api-key: Bearer api_key=\\Bearer X-API-KEY="K9fabricatedSecretValue15" next=1',
     )
+] + [
+    # #561: what #562's block left that the block before it took, a gap reading in place consuming
+    # a later name or label; the capital's minimized line first, then the shapes this differential
+    # found (seeds 1 to 4 at 540,000 lines).
+    'api_key= PASSWORD=\\"a b\\"bearer -${eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt`',
+    'SECRET_KEY_BASE= ,}A_TOKEN=,:Fab1catedQ7ZkW9xDiffVq3Lm8Rt,tail"',
+    'Bearer `KBearer \x00-A_TOKEN=,="a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b"}',
+    "SECRET_KEY_BASE= 'Bearer\t PASSWORD=x'a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b'&a=1",
+    'x-api-key: api_key=\\"export GH_TOKEN=\x00,A_TOKEN=,eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt\\',
+    'Bearer \'q KBearer \x00"API-KEY=$("(a)\t&a=1 next=1 \\\\"Fab1catedQ7ZkW9xDiffVq3Lm8Rt\\\\"`',
+    "Bearer ${X-API-KEY=,q'q'\"Bearer \x00\\\"('x-api-key', ':'\"Fab1catedQ7ZkW9xDiffVq3Lm8Rt\"",
+    '{"h": "auth: PASSWORD= ,})A_TOKEN=,:\\"Fab1catedQ7ZkW9xDiffVq3Lm8Rt\\"next}", "n": 1}',
+    '{"h": "A_TOKEN= \\\\\\\\\'API_KEY=$\'-A_TOKEN=, ${Fab1catedQ7ZkW9xDiffVq3Lm8Rt}\\"", "n": 1}',
+    'PASSWORD=\u2028""SECRET_KEY_BASE=(a)\t=\'q\'$(""=Bearer Secret0001$(Fab1catedQ7ZkW9xDiffVq3Lm8Rt)',  # noqa: E501 — a reproduction, byte for byte
+    "'<a redacted value>' A_TOKEN=cost=0.1KBearer \r\n\\abc'A_TOKEN=$'}Fab1catedQ7ZkW9xDiffVq3Lm8Rt",  # noqa: E501 — a reproduction, byte for byte
+    "Bearer 'q x\"q\"bearer Kx,DB_PASSWORD= a=Bearer  'api_key==X-API-KEY=x'a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b',",  # noqa: E501 — a reproduction, byte for byte
+    '{"h": "err: },.$\':export GH_TOKEN= \\\\\\"`Bearer \\t\\\\\\"A_TOKEN=,\'$\'Fab1catedQ7ZkW9xDiffVq3Lm8Rt\'\\nnext", "n": 1}',  # noqa: E501 — a reproduction, byte for byte
+    '`x\tBearer ,)>(a)Bearer \'\\\\""(a)Bearer \x00x"q"bearer =,Fab1catedQ7ZkW9xDiffVq3Lm8Rt\x00\n\'<a value the box redacted>\'',  # noqa: E501 — a reproduction, byte for byte
+    '{"h": "api_key=\\\\\\"SECRET_KEY_BASE= Bearer \\\\A_TOKEN=,\\\\\\"\\\\\\\\\\"Fab1catedQ7ZkW9xDiffVq3Lm8Rt\\\\\\\\\\"\\"}", "n": 1}',  # noqa: E501 — a reproduction, byte for byte
+    "x-api-key: api_key=\\\"SECRET_KEY_BASE= (a)\t'export GH_TOKEN=\\\"\tapi_key=\\\".X-API-KEY=='a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b' | other",  # noqa: E501 — a reproduction, byte for byte
+    "A_TOKEN= \t\tBearer abcA_TOKEN=,q(eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt'<a value the box redacted>' 'q'api_key='\\Bearer api_key=cost=0.1\tBearer ",  # noqa: E501 — a reproduction, byte for byte
+    "PASSWORD=\rKBearer :PASSWORD=,eyJFab1catedQ7ZkW9xDiffVq3Lm8Rt.e30.sig'<a value the box redacted>'\"\"\\Bearer ,\r'<a redacted value>' \u2028\\\\SECRET_KEY_BASE='<a value the box redacted>' ",  # noqa: E501 — a reproduction, byte for byte
+    # #561: what #562's block took that the first cut of the next one left (its gap parity
+    # output read by the gap run, and the reread by the gap pieces).
+    'A_TOKEN=\\"KBearer MY_API_KEY=\nx_token="\nx\t:.;\\Bearer .:"a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b"\'<a redacted value>\' ',  # noqa: E501 — a reproduction, byte for byte
+    "\\'PASSWORD=\\\"a b\\\"bearer Secret0001$(\tBearer \rBearer =='a Fab1catedQ7ZkW9xDiffVq3Lm8Rt b'=\\'<a redacted value>' }\x00(a)Bearer ",  # noqa: E501 — a reproduction, byte for byte
 ]
 assert all(leaks(line) for line in REPRODUCTIONS)
 

@@ -67,6 +67,80 @@ tests:
             source: |
               assert_eq!(.message, "[basecradle-router] failed: risk-model-pipeline_apiKey=[REDACTED] rejected")
 
+  - name: "a bearer token after an escape or a nul is redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#561: the gap after a scheme word is whitespace or control characters,
+          # so an escape or a NUL between the scheme word and its token never leaves the token.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "Authorization: Bearer\u{1b}eyJfabricatedBearer0004 next=1 | Authorization: Bearer\u{0}eyJfabricatedBearer0005 next=2"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] Authorization: Bearer [REDACTED] next=1 | Authorization: Bearer [REDACTED] next=2")
+
+  - name: "a credential-named json member after an escape or a nul around its colon is redacted"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#561: the member's colon reads the same gap on either side of it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "{\"password\":\u{1b}\"fabricatedMember0005\",\"n\":1} {\"client_secret\"\u{0}:\u{0}\"fabricatedMember0006\",\"n\":2}"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] {\"password\":\u{1b}\"'<a value the box redacted>'\",\"n\":1} {\"client_secret\"\u{0}:\u{0}\"'<a value the box redacted>'\",\"n\":2}")
+
+  - name: "a header and an assignment read the gap in each of their bearer readings"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#561: the x-api-key label's separator and every scheme word a header or
+          # an `api_key=` value reads through (alone, glued, and the glued token) read the same gap.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "x-api-key:\u{0}\"fabricatedXKey0001\" n=1 | x-api-key: Bearer\u{1b}eyJfabricatedXKey0002 n=2 | api_key=Bearer\u{0}eyJfabricatedApiKey0003 n=3 | api_key=KBearer\u{1b}eyJfabricatedApiKey0004 n=4"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert!(!contains(string!(.message), "fabricated"), .message)
+
+  - name: "an escaped credential-named json member reads the gap around its colon"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # basecradle-router#561: the member inside a JSON string, and at any depth, alike.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "{\"body\":\"{\\\"password\\\":\u{1b}\\\"fabricatedEscaped0005\\\"}\"} {\"b\":\"\\\\\\\"client_secret\\\\\\\"\u{0}:\\\\\\\"fabricatedDeeper0006\\\\\\\"\"}"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert!(!contains(string!(.message), "fabricated"), .message)
+
+  - name: "a credential value inside an api_key value reads on through what is glued after it"
+    inputs:
+      - insert_at: "ai_scrub"
+        type: "vrl"
+        source: |
+          # The NOC's differential on basecradle-router#561, minimized by the capital: the `api_key=`
+          # gap reading (#562) starts the merged span before the credential value, and a merged span
+          # holding a credential value still reads on at its end, whichever rule's span starts it.
+          . = {"SYSLOG_IDENTIFIER": "basecradle-router", "_UID": "999", "message": "api_key= PASSWORD=\\\"a b\\\"bearer -${eyJfuzzSecretTokenQ7Zk9W`"}
+    outputs:
+      - extract_from: "ai_scrub"
+        conditions:
+          - type: "vrl"
+            source: |
+              assert_eq!(.message, "[basecradle-router] apiKey=[REDACTED]")
+
   - name: "a bearer glued to a github-token run redacts its credential"
     inputs:
       - insert_at: "ai_scrub"

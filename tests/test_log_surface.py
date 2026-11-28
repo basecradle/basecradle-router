@@ -354,8 +354,12 @@ def test_every_rule_of_the_block_runs_for_every_writer() -> None:
         )
     ]
     # Every rule but the run over the parity pass's output, which reads `scrub_parity`; the
-    # credential-named JSON member's is the eleventh (#516's last round).
-    assert len(starts) == 11, len(starts)
+    # credential-named JSON member's is the eleventh (#516's last round), and the eight gap readings
+    # beside them (#561): the credential rule's run and its wide run, `x-api-key`, two of
+    # `api_key=`, the bearer header's two readings and the member, the member's gap reading last.
+    # (Neither parity pass is counted: each writes an output of its own, `scrub_parity` and
+    # `scrub_parity_gap`, so neither opens its line with `replace_with`.)
+    assert len(starts) == 19, len(starts)
     assert "(?P<member_0>" in source[starts[-1].start() : source.index("\n", starts[-1].start())]
     credential = source.index('if contains(scrub_text, "=") {')
     end = source.index("\n" + " " * indent + "}\n", credential)
@@ -532,6 +536,11 @@ def test_the_bearer_header_is_the_fleets_minimum_and_every_token_as_a_middle_wor
     assert middle == f"(?:(?:{pieces})*)"
     # The token opens with what a middle word may open with, so a word read as either is one word.
     assert bearer_rule.TOKEN.startswith(f"(?:{bearer_rule.OPENED}")
+    # The gap reading (#561) is the same header with the gap after each scheme word, wider than
+    # the minimum's whitespace: every whitespace character and every control character.
+    gap_scheme = f"(?i:bearer){credential_rule.GAP}+"
+    assert bearer_rule.HEADER.replace(bearer_rule.SCHEME, gap_scheme) == bearer_rule.HEADER_GAP
+    assert bearer_rule.HEADER.count(bearer_rule.SCHEME) == 2
 
 
 def test_every_hosts_credential_rule_is_the_documented_construction() -> None:
@@ -590,17 +599,24 @@ def test_a_scheme_word_a_tab_glues_to_a_value_is_reached_after_closed_pieces() -
     # word and open a quote that eats a line's fields.
     reached = credential_rule.REACHED_SCHEMES
     closed = credential_rule.CLOSED_PIECE
-    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}{credential_rule.GAP}+)"
+    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}[\x20\t]+)"
     chain = credential_rule.SCHEME_CHAIN
     assert chain == f"(?:{reached}{credential_rule.INNER_NAMES})"
     assert f"| {chain}+{credential_rule.OPEN_PIECE}+\n" in credential_rule.BLOCK
     inner = credential_rule.INNER_NAMES
     # A credential name the value holds outside every quote goes on into its value (#504's
     # review): only closed pieces stand before it, so a name inside a quote is the quote's text.
-    # Its value reads past a gap only after plain pieces (#561), the reading tried first.
+    assert inner == f"(?:{closed}*?{credential_rule.NAME}=)*"
+    # The gap reading (#561): each scheme word's blanks are the gap, and an inner name's value reads
+    # past a gap only after plain pieces, the reading tried first.
     plain = credential_rule.PLAIN_PIECE
     gap = credential_rule.GAP
-    assert inner == f"(?:{plain}*?{credential_rule.NAME}={gap}+|{closed}*?{credential_rule.NAME}=)*"
+    assert reached.replace(r"[\x20\t]+", f"{gap}+") == credential_rule.REACHED_SCHEMES_GAP
+    assert credential_rule.SCHEMES.replace(r"[\x20\t]+", f"{gap}+") == credential_rule.SCHEMES_GAP
+    assert (
+        f"(?:{plain}*?{credential_rule.NAME}={gap}+|{closed}*?{credential_rule.NAME}=)*"
+        == credential_rule.INNER_NAMES_GAP
+    )
     # A plain piece is a closed one the run's open pieces read the same way: no bare `$` or `(`
     # (an open substitution), no escaped `"` (an open JSON-escaped quote).
     escape, *quoted, bare = credential_rule.CLOSED_PIECES
@@ -660,7 +676,8 @@ def test_both_markers_are_kept_and_neither_is_a_canary_match(canary: re.Pattern[
     assert f'if {keep}element) {{ element }} else {{ "{BOX_REDACTED_VALUE}" }}' in source
     assert f"}} else if !{keep}value) {{" in source
     assert f'. = set!(., [field], "{BOX_REDACTED_VALUE}")' in source
-    assert credential_rule.BLOCK.count(f'"{BOX_REDACTED_VALUE}"') == 6
+    # Six for the first reading, and two for the gap reading's two passes after it (#561).
+    assert credential_rule.BLOCK.count(f'"{BOX_REDACTED_VALUE}"') == 8
     assert credential_rule.BLOCK.count(f'"{REDACTED_VALUE}"') == 2
     # The fleet's scrub writes the same marker, and its assignment rules keep both.
     assert scrub_block.MARKS["c"] == BOX_REDACTED_VALUE
