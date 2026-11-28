@@ -2663,12 +2663,14 @@ The box is the one place every writer passes, so `ai_scrub` carries the rule too
   `api[-_]?key=`, the bearer header's two readings and the JSON member, with the readings of the
   block that first read the gap, #562, so the message takes what either block before took). In
   every other field the credential rule's gap reading runs after the first, on what the first
-  left, and only writes a marker over it: that field takes at least what the block before #562
-  took there, but a value the first reading cut short before an inner name's gap keeps the first
-  reading's marker, where #562 read on past it (named on #561, closed by reading every field by the
-  message's union). The first reading in every other field is the one before #562 with two
-  changes: no marker before a record break, and none over a value of gap characters alone, both
-  left to the gap reading.
+  left, and only writes a marker over it, so that field takes at least what the first reading did.
+  The first reading in every other field is the one before #562 with three changes, each leaving a
+  value to the gap reading: no marker before a record break; none over a value of gap characters
+  alone; and none over a value the gap reading reaches farther from the same `=` (a value the first
+  reading cuts short before an inner name's gap, `A_TOKEN=aB_TOKEN= value`), unless the gap
+  reading ends at a name's `=` whose value it has not read, since the pass after would take that
+  name and leave its value. The print site's first reading leaves a value to its gap reading by
+  the same rule (`logfmt.redact_credentials`).
   An empty value (nothing but a gap to the record's end) is left as it is, except right before a
   record break: the canary's run crosses a break, so the marker stands between the `=` and the
   break, and nothing is taken.
