@@ -345,10 +345,38 @@ _AGREED = "\n".join(
         # the value's; and a scheme word's token is a word on its own record (the review of #502).
         "R_TOKEN=a\\\tBearer eyJabc next=1 | S_TOKEN=Bearer ,next=1 | T_TOKEN=Bearer \\\t}x",
         "U_TOKEN=(a)\tBearer eyJabc next=1 | V_TOKEN=f(x)\tKBearer eyJabc next=2",
+        # A gap before a value is the value's (#561): blanks, controls and line breaks after a
+        # name's `=`; a marker after one is the whole value. After an inner name's `=` and after a
+        # scheme word, the fallback reads as before #561 and ships the value past the gap
+        # (`J_TOKEN=Bearer<LF>eyJabc`, `L_TOKEN= secretsecret`): its named limit, where the
+        # translator reads farther (`test_the_translator_reads_farther_than_the_fallback`).
+        "A_TOKEN= secretsecret1 | B_TOKEN=  secretsecret2 | C_TOKEN=\t secretsecret3",
+        "D_TOKEN=\xa0secretsecret4 | E_TOKEN=\x1bsecretsecret5 | F_TOKEN=\x00secretsecret6",
+        "G_TOKEN=\nsecretsecret7 next=1 | H_TOKEN=\r\nsecretsecret8 next=2",
+        "I_TOKEN=\n  secretsecret9 next=1 | J_TOKEN=Bearer\neyJabc next=2",
+        "K_TOKEN=x,L_TOKEN= secretsecret next=1 | M_TOKEN= '<a redacted value>' twice",
+        "N_TOKEN= ,x next=1 | O_TOKEN=\t\u2028\tsecretsecret next=2 | P_TOKEN=Bearer \x00eyJ x",
         "",
         "The rest of the reply.",
     ]
 )
+
+
+def fallback_quoted(reply: str) -> list[str]:
+    """What the fallback writes, by its stated reading (#561, `tests/fallback_rule.py`): the
+    translator's two readings, the first leaving to the gap reading only a value of gap characters
+    alone, where the translator's also leaves it every value the gap reading reaches farther."""
+    from basecradle_router import claude_stream, logfmt
+
+    def reading(text: str) -> str:
+        return logfmt._redacted(logfmt._redacted(text, gap=False, farther=False), gap=True)
+
+    translator_reading = claude_stream.redact_credentials
+    claude_stream.redact_credentials = reading
+    try:
+        return claude_stream.quoted(reply)
+    finally:
+        claude_stream.redact_credentials = translator_reading
 
 
 def _fallback(tmp_path: Path, reply: str) -> list[str]:
@@ -361,10 +389,9 @@ def _fallback(tmp_path: Path, reply: str) -> list[str]:
 
 @needs_jq
 def test_the_fallback_redacts_by_the_translators_rule(tmp_path: Path, canary) -> None:
-    from basecradle_router.claude_stream import quoted
 
     out = _fallback(tmp_path, _AGREED)
-    assert out == quoted(_AGREED)
+    assert out == fallback_quoted(_AGREED)
     assert not any(_FAKE_TOKEN in line or canary.search(line) for line in out)
     assert "> Done. I ran GH_TOKEN='<a redacted value>' || exit 1; export GH_TOKEN" in out
 
@@ -410,14 +437,53 @@ _SCHEME_PIECES = [
 @needs_jq
 def test_the_fallback_reads_scheme_words_as_the_translator_does(tmp_path: Path) -> None:
     # Seeded fuzz, 600 lines: on every run of scheme words the two spellings agree (#497).
-    from basecradle_router.claude_stream import quoted
 
     rng = random.Random(497)
     reply = "\n".join(
         "".join(rng.choice(_SCHEME_PIECES) for _ in range(rng.randint(1, 16))) + " end"
         for _ in range(600)
     )
-    assert _fallback(tmp_path, reply) == quoted(reply)
+    assert _fallback(tmp_path, reply) == fallback_quoted(reply)
+
+
+#: The pieces of a fuzzed reply around a gap before a value (#561): names, every kind of gap, a
+#: marker, a scheme word and the words a value is read from.
+_GAP_PIECES = [
+    "A_TOKEN=", "DB_PASSWORD=", "x,", " ", "  ", "\t", "\t ", "\xa0", "\x1b", "\x00", "\n",
+    "\r\n", "\n  ", "\r", "\u2028", "Bearer", "Bearer ", "abc", "y" * 9,
+    ",", "}", "'q'", "x\t", "=",
+]  # fmt: skip
+
+
+@needs_jq
+@pytest.mark.parametrize("seed", [561, 562])
+def test_the_fallback_reads_a_gap_before_a_value_as_the_translator_does(seed: int) -> None:
+    # Seeded fuzz, 2,000 replies of up to 20 pieces, read by the shipped program in one jq run:
+    # wherever a gap stands before a value, the two spellings agree, a value that is a gap alone to
+    # the reply's end included.
+    import fallback_rule
+
+    rng = random.Random(seed)
+    replies = [
+        "".join(rng.choice(_GAP_PIECES) for _ in range(rng.randint(1, 20))) for _ in range(2_000)
+    ]
+    jq = shutil.which("jq")
+    assert jq
+    out = subprocess.run(
+        [jq, "-R", "-r", fallback_rule.PROGRAM_JQ],
+        input="".join(json.dumps({"type": "result", "result": r}) + "\n" for r in replies),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split("\n")[:-1]
+    expected = [line for reply in replies for line in fallback_quoted(reply)]
+    if out != expected:
+        at = 0
+        for reply in replies:
+            lines = fallback_quoted(reply)
+            assert out[at : at + len(lines)] == lines, repr(reply)
+            at += len(lines)
+    assert out == expected
 
 
 @needs_jq
@@ -434,7 +500,10 @@ def test_the_fallback_reads_scheme_words_as_the_translator_does(tmp_path: Path) 
         ("'q'\t", " x"),
         ("`a`\t", " x"),
         ("x\tBearer ", ""),
-        ("\t", " x"),
+        # A gap before a value, tabs and then the blank before `x` (#561): `x` is the value's.
+        ("\t", ""),
+        # After an inner name's gap the fallback writes its first reading's marker, as before #561
+        # (`tests/fallback_rule.py`): the translator reads on to `x`.
         ("\tA_TOKEN=", " x"),
         # Credential names inside a value (#504's review): each one item, read once.
         ("x,A_TOKEN=", " x"),
@@ -452,9 +521,8 @@ def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
     out = _fallback(tmp_path, reply)
     assert time.monotonic() - started < 15.0
     assert out == ["> A_TOKEN='<a redacted value>'" + left]
-    from basecradle_router.claude_stream import quoted
 
-    assert out == quoted(reply)
+    assert out == fallback_quoted(reply)
 
 
 @needs_jq
@@ -470,13 +538,12 @@ def test_the_fallback_reads_a_long_run_of_scheme_words_in_linear_time(
 def test_the_fallback_reads_many_assignments_in_seconds(tmp_path: Path, assignment: str) -> None:
     # `gsub` cost the text's length for each assignment: 4,000 took over a second, 40,000 minutes
     # (#505). The redaction reads 256 a search, and `stream` times out at 60 s.
-    from basecradle_router.claude_stream import quoted
 
     reply = assignment * 40_000
     started = time.monotonic()
     out = _fallback(tmp_path, reply)
     assert time.monotonic() - started < 15.0
-    assert out == quoted(reply)
+    assert out == fallback_quoted(reply)
 
 
 @needs_jq
@@ -485,7 +552,6 @@ def test_sparse_assignments_cost_neither_time_nor_memory(tmp_path: Path) -> None
     # further apart than its gap, and a loop holding a copy of the text for each search held 1.45 GB
     # of this, `gsub` 41 MB (#505's review). The peak is jq's own, read in a process of its own.
     import fallback_rule
-    from basecradle_router.claude_stream import quoted
 
     reply = ("A_TOKEN=x " + "y" * 290 + " ") * 3_000
     forged = tmp_path / "sparse.jsonl"
@@ -509,7 +575,7 @@ def test_sparse_assignments_cost_neither_time_nor_memory(tmp_path: Path) -> None
     assert time.monotonic() - started < 15.0
     peak, _, out = done.stdout.partition("\n")
     assert int(peak) < 256 * 1024 * 1024
-    assert out.splitlines() == quoted(reply)
+    assert out.splitlines() == fallback_quoted(reply)
 
 
 @needs_jq
@@ -517,10 +583,9 @@ def test_a_search_that_exhausts_the_retry_limit_is_made_again_for_fewer(tmp_path
     # Short assignments let a search read 256, and the long ones after them take it past its retry
     # limit, which a quarter as many are not. Their values are escapes, a piece that costs retries:
     # a plain character costs none (#509).
-    from basecradle_router.claude_stream import quoted
 
     reply = "A_TOKEN=x " * 1_000 + ("A_TOKEN=" + "\\x" * 5_000 + " ") * 100
-    assert _fallback(tmp_path, reply) == quoted(reply)
+    assert _fallback(tmp_path, reply) == fallback_quoted(reply)
 
 
 @needs_jq
@@ -529,7 +594,7 @@ def test_a_search_that_exhausts_the_retry_limit_is_made_again_for_fewer(tmp_path
     [
         ("x", 3_000_000),  # a plain character, the first piece tried: no retry at all
         ("\\x", 350_000),  # an escape, the piece tried last
-        ("\t", 3_000_000),  # tabs, read possessively
+        ("\t", 3_000_000),  # tabs, read possessively: a gap before `after`, which is the value's
         ("SE=", 130_000),  # the costliest: under the some 430,000 the program's comment states
     ],
 )
@@ -539,11 +604,11 @@ def test_one_value_of_millions_of_characters_stays_under_the_retry_limit(
     # Each piece tried before a value's own costs a retry when it fails, and the engine allows
     # 10,000,000 in one search: one value of some 600,000 plain characters exhausted them, jq
     # failed, and the reply was lost (#509).
-    from basecradle_router.claude_stream import quoted
 
     reply = "A_TOKEN=" + piece * count + " after"
     out = _fallback(tmp_path, reply)
-    assert out == quoted(reply) == ["> A_TOKEN='<a redacted value>' after"]
+    left = "" if piece == "\t" else " after"  # a gap before a value is the value's (#561)
+    assert out == fallback_quoted(reply) == ["> A_TOKEN='<a redacted value>'" + left]
 
 
 #: Every piece the fuzz below writes a reply from: the scheme words' pieces, and every opener,
@@ -622,7 +687,7 @@ def test_the_fallback_names_a_credential_by_the_translators_spelling() -> None:
     # Every piece the value reads is the translator's (#497, #502, #504's review), one spelling.
     program = fallback_rule.PROGRAM_JQ
     assert f"{fallback_rule.CLOSED_PIECE}*+(?:{fallback_rule.A_NAMES_EQ}" in fallback_rule.ITEM
-    assert f"(?<={SCHEME_WORD})[ \\t]+" in program
+    assert f"(?<={SCHEME_WORD}){fallback_rule.VALUE_GAP}++" in program
     assert fallback_rule.run_char("\t" + LEAD_OPENERS + "=") in fallback_rule.LEAD
     assert all(f"(?<={s})" in program and f"(?<!{s})" in program for s in fallback_rule.SPELLINGS)
 
@@ -659,3 +724,14 @@ def test_the_translator_runs_without_the_agents_loader_names_and_claude_keeps_th
     assert done.returncode == 0, done.stderr
     assert (tmp_path / "claude.env").read_text() == "LD_PROOF_MARK LD_PROOF_SECOND"
     assert (tmp_path / "dump.py.env").read_text() == ""
+
+
+def test_the_translator_reads_farther_than_the_fallback() -> None:
+    # The fallback's named limit (#561, `tests/fallback_rule.py`): after an inner name's gap and a
+    # scheme word's, the translator takes the value past the gap, and the fallback, which writes the
+    # reply only when the translator has died, does not.
+    from basecradle_router.claude_stream import quoted
+
+    for text in ("J_TOKEN=Bearer\nfabricatedToken01", "K_TOKEN=x,L_TOKEN= fabricatedToken02"):
+        assert not any("fabricatedToken" in line for line in quoted(text)), text
+        assert any("fabricatedToken" in line for line in fallback_quoted(text)), text

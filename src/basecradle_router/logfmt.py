@@ -119,20 +119,25 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # it. "Names a credential" is the NOC's log-store canary's definition, its `credential_assignment`
 # rule (basecradle-noc `observability/log-canary.json`), never a list of this repository's own:
 #
-#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}
+#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[ ]*[^ ",}]{8,}
 #
 # (widened by @origin on 2026-11-17, basecradle-noc#1547: a bare word is a name, and `_BASE` is the
-# one tail after the word, basecradle-router#504).
+# one tail after the word, basecradle-router#504; and by the NOC on 2026-11-28, basecradle-noc#1849:
+# a run of spaces may stand between the `=` and the value, basecradle-router#561).
 #
 # `tests/conftest.py` holds that pattern byte for byte, and the tests hold the pieces below to
-# it: the words, the value's stop characters and its floor must spell it exactly, and the canary's
-# own pattern is the oracle every redacted line is checked against.
+# it: the words, the blanks it reads past, the value's stop characters and its floor must spell it
+# exactly, and the canary's own pattern is the oracle every redacted line is checked against.
 
 #: The words that make a name a credential's, in the canary's order.
 CREDENTIAL_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSPHRASE")
 
+#: The canary reads past a run of these after the ``=`` (#561): the redaction reads past every gap
+#: (:data:`VALUE_GAP_RANGES`), which holds it.
+CANARY_BLANKS = "[ ]*"
+
 #: The canary reads a value as a run of anything but these, at least :data:`CANARY_VALUE_FLOOR`
-#: characters long, from the character after the ``=``.
+#: characters long, from the character after the ``=`` and its blanks.
 CANARY_VALUE_STOPS = ' ",}'
 CANARY_VALUE_FLOOR = 8
 
@@ -194,6 +199,13 @@ def value_gap_class(spell: Callable[[int], str]) -> str:
         + "".join(spell(a) + ("-" + spell(b) if b > a else "") for a, b in VALUE_GAP_RANGES)
         + "]"
     )
+
+
+#: The gap, as Python's ``re`` reads it.
+_GAP_CLASS = value_gap_class(lambda point: re.escape(chr(point)))
+_VALUE_GAP = re.compile(_GAP_CLASS + "*")
+_GAP_CHAR = re.compile(_GAP_CLASS)
+_GAP_ONLY = re.compile(_GAP_CLASS + "+")
 
 
 #: The canary's value run, where it ends in every record the text can be written into: at one of
@@ -307,8 +319,10 @@ SCHEME_WORD = f"(?i:{_SCHEME_LETTERS})"
 _SCHEME_WORD = re.compile(SCHEME_WORD)
 _SCHEME_WORD_LENGTH = len(_SCHEME_LETTERS)
 
-#: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
+#: What stands between a scheme word and its token: blanks, never a newline, in the first reading;
+#: the gap (:data:`VALUE_GAP_RANGES`, #561) in the gap reading, as the box reads it.
 _SCHEME_BLANKS = re.compile("[ \t]+")
+_SCHEME_GAP = re.compile(_GAP_CLASS + "+")
 
 #: The characters, beyond a blank, a canary stop and a record break, that a word may not hold
 #: unquoted before the tab ahead of a bearer scheme word (#502): a quote's opener, a backslash's
@@ -369,24 +383,38 @@ def _reached(text: str, at: int) -> bool:
     return at < len(text) and text[at] not in _UNREACHED
 
 
-def _token_after_a_scheme_word(text: str, floor: int, end: int) -> int | None:
+def _token_after_a_scheme_word(text: str, floor: int, end: int, gap: bool = False) -> int | None:
     """Where the token starts, when what was read from ``floor`` ends at ``end`` in a bearer scheme
     word (:data:`_SCHEME_WORD`), with a word on its record after its blanks; else ``None``. A value
     never ends between a scheme word and its token, whatever the scheme word is glued to: a word
     the shell reads (``x"q"bearer``), or one a tab glues to the value (``(a)<TAB>Bearer``, the
-    canary's run taking the scheme word, the review of #502)."""
-    if end - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
-        text, end - _SCHEME_WORD_LENGTH, end
+    canary's run taking the scheme word, the review of #502). In the gap reading (``gap``, #561) the
+    scheme word stands before any gap characters its word ends in (a carriage return or a NUL is no
+    shell blank, so ``Bearer<CR>`` is one word): they are its gap's, and so is every blank or break
+    after them."""
+    stem = end
+    while gap and stem > floor and _GAP_CHAR.fullmatch(text, stem - 1, stem):
+        stem -= 1
+    if stem - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
+        text, stem - _SCHEME_WORD_LENGTH, stem
     ):
         return None
-    if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
+    blanks = (_SCHEME_GAP if gap else _SCHEME_BLANKS).match(text, stem)
+    if blanks is None or not _reached(text, blanks.end()):
         return None
     return blanks.end()
 
 
-def _value_end(text: str, start: int) -> int:
+def _value_end(text: str, start: int, gap: bool = False, past: int | None = None) -> int:
     """Where a credential's value from ``start`` ends: past every word the value reaches, each read
     whole as a shell word, and past the canary's run.
+
+    In the gap reading (``gap``, #561) the value reaches its first word past the gap it opens with
+    (:data:`VALUE_GAP_RANGES`), after the name's ``=`` and after an inner name's alike, so a line
+    break or a blank between a name's ``=`` and its value never leaves the value; and a scheme word
+    reaches its token across a gap (:func:`_token_after_a_scheme_word`). A value that is nothing but
+    a gap to the text's end is the canary's run alone. With ``past``, the walk stops as soon as the
+    value reaches past it: all :func:`_reaches_farther` asks.
 
     A value reaches its first word, after any tabs it opens with, unless it opens with a marker
     where the canary's run would end after it, which is the whole value. From a word it reaches:
@@ -411,21 +439,34 @@ def _value_end(text: str, start: int) -> int:
     end = run_end
     at = start
     while True:  # a value from `at`
+        if past is not None and end > past:
+            return end
+        if gap:
+            at = _VALUE_GAP.match(text, at).end()  # the gap before it is the value's (#561)
+            if not _reached(text, at):
+                # Nothing but a gap, or a gap before a `,`, a `}` or the text's end, as after a
+                # scheme word's gap: the canary's run is the whole value.
+                return end
+            if at >= run_end:  # the canary's run from where the value starts, past its gap
+                run_end = _CANARY_RUN.match(text, at).end()
+                end = max(end, run_end)
         floor = at
         if text.startswith(REDACTED_VALUE, at):
             after = at + len(REDACTED_VALUE)
             if after == len(text) or text[after] in _MARKER_ENDS:
                 return max(end, after)
-        if (tabs := _TABS.match(text, at).end()) > at:
+        if not gap and (tabs := _TABS.match(text, at).end()) > at:
             if not _reached(text, tabs):
                 return end  # nothing after the tabs is the value's: a blank, a stop or a break
             at = tabs
         while True:  # the words it reaches
+            if past is not None and end > past:
+                return end
             word_end, at_a_name = _shell_word_end(text, at)
             end = max(end, word_end)
             if at_a_name:
                 break  # a credential name's `=`: its value is read as one from here
-            if (token := _token_after_a_scheme_word(text, at, word_end)) is not None:
+            if (token := _token_after_a_scheme_word(text, at, word_end, gap)) is not None:
                 at = token  # a word after the blanks, on the same record
                 if at >= run_end:
                     run_end = _CANARY_RUN.match(text, at).end()
@@ -435,7 +476,7 @@ def _value_end(text: str, start: int) -> int:
             if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
                 # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
                 # unless it ends just after a scheme word.
-                if (token := _token_after_a_scheme_word(text, floor, end)) is None:
+                if (token := _token_after_a_scheme_word(text, floor, end, gap)) is None:
                     return end
                 at = floor = token
                 if at >= run_end:
@@ -458,25 +499,78 @@ def redact_credentials(text: str) -> str:
     record the text is written into, a prose line that keeps a tab included. It reaches across a tab
     after a lead word (#502), past a bearer scheme word to its token (#497: any word ending in one,
     #510), and into the value of a credential name standing in it outside a quote (#504's review).
-    An empty value (a space, a record break or the text's end follows the ``=``) has nothing to
-    hide and is left as it is.
+    A gap of whitespace or control characters before a value, line breaks included, is the value's
+    and is taken with it, so the marker stands directly after the name (#561): read by a second
+    reading after the first, on what the first left. A word of prose after ``NAME= `` is the
+    accepted cost. An empty value (nothing but spaces and record breaks before the text's end, a
+    ``,`` or a ``}``) has nothing to hide and is left as it is; a run the canary would read there
+    (a tab, an escape) is still redacted.
     Linear in ``text``, and idempotent: a marker where the canary's run would end after it is a
     whole value, so a value redacted where it is bounded and again where it is rendered stays one
     marker.
     """
     if "=" not in text:
         return text
+    # Two readings, the gap reading after the first and on what it left (#561), never in its place:
+    # read in place, a value past a gap held a later name its reading took as text (inside a quote),
+    # and that name's own value shipped. The gap reading only writes a marker over what the first
+    # left, so the redaction never takes less than the first reading did alone, but for a value of
+    # gap characters alone the first leaves to it and it reads as empty (`B_KEY=<NUL><TAB>}`),
+    # which holds nothing to hide. The first leaves to
+    # it every value of gap characters alone, and every value the gap reading reaches farther from
+    # the same `=` (a marker there would be one the gap reading keeps), going on past that value as
+    # it always did.
+    return _redacted(_redacted(text, gap=False), gap=True)
+
+
+def _redacted(text: str, *, gap: bool, farther: bool = True) -> str:
+    """``text`` with each credential-named assignment's value, by one reading, made a marker. The
+    first reading (not ``gap``) leaves a value of gap characters alone to the gap reading, and with
+    ``farther`` every value that reading reaches farther. ``farther`` is off only in the tests'
+    model of ``wake-runner``'s ``jq`` fallback (``tests/fallback_rule.py``), which cannot read
+    farther within jq 1.7's cost: there a value past a scheme word's or an inner name's gap ships,
+    as before #561."""
     out: list[str] = []
     pos = 0
     while (match := _CREDENTIAL_NAME.search(text, pos)) is not None:
         start = match.end()
-        end = _value_end(text, start)
+        end = _value_end(text, start, gap)
         out.append(text[pos:start])
-        if end > start:
+        if end > start and (
+            gap
+            or not (
+                _GAP_ONLY.fullmatch(text, start, end)
+                or (farther and _reaches_farther(text, start, end))
+            )
+        ):
             out.append(REDACTED_VALUE)
+        else:
+            out.append(text[start:end])  # left to the gap reading, which reads it farther
         pos = end
     out.append(text[pos:])
     return "".join(out)
+
+
+#: How far past a value the gap reading is read to say whether it reaches farther (#561): a reading
+#: that reaches the window's end is farther. Bounded, so the first reading stays linear however
+#: far a quote left open would carry the gap reading; the box reads its own by the same window
+#: (``tests/credential_rule.py`` ``FARTHER_WINDOW``).
+FARTHER_WINDOW = 4096
+
+
+def _reaches_farther(text: str, start: int, end: int) -> bool:
+    """Whether the gap reading of the value from ``start`` reaches past ``end``, the first reading's
+    end, read within :data:`FARTHER_WINDOW` characters past it and no farther than it must. Only a
+    first reading that ends at a gap character can be read farther: the gap reading reads past a gap
+    only at a value's start, after an inner name's ``=`` and after a scheme word, and the first
+    reading ends at each of those right before the gap."""
+    if end >= len(text) or not _GAP_CHAR.match(text, end):
+        return False
+    # The window starts past the gap at the first reading's end, however long it runs, so a gap
+    # longer than the window never hides the value after it.
+    gap_end = _VALUE_GAP.match(text, end).end()
+    window = text[start : gap_end + FARTHER_WINDOW]
+    return _value_end(window, 0, gap=True, past=end - start) > end - start
 
 
 def _render_value(value: object) -> str:
@@ -555,7 +649,7 @@ def bounded(value: object, limit: int = BOUND) -> str:
         head = _TRAILING_CREDENTIAL_RUN.sub("", head)
     head = head.strip()
     while (name := _last_name(text, len(head))) is not None:
-        if _value_end(text, name.end()) < len(head):
+        if _value_end(text, name.end(), gap=True) < len(head):
             break  # the last assignment before the cut ends before it: nothing reaches the cut
         head = _TRAILING_CREDENTIAL_RUN.sub("", text[: name.start()]).strip()
     return f"{head}…" if head else ""

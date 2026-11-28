@@ -35,13 +35,17 @@ NOC_HEAD_POSITION = (
 )
 
 #: The NOC's log-store canary rule `credential_assignment`, byte for byte as basecradle-noc spells
-#: it (`observability/log-canary.json`, read at 4ca50868bd219493c0290b62d89f267915c8d70f,
-#: committed 2026-11-18 04:31Z; `docs/observability.md` §10), as @origin widened it on 2026-11-17
+#: it (`observability/log-canary.json`, read at d15ab9cc1996e62562c6ecc57877a18ee5f8e02a,
+#: committed 2026-11-28 04:03Z; `docs/observability.md` §10), as @origin widened it on 2026-11-17
 #: (basecradle-noc#1547, basecradle-router#504): a bare word is a name, and `_BASE` is the one tail
-#: after the word. The router's redaction (`logfmt.redact_credentials`, #491) takes its
-#: definition of a credential's name from these bytes, and every redaction test uses this pattern as
-#: its oracle. Moving it is a change to the NOC's rule: move it here with it.
-NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}'
+#: after the word; and as the NOC widened it on 2026-11-28 (basecradle-noc#1849, live 04:16Z,
+#: basecradle-router#561): a run of spaces may stand between the `=` and the value, so a writer that
+#: still writes `NAME= value` matches it. The router's redaction (`logfmt.redact_credentials`, #491)
+#: takes its definition of a credential's name from these bytes, and every redaction test uses this
+#: pattern as its oracle. Moving it is a change to the NOC's rule: move it here with it.
+NOC_CREDENTIAL_ASSIGNMENT = (
+    r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[ ]*[^ ",}]{8,}'
+)
 
 #: The box's marker: what `ai_scrub` writes where a credential-named assignment's value stood
 #: (basecradle-router#494), and what the NOC counts per writer as a value a source let through

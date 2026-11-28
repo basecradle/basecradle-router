@@ -64,7 +64,8 @@ def silent(canary: re.Pattern[str], *lines: str) -> bool:
 
 def test_the_pieces_spell_the_canarys_rule_byte_for_byte() -> None:
     words, tail, stops = "|".join(CREDENTIAL_WORDS), CREDENTIAL_TAIL, CANARY_VALUE_STOPS
-    spelled = f"[A-Z0-9_]*({words})({tail})?=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
+    blanks = logfmt.CANARY_BLANKS
+    spelled = f"[A-Z0-9_]*({words})({tail})?={blanks}[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
     assert spelled == NOC_CREDENTIAL_ASSIGNMENT
 
 
@@ -200,10 +201,9 @@ def test_the_name_stays_and_the_value_goes_whole(text: str, redacted: str, canar
     assert silent(canary, redact_credentials(text))
 
 
-@pytest.mark.parametrize(
-    "text", ["GH_TOKEN=", "GH_TOKEN= next", "GH_TOKEN=\nnext", "no=credential"]
-)
+@pytest.mark.parametrize("text", ["GH_TOKEN=", "GH_TOKEN=  ", "GH_TOKEN= \n ", "no=credential"])
 def test_an_empty_value_has_nothing_to_hide_and_is_left_alone(text: str) -> None:
+    # Nothing but blanks and record breaks to the text's end: a gap before no value (#561).
     assert redact_credentials(text) == text
 
 
@@ -222,8 +222,9 @@ def test_a_record_break_is_defined_once() -> None:
 
 @pytest.mark.parametrize("brk", list(logfmt._BREAK_CHARS))
 def test_the_canarys_run_ends_at_every_record_break(brk: str) -> None:
-    # No record holds a run across a break, so the value read as the canary's run stops there.
-    assert redact_credentials(f"A_TOKEN=\t{brk}next") == f"A_TOKEN='<a redacted value>'{brk}next"
+    # No record holds a run across a break, so the value read as the canary's run stops there. (A
+    # break right after the `=` is a gap before the value, which goes with it: #561.)
+    assert redact_credentials(f"A_TOKEN=x\t{brk}next") == f"A_TOKEN='<a redacted value>'{brk}next"
 
 
 # --- a bearer value goes with its token (#497) ------------------------------------------------
@@ -264,7 +265,8 @@ FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
         # A scheme word with no word after it on its line is the value.
         ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),
-        ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>' \nnext=1"),
+        # A token across a gap, a line break in it included, is the scheme word's (#561).
+        ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>'"),
         # A marker after a scheme word is the token, already redacted: one marker stands.
         ("A_TOKEN=Bearer '<a redacted value>' next=1", "A_TOKEN='<a redacted value>' next=1"),
     ],
@@ -330,10 +332,9 @@ def test_a_scheme_word_a_tab_glues_to_a_value_goes_with_its_token(
     ("text", "redacted"),
     [
         ("A_TOKEN=x\t,next=1", "A_TOKEN='<a redacted value>',next=1"),
-        ("A_TOKEN=\t\rnext=1", "A_TOKEN='<a redacted value>'\rnext=1"),
+        ("A_TOKEN=x\t\rnext=1", "A_TOKEN='<a redacted value>'\rnext=1"),
         ("A_TOKEN=x\t\u2028next=1", "A_TOKEN='<a redacted value>'\u2028next=1"),
         # A scheme word's token is a word reached after its blanks the same way (#502's review).
-        ("A_TOKEN=Bearer \rImportant next", "A_TOKEN='<a redacted value>' \rImportant next"),
         ("A_TOKEN=Bearer ,next=1 b=2", "A_TOKEN='<a redacted value>' ,next=1 b=2"),
     ],
 )
@@ -374,10 +375,12 @@ def test_a_word_after_the_tabs_outside_the_canarys_run_is_not_the_values(
             "A_TOKEN='<a redacted value>' x",
         ),
         (f"A_TOKEN='q'B_TOKEN=x\tBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
-        # An inner name's empty value, or tabs alone, ends the value there.
-        ("A_TOKEN=x,B_TOKEN= next=1", "A_TOKEN='<a redacted value>' next=1"),
-        ("A_TOKEN=x,B_TOKEN=\t next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # An inner name's value past its gap goes with it (#561); a gap alone to the end is none.
+        ("A_TOKEN=x,B_TOKEN= next=1", "A_TOKEN='<a redacted value>'"),
+        ("A_TOKEN=x,B_TOKEN=\t next=1", "A_TOKEN='<a redacted value>'"),
+        # A gap before a `,` or a `}` ends the value, as after a scheme word's gap (#561).
         ("A_TOKEN=x,B_TOKEN=\t,next=1", "A_TOKEN='<a redacted value>',next=1"),
+        ("A_TOKEN=x,B_TOKEN=\n  ", "A_TOKEN='<a redacted value>'\n  "),
         # A name inside a quote is the quote's text, not an assignment: nothing past the quote goes.
         ("A_TOKEN='B_TOKEN=x' next=1 other=2", "A_TOKEN='<a redacted value>' next=1 other=2"),
         ('A_TOKEN="B_TOKEN=x" next=1', "A_TOKEN='<a redacted value>' next=1"),
@@ -450,6 +453,10 @@ def test_a_long_run_of_scheme_words_is_read_in_linear_time() -> None:
         redact_credentials("A_TOKEN=" + inner * 30_000 + "x")
     bounded("A_TOKEN=" + "Bearer " * 50_000 + "x")
     bounded("A_TOKEN=" + "x\t" * 50_000 + "x")
+    # A first reading the gap reading may read farther, before a quote left open (#561): the check
+    # is read no farther than it must, so the reply stays linear.
+    for piece in ('A_TOKEN=Bearer\n"', "A_TOKEN=Bearer\n`", "A_TOKEN=aB_TOKEN= x", "A_TOKEN=\t\n'"):
+        redact_credentials(piece * 20_000)
     assert time.monotonic() - started < 5.0
 
 
@@ -633,3 +640,66 @@ def test_the_gap_is_unicodes_whitespace_and_its_control_characters_exactly() -> 
     assert ranges == expected
     assert all(a <= b for a, b in VALUE_GAP_RANGES)
     assert sorted(VALUE_GAP_RANGES) == list(VALUE_GAP_RANGES)
+
+
+#: The issue's table (#561), and the capital's rows: what stands between the `=` and the value.
+GAPS = ["", " ", "  ", "\t", "\t ", "\xa0", "\x1b", "\x00", "\n", "\r\n", "\n  ", "\r", "\u2028"]
+GAP_SECRET = "secretsecret12345"
+
+
+@pytest.mark.parametrize("gap", GAPS)
+def test_a_gap_before_a_value_is_redacted_through_every_writer(gap: str, canary) -> None:
+    # Through the writer, never the function alone: the renderer's field, a bounded text, the
+    # translator's quoted reply, and a tool's error line. The marker stands directly after the name.
+    text = f"A_TOKEN={gap}{GAP_SECRET}"
+    lines = [
+        log_fields(detail=text),
+        log_fields(detail=f"pre {text} post=1"),
+        bounded(text),
+        *quoted(text),
+        *translate(tool_run(text)),
+    ]
+    assert not any(GAP_SECRET in line for line in lines), lines
+    assert silent(canary, *lines)
+    assert log_fields(detail=text) == "detail=\"A_TOKEN='<a redacted value>'\""
+    assert quoted(text) == ["> A_TOKEN='<a redacted value>'"]
+    assert redact_credentials(redact_credentials(text)) == redact_credentials(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # A word of prose after `NAME= ` is the accepted cost (#561).
+        ("export GH_TOKEN=\necho done", "export GH_TOKEN='<a redacted value>' done"),
+        # After an inner name's `=` and after a scheme word, the same gap.
+        (
+            "AUTH_TOKEN=x,DB_PASSWORD=\n  hunter2hunter2 next=1",
+            "AUTH_TOKEN='<a redacted value>' next=1",
+        ),
+        (f"A_TOKEN=Bearer\r\n{FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # A marker after a gap is the whole value, and stands directly after the name.
+        ("A_TOKEN= '<a redacted value>' next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # A quoted value after a gap goes whole.
+        ('A_TOKEN=\t "a b c" next=1', "A_TOKEN='<a redacted value>' next=1"),
+    ],
+)
+def test_a_gap_is_read_after_every_separator(text: str, redacted: str, canary) -> None:
+    assert redact_credentials(text) == redacted
+    assert redact_credentials(redacted) == redacted
+    assert silent(canary, redacted)
+
+
+def test_the_print_site_and_the_box_read_farther_within_one_window() -> None:
+    # The first reading leaves a value to the gap reading when that reading reaches farther, read
+    # within a window past the first reading's end and its gap (#561): one size, both readers.
+    import credential_rule
+
+    assert logfmt.FARTHER_WINDOW == credential_rule.FARTHER_WINDOW
+
+
+@pytest.mark.parametrize("gap", [" " * 5_000, "\n" * 5_000, "\t " * 3_000])
+def test_a_gap_longer_than_the_window_never_hides_the_value_after_it(gap: str, canary) -> None:
+    for text in (f"A_TOKEN=aB_TOKEN={gap}secrettoken1", f"A_TOKEN=Bearer{gap}secrettoken1"):
+        out = log_fields(detail=text)
+        assert "secrettoken1" not in out, out[-80:]
+        assert "secrettoken1" not in "".join(quoted(text))
