@@ -40,7 +40,7 @@ Live Tail whichever daemon emitted the line.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import MappingProxyType
@@ -166,6 +166,35 @@ REDACTED_VALUE = "'<a redacted value>'"
 #: ``wake-runner``'s ``jq`` fallback splits by this pattern, spelled for jq (pinned by a test).
 _BREAK_CHARS = "\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 RECORD_BREAKS = "\r\n|[" + _BREAK_CHARS + "]"
+
+#: What may stand between a separator and the value it anchors (#561): a run of whitespace or
+#: control characters, line breaks included (`A_TOKEN=<NEWLINE>value`, `A_TOKEN=  value`). Every
+#: value rule reads past it, and the redacted span takes it with the value, so the marker stands
+#: directly after the name (the NOC counts a marker only there). Unicode's whitespace and its
+#: ``Cc`` category exactly, as ranges of code points (pinned by a test), so each engine spells one
+#: set: :func:`value_gap_class` for Python's ``re``, ``tests/credential_rule.py`` for the box's
+#: Rust regex. Over-redacting a word of prose after ``NAME= `` is the accepted cost; a credential
+#: written in full is not.
+VALUE_GAP_RANGES = (
+    (0x00, 0x20),
+    (0x7F, 0xA0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200A),
+    (0x2028, 0x2029),
+    (0x202F, 0x202F),
+    (0x205F, 0x205F),
+    (0x3000, 0x3000),
+)
+
+
+def value_gap_class(spell: Callable[[int], str]) -> str:
+    """The gap's character class, each code point written by ``spell``."""
+    return (
+        "["
+        + "".join(spell(a) + ("-" + spell(b) if b > a else "") for a, b in VALUE_GAP_RANGES)
+        + "]"
+    )
+
 
 #: The canary's value run, where it ends in every record the text can be written into: at one of
 #: the canary's own stops, or at a record break, since no record holds a run across one.

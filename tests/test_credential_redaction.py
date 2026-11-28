@@ -612,3 +612,24 @@ def test_the_daemons_fields_pass_the_same_rule(canary) -> None:
 
 def test_the_module_states_its_marker_once() -> None:
     assert logfmt.REDACTED_VALUE == "'<a redacted value>'"
+
+
+# --- the gap before a value (#561) ----------------------------------------------------------------
+
+
+def test_the_gap_is_unicodes_whitespace_and_its_control_characters_exactly() -> None:
+    # One set, spelled by every engine from these ranges: whitespace or a control character, line
+    # breaks included, and nothing else (a `"`, a `,` or a letter after the `=` is the value's own).
+    import unicodedata
+
+    from basecradle_router.logfmt import VALUE_GAP_RANGES
+
+    ranges = {point for a, b in VALUE_GAP_RANGES for point in range(a, b + 1)}
+    expected = {
+        point
+        for point in range(0x110000)
+        if chr(point).isspace() or unicodedata.category(chr(point)) == "Cc"
+    }
+    assert ranges == expected
+    assert all(a <= b for a, b in VALUE_GAP_RANGES)
+    assert sorted(VALUE_GAP_RANGES) == list(VALUE_GAP_RANGES)

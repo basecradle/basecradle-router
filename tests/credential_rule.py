@@ -31,10 +31,17 @@ from pathlib import Path
 from basecradle_router.logfmt import (
     CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
+    value_gap_class,
 )
 
 #: Every record break, as each class spells it (`logfmt._BREAK_CHARS`, pinned by a test).
 BRK = r"\n\r\x00\x0b\x0c\x1c\x1d\x1e\x85\x{2028}\x{2029}"
+
+#: What may stand between a separator and its value (`logfmt.VALUE_GAP_RANGES`, #561): a run of
+#: whitespace or control characters, line breaks included. Every value here reads past it, after the
+#: name's `=`, an inner name's `=` and a scheme word alike, and the span it is in takes it, so the
+#: marker stands directly after the name.
+GAP = value_gap_class(lambda point: f"\\x{{{point:x}}}")
 
 #: The canary's credential name, byte for byte (`conftest.NOC_CREDENTIAL_ASSIGNMENT`).
 NAME = f"[A-Z0-9_]*({'|'.join(CREDENTIAL_WORDS)})({CREDENTIAL_TAIL})?"
@@ -100,9 +107,9 @@ GLUED = f"[{SCHEME_GLUE}]*?Bearer"
 SCHEME = f"(?:(?i:bearer)|{GLUED})"
 
 
-#: A run of scheme words, each with the blanks after it, in any order, as the print site's
+#: A run of scheme words, each with the gap after it (#561), in any order, as the print site's
 #: `logfmt._value_end` reads them (#497).
-SCHEMES = rf"(?:{SCHEME}[\x20\t]+)"
+SCHEMES = rf"(?:{SCHEME}{GAP}+)"
 
 
 #: A run of scheme words reached across tabs, as well as blanks (#502): each one after any prefix of
@@ -111,14 +118,28 @@ SCHEMES = rf"(?:{SCHEME}[\x20\t]+)"
 #: value between a scheme word and its token. Every piece of the prefix closes, so none can stop
 #: inside a quote: one that could would let `'a<TAB>Bearer b'` read as a scheme word and open a
 #: quote that eats the line's fields. The box reads at least what the print site does here.
-REACHED_SCHEMES = rf"(?:(?:{CLOSED_PIECE}*?\\?\t)?\t*{SCHEME}[\x20\t]+)"
+REACHED_SCHEMES = rf"(?:(?:{CLOSED_PIECE}*?\\?\t)?\t*{SCHEME}{GAP}+)"
 
+
+#: The closed pieces the run's open pieces read the same way: every closed piece but a bare `$` or
+#: `(`, which may open the run's unclosed substitution, and an escaped `"`, which opens its
+#: JSON-escaped quote. An inner name after these alone may have a gap after its `=` (#561): the
+#: run's reading with no inner name reads these pieces as they are and ends at the gap's blank, so
+#: reading on past the gap only ever takes more. Read after any closed piece, a gap would let a
+#: shorter reading win where the run's open substitution read to the record's end (leftmost-first
+#: keeps the first reading that matches, not the longest).
+_ESCAPE, *_QUOTED, _BARE_PIECE = CLOSED_PIECES
+assert _ESCAPE == r"\\[^" + BRK + "]" and _BARE_PIECE.startswith(r"[^\x20"), (_ESCAPE, _BARE_PIECE)
+PLAIN_PIECES = [r"\\[^\"" + BRK + "]", *_QUOTED, _BARE_PIECE.replace("`", r"`\x24\(", 1)]
+PLAIN_PIECE = "(?:" + "|".join(PLAIN_PIECES) + ")"
 
 #: The credential names a value holds outside every quote, each with its `=` (`'q'DB_PASSWORD=`):
 #: the value goes on into each one's value, as the print site's `logfmt._value_end` reads it (#504's
-#: review). The pieces before each name all close, so a name inside a quote is the quote's text. (A
-#: `,` ends the box's value, so a name after one is an assignment of the box's own.)
-INNER_NAMES = f"(?:{CLOSED_PIECE}*?{NAME}=)*"
+#: review), past the gap after its `=` where only plain pieces stand before it (#561), a reading
+#: tried first so that it is the one kept where both match (leftmost-first). The pieces
+#: before each name all close, so a name inside a quote is the quote's text. (A `,` ends the box's
+#: value, so a name after one is an assignment of the box's own.)
+INNER_NAMES = f"(?:{PLAIN_PIECE}*?{NAME}={GAP}+|{CLOSED_PIECE}*?{NAME}=)*"
 
 #: A run of scheme words, each with the inner names its token holds before the next.
 SCHEME_CHAIN = f"(?:{REACHED_SCHEMES}{INNER_NAMES})"
@@ -178,12 +199,19 @@ COMMENT = """      # CREDENTIAL-NAMED ASSIGNMENTS, IN EVERY FIELD, FOR EVERY WRI
       #      never ends between a scheme word and its token.
       #   Both passes read on into the value of a credential name the value holds outside every
       #   quote (`'q'DB_PASSWORD=<TAB>…`, `'q'DB_PASSWORD=Bearer …`), as the print site does.
-      # An empty value is left as it is, except before a record break, which the canary's run
+      # A GAP BEFORE A VALUE IS THE VALUE'S (basecradle-router#561): a run of whitespace or control
+      # characters, line breaks included, after a name's `=`, an inner name's `=` or a scheme word,
+      # is read past, and the value after it is taken with it, so the marker stands directly after
+      # the name (`A_TOKEN=<NEWLINE>value` ships as `A_TOKEN='<a value the box redacted>'`). A word
+      # of prose after `NAME= ` is the accepted cost. An empty value (nothing but a gap to the
+      # record's end) is left as it is, except before a record break, which the canary's run
       # crosses: the marker stands between the `=` and the break, and nothing is taken.
       #
       # THE TWO MARKERS PASS UNTOUCHED: the print site's `'<a redacted value>'` (the router's
       # renderer, and the harness's scrub) is a source doing its job, so the NOC's count of the box's
-      # marker, per writer, is only what a source let through. A marker is one where the canary's run
+      # marker, per writer, is only what a source let through. A marker after a gap is kept with
+      # its gap, as its source wrote it (#561): only the box's own marker is written directly
+      # after the name. A marker is one where the canary's run
       # would end after it, where both redactors end every value: anything glued to it goes with it.
       # Each is one shell word with a space at its fourth character, so the canary reads `'<a`, under
       # its floor of eight. The bytes are a contract the NOC counts on (deploy/README.md → Part 5).
@@ -208,9 +236,9 @@ BLOCK = (
               if contains(text, "\\"") {{
                   parity = replace_with(text, r'(?x)
                       (?P<head>{OUTSIDE}*?\\\\?{NAME}=)
-                      (?P<value>{PARITY_WORD})
+                      (?P<value>{GAP}*(?P<word>{PARITY_WORD}))
                     | {OUTSIDE}*(?:{DOUBLE_QUOTED})?') -> |segment| {{
-                      if segment.value == null || includes(["\\"'<a redacted value>'\\"", "\\"'<a value the box redacted>'\\""], segment.value) {{
+                      if segment.value == null || includes(["\\"'<a redacted value>'\\"", "\\"'<a value the box redacted>'\\""], segment.word) {{
                           segment.string
                       }} else {{
                           (string(segment.head) ?? "") + "'<a value the box redacted>'"
@@ -220,9 +248,9 @@ BLOCK = (
               replace_with(parity, r'(?x)
                   (?P<name>{NAME}=)
                   (?:
-                      (?P<kept>{MARKERS}|"{MARKERS}")(?P<kept_end>{MARKER_END})
+                      (?P<kept>{GAP}*(?:{MARKERS}|"{MARKERS}"))(?P<kept_end>{MARKER_END})
                     | (?P<value>
-                          {INNER_NAMES}
+                          {GAP}*{INNER_NAMES}
                           (?:
                               {CLOSED_QUOTED_VALUE}
                             | {SCHEME_CHAIN}+{OPEN_PIECE}+

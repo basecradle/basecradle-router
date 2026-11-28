@@ -590,14 +590,25 @@ def test_a_scheme_word_a_tab_glues_to_a_value_is_reached_after_closed_pieces() -
     # word and open a quote that eats a line's fields.
     reached = credential_rule.REACHED_SCHEMES
     closed = credential_rule.CLOSED_PIECE
-    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}[\x20\t]+)"
+    assert reached == rf"(?:(?:{closed}*?\\?\t)?\t*{credential_rule.SCHEME}{credential_rule.GAP}+)"
     chain = credential_rule.SCHEME_CHAIN
     assert chain == f"(?:{reached}{credential_rule.INNER_NAMES})"
     assert f"| {chain}+{credential_rule.OPEN_PIECE}+\n" in credential_rule.BLOCK
     inner = credential_rule.INNER_NAMES
     # A credential name the value holds outside every quote goes on into its value (#504's
     # review): only closed pieces stand before it, so a name inside a quote is the quote's text.
-    assert inner == f"(?:{closed}*?{credential_rule.NAME}=)*"
+    # Its value reads past a gap only after plain pieces (#561), the reading tried first.
+    plain = credential_rule.PLAIN_PIECE
+    gap = credential_rule.GAP
+    assert inner == f"(?:{plain}*?{credential_rule.NAME}={gap}+|{closed}*?{credential_rule.NAME}=)*"
+    # A plain piece is a closed one the run's open pieces read the same way: no bare `$` or `(`
+    # (an open substitution), no escaped `"` (an open JSON-escaped quote).
+    escape, *quoted, bare = credential_rule.CLOSED_PIECES
+    assert plain == "(?:" + "|".join(credential_rule.PLAIN_PIECES) + ")"
+    plain_escape, *plain_quoted, plain_bare = credential_rule.PLAIN_PIECES
+    assert _negated_classes(plain_escape)[0] == _negated_classes(escape)[0] | {'"'}
+    assert "|".join(plain_quoted) == "|".join(quoted)
+    assert _negated_classes(plain_bare)[0] == _negated_classes(bare)[0] | {"$", "("}
     # Pass 1's word goes on past its quoted piece to a tab, and past one only by a scheme word.
     before_a_tab = credential_rule.CLOSED_PIECE_BEFORE_A_TAB
     assert _negated_classes(before_a_tab)[-1] == _negated_classes(closed)[-1] | {"\t"}
